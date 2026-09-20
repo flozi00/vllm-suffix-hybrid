@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "suffix-hybrid"
+version = "0.1.0"
+description = "Pure-Python vLLM speculative decoding plugin combining a self-improving cross-request suffix cache with native n-gram drafting."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [{ name = "flozi00" }]
+
+[tool.setuptools]
+packages = ["suffix_hybrid"]
