@@ -127,16 +127,27 @@ class HybridProposer:
     def propose(self, *args: Any, **kwargs: Any) -> List[List[int]]:
         """Introspected-signature propose().
 
-        vLLM versions differ: newer main calls
-        ``propose(num_speculative_tokens, input_batch, sampled_token_ids, slot_mappings=...)``
-        while some versions call ``propose(input_batch, sampled_token_ids)``.
-        We detect: the arg with a ``req_ids`` attribute is the input batch;
-        the arg that is a list of lists is ``sampled_token_ids``; an int arg
-        is ``num_speculative_tokens`` (fall back to the config value).
+        Two call shapes exist across vLLM versions:
+
+        - Older / suffix-style:
+          ``propose(num_speculative_tokens, input_batch, sampled_token_ids,
+          slot_mappings=...)`` — an InputBatch object with ``req_ids``.
+        - vLLM >= 0.29 custom_class (verified against v0.29.0
+          gpu_model_runner): ``propose(sampled_token_ids,
+          num_tokens_no_spec, token_ids_cpu, slot_mappings=...)`` — NO
+          InputBatch, so no request ids and no prompt lengths. We detect
+          the parts (int -> token cap; ``req_ids`` attr -> input batch;
+          list-of-lists -> sampled ids; 1-D list-of-ints/tensor ->
+          num_tokens_no_spec; 2-D tensor -> token_ids_cpu) and, in the
+          second shape, wrap them in a ``_RowAdapter`` that synthesizes
+          per-row request ids (see its docstring for the reuse-detection
+          invariant).
         """
         num_spec = self.num_speculative_tokens
         input_batch = None
         sampled_token_ids: List[List[int]] = []
+        token_cpu: Any = None
+        num_tokens_no_spec_arg: Any = None
 
         for a in args:
             if isinstance(a, int):
@@ -147,12 +158,40 @@ class HybridProposer:
                 not a or isinstance(a[0], (list, tuple))
             ):
                 sampled_token_ids = a
+            elif isinstance(a, (list, tuple)) and a and isinstance(a[0], int):
+                num_tokens_no_spec_arg = a
+            elif _shape_len(a) == 2:
+                token_cpu = a
+            elif _shape_len(a) == 1:
+                num_tokens_no_spec_arg = a
         if "input_batch" in kwargs and kwargs["input_batch"] is not None:
             input_batch = kwargs["input_batch"]
         if kwargs.get("sampled_token_ids") is not None:
             sampled_token_ids = kwargs["sampled_token_ids"]
-        if isinstance(kwargs.get("num_speculative_tokens"), int):
+        if kwargs.get("num_speculative_tokens") is not None and isinstance(
+            kwargs["num_speculative_tokens"], int
+        ):
             num_spec = kwargs["num_speculative_tokens"]
+
+        if input_batch is None and token_cpu is not None:
+            # vLLM >= 0.29 custom_class shape: no InputBatch, positional
+            # (sampled_token_ids, num_tokens_no_spec, token_ids_cpu). The
+            # adapter PERSISTS on the proposer (self._row_adapter) so row
+            # continuity is tracked across steps — a fresh adapter every
+            # call would treat every row as new every step and never build
+            # request state.
+            adapter = getattr(self, "_row_adapter", None)
+            if adapter is None:
+                adapter = _RowAdapter(
+                    token_cpu, num_tokens_no_spec_arg, len(sampled_token_ids)
+                )
+                self._row_adapter = adapter
+            else:
+                adapter.update(
+                    token_cpu, num_tokens_no_spec_arg, len(sampled_token_ids)
+                )
+            adapter.refresh(sampled_token_ids)
+            input_batch = adapter
 
         if input_batch is None:
             return [[] for _ in sampled_token_ids]
@@ -196,9 +235,20 @@ class HybridProposer:
                 index = input_batch.req_id_to_index.get(req_id)
                 prompt_tokens: List[int] = []
                 if index is not None:
-                    prompt_tokens = _read_row(
-                        input_batch, index, int(input_batch.num_prompt_tokens[index])
-                    )
+                    try:
+                        npt = int(input_batch.num_prompt_tokens[index])
+                    except Exception:
+                        npt = 0
+                    if npt > 0:
+                        prompt_tokens = _read_row(
+                            input_batch, index, npt
+                        )
+                    else:
+                        # v0.29 adapter shape: prompt length is unknown.
+                        # The full row content (prompt + generated so far)
+                        # is the best available context, and a frequency
+                        # suffix cache tolerates the small overlap.
+                        prompt_tokens = _read_row(input_batch, index, num_tokens)
                 self._active[req_id] = {"active_tokens": list(prompt_tokens), "prev_draft": []}
                 self.suffix_cache.add_prompt(prompt_tokens)
                 state = self._active[req_id]
@@ -431,3 +481,114 @@ def _read_row(input_batch: Any, index: int, num_tokens: int) -> List[int]:
         return [int(t) for t in row]
     except Exception:
         return []
+
+
+def _shape_len(obj: Any) -> Optional[int]:
+    """Tensor rank for torch tensors / numpy arrays / nested lists, else None.
+
+    Used by propose() introspection to tell a 2-D token_ids_cpu apart from
+    a 1-D num_tokens_no_spec without importing torch.
+    """
+    try:
+        shape = getattr(obj, "shape", None)
+        if shape is not None and len(shape) >= 1:
+            return len(shape)
+    except Exception:
+        pass
+    # Nested python lists: probe one level.
+    if isinstance(obj, (list, tuple)) and obj and isinstance(obj[0], (list, tuple)):
+        return 2
+    return None
+
+
+class _RowAdapter:
+    """Duck-typed InputBatch for the vLLM >= 0.29 custom_class call shape.
+
+    v0.29.0's gpu_model_runner calls the custom proposer positionally as
+    ``propose(sampled_token_ids, num_tokens_no_spec, token_ids_cpu,
+    slot_mappings=...)`` — no InputBatch object, hence no request ids and
+    no per-row prompt lengths. This adapter synthesizes both:
+
+    - ``req_ids``/``req_id_to_index``: synthetic ids keyed by ROW position
+      plus a generation counter. A row is considered the SAME request while
+      ``cur_tokens == prev_tokens + len(prev sampled)`` (the exact continue
+      invariant of a decode step under spec decode); when a row's token
+      count does not extend the previous sequence, the row is treated as a
+      NEW request and the old one is finalized into the suffix corpus
+      (its full sequence enters the cache — the self-improvement path).
+    - ``num_prompt_tokens``: unknown in this shape; reported as 0 so the
+      proposer seeds state from the first sampled tokens. The prompt still
+      reaches the corpus on finalize because active_tokens grows from what
+      IS observable (the sampled ids plus prior row content).
+    """
+
+    def __init__(self, token_cpu: Any, num_tokens_no_spec: Any, num_rows: int) -> None:
+        self.token_ids_cpu = token_cpu
+        self._nts_list = self._to_list(num_tokens_no_spec)
+        self._prev: Dict[int, Tuple[str, int, int]] = {}  # row -> (req_id, prev_tokens, prev_sampled_len)
+        self._gen = 0
+        req_ids: List[str] = []
+        self.req_id_to_index: Dict[str, int] = {}
+        self.num_prompt_tokens: List[int] = []
+        for row in range(num_rows):
+            self._gen += 1
+            rid = f"row{row}-gen{self._gen}"
+            req_ids.append(rid)
+            self.req_id_to_index[rid] = row
+            self.num_prompt_tokens.append(0)
+            cur = self._nts_list[row] if row < len(self._nts_list) else 0
+            self._prev[row] = (rid, cur, 0)
+        self.req_ids = req_ids
+
+    def update(self, token_cpu: Any, num_tokens_no_spec: Any, num_rows: int) -> None:
+        """Swap in this step's tensors (row count can change between steps)."""
+        self.token_ids_cpu = token_cpu
+        self._nts_list = self._to_list(num_tokens_no_spec)
+
+    @staticmethod
+    def _to_list(x: Any) -> List[int]:
+        try:
+            if x is None:
+                return []
+            tolist = getattr(x, "tolist", None)
+            if callable(tolist):
+                x = tolist()
+            return [int(v) for v in list(x)]
+        except Exception:
+            return []
+
+    def refresh(self, sampled_token_ids: List[List[int]]) -> None:
+        """Re-key rows whose token count did not extend the previous step.
+
+        A row continues the SAME request iff
+        ``cur_tokens == prev_tokens + prev_sampled_len`` — the exact
+        invariant of a decode step (num_tokens_no_spec grows by exactly the
+        tokens sampled last step, draft-accepted or not). Anything else
+        (count reset, row shrunk, batch reshuffled) means the row now holds
+        a different request: assign a fresh synthetic id, which the proposer
+        treats as a new request and finalizes the old one into the suffix
+        corpus — the self-improvement path.
+        """
+        new_prev: Dict[int, Tuple[str, int, int]] = {}
+        req_ids: List[str] = []
+        self.req_id_to_index = {}
+        self.num_prompt_tokens = []
+        for row in range(len(sampled_token_ids)):
+            cur = self._nts_list[row] if row < len(self._nts_list) else 0
+            prev = self._prev.get(row)
+            if prev is not None and cur == prev[1] + max(prev[2], 1):
+                rid = prev[0]
+            else:
+                self._gen += 1
+                rid = f"row{row}-gen{self._gen}"
+            sampled_len = len(sampled_token_ids[row]) if row < len(sampled_token_ids) else 0
+            req_ids.append(rid)
+            self.req_id_to_index[rid] = row
+            self.num_prompt_tokens.append(0)
+            new_prev[row] = (rid, cur, sampled_len)
+        self._prev = new_prev
+        self.req_ids = req_ids
+
+    @property
+    def num_tokens_no_spec(self) -> List[int]:
+        return self._nts_list

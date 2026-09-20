@@ -56,6 +56,28 @@ def reset_env():
         os.environ.pop(k)
 
 
+class _Fake2DTensor:
+    """2-D token_ids_cpu stand-in with a .shape (tensor introspection)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.shape = (len(rows), max((len(r) for r in rows), default=0))
+
+    def __getitem__(self, idx):
+        return _FakeRow(self.rows[idx])
+
+
+class _Fake1DTensor:
+    """1-D num_tokens_no_spec stand-in with a .shape."""
+
+    def __init__(self, values):
+        self.values = list(values)
+        self.shape = (len(self.values),)
+
+    def tolist(self):
+        return list(self.values)
+
+
 class TestHybridProposer(unittest.TestCase):
     def setUp(self):
         reset_env()
@@ -111,6 +133,49 @@ class TestHybridProposer(unittest.TestCase):
         batch2 = FakeInputBatch([seq[:9]], [8], ids=["r1"])
         out2 = p.propose(4, batch2, [[9]])
         self.assertEqual(out2[0], [10])
+
+    def test_v029_positional_shape_drafts(self):
+        """vLLM 0.29 custom_class: propose(sampled, num_tokens_no_spec,
+        token_ids_cpu, slot_mappings=...) — no InputBatch. Regression for
+        the always-empty-drafts bug (introspection found no req_ids)."""
+        p = HybridProposer(self._cfg())
+        seq = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+        # Step 1: request r starts, one token sampled.
+        rows = [seq[:8]]
+        out = p.propose([[9]], _Fake1DTensor([8]), _Fake2DTensor(rows))
+        self.assertEqual(len(out), 1)
+        # No corpus yet -> no draft (or whatever suffix has), but NOT the
+        # blanket empty-from-failed-introspection: assert the row was
+        # registered by checking stats.
+        self.assertEqual(p.get_stats()["active_requests"], 1)
+
+        # Step 2: same request continues (8 -> 9 tokens), corpus built from
+        # a finished neighbour below. Feed a finished request first.
+        p2 = HybridProposer(self._cfg())
+        # Request A finishes: [1..8] prompt, samples [9, 10].
+        p2.propose([[9, 10]], _Fake1DTensor([8]), _Fake2DTensor([seq[:8]]))
+        # New request B on the same row (count reset 10 -> 8): row re-keyed,
+        # A finalized into corpus.
+        out = p2.propose([[9]], _Fake1DTensor([8]), _Fake2DTensor([seq[:8]]))
+        # B continues: 8 -> 9 tokens, context [1..9] — corpus knows [10].
+        out = p2.propose([[9]], _Fake1DTensor([9]), _Fake2DTensor([seq[:9]]))
+        self.assertEqual(out[0], [10])
+
+    def test_v029_row_adapter_continuity(self):
+        """The persistent row adapter: consecutive steps on the same row
+        keep ONE request id; a count reset re-keys the row."""
+        from suffix_hybrid.hybrid_proposer import _RowAdapter
+
+        a = _RowAdapter(None, _Fake1DTensor([8]), 1)
+        a.refresh([[9]])            # step 1: new request, sampled len 1
+        rid1 = a.req_ids[0]
+        a.update(None, _Fake1DTensor([9]), 1)
+        a.refresh([[10]])           # 9 == 8 + 1 -> same request
+        self.assertEqual(a.req_ids[0], rid1)
+        a.update(None, _Fake1DTensor([8]), 1)
+        a.refresh([[5]])            # 8 != 9 + 1 -> new request
+        self.assertNotEqual(a.req_ids[0], rid1)
 
     def test_max_model_len_rows_get_empty_draft(self):
         class Big:
