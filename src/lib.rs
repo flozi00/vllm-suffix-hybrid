@@ -188,7 +188,7 @@ impl Cache {
         ])
     }
 }
-#[pyclass(module = "suffix_hybrid._native")]
+#[pyclass(module = "suffix_hybrid._native", skip_from_py_object)]
 #[derive(Clone)]
 struct SuffixCache {
     inner: Arc<Mutex<Cache>>,

@@ -303,7 +303,7 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "sitecustomize",
-      "community": 14,
+      "community": 1,
       "norm_label": "sitecustomize.py"
     },
     {
@@ -1023,7 +1023,7 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "suffix_hybrid_hybrid_proposer",
-      "community": 14,
+      "community": 1,
       "norm_label": "hybrid_proposer.py"
     },
     {
@@ -1043,7 +1043,7 @@
       "source_location": "L20",
       "_origin": "ast",
       "id": "suffix_hybrid_hybrid_proposer_hybridproposer_init",
-      "community": 14,
+      "community": 1,
       "norm_label": ".__init__()"
     },
     {
@@ -1083,7 +1083,7 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "suffix_hybrid_wrap",
-      "community": 14,
+      "community": 1,
       "norm_label": "wrap.py"
     },
     {
@@ -1093,7 +1093,7 @@
       "source_location": "L50",
       "_origin": "ast",
       "id": "suffix_hybrid_wrap_verify_sources",
-      "community": 14,
+      "community": 1,
       "norm_label": "_verify_sources()"
     },
     {
@@ -1103,7 +1103,7 @@
       "source_location": "L57",
       "_origin": "ast",
       "id": "suffix_hybrid_wrap_wrap_propose",
-      "community": 14,
+      "community": 1,
       "norm_label": "_wrap_propose()"
     },
     {
@@ -1113,7 +1113,7 @@
       "source_location": "L129",
       "_origin": "ast",
       "id": "suffix_hybrid_wrap_install",
-      "community": 14,
+      "community": 1,
       "norm_label": "install()"
     },
     {
@@ -1817,30 +1817,20 @@
       "norm_label": "vllm-suffix-hybrid"
     },
     {
-      "label": "Native model + suffix usage",
+      "label": "Usage",
       "file_type": "document",
       "source_file": "README.md",
-      "source_location": "L14",
+      "source_location": "L13",
       "_origin": "ast",
-      "id": "readme_native_model_suffix_usage",
+      "id": "readme_usage",
       "community": 8,
-      "norm_label": "native model + suffix usage"
-    },
-    {
-      "label": "Auxiliary weight-free mode",
-      "file_type": "document",
-      "source_file": "README.md",
-      "source_location": "L43",
-      "_origin": "ast",
-      "id": "readme_auxiliary_weight_free_mode",
-      "community": 8,
-      "norm_label": "auxiliary weight-free mode"
+      "norm_label": "usage"
     },
     {
       "label": "Build and deliver",
       "file_type": "document",
       "source_file": "README.md",
-      "source_location": "L58",
+      "source_location": "L34",
       "_origin": "ast",
       "id": "readme_build_and_deliver",
       "community": 8,
@@ -1850,7 +1840,7 @@
       "label": "Correctness and isolation",
       "file_type": "document",
       "source_file": "README.md",
-      "source_location": "L79",
+      "source_location": "L55",
       "_origin": "ast",
       "id": "readme_correctness_and_isolation",
       "community": 8,
@@ -1860,7 +1850,7 @@
       "label": "Benchmarking",
       "file_type": "document",
       "source_file": "README.md",
-      "source_location": "L92",
+      "source_location": "L68",
       "_origin": "ast",
       "id": "readme_benchmarking",
       "community": 8,
@@ -1870,7 +1860,7 @@
       "label": "License",
       "file_type": "document",
       "source_file": "README.md",
-      "source_location": "L116",
+      "source_location": "L92",
       "_origin": "ast",
       "id": "readme_license",
       "community": 8,
@@ -5098,17 +5088,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "README.md",
-      "source_location": "L43",
-      "weight": 1.0,
-      "source": "readme_vllm_suffix_hybrid",
-      "target": "readme_auxiliary_weight_free_mode",
-      "confidence_score": 1.0
-    },
-    {
-      "relation": "contains",
-      "confidence": "EXTRACTED",
-      "source_file": "README.md",
-      "source_location": "L92",
+      "source_location": "L68",
       "weight": 1.0,
       "source": "readme_vllm_suffix_hybrid",
       "target": "readme_benchmarking",
@@ -5118,7 +5098,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "README.md",
-      "source_location": "L58",
+      "source_location": "L34",
       "weight": 1.0,
       "source": "readme_vllm_suffix_hybrid",
       "target": "readme_build_and_deliver",
@@ -5128,7 +5108,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "README.md",
-      "source_location": "L79",
+      "source_location": "L55",
       "weight": 1.0,
       "source": "readme_vllm_suffix_hybrid",
       "target": "readme_correctness_and_isolation",
@@ -5138,7 +5118,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "README.md",
-      "source_location": "L116",
+      "source_location": "L92",
       "weight": 1.0,
       "source": "readme_vllm_suffix_hybrid",
       "target": "readme_license",
@@ -5148,10 +5128,10 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "README.md",
-      "source_location": "L14",
+      "source_location": "L13",
       "weight": 1.0,
       "source": "readme_vllm_suffix_hybrid",
-      "target": "readme_native_model_suffix_usage",
+      "target": "readme_usage",
       "confidence_score": 1.0
     },
     {
@@ -5206,5 +5186,5 @@
     }
   ],
   "hyperedges": [],
-  "built_at_commit": "d1af3b7d6808bb75aa7000040e50c595a5a3170d"
+  "built_at_commit": "970e24ddb573b9b49a5408a269d40b0cce76bac0"
 }

@@ -1,16 +1,16 @@
 # Graph Report - vllm-suffix-hybrid  (2026-09-20)
 
 ## Corpus Check
-- 21 files · ~9,152 words
+- 21 files · ~8,990 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 193 nodes · 310 edges · 15 communities (11 shown, 4 thin omitted)
+- 192 nodes · 309 edges · 14 communities (10 shown, 4 thin omitted)
 - Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 5 edges (avg confidence: 0.74)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `d1af3b7d`
+- Built from commit: `970e24dd`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -28,7 +28,6 @@
 - [[_COMMUNITY_BundleTest|BundleTest]]
 - [[_COMMUNITY___init__.py|__init__.py]]
 - [[_COMMUNITY_suffix-hybrid|suffix-hybrid]]
-- [[_COMMUNITY_wrap.py|wrap.py]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `HybridProposer` - 19 edges
@@ -55,15 +54,15 @@
 ## Import Cycles
 - None detected.
 
-## Communities (15 total, 4 thin omitted)
+## Communities (14 total, 4 thin omitted)
 
 ### Community 0 - "SuffixCache"
 Cohesion: 0.12
 Nodes (17): Arc, Default, Mutex, PyModule, Cache, Config, env_float(), env_usize() (+9 more)
 
 ### Community 1 - "HybridProposer"
-Cohesion: 0.26
-Nodes (4): HybridProposer, config(), vLLM 0.29 custom_class contract: rows ALREADY include sampled IDs.  Legacy fake-, TestHybridProposer
+Cohesion: 0.18
+Nodes (7): HybridProposer, install(), _verify_sources(), _wrap_propose(), config(), vLLM 0.29 custom_class contract: rows ALREADY include sampled IDs.  Legacy fake-, TestHybridProposer
 
 ### Community 2 - "TestSuffixCache"
 Cohesion: 0.10
@@ -86,19 +85,15 @@ Cohesion: 0.28
 Nodes (12): invoke(), Contract tests with real tensors; vLLM/CUDA execution is a deployment gate., runner(), test_feedback_uses_accepted_and_scheduled_counts_with_discard_censoring(), test_native_list_not_mutated_and_short_mixed_lists_not_padded(), test_native_probabilities_preserved_suffix_tail_is_one_hot(), test_native_runs_first_and_rust_mixes_with_authoritative_context(), test_qwen35_full_attention_mtp_allowed_with_hybrid_target() (+4 more)
 
 ### Community 8 - "vllm-suffix-hybrid"
-Cohesion: 0.25
-Nodes (7): Auxiliary weight-free mode, Benchmarking, Build and deliver, Correctness and isolation, License, Native model + suffix usage, vllm-suffix-hybrid
+Cohesion: 0.29
+Nodes (6): Benchmarking, Build and deliver, Correctness and isolation, License, Usage, vllm-suffix-hybrid
 
 ### Community 9 - "Native hybrid design"
 Cohesion: 0.33
 Nodes (5): Components, Correctness boundaries, Learning the allocation, Native hybrid design, Required behavior
 
-### Community 14 - "wrap.py"
-Cohesion: 0.48
-Nodes (3): install(), _verify_sources(), _wrap_propose()
-
 ## Knowledge Gaps
-- **11 isolated node(s):** `suffix-hybrid`, `Native model + suffix usage`, `Auxiliary weight-free mode`, `Build and deliver`, `Correctness and isolation` (+6 more)
+- **10 isolated node(s):** `suffix-hybrid`, `Usage`, `Build and deliver`, `Correctness and isolation`, `Benchmarking` (+5 more)
   These have ≤1 connection - possible missing edges or undocumented components.
 - **4 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
@@ -108,11 +103,11 @@ _Questions this graph is uniquely positioned to answer:_
 - **Why does `SuffixCache` connect `SuffixCache` to `Engine`, `HybridMixer`?**
   _High betweenness centrality (0.085) - this node is a cross-community bridge._
 - **Why does `HybridMixer` connect `HybridMixer` to `SuffixCache`?**
-  _High betweenness centrality (0.053) - this node is a cross-community bridge._
+  _High betweenness centrality (0.054) - this node is a cross-community bridge._
 - **Why does `Engine` connect `Engine` to `SuffixCache`?**
-  _High betweenness centrality (0.049) - this node is a cross-community bridge._
+  _High betweenness centrality (0.050) - this node is a cross-community bridge._
 - **What connects `Parse SSE data fields, including comments, CRLF and multiline events.`, `Synthetic local fixtures only; these are not benchmark results.`, `suffix-hybrid` to the rest of the system?**
-  _17 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _16 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `SuffixCache` be split into smaller, more focused modules?**
   _Cohesion score 0.11724137931034483 - nodes in this community are weakly interconnected._
 - **Should `TestSuffixCache` be split into smaller, more focused modules?**
