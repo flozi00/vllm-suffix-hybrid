@@ -16,3 +16,4 @@ authors = [{ name = "flozi00" }]
 python-source = "."
 module-name = "suffix_hybrid._native"
 features = ["pyo3/extension-module"]
+include = [{ path = "sitecustomize.py", format = "wheel" }]
