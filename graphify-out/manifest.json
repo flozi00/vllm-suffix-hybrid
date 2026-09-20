@@ -1,0 +1,112 @@
+{
+  "bench/bench.py": {
+    "mtime": 1789926254.533119,
+    "ast_hash": "11479f95f0836db17b9a91f1ea322cc4",
+    "semantic_hash": ""
+  },
+  "bench/compare.py": {
+    "mtime": 1789931418.779458,
+    "ast_hash": "89547f1511f5878c3e7a7833a4e7bb1c",
+    "semantic_hash": ""
+  },
+  "bench/test_compare.py": {
+    "mtime": 1789931436.2639472,
+    "ast_hash": "2e09d5998f7f843b06d377966a88bde2",
+    "semantic_hash": ""
+  },
+  "pyproject.toml": {
+    "mtime": 1789931379.7571545,
+    "ast_hash": "61b5a03d40b46e359b5b61c9f1fb9fa9",
+    "semantic_hash": ""
+  },
+  "scripts/runtime_bundle.py": {
+    "mtime": 1789932505.167345,
+    "ast_hash": "1907815df0e0ef48532d5555a3b746ca",
+    "semantic_hash": ""
+  },
+  "scripts/test_runtime_bundle.py": {
+    "mtime": 1789931384.603173,
+    "ast_hash": "d096000fefca3a93d6b463a50835e97b",
+    "semantic_hash": ""
+  },
+  "sitecustomize.py": {
+    "mtime": 1789932195.689212,
+    "ast_hash": "8ae966f5da853713991dc16161d04138",
+    "semantic_hash": ""
+  },
+  "src/engine.rs": {
+    "mtime": 1789931608.3229492,
+    "ast_hash": "276038235229cbee7a17352c559a922d",
+    "semantic_hash": ""
+  },
+  "src/lib.rs": {
+    "mtime": 1789931984.4106555,
+    "ast_hash": "0246ca2de9f2db3b96ed114f22d519e1",
+    "semantic_hash": ""
+  },
+  "src/mixer.rs": {
+    "mtime": 1789932454.3121924,
+    "ast_hash": "3c377b1d22d18e3f195689e70e5364c3",
+    "semantic_hash": ""
+  },
+  "suffix_hybrid/__init__.py": {
+    "mtime": 1789931550.3582306,
+    "ast_hash": "401d533b6134c36c8bf23b8b8a9fa770",
+    "semantic_hash": ""
+  },
+  "suffix_hybrid/hybrid_proposer.py": {
+    "mtime": 1789931550.1781867,
+    "ast_hash": "32484fa9ae328cec6c0b03b99bf79c56",
+    "semantic_hash": ""
+  },
+  "suffix_hybrid/suffix_cache.py": {
+    "mtime": 1789931379.8867457,
+    "ast_hash": "05e99f233866305cb6bdcf3b46bea58f",
+    "semantic_hash": ""
+  },
+  "suffix_hybrid/wrap.py": {
+    "mtime": 1789932285.2100694,
+    "ast_hash": "39dce830e23ebc8996e6ebb99adfc11a",
+    "semantic_hash": ""
+  },
+  "tests/test_hybrid_proposer.py": {
+    "mtime": 1789931584.4002986,
+    "ast_hash": "1d0d3f416891dd1fa7a0b51f31d59e3f",
+    "semantic_hash": ""
+  },
+  "tests/test_mixer.py": {
+    "mtime": 1789932118.032959,
+    "ast_hash": "201f559e44e2753ddeb084adc4006a4f",
+    "semantic_hash": ""
+  },
+  "tests/test_native.py": {
+    "mtime": 1789931592.629328,
+    "ast_hash": "53bc96c1eff08529cf59c5d950628d6e",
+    "semantic_hash": ""
+  },
+  "tests/test_native_wrap.py": {
+    "mtime": 1789932275.527268,
+    "ast_hash": "8ffe424ef5771fd610592c71a44af9a0",
+    "semantic_hash": ""
+  },
+  "tests/test_suffix_cache.py": {
+    "mtime": 1789931601.9203677,
+    "ast_hash": "8ebe990524634e91099f288b2e0be38a",
+    "semantic_hash": ""
+  },
+  ".github/workflows/native.yml": {
+    "mtime": 1789932505.7324924,
+    "ast_hash": "68e38acebf273ca6b18ab85e05e5c940",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1789931535.1958408,
+    "ast_hash": "a09ac8d1683725c2d2fc16b27cd21f8d",
+    "semantic_hash": ""
+  },
+  "docs/DESIGN.md": {
+    "mtime": 1789932440.8456562,
+    "ast_hash": "e36957ff4982ce5e9b13116ded1ad762",
+    "semantic_hash": ""
+  }
+}

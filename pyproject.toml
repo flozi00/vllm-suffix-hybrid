@@ -1,15 +1,18 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
 [project]
 name = "suffix-hybrid"
-version = "0.1.0"
-description = "Pure-Python vLLM speculative decoding plugin combining a self-improving cross-request suffix cache with native n-gram drafting."
+version = "0.2.0"
+description = "Rust-native bounded suffix-cache and n-gram vLLM proposer"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
+dependencies = ["numpy>=1.23"]
 authors = [{ name = "flozi00" }]
 
-[tool.setuptools]
-packages = ["suffix_hybrid"]
+[tool.maturin]
+python-source = "."
+module-name = "suffix_hybrid._native"
+features = ["pyo3/extension-module"]

@@ -5,7 +5,7 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 
 from suffix_hybrid.suffix_cache import SuffixCache
 
@@ -99,12 +99,13 @@ class TestSuffixCache(unittest.TestCase):
         stats = cache.stats()
         self.assertEqual(stats["num_sequences"], 2)
 
-    def test_unlimited_cap(self):
+    def test_negative_cap_uses_bounded_default(self):
         set_env(SUFFIX_HYBRID_MAX_CACHED_REQUESTS=-1)
         cache = SuffixCache()
         for i in range(20):
             cache.add_sequence([1, 2, 3, 4, 5, 6, 7, 8, i])
         self.assertEqual(cache.stats()["num_sequences"], 20)
+        self.assertEqual(cache.stats()["max_cached_requests"], 512)
 
     def test_short_sequence_rejected(self):
         cache = SuffixCache()

@@ -1,0 +1,38 @@
+name: Native plugin
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', 'graphify-out/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: '2_28'
+          args: --release --locked --out dist
+      - name: Exercise installed Linux wheel
+        run: |
+          python -m pip install dist/*.whl numpy pytest
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          cd "$RUNNER_TEMP"
+          python -m pytest "$GITHUB_WORKSPACE/tests" -q --import-mode=importlib
+      - name: Create directly mountable runtime bundle
+        run: python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-linux-x86_64
+          path: runtime/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-x86_64
+          path: dist/*.whl
