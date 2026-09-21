@@ -6,9 +6,18 @@ from suffix_hybrid.suffix_cache import SuffixCache
 
 class NativeCacheTests(unittest.TestCase):
     def setUp(self):
+        # Keep the conftest-pinned INDEX_N (file order must not change
+        # lookup semantics); reset every other knob for determinism.
         for key in list(os.environ):
-            if key.startswith('SUFFIX_HYBRID'):
+            if key.startswith('SUFFIX_HYBRID') and key != 'SUFFIX_HYBRID_INDEX_N':
                 del os.environ[key]
+        os.environ.setdefault('SUFFIX_HYBRID_INDEX_N', '2')
+
+    def tearDown(self):
+        for key in list(os.environ):
+            if key.startswith('SUFFIX_HYBRID') and key != 'SUFFIX_HYBRID_INDEX_N':
+                del os.environ[key]
+        os.environ['SUFFIX_HYBRID_INDEX_N'] = '2'
 
     def test_oversized_sequence_allocation_is_bounded(self):
         os.environ['SUFFIX_HYBRID_MAX_CACHED_TOKENS'] = '16'
@@ -28,6 +37,8 @@ class NativeCacheTests(unittest.TestCase):
         stats = cache.stats()
         self.assertLessEqual(stats['num_sequences'], 2)
         self.assertLessEqual(stats['cached_tokens'], 20)
-        self.assertLessEqual(stats['num_index_keys'], 6)
+        # n=2 (conftest-pinned): 10-token sequences index 9 bigrams each,
+        # 2 live sequences => <= 18 keys. (Was 6 at n=8.)
+        self.assertLessEqual(stats['num_index_keys'], 18)
         self.assertEqual(cache.speculate(list(range(8)), 2)[0], [])
         self.assertEqual(cache.speculate(list(range(1980, 1988)), 2)[0], [1988, 1989])

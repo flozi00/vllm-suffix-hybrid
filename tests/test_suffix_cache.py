@@ -20,10 +20,13 @@ def set_env(**kv):
 
 class TestSuffixCache(unittest.TestCase):
     def setUp(self):
-        # Reset all env knobs so tests are deterministic.
-        keys = [k for k in os.environ if k.startswith("SUFFIX_HYBRID")]
-        for k in keys:
-            os.environ.pop(k)
+        # Reset all env knobs so tests are deterministic -- except the
+        # n-gram order pinned by tests/conftest.py (file order must not
+        # change lookup semantics).
+        for k in [k for k in os.environ if k.startswith("SUFFIX_HYBRID")]:
+            if k != "SUFFIX_HYBRID_INDEX_N":
+                os.environ.pop(k)
+        os.environ.setdefault("SUFFIX_HYBRID_INDEX_N", "2")
 
     def test_no_match_on_empty_cache(self):
         cache = SuffixCache()

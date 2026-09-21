@@ -22,7 +22,7 @@ struct Config {
     n: usize,
     depth: usize,
     sequences: usize,
-    tokens: usize,
+    pub tokens: usize,
     positions: usize,
     candidates: usize,
     support: usize,
@@ -46,8 +46,8 @@ impl Default for Config {
         }
     }
 }
-struct Cache {
-    cfg: Config,
+pub struct Cache {
+    pub cfg: Config,
     sequences: HashMap<u64, Vec<i64>>,
     fifo: VecDeque<u64>,
     index: HashMap<Vec<i64>, VecDeque<(u64, usize)>>,
@@ -215,6 +215,12 @@ impl SuffixCache {
             .lock()
             .unwrap()
             .speculate(&context_tokens, max_tokens.max(0) as usize)
+    }
+    /// Test seam: pin the n-gram order for deterministic unit tests,
+    /// independent of process env and pytest file order. Production code
+    /// never calls this (n comes from SUFFIX_HYBRID_INDEX_N, default 8).
+    fn set_test_n(&self, n: usize) {
+        self.inner.lock().unwrap().cfg.n = n.clamp(1, 128);
     }
     fn stats(&self) -> HashMap<String, usize> {
         self.inner.lock().unwrap().stats()

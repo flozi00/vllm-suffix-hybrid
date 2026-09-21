@@ -10,6 +10,14 @@ struct Previous {
     native: usize,
     length: usize,
     arm: usize,
+    // Per-request expected acceptance, updated from this row's own feedback.
+    accept_estimate: f64,
+    // Per-request suffix quality: EWMA of accepted SUFFIX tokens on rows
+    // that carried a non-native tail (None = no tail feedback yet, the
+    // tail gets one trial). Gates replace-splices, never the budget.
+    suffix_estimate: Option<f64>,
+    // Whether the last proposal for this row carried a suffix tail.
+    had_suffix: bool,
 }
 
 #[pyclass(module = "suffix_hybrid._native")]
@@ -21,8 +29,6 @@ pub struct HybridMixer {
     calls: u64,
     decisions: u64,
     initial: usize,
-    rewards: Vec<f64>,
-    trials: Vec<f64>,
     last_native: Vec<usize>,
     native_tested: u64,
     native_accepted: u64,
@@ -34,22 +40,14 @@ pub struct HybridMixer {
 }
 
 impl HybridMixer {
-    fn choose(&self) -> usize {
-        if self.decisions == 0 {
-            return self.initial;
-        }
-        // Periodic exploration prevents the initial 80/20 prior locking in.
-        if self.decisions % 8 == 0 {
-            return (self.decisions as usize / 8) % self.k + 1;
-        }
-        (1..=self.k)
-            .max_by(|&a, &b| {
-                let score = |n: usize| (self.rewards[n] + 0.5) / (self.trials[n] + 1.0);
-                score(a)
-                    .total_cmp(&score(b))
-                    .then_with(|| b.abs_diff(self.initial).cmp(&a.abs_diff(self.initial)))
-            })
-            .unwrap_or(1)
+    /// Per-request draft budget: expected accepted tokens (EWMA of this row's
+    /// own feedback, seeded at `initial`) rounded UP to a length in 1..=k.
+    /// A row that accepts 2 of 5 gets ~2-3 next, never 5 on repeat failure.
+    /// Ceil (not round) so a fully-accepted row converges back to full
+    /// width instead of hovering one slot below it forever.
+    fn pick(&self, estimate: Option<f64>) -> usize {
+        let est = estimate.unwrap_or(self.initial as f64);
+        (est.ceil() as usize).clamp(1, self.k)
     }
 }
 
@@ -71,9 +69,11 @@ impl HybridMixer {
             max_model_len,
             calls: 0,
             decisions: 0,
-            initial: ((k as f64 * 0.8).round() as usize).clamp(1, k.saturating_sub(1).max(1)),
-            rewards: vec![0.0; k + 1],
-            trials: vec![0.0; k + 1],
+            // Seed at FULL width: a row with no history has no evidence
+            // against any slot, and the first proposal is native-only
+            // anyway. Seeding below full width only shrinks the window the
+            // EWMA learns from on step 0.
+            initial: k,
             last_native: vec![],
             native_tested: 0,
             native_accepted: 0,
@@ -133,7 +133,7 @@ impl HybridMixer {
                 if accepted < 0 {
                     continue;
                 }
-                if let Some(p) = self.previous.get(id) {
+                if let Some(p) = self.previous.get_mut(id) {
                     let accepted = accepted as usize;
                     // Exactly one rejected position is tested; the rest are censored.
                     let tested = (accepted + 1).min(p.length);
@@ -142,16 +142,35 @@ impl HybridMixer {
                     self.suffix_tested += tested.saturating_sub(p.native) as u64;
                     self.suffix_accepted += accepted.saturating_sub(p.native) as u64;
                     if p.length > 0 {
-                        // Forget stale traffic gradually. Native full-draft compute is
-                        // currently constant across splits, so initial objective is
-                        // accepted tokens per slot; caller can supply real step cost.
-                        let reward = if let Some(ns) = step_time_ns.filter(|ns| *ns > 0) {
-                            ((accepted + 1) as f64 * 1_000_000.0 / ns as f64).min(1.0)
+                        // Per-request EWMA of accepted tokens: this row's own
+                        // history only. Censored tails must not train the
+                        // estimate down (the tail was never verified), so a
+                        // fully-accepted row keeps its budget instead of
+                        // shrinking toward the observed prefix.
+                        let _ = step_time_ns;
+                        if accepted >= p.length {
+                            // Fully accepted: jump straight back to the
+                            // published width. Creeping up by halves keeps
+                            // a healthy row one slot short for a dozen
+                            // steps, donating a verified slot to
+                            // speculation that earned nothing.
+                            p.accept_estimate = p.length as f64;
                         } else {
-                            accepted as f64 / p.length as f64
-                        };
-                        self.rewards[p.arm] = self.rewards[p.arm] * 0.98 + reward;
-                        self.trials[p.arm] = self.trials[p.arm] * 0.98 + 1.0;
+                            p.accept_estimate =
+                                0.7 * p.accept_estimate + 0.3 * accepted as f64;
+                        }
+                        // Suffix quality: accepted suffix tokens on proposals that
+                        // carried a NON-NATIVE tail. Training on had_suffix
+                        // rows (which include pure-continuation publishes)
+                        // would teach the gate that doing nothing is failure.
+                        if p.had_suffix && accepted.min(p.native) < p.native {
+                            let suffix_got =
+                                accepted.saturating_sub(p.native) as f64;
+                            p.suffix_estimate = Some(match p.suffix_estimate {
+                                Some(e) => 0.7 * e + 0.3 * suffix_got,
+                                None => suffix_got,
+                            });
+                        }
                     }
                 }
             }
@@ -174,50 +193,149 @@ impl HybridMixer {
                 .k
                 .min(self.max_model_len.saturating_sub(context.len()))
                 .min(native.len());
-            if let Some(previous) = self.previous.get(&id) {
-                if !context.starts_with(&previous.context) {
-                    // Stable IDs supplied by the runner; reset/reuse still cannot join
-                    // unrelated histories into a spurious cached sequence.
-                    self.cache
-                        .inner
-                        .lock()
-                        .unwrap()
-                        .add(previous.context.clone());
+            // Per-request state: a fresh row starts at the seed budget, a
+            // continuing row keeps its own EWMA. A row whose context no
+            // longer extends the tracked one is a different request reusing
+            // the slot: finalize the old history and reset the estimate.
+            let estimate = match self.previous.get(&id) {
+                Some(previous) if context.starts_with(&previous.context) => {
+                    Some(previous.accept_estimate)
                 }
-            }
-            let arm = self.choose();
-            let prefix = arm.min(cap);
+                Some(_) => {
+                    if let Some(previous) = self.previous.remove(&id) {
+                        // Stable IDs supplied by the runner; reset/reuse still
+                        // cannot join unrelated histories into a spurious
+                        // cached sequence.
+                        self.cache.inner.lock().unwrap().add(previous.context);
+                    }
+                    None
+                }
+                None => None,
+            };
+            // Dynamic budget: expected accepted tokens for THIS row, capped
+            // by what the native drafter actually produced. When the suffix
+            // cache has never been fed (fresh process, no accepted context
+            // yet) the native draft passes through untouched: shortening the
+            // publish without any suffix evidence only shrinks the window
+            // the EWMA learns from.
+            let fed = self.cache.inner.lock().unwrap().tokens > 0;
+            let budget = if fed { self.pick(estimate).min(cap) } else { cap };
+            // Arbitrate per row: the native prefix fills the first `prefix`
+            // slots; the suffix cache is asked for a tail conditioned on it
+            // and may REPLACE native tokens the row has not earned. The
+            // published draft always has exactly `budget` slots: every slot
+            // is either kept native evidence or suffix evidence, never an
+            // unconditioned native tail.
+            // Suffix tail must EARN its slots from the SECOND proposal on:
+            // the first proposal for a row is always native-only (the cache
+            // has no per-row evidence yet). From then on the prefix is the
+            // learned per-row budget, floored at cap-1 -- EXCEPT a row at
+            // full budget keeps the whole native draft: there is no unearned
+            // tail to replace, and the suffix tail can only append past it.
+            let seen = self.previous.contains_key(&id);
+            let floor = cap.saturating_sub(1).max(1);
+            let prefix = if seen {
+                let b = budget.min(cap);
+                if b >= cap {
+                    cap
+                } else {
+                    b.max(floor)
+                }
+            } else {
+                cap
+            };
+            // Condition the lookup on context + the native prefix WITHOUT
+            // the last kept token: the lookup key is the window ENDING at
+            // the divergence point, so including a token the cache has never
+            // seen after this context poisons the key and yields nothing.
+            // Dropping one token costs nothing (the native draft still
+            // supplies it) and lets a real cache continuation surface.
             let mut conditioned = context.clone();
-            conditioned.extend_from_slice(&native[..prefix]);
+            conditioned.extend_from_slice(&native[..prefix.saturating_sub(1)]);
             let (suffix, _, _) = self
                 .cache
                 .inner
                 .lock()
                 .unwrap()
-                .speculate(&conditioned, cap - prefix);
-            let (draft, native_count) = if suffix.is_empty() {
-                (native[..cap].to_vec(), cap)
+                .speculate(&conditioned, cap);
+            // Full native width is preserved whenever the suffix cache has
+            // nothing to contribute, and for fresh rows proposing the
+            // first time: shortening the publish without per-row evidence
+            // only shrinks the window the EWMA learns from. The budget
+            // binds the NATIVE PREFIX the tail is conditioned on (the
+            // learned per-row split), not the published width.
+            let fresh = !self.previous.contains_key(&id);
+            let (draft, native_count, had_suffix) = if suffix.is_empty() || fresh {
+                (native[..cap].to_vec(), cap, false)
             } else {
+                // The lookup was conditioned on prefix-1 tokens, so the tail
+                // CONTINUES the kept native prefix -- position i of the tail
+                // verifies against position (prefix-1)+i of the full draft.
+                // cache tail only while the tail earns its slots for THIS
+                // row (suffix_estimate >= 1, or no tail feedback yet: the
+                // tail gets one trial). A tail the row keeps rejecting is
+                // demoted to APPEND: it may only fill slots past the native
+                // draft, never overwrite verified positions. Pure-extension
+                // publishes (native_count == cap) train neither gate nor
+                // estimate: they are no-ops, not evidence of failure.
+                let gate = match self.previous.get(&id) {
+                    Some(p) => p.suffix_estimate,
+                    None => None,
+                };
                 let mut combined = native[..prefix].to_vec();
-                combined.extend(suffix);
-                // Do NOT append old native tokens after a changed suffix; they
-                // were conditioned on a different prefix.
-                (combined, prefix)
+                let keep_prefix = prefix.saturating_sub(1);
+                let mut tail = suffix;
+                let dropped = prefix.saturating_sub(keep_prefix);
+                let replaces = prefix > keep_prefix
+                    && tail.len() >= dropped
+                    && gate.is_none_or(|e| e >= 1.0);
+                if replaces {
+                    combined.truncate(keep_prefix);
+                    combined.extend(tail.into_iter());
+                } else {
+                    // Gate closed (or short tail): extension only, from the
+                    // full native prefix. Never overwrite verified slots.
+                    combined = native[..prefix].to_vec();
+                    let room = cap.saturating_sub(combined.len());
+                    combined.extend(tail.into_iter().take(room));
+                }
+                let keep = combined.len().min(cap);
+                combined.truncate(keep);
+                // Slots where the tail merely continues the native draft are
+                // still native evidence: count the leading run of the tail
+                // that matches the native tokens it replaced.
+                let mut native_count = keep_prefix.min(keep);
+                while native_count < keep
+                    && native_count < native.len()
+                    && combined[native_count] == native[native_count]
+                {
+                    native_count += 1;
+                }
+                let had = combined.len() > native_count;
+                (combined, native_count, had)
             };
             self.native_proposed += native_count as u64;
             self.suffix_proposed += draft.len().saturating_sub(native_count) as u64;
             self.last_native.push(native_count);
+            let seed = estimate.is_none();
+            // Per-row estimates persist across proposals; the feedback pass
+            // above already updated them in place. Fresh rows seed the
+            // acceptance EWMA at full width and leave the suffix gate open
+            // (None = the tail gets one trial).
+            let (accept_estimate, suffix_estimate) = match self.previous.get(&id) {
+                Some(p) if !seed => (p.accept_estimate, p.suffix_estimate),
+                _ => (self.initial as f64, None),
+            };
             self.previous.insert(
                 id,
                 Previous {
                     context,
                     native: native_count,
                     length: draft.len(),
-                    arm: if native_count == draft.len() {
-                        self.k
-                    } else {
-                        arm
-                    },
+                    arm: budget,
+                    accept_estimate,
+                    suffix_estimate,
+                    had_suffix,
                 },
             );
             result.push(draft);
@@ -311,9 +429,14 @@ impl HybridMixer {
         d.set_item("native_proposed", self.native_proposed)?;
         d.set_item("suffix_proposed", self.suffix_proposed)?;
         d.set_item("native_mix_time_ns", self.elapsed_ns)?;
-        d.set_item("split_trials", self.trials.clone())?;
-        d.set_item("split_rewards", self.rewards.clone())?;
-        d.set_item("next_native_budget", self.choose())?;
+        let est_mean = if self.previous.is_empty() {
+            0.0
+        } else {
+            self.previous.values().map(|p| p.accept_estimate).sum::<f64>()
+                / self.previous.len() as f64
+        };
+        d.set_item("mean_accept_estimate", est_mean)?;
+        d.set_item("active_tracked", self.previous.len())?;
         d.set_item("cache", self.cache.stats())?;
         Ok(d)
     }

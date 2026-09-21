@@ -191,9 +191,18 @@ def test_real_rust_mixer_keeps_native_prefix_and_conditions_suffix(monkeypatch, 
         calls.append(True)
         self._draft_probs = None
         return torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
-    result = invoke(wrap._wrap_propose(native, HybridMixer), r)
+    fn = wrap._wrap_propose(native, HybridMixer)
+    result = invoke(fn, r)
     assert calls == [True]
-    assert result == [[10, 11, 12, 99], [20, 21, 22, 23]]
+    # Fresh rows publish native-only (no per-row evidence yet); the second
+    # proposal carries the learned split: cache tail replaces the 4th slot.
+    assert result == [[10, 11, 12, 13], [20, 21, 22, 23]]
+    # Second proposal: the row is now seen, gate open (no tail feedback
+    # yet -> one trial). n=2 lookup on [1,2,3,10,11] yields [12,99],
+    # replacing the unearned 4th native slot. suffix_proposed counts the
+    # one genuinely non-native slot.
+    result2 = invoke(fn, r)
+    assert result2[0] == [10, 11, 12, 99]
     assert r._suffix_hybrid_mixer.get_stats()["suffix_proposed"] == 1
     assert '"suffix_proposed": 1' in capsys.readouterr().err
 
