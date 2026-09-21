@@ -407,3 +407,34 @@ def test_unaudited_drafter_subclass_rejected():
     r.drafter = object()
     with pytest.raises(RuntimeError, match="drafter"):
         invoke(wrap._wrap_propose(lambda *args: pytest.fail("must not run"), None), r)
+
+
+def test_wrapped_propose_mean_overhead_under_5ms():
+    """Perf guard: mean wrapped-propose overhead must stay well under 5ms.
+
+    Intent guard, not a hardware benchmark: 5ms is generous on any CPU
+    (typical is tens of microseconds). Catches accidental per-call
+    blowups (extra clones, per-call env/config reads, torch round-trips).
+    """
+    import time
+    r = runner()
+    native = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
+
+    class Mixer:
+        def __init__(self, *args): pass
+        def mix_numpy(self, ids, counts, tokens, drafts, accepted, cost):
+            return drafts
+
+    def propose(self, *args):
+        self._draft_probs = None
+        self._draft_prob_req_ids = None
+        return native
+
+    fn = wrap._wrap_propose(propose, Mixer)
+    invoke(fn, r)  # warmup (lazy init, first-call paths)
+    n = 200
+    start = time.perf_counter()
+    for _ in range(n):
+        invoke(fn, r)
+    mean_s = (time.perf_counter() - start) / n
+    assert mean_s < 0.005, f"mean wrapped propose overhead {mean_s*1e3:.3f}ms >= 5ms"
