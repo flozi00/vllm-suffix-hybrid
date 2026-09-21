@@ -149,104 +149,169 @@ def _wrap_propose(original, mixer_factory):
         draft_config = getattr(spec, "draft_model_config", None)
         draft_type = getattr(getattr(draft_config, "hf_config", None), "model_type", None)
         drafter_type = type(self.drafter)
+        # DEGRADE, never raise: every condition below is a PER-STEP property
+        # of the live batch — all_greedy flips the moment one stochastic
+        # request joins, async scheduling or the padded drafter batch can be
+        # toggled by config reload, a vendor patch can swap the drafter class
+        # at runtime. Raising here propagates through propose_draft_token_ids
+        # as "EngineCore encountered a fatal error" and kills the whole pod
+        # (the exact cascade seen in the 2026-09-21 GLM crash log). The
+        # correct response to an unsupported STEP is the pre-plugin baseline:
+        # run the native drafter and return its draft untouched. The
+        # install-time capability check in install() stays fail-closed —
+        # that one gates a contract that cannot change per step.
         # MTP shares the llm_base chain with Eagle/DFlash but ships its own
         # class name (EagleProposer on fresh checkouts, MtpProposer where the
         # vendor split it out). Accept either; the chain-state reasoning is
         # the same (draft proposals only, mixer never touches drafter KV).
+        unsupported = None
         if (drafter_type.__module__, drafter_type.__name__) not in _ACCEPT_DRAFTERS:
-            raise RuntimeError("suffix hybrid unsupported drafter class/state contract")
-        if (self.use_async_scheduling or not spec.disable_padded_drafter_batch
+            unsupported = "unsupported drafter class/state contract"
+        elif (self.use_async_scheduling or not spec.disable_padded_drafter_batch
                 or not sampling_metadata.all_greedy
                 or not isinstance(sampled_token_ids, list)
                 or self.parallel_config.pipeline_parallel_size != 1
                 or (self.model_config.is_hybrid and draft_type != "qwen3_5_mtp")
                 or self.rejection_sampler.synthetic_mode
                 or spec.method not in _ACCEPT_METHODS):
-            raise RuntimeError("suffix hybrid requires synchronous, unpadded, greedy-only "
-                               "Eagle/MTP/DFlash/DSpark; no PP, unaudited recurrent model, or synthetic acceptance")
+            unsupported = ("requires synchronous, unpadded, greedy-only "
+                           "Eagle/MTP/DFlash/DSpark; no PP, unaudited recurrent "
+                           "model, or synthetic acceptance")
+        if unsupported is not None:
+            skips = getattr(self, "_suffix_hybrid_gate_skips", 0) + 1
+            self._suffix_hybrid_gate_skips = skips
+            if skips <= 3 or skips % 100 == 0:
+                print(f"suffix_hybrid native passthrough "
+                      f"(gate skip #{skips}): {unsupported}",
+                      file=sys.stderr, flush=True)
+            return original(self, scheduler_output, sampled_token_ids,
+                            sampling_metadata, hidden_states, sample_hidden_states,
+                            aux_hidden_states, spec_decode_metadata,
+                            common_attn_metadata, slot_mappings)
         started = time.perf_counter_ns()
         native = original(self, scheduler_output, sampled_token_ids, sampling_metadata,
                           hidden_states, sample_hidden_states, aux_hidden_states,
                           spec_decode_metadata, common_attn_metadata, slot_mappings)
-        # Single branch: Tensor is the live Eagle/MTP path (one D2H for the
-        # Rust Vec<Vec<i64>> ABI); list only exists in unit tests.
-        native_is_tensor = torch is not None and isinstance(native, torch.Tensor)
-        if native_is_tensor:
-            drafts = native.detach().cpu().tolist()
-        else:
-            drafts = [list(row) for row in native]
-        batch = self.input_batch
-        ids = list(batch.req_ids)
-        mixer = getattr(self, "_suffix_hybrid_mixer", None)
-        if mixer is None:
-            mixer = self._suffix_hybrid_mixer = mixer_factory(self.num_spec_tokens, self.max_model_len)
-        # parse_output has removed -1 padding; the final token is recovery/bonus,
-        # never an accepted draft token. No token-equality acceptance inference.
-        num_draft = (spec_decode_metadata.num_draft_tokens
-                     if spec_decode_metadata is not None else None)
-        previous_lengths = getattr(self, "_suffix_hybrid_lengths", {})
-        # One fused pass (was: empty-clear loop + verified list + accepted
-        # list): no intermediate verified alloc, no second iteration.
-        accepted = []
-        append = accepted.append
-        for i, sampled in enumerate(sampled_token_ids):
-            if not sampled:
-                drafts[i] = []
-                append(-1)
-                continue
-            v = int(num_draft[i]) if num_draft is not None else 0
-            a = len(sampled) - 1 if v else -1
-            if a == v and v != previous_lengths.get(ids[i]):
-                # All scheduled tokens accepted, but unseen tail is censored.
-                a = -1
-            append(a)
-        mixed = mixer.mix_numpy(
-            ids, batch.num_tokens_no_spec, batch.token_ids_cpu, drafts, accepted,
-            getattr(self, "_suffix_hybrid_cost_ns", None))
-        # Fast path is a single attr + None check: greedy live traffic never
-        # touches torch here (clone + one-hot fixup only when native q exists).
-        draft_probs = self._draft_probs
-        if draft_probs is not None:
-            prefixes = mixer.last_native_counts()
-            probs = draft_probs.clone()
-            for i, (row, prefix) in enumerate(zip(mixed, prefixes)):
-                if prefix < len(row):
-                    tail = probs[i, prefix:len(row)]
-                    tail.zero_()
-                    indices = torch.tensor(row[prefix:], device=probs.device,
-                                           dtype=torch.long).unsqueeze(1)
-                    tail.scatter_(1, indices, 1.0)
-            self._draft_probs = probs
-        # Reuse the lengths dict instead of allocating a new one per call;
-        # previous_lengths reads above already completed, so the clear is safe
-        # even when both names alias the same dict.
-        lengths = getattr(self, "_suffix_hybrid_lengths", None)
-        if lengths is None:
-            lengths = self._suffix_hybrid_lengths = {}
-        else:
-            lengths.clear()
-        lengths.update(zip(ids, map(len, mixed)))
-        self._suffix_hybrid_cost_ns = time.perf_counter_ns() - started
-        calls = getattr(self, "_suffix_hybrid_calls", 0) + 1
-        self._suffix_hybrid_calls = calls
-        # Env read hoisted: one lookup on first call (plus one per emitted log
-        # line to pick up operator changes), not ~300ns on every propose.
-        interval = getattr(self, "_suffix_hybrid_log_interval", None)
-        if interval is None:
-            interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
-            self._suffix_hybrid_log_interval = interval
-        if interval > 0 and calls % interval == 0:
-            self._suffix_hybrid_log_interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
-            print("suffix_hybrid_native " + json.dumps(mixer.get_stats(),
-                                                      sort_keys=True), file=sys.stderr, flush=True)
-        if native_is_tensor:
-            # Upstream returns Tensor [batch, K]; returning a list silently
-            # disabled _copy_draft_token_ids_to_cpu. Same dtype/device.
-            try:
-                return torch.as_tensor(mixed, dtype=native.dtype, device=native.device)
-            except (ValueError, RuntimeError, TypeError):
-                return mixed  # ragged (chunked/discard rows): keep lists
-        return mixed
+        # Runtime degradation boundary: everything after the native drafter
+        # succeeded is an acceptance-rate OPTIMIZATION, not a correctness
+        # component — the target's rejection sampler verifies every draft
+        # token either way. A mixer validation raise (e.g. feedback that
+        # exceeds the tracked proposal after a scheduler retry), a missing
+        # runner attribute on a patched image, or any transient error must
+        # therefore fall back to the native draft, NOT propagate through
+        # propose_draft_token_ids and kill EngineCore. The pre-native
+        # contract gates stay fail-closed: they reject unsupported shapes
+        # before any draft is produced.
+        probs_original = None
+        try:
+            # Single branch: Tensor is the live Eagle/MTP path (one D2H for
+            # the Rust Vec<Vec<i64>> ABI); list only exists in unit tests.
+            native_is_tensor = torch is not None and isinstance(native, torch.Tensor)
+            if native_is_tensor:
+                drafts = native.detach().cpu().tolist()
+            else:
+                drafts = [list(row) for row in native]
+            batch = self.input_batch
+            ids = list(batch.req_ids)
+            mixer = getattr(self, "_suffix_hybrid_mixer", None)
+            if mixer is None:
+                mixer = self._suffix_hybrid_mixer = mixer_factory(self.num_spec_tokens, self.max_model_len)
+            # parse_output has removed -1 padding; the final token is recovery/bonus,
+            # never an accepted draft token. No token-equality acceptance inference.
+            num_draft = (spec_decode_metadata.num_draft_tokens
+                         if spec_decode_metadata is not None else None)
+            previous_lengths = getattr(self, "_suffix_hybrid_lengths", {})
+            # One fused pass (was: empty-clear loop + verified list + accepted
+            # list): no intermediate verified alloc, no second iteration.
+            accepted = []
+            append = accepted.append
+            for i, sampled in enumerate(sampled_token_ids):
+                if not sampled:
+                    drafts[i] = []
+                    append(-1)
+                    continue
+                v = int(num_draft[i]) if num_draft is not None else 0
+                a = len(sampled) - 1 if v else -1
+                tracked = previous_lengths.get(ids[i])
+                if tracked is not None and a > tracked:
+                    # ROOT-CAUSE CLAMP (source of the mixer's hard
+                    # "accepted length exceeds previous proposal" raise):
+                    # the scheduler verified more slots than our last mixed
+                    # proposal carried — the extra slots came from a draft
+                    # we did not produce (a gate-skip passthrough step, a
+                    # scheduler retry, or a per-step spec-budget change).
+                    # Feeding it back trips the mixer's proposal-bound
+                    # validation and (pre-fix) propagated as an engine-fatal
+                    # error. The honest value is "no usable feedback". An
+                    # UNTRACKED row needs no clamp: the wrapper's lengths map
+                    # is a superset of the mixer's previous map (the mixer
+                    # evicts absent rows, we keep them), so no tracked ID
+                    # means the mixer has no proposal to exceed.
+                    a = -1
+                elif a == v and v != tracked:
+                    # All scheduled tokens accepted, but unseen tail is censored.
+                    a = -1
+                append(a)
+            mixed = mixer.mix_numpy(
+                ids, batch.num_tokens_no_spec, batch.token_ids_cpu, drafts, accepted,
+                getattr(self, "_suffix_hybrid_cost_ns", None))
+            # Fast path is a single attr + None check: greedy live traffic never
+            # touches torch here (clone + one-hot fixup only when native q exists).
+            draft_probs = self._draft_probs
+            if draft_probs is not None:
+                prefixes = mixer.last_native_counts()
+                probs = draft_probs.clone()
+                for i, (row, prefix) in enumerate(zip(mixed, prefixes)):
+                    if prefix < len(row):
+                        tail = probs[i, prefix:len(row)]
+                        tail.zero_()
+                        indices = torch.tensor(row[prefix:], device=probs.device,
+                                               dtype=torch.long).unsqueeze(1)
+                        tail.scatter_(1, indices, 1.0)
+                probs_original = draft_probs
+                self._draft_probs = probs
+            # Reuse the lengths dict instead of allocating a new one per call;
+            # previous_lengths reads above already completed, so the clear is safe
+            # even when both names alias the same dict.
+            lengths = getattr(self, "_suffix_hybrid_lengths", None)
+            if lengths is None:
+                lengths = self._suffix_hybrid_lengths = {}
+            else:
+                lengths.clear()
+            lengths.update(zip(ids, map(len, mixed)))
+            self._suffix_hybrid_cost_ns = time.perf_counter_ns() - started
+            calls = getattr(self, "_suffix_hybrid_calls", 0) + 1
+            self._suffix_hybrid_calls = calls
+            # Env read hoisted: one lookup on first call (plus one per emitted
+            # log line to pick up operator changes), not ~300ns on every propose.
+            interval = getattr(self, "_suffix_hybrid_log_interval", None)
+            if interval is None:
+                interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
+                self._suffix_hybrid_log_interval = interval
+            if interval > 0 and calls % interval == 0:
+                self._suffix_hybrid_log_interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
+                print("suffix_hybrid_native " + json.dumps(mixer.get_stats(),
+                                                          sort_keys=True), file=sys.stderr, flush=True)
+            if native_is_tensor:
+                # Upstream returns Tensor [batch, K]; returning a list silently
+                # disabled _copy_draft_token_ids_to_cpu. Same dtype/device.
+                try:
+                    return torch.as_tensor(mixed, dtype=native.dtype, device=native.device)
+                except (ValueError, RuntimeError, TypeError):
+                    return mixed  # ragged (chunked/discard rows): keep lists
+            return mixed
+        except Exception as exc:
+            # Native drafts are always self-consistent with the native probs,
+            # so undo a half-applied probs fixup before falling back.
+            if probs_original is not None:
+                self._draft_probs = probs_original
+            errors = getattr(self, "_suffix_hybrid_errors", 0) + 1
+            self._suffix_hybrid_errors = errors
+            if errors <= 3 or errors % 100 == 0:
+                print(f"suffix_hybrid degraded to native drafts "
+                      f"(error #{errors}): {type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
+            return native
     return propose
 
 

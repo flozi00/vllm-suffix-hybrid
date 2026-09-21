@@ -76,30 +76,49 @@ def test_mtp_drafter_class_accepted_like_eagle():
     assert as_lists(invoke(wrap._wrap_propose(native, Mixer), r)) == [[10, 11, 12, 13], [20, 21, 22, 23]]
 
 
-def test_unknown_drafter_class_rejected():
+def test_unknown_drafter_class_passes_through_to_native():
+    """A drafter swap at runtime must NOT raise into EngineCore: the step
+    runs the native drafter untouched (pre-plugin baseline)."""
     r = runner()
     r.drafter = type("WeirdProposer", (), {"__module__": "vllm.v1.spec_decode.eagle"})()
-    with pytest.raises(RuntimeError, match="drafter"):
-        invoke(wrap._wrap_propose(lambda *a: pytest.fail("must not run"), None), r)
+    native = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+    def propose(self, *args):
+        self._draft_probs = None
+        return native
+    result = invoke(wrap._wrap_propose(propose, None), r)
+    assert result is native
+    assert r._suffix_hybrid_gate_skips == 1
 
 
 @pytest.mark.parametrize("case", ["stochastic", "async", "padded", "pipeline", "recurrent", "synthetic", "wrong_method", "tensor_sampled"])
-def test_unsupported_contract_rejected_before_native(case):
+def test_unsupported_step_degrades_to_native_not_engine_death(case):
+    """Per-step unsupported conditions (all_greedy flipping, async toggle,
+    drafter swap...) must run the native drafter and return its draft —
+    raising here is the EngineCore-killer the 2026-09-21 crash exposed."""
     r = runner()
+    native = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
     if case == "async": r.use_async_scheduling = True
     if case == "padded": r.speculative_config.disable_padded_drafter_batch = False
     if case == "pipeline": r.parallel_config.pipeline_parallel_size = 2
     if case == "recurrent": r.model_config.is_hybrid = True
     if case == "synthetic": r.rejection_sampler.synthetic_mode = True
     if case == "wrong_method": r.speculative_config.method = "custom_class"
-    def native(*args):
-        pytest.fail("must reject before executing native")
-    fn = wrap._wrap_propose(native, None)
-    with pytest.raises(RuntimeError, match="suffix hybrid"):
-        if case == "tensor_sampled":
-            fn(r, NS(), torch.tensor([[3], [8]]), NS(all_greedy=True), None, None, None, None, None, None)
-        else:
-            invoke(fn, r, greedy=case != "stochastic")
+    mixer_calls = []
+    class Mixer:
+        def __init__(self, *args): pass
+        def mix_numpy(self, *args):
+            mixer_calls.append(1); return []
+    def propose(self, *args):
+        self._draft_probs = None
+        return native
+    fn = wrap._wrap_propose(propose, Mixer)
+    if case == "tensor_sampled":
+        out = fn(r, NS(), torch.tensor([[3], [8]]), NS(all_greedy=True), None, None, None, None, None, None)
+    else:
+        out = invoke(fn, r, greedy=case != "stochastic")
+    assert out is native          # native draft served untouched
+    assert not mixer_calls        # mixer never engaged
+    assert r._suffix_hybrid_gate_skips == 1
 
 
 def test_feedback_uses_accepted_and_scheduled_counts_with_discard_censoring():
@@ -402,11 +421,85 @@ def test_log_interval_env_read_once_not_per_call(monkeypatch):
     assert len(reads) == 1
 
 
-def test_unaudited_drafter_subclass_rejected():
+def test_unaudited_drafter_subclass_passes_through():
     r = runner()
     r.drafter = object()
-    with pytest.raises(RuntimeError, match="drafter"):
-        invoke(wrap._wrap_propose(lambda *args: pytest.fail("must not run"), None), r)
+    native = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+    def propose(self, *args):
+        self._draft_probs = None
+        return native
+    assert invoke(wrap._wrap_propose(propose, None), r) is native
+
+
+def test_feedback_clamped_to_last_mixed_proposal():
+    """Regression: the scheduler verifying MORE slots than our last mixed
+    proposal carried (retry / passthrough step) must clamp to no-feedback,
+    never feed the mixer a length that trips its hard
+    'accepted length exceeds previous proposal' validation."""
+    r = runner()
+    # Last mixed proposal: row a had 2 slots. This step the scheduler
+    # verified 4 sampled tokens for a (3 accepted + bonus) — impossible
+    # against our 2-slot proposal, so it must not reach the mixer as 3.
+    r._suffix_hybrid_lengths = {"a": 2, "b": 4}
+    class Mixer:
+        def __init__(self, *args): pass
+        def mix_numpy(self, ids, counts, tokens, drafts, accepted, cost):
+            assert accepted == [-1, 3]  # a clamped; b within its 4-slot proposal
+            return drafts
+    def native(self, *args):
+        self._draft_probs = None
+        return torch.ones((2, 4), dtype=torch.int32)
+    # a: 4 sampled (3 accepted) against tracked 2 -> clamp; b: 4 sampled
+    # (3 accepted) against tracked 4 -> valid, and != num_draft so uncensored.
+    invoke(wrap._wrap_propose(native, Mixer), r,
+           sampled=[[1, 2, 3, 4], [5, 6, 7, 8]],
+           metadata=NS(num_draft_tokens=[4, 2]))
+
+
+def test_post_native_mixer_error_degrades_to_native_draft():
+    """A mixer/adapter raise AFTER the native drafter ran must never kill
+    EngineCore: the wrapper returns the native draft and logs once."""
+    r = runner()
+    native = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
+
+    class ExplodingMixer:
+        def __init__(self, *args): pass
+        def mix_numpy(self, *args):
+            raise ValueError("accepted length exceeds previous proposal")
+
+    def propose(self, *args):
+        self._draft_probs = None
+        return native
+
+    fn = wrap._wrap_propose(propose, ExplodingMixer)
+    result = invoke(fn, r)
+    assert result is native  # native draft served, engine survives
+    assert r._suffix_hybrid_errors == 1
+    invoke(fn, r)
+    assert result is native and r._suffix_hybrid_errors == 2
+
+
+def test_probs_fixup_undone_on_late_error():
+    """If the error lands AFTER the one-hot probs fixup, the native probs
+    buffer must be restored so drafts and probs stay consistent."""
+    r = runner()
+    probabilities = torch.rand(2, 4, 100)
+    original = probabilities.clone()
+
+    class LateExploder:
+        def __init__(self, *args): pass
+        def mix_numpy(self, *args): return [[10, 11, 12, 99], [20, 21, 22, 23]]
+        def last_native_counts(self): raise RuntimeError("boom after fixup")
+
+    def propose(self, *args):
+        self._draft_probs = probabilities
+        return torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+
+    fn = wrap._wrap_propose(propose, LateExploder)
+    result = invoke(fn, r)
+    assert isinstance(result, torch.Tensor) and result.shape == (2, 4)
+    assert r._draft_probs is probabilities  # fixup undone
+    assert torch.equal(probabilities, original)  # native buffer untouched
 
 
 def test_wrapped_propose_mean_overhead_under_5ms():
