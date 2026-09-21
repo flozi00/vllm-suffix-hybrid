@@ -216,10 +216,14 @@ def install():
         raise RuntimeError("suffix hybrid unsupported installation; requires vLLM and Rust HybridMixer") from exc
     # Drift from the audited pin is telemetry (stderr), never fatal: the
     # capability check below is the real gate.
-    _verify_sources(Path(vllm.__file__).parent)
+    drifted = _verify_sources(Path(vllm.__file__).parent) or []
     original = _check_runner_capability(module.GPUModelRunner)
     if not getattr(original, "_suffix_hybrid_hook", False):
         wrapped = _wrap_propose(original, HybridMixer)
         wrapped._suffix_hybrid_hook = True
         module.GPUModelRunner.propose_draft_token_ids = wrapped
+    runner = module.GPUModelRunner
+    print(f"suffix_hybrid installed hook={runner.__module__}.{runner.__name__} "
+          f"drift={json.dumps(sorted(drifted))}",
+          file=sys.stderr, flush=True)
     return True

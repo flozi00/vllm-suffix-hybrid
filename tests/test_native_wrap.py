@@ -206,7 +206,7 @@ def test_capability_gate_accepts_live_shape():
     assert wrap._check_runner_capability(Runner) is Runner.propose_draft_token_ids
 
 
-def test_install_patches_runner_once_not_drafter(monkeypatch, tmp_path):
+def test_install_patches_runner_once_not_drafter(monkeypatch, tmp_path, capsys):
     import sys
     import suffix_hybrid._native as rust
     class Runner:
@@ -218,14 +218,39 @@ def test_install_patches_runner_once_not_drafter(monkeypatch, tmp_path):
     monkeypatch.setenv("SUFFIX_HYBRID_WRAP", "1")
     monkeypatch.setitem(sys.modules, "vllm", NS(__file__=str(tmp_path / "__init__.py")))
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_model_runner", NS(GPUModelRunner=Runner))
-    monkeypatch.setattr(wrap, "_verify_sources", lambda root: None)
+    monkeypatch.setattr(wrap, "_verify_sources", lambda root: [])
     monkeypatch.setattr(rust, "HybridMixer", object, raising=False)
     assert wrap.install() is True
     first = Runner.propose_draft_token_ids
     assert first is not original
     assert first.__wrapped__ is original
+    out = capsys.readouterr().err
+    assert "suffix_hybrid installed hook=" in out and "drift=[]" in out
+    # Idempotent double-install: second call keeps the same wrapper and
+    # still emits the one-line success log.
     assert wrap.install() is True
     assert Runner.propose_draft_token_ids is first
+    out2 = capsys.readouterr().err
+    assert "suffix_hybrid installed hook=" in out2 and "drift=[]" in out2
+
+
+def test_install_logs_drift_list(monkeypatch, tmp_path, capsys):
+    import sys
+    import suffix_hybrid._native as rust
+    class Runner:
+        def propose_draft_token_ids(self, scheduler_output, sampled_token_ids,
+                                    sampling_metadata, spec_decode_metadata,
+                                    slot_mappings, **kwargs):
+            return torch.zeros((2, 4), dtype=torch.int32)
+    monkeypatch.setenv("SUFFIX_HYBRID_WRAP", "1")
+    monkeypatch.setitem(sys.modules, "vllm", NS(__file__=str(tmp_path / "__init__.py")))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_model_runner", NS(GPUModelRunner=Runner))
+    monkeypatch.setattr(wrap, "_verify_sources", lambda root: ["v1/spec_decode/eagle.py"])
+    monkeypatch.setattr(rust, "HybridMixer", object, raising=False)
+    assert wrap.install() is True
+    out = capsys.readouterr().err
+    assert "suffix_hybrid installed hook=" in out
+    assert "v1/spec_decode/eagle.py" in out
 
 
 def test_real_rust_mixer_keeps_native_prefix_and_conditions_suffix(monkeypatch, capsys):
