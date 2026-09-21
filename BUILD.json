@@ -1,0 +1,13 @@
+{
+  "source_revision": "b624607f6b4caef7a1b897cde7eaa774d9144a43",
+  "wheel": "suffix_hybrid-0.2.0-cp39-abi3-manylinux_2_28_x86_64.whl",
+  "sha256": {
+    "suffix_hybrid/__init__.py": "d0a15448c7a8e3cc2783f2fdca7a9aa8a5d5f33edcd55ccb7979e20a9df76d2e",
+    "suffix_hybrid/_native.abi3.so": "3dc81743b1aeb602dc52d62e73e1c6d618a0b7378073c67a24b85d682d2c7778",
+    "suffix_hybrid/hybrid_proposer.py": "c84f861df29f36b9e173c756bb9d59788bb5fb80233139758652bfa0414b3c6f",
+    "suffix_hybrid/suffix_cache.py": "52be810ac9b88109a7a3af3e46cbff9ca022f256c6a85ead64ef0eaf7556074d",
+    "suffix_hybrid/wrap.py": "f7105f922de6805f88264d1c6712812612c3edae48c4623987e200118cf98c14",
+    "suffix_hybrid/wrap_v2.py": "70eabc8a3fb8c9dfcb14852aaf650e67c1b8db23da1fde761dacac982c32bb9e",
+    "sitecustomize.py": "01527dbaa515a8af87564cd939ee0bc473cb75a0601164ffb52d3345247d57c2"
+  }
+}
