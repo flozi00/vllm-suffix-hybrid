@@ -306,7 +306,7 @@ impl HybridMixer {
                 // estimate: they are no-ops, not evidence of failure.
                 let mut combined = native[..prefix].to_vec();
                 let keep_prefix = prefix.saturating_sub(1);
-                let mut tail = suffix;
+                let tail = suffix;
                 let dropped = prefix.saturating_sub(keep_prefix);
                 let replaces = prefix > keep_prefix
                     && tail.len() >= dropped
