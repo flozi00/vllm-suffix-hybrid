@@ -149,22 +149,53 @@ def test_qwen35_full_attention_mtp_allowed_with_hybrid_target():
     assert invoke(wrap._wrap_propose(native, Mixer), r) == [[1]*4, [1]*4]
 
 
-def test_exact_source_gate_rejects_changed_file(tmp_path, monkeypatch):
+def test_source_drift_is_telemetry_not_fatal(tmp_path, monkeypatch, capsys):
     import hashlib
     monkeypatch.setattr(wrap, "_SOURCE_HASHES", {"runner.py": hashlib.sha256(b"pinned").hexdigest()})
     path = tmp_path / "runner.py"
     path.write_bytes(b"pinned")
-    wrap._verify_sources(tmp_path)
+    assert wrap._verify_sources(tmp_path) == []
     path.write_bytes(b"other")
-    with pytest.raises(RuntimeError, match="d05da62e9"):
-        wrap._verify_sources(tmp_path)
+    # Drift from the audited pin must NOT raise (that CrashLoops every
+    # image rebuild); it is reported and execution continues on the
+    # capability check.
+    assert wrap._verify_sources(tmp_path) == ["runner.py"]
+    assert "source drift" in capsys.readouterr().err
+
+
+def test_capability_gate_rejects_missing_hook_shape():
+    from types import SimpleNamespace as NS
+    with pytest.raises(RuntimeError, match="propose_draft_token_ids"):
+        wrap._check_runner_capability(NS())
+
+
+def test_capability_gate_rejects_changed_signature():
+    from types import SimpleNamespace as NS
+    class Runner:
+        def propose_draft_token_ids(self, something_entirely_new):
+            return None
+    with pytest.raises(RuntimeError, match="missing params"):
+        wrap._check_runner_capability(Runner)
+
+
+def test_capability_gate_accepts_live_shape():
+    from types import SimpleNamespace as NS
+    class Runner:
+        def propose_draft_token_ids(self, scheduler_output, sampled_token_ids,
+                                    sampling_metadata, spec_decode_metadata,
+                                    slot_mappings, extra_future_arg=None):
+            return None
+    assert wrap._check_runner_capability(Runner) is Runner.propose_draft_token_ids
 
 
 def test_install_patches_runner_once_not_drafter(monkeypatch, tmp_path):
     import sys
     import suffix_hybrid._native as rust
     class Runner:
-        def propose_draft_token_ids(self, *args): return torch.zeros((2, 4), dtype=torch.int32)
+        def propose_draft_token_ids(self, scheduler_output, sampled_token_ids,
+                                    sampling_metadata, spec_decode_metadata,
+                                    slot_mappings, **kwargs):
+            return torch.zeros((2, 4), dtype=torch.int32)
     original = Runner.propose_draft_token_ids
     monkeypatch.setenv("SUFFIX_HYBRID_WRAP", "1")
     monkeypatch.setitem(sys.modules, "vllm", NS(__file__=str(tmp_path / "__init__.py")))
