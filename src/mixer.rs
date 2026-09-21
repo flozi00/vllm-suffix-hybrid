@@ -100,11 +100,15 @@ impl HybridMixer {
     ) -> PyResult<Vec<Vec<i64>>> {
         let start = std::time::Instant::now();
         let n = request_ids.len();
+        // Duplicate-ID set doubles as the eviction allowlist below: build it
+        // once, pre-sized, instead of hashing every ID twice per call.
+        let mut id_set: HashSet<&str> = HashSet::with_capacity(n.max(1) * 2);
+        id_set.extend(request_ids.iter().map(String::as_str));
         if n > 4096
             || contexts.len() != n
             || native_drafts.len() != n
             || accepted_lengths.as_ref().is_some_and(|v| v.len() != n)
-            || request_ids.iter().collect::<HashSet<_>>().len() != n
+            || id_set.len() != n
             || contexts.iter().any(|c| c.len() > self.max_model_len)
             || native_drafts
                 .iter()
@@ -175,7 +179,7 @@ impl HybridMixer {
                 }
             }
         }
-        let ids: HashSet<&str> = request_ids.iter().map(String::as_str).collect();
+        let ids: &HashSet<&str> = &id_set;
         let gone: Vec<String> = self
             .previous
             .keys()
@@ -187,7 +191,23 @@ impl HybridMixer {
             self.cache.inner.lock().unwrap().add(previous.context);
         }
         self.last_native.clear();
+        self.last_native.reserve(n.saturating_sub(self.last_native.capacity()));
         let mut result = Vec::with_capacity(n);
+        // One lock acquisition per mix() call: the cache's fed flag and every
+        // speculate() below previously re-locked the mutex per row (2n+1
+        // locks). A single guard covers validation-free reads; the evictions
+        // above already dropped their borrows, so this cannot deadlock.
+        // NOTE: SuffixCache wraps Arc<Mutex<Cache>> shared with Python, so a
+        // per-row lock was also a per-row contention point with add_sequence
+        // callers on other threads; holding one guard shortens that window.
+        let mut cache = self.cache.inner.lock().unwrap();
+        // Reuses `conditioned` scratch across rows: pre-sized once to the
+        // largest key this batch can build (context + kept prefix), then
+        // truncated per row instead of cloned per row. Same bytes fed to
+        // speculate(), one fewer context-length Vec alloc per row.
+        let mut conditioned = Vec::with_capacity(
+            contexts.iter().map(Vec::len).max().unwrap_or(0) + self.k,
+        );
         for ((id, context), native) in request_ids.into_iter().zip(contexts).zip(native_drafts) {
             let cap = self
                 .k
@@ -206,7 +226,7 @@ impl HybridMixer {
                         // Stable IDs supplied by the runner; reset/reuse still
                         // cannot join unrelated histories into a spurious
                         // cached sequence.
-                        self.cache.inner.lock().unwrap().add(previous.context);
+                        cache.add(previous.context);
                     }
                     None
                 }
@@ -218,7 +238,7 @@ impl HybridMixer {
             // yet) the native draft passes through untouched: shortening the
             // publish without any suffix evidence only shrinks the window
             // the EWMA learns from.
-            let fed = self.cache.inner.lock().unwrap().tokens > 0;
+            let fed = cache.tokens > 0;
             let budget = if fed { self.pick(estimate).min(cap) } else { cap };
             // Arbitrate per row: the native prefix fills the first `prefix`
             // slots; the suffix cache is asked for a tail conditioned on it
@@ -250,21 +270,27 @@ impl HybridMixer {
             // seen after this context poisons the key and yields nothing.
             // Dropping one token costs nothing (the native draft still
             // supplies it) and lets a real cache continuation surface.
-            let mut conditioned = context.clone();
+            conditioned.clear();
+            conditioned.extend_from_slice(&context);
             conditioned.extend_from_slice(&native[..prefix.saturating_sub(1)]);
-            let (suffix, _, _) = self
-                .cache
-                .inner
-                .lock()
-                .unwrap()
-                .speculate(&conditioned, cap);
+            let (suffix, _, _) = cache.speculate(&conditioned, cap);
             // Full native width is preserved whenever the suffix cache has
             // nothing to contribute, and for fresh rows proposing the
             // first time: shortening the publish without per-row evidence
             // only shrinks the window the EWMA learns from. The budget
             // binds the NATIVE PREFIX the tail is conditioned on (the
             // learned per-row split), not the published width.
-            let fresh = !self.previous.contains_key(&id);
+            // `fresh` and `gate` come from the single entry borrow below: the
+            // old code re-hashed the ID here (contains_key + get) before the
+            // final insert. `slot` stays borrowed through the tail branch;
+            // `self.pick`/`cache` use disjoint fields so this still compiles.
+            use std::collections::hash_map::Entry;
+            let slot = self.previous.entry(id);
+            let fresh = matches!(slot, Entry::Vacant(_));
+            let gate = match &slot {
+                Entry::Occupied(o) => o.get().suffix_estimate,
+                Entry::Vacant(_) => None,
+            };
             let (draft, native_count, had_suffix) = if suffix.is_empty() || fresh {
                 (native[..cap].to_vec(), cap, false)
             } else {
@@ -278,10 +304,6 @@ impl HybridMixer {
                 // draft, never overwrite verified positions. Pure-extension
                 // publishes (native_count == cap) train neither gate nor
                 // estimate: they are no-ops, not evidence of failure.
-                let gate = match self.previous.get(&id) {
-                    Some(p) => p.suffix_estimate,
-                    None => None,
-                };
                 let mut combined = native[..prefix].to_vec();
                 let keep_prefix = prefix.saturating_sub(1);
                 let mut tail = suffix;
@@ -317,27 +339,38 @@ impl HybridMixer {
             self.native_proposed += native_count as u64;
             self.suffix_proposed += draft.len().saturating_sub(native_count) as u64;
             self.last_native.push(native_count);
-            let seed = estimate.is_none();
             // Per-row estimates persist across proposals; the feedback pass
             // above already updated them in place. Fresh rows seed the
             // acceptance EWMA at full width and leave the suffix gate open
-            // (None = the tail gets one trial).
-            let (accept_estimate, suffix_estimate) = match self.previous.get(&id) {
-                Some(p) if !seed => (p.accept_estimate, p.suffix_estimate),
+            // (None = the tail gets one trial). The `slot` entry above
+            // already holds the borrow, so reuse it instead of re-hashing.
+            let seed = estimate.is_none();
+            let (accept_estimate, suffix_estimate) = match &slot {
+                Entry::Occupied(o) if !seed => {
+                    let p = o.get();
+                    (p.accept_estimate, p.suffix_estimate)
+                }
                 _ => (self.initial as f64, None),
             };
-            self.previous.insert(
-                id,
-                Previous {
-                    context,
-                    native: native_count,
-                    length: draft.len(),
-                    arm: budget,
-                    accept_estimate,
-                    suffix_estimate,
-                    had_suffix,
-                },
-            );
+            let row = Previous {
+                context,
+                native: native_count,
+                length: draft.len(),
+                arm: budget,
+                accept_estimate,
+                suffix_estimate,
+                had_suffix,
+            };
+            match slot {
+                Entry::Occupied(mut o) => {
+                    o.insert(row);
+                }
+                Entry::Vacant(v) => {
+                    v.insert(row);
+                }
+            }
+            // NLL ends the entry borrow here; `result`/`self.decisions` below
+            // touch disjoint state.
             result.push(draft);
             self.decisions += 1;
         }
@@ -359,29 +392,67 @@ impl HybridMixer {
         step_time_ns: Option<u64>,
     ) -> PyResult<Vec<Vec<i64>>> {
         use numpy::{PyReadonlyArray1, PyReadonlyArray2};
-        let counts: Vec<i64> =
-            if let Ok(a) = num_tokens_no_spec.extract::<PyReadonlyArray1<'_, i32>>() {
-                a.as_array().iter().map(|&x| x as i64).collect()
-            } else if let Ok(a) = num_tokens_no_spec.extract::<PyReadonlyArray1<'_, i64>>() {
-                a.as_array().iter().copied().collect()
-            } else {
-                return Err(PyValueError::new_err("counts must be int32/int64 NumPy"));
-            };
+        // Read counts with at most one widening alloc. borrowck rejects
+        // returning a slice of the temporary ArrayView, so keep the i64
+        // path allocation-free by deref-copying through ArrayView1 (it
+        // derefs to &[i64]) inside the read closure's scope instead:
+        // validate bounds up front, then slice per row below.
         let n = request_ids.len();
-        if counts.len() < n {
-            return Err(PyValueError::new_err("missing counts"));
-        }
+        let counts_i64 = num_tokens_no_spec.extract::<PyReadonlyArray1<'_, i64>>().ok();
+        let counts_i32 = if counts_i64.is_none() {
+            num_tokens_no_spec.extract::<PyReadonlyArray1<'_, i32>>().ok()
+        } else {
+            None
+        };
+        // Widened scratch for the i32 path (and non-contiguous i64); the
+        // common contiguous-i64 path reads the NumPy view inline with zero
+        // allocs. No unsafe: guards outlive the whole function body.
+        let counts_widened: Vec<i64> = if let Some(ref a) = counts_i32 {
+            let view = a.as_array();
+            if view.len() < n {
+                return Err(PyValueError::new_err("missing counts"));
+            }
+            match view.as_slice() {
+                Some(s) => s.iter().map(|&x| x as i64).collect(),
+                None => view.iter().map(|&x| x as i64).collect(),
+            }
+        } else if let Some(ref a) = counts_i64 {
+            let view = a.as_array();
+            if view.len() < n {
+                return Err(PyValueError::new_err("missing counts"));
+            }
+            match view.as_slice() {
+                Some(_) => Vec::new(), // contiguous: count_at reads the view
+                None => view.iter().copied().collect(),
+            }
+        } else {
+            return Err(PyValueError::new_err("counts must be int32/int64 NumPy"));
+        };
+        // Uniform accessor: scratch wins when non-empty OR when the i64 view
+        // is non-contiguous (scratch holds the copy); otherwise read the view.
+        // (Single indexing branch; the view derefs to a slice.)
+        let use_scratch = !counts_widened.is_empty()
+            || counts_i64
+                .as_ref()
+                .is_some_and(|a| a.as_array().as_slice().is_none());
+        let count_at = |i: usize| -> i64 {
+            if use_scratch {
+                counts_widened[i]
+            } else {
+                counts_i64.as_ref().unwrap().as_array()[i]
+            }
+        };
         let read = |a: numpy::ndarray::ArrayView2<'_, i64>| -> PyResult<Vec<Vec<i64>>> {
             if a.nrows() < n
-                || counts
-                    .iter()
-                    .take(n)
-                    .any(|&c| c < 0 || c as usize > a.ncols() || c as usize > self.max_model_len)
+                || (0..n).any(|i| {
+                    let c = count_at(i);
+                    c < 0 || c as usize > a.ncols() || c as usize > self.max_model_len
+                })
             {
                 return Err(PyValueError::new_err("invalid row bounds"));
             }
             Ok((0..n)
-                .map(|i| a.row(i).iter().take(counts[i] as usize).copied().collect())
+                .map(|i| a.row(i).iter().take(count_at(i) as usize).copied().collect())
                 .collect())
         };
         let contexts = if let Ok(a) = token_ids_cpu.extract::<PyReadonlyArray2<'_, i64>>() {
@@ -389,10 +460,10 @@ impl HybridMixer {
         } else if let Ok(a) = token_ids_cpu.extract::<PyReadonlyArray2<'_, i32>>() {
             let a = a.as_array();
             if a.nrows() < n
-                || counts
-                    .iter()
-                    .take(n)
-                    .any(|&c| c < 0 || c as usize > a.ncols() || c as usize > self.max_model_len)
+                || (0..n).any(|i| {
+                    let c = count_at(i);
+                    c < 0 || c as usize > a.ncols() || c as usize > self.max_model_len
+                })
             {
                 return Err(PyValueError::new_err("invalid row bounds"));
             }
@@ -400,7 +471,7 @@ impl HybridMixer {
                 .map(|i| {
                     a.row(i)
                         .iter()
-                        .take(counts[i] as usize)
+                        .take(count_at(i) as usize)
                         .map(|&x| x as i64)
                         .collect()
                 })

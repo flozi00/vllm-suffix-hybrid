@@ -27,6 +27,11 @@ def invoke(fn, r, sampled=None, metadata=None, greedy=True):
               NS(all_greedy=greedy), None, None, None, metadata, None, None)
 
 
+def as_lists(value):
+    """Normalize the wrapper return: Tensor on the live path, list on the list path."""
+    return value.tolist() if isinstance(value, torch.Tensor) else value
+
+
 def test_native_runs_first_and_rust_mixes_with_authoritative_context():
     r = runner()
     calls = []
@@ -54,7 +59,9 @@ def test_native_runs_first_and_rust_mixes_with_authoritative_context():
 
     result = invoke(wrap._wrap_propose(propose, Mixer), r)
     assert calls == ["native", "rust"]
-    assert result == [[10, 11, 12, 99], [20, 21, 22, 23]]
+    assert as_lists(result) == [[10, 11, 12, 99], [20, 21, 22, 23]]
+    assert isinstance(result, torch.Tensor)  # live Tensor path stays Tensor
+    assert result.dtype == native.dtype and result.device == native.device
     assert native.tolist() == [[10, 11, 12, 13], [20, 21, 22, 23]]
 
 
@@ -66,7 +73,7 @@ def test_mtp_drafter_class_accepted_like_eagle():
     def native(self, *args):
         self._draft_probs = None
         return torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
-    assert invoke(wrap._wrap_propose(native, Mixer), r) == [[10, 11, 12, 13], [20, 21, 22, 23]]
+    assert as_lists(invoke(wrap._wrap_propose(native, Mixer), r)) == [[10, 11, 12, 13], [20, 21, 22, 23]]
 
 
 def test_unknown_drafter_class_rejected():
@@ -111,7 +118,7 @@ def test_feedback_uses_accepted_and_scheduled_counts_with_discard_censoring():
         return torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
     output = invoke(wrap._wrap_propose(native, Mixer), r,
                     sampled=[[2, 3], []], metadata=NS(num_draft_tokens=[2, 3]))
-    assert output[1] == []
+    assert as_lists(output)[1] == []
 
 
 def test_native_probabilities_preserved_suffix_tail_is_one_hot():
@@ -164,7 +171,7 @@ def test_qwen35_full_attention_mtp_allowed_with_hybrid_target():
     def native(self, *args):
         self._draft_probs = None
         return torch.ones((2, 4), dtype=torch.int32)
-    assert invoke(wrap._wrap_propose(native, Mixer), r) == [[1]*4, [1]*4]
+    assert as_lists(invoke(wrap._wrap_propose(native, Mixer), r)) == [[1]*4, [1]*4]
 
 
 def test_source_drift_is_telemetry_not_fatal(tmp_path, monkeypatch, capsys):
@@ -270,13 +277,13 @@ def test_real_rust_mixer_keeps_native_prefix_and_conditions_suffix(monkeypatch, 
     assert calls == [True]
     # Fresh rows publish native-only (no per-row evidence yet); the second
     # proposal carries the learned split: cache tail replaces the 4th slot.
-    assert result == [[10, 11, 12, 13], [20, 21, 22, 23]]
+    assert as_lists(result) == [[10, 11, 12, 13], [20, 21, 22, 23]]
     # Second proposal: the row is now seen, gate open (no tail feedback
     # yet -> one trial). n=2 lookup on [1,2,3,10,11] yields [12,99],
     # replacing the unearned 4th native slot. suffix_proposed counts the
     # one genuinely non-native slot.
     result2 = invoke(fn, r)
-    assert result2[0] == [10, 11, 12, 99]
+    assert as_lists(result2)[0] == [10, 11, 12, 99]
     assert r._suffix_hybrid_mixer.get_stats()["suffix_proposed"] == 1
     assert '"suffix_proposed": 1' in capsys.readouterr().err
 
@@ -312,6 +319,87 @@ def test_native_list_not_mutated_and_short_mixed_lists_not_padded():
         return native_rows
     assert invoke(wrap._wrap_propose(native, Mixer), r, sampled=[[3], []]) == [[10, 11], []]
     assert native_rows[1] == [20, 21, 22, 23]
+
+
+def test_tensor_native_returns_tensor_same_dtype_device():
+    r = runner()
+    native = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
+
+    class Mixer:
+        def __init__(self, *args): pass
+        def mix_numpy(self, *args): return [[10, 11, 12, 99], [20, 21, 22, 23]]
+
+    def propose(self, *args):
+        self._draft_probs = None
+        return native
+
+    result = invoke(wrap._wrap_propose(propose, Mixer), r)
+    assert isinstance(result, torch.Tensor)
+    assert result.dtype == native.dtype and result.device == native.device
+    assert result.tolist() == [[10, 11, 12, 99], [20, 21, 22, 23]]
+
+
+def test_all_greedy_fast_path_pays_zero_torch_cost(monkeypatch):
+    """Wrapper overhead on the live all-greedy path must not touch torch.
+
+    Monkeypatching the two torch entry points the wrapper may use proves
+    the per-call fast path does no clone/as_tensor work beyond the single
+    unavoidable D2H tolist for the Rust ABI (mocked out here): any torch
+    call raises, so regressions fail loudly instead of as slow timings.
+    """
+    r = runner()
+    native = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
+
+    class Mixer:
+        def __init__(self, *args): pass
+        def mix_numpy(self, ids, counts, tokens, drafts, accepted, cost):
+            assert drafts == [[10, 11, 12, 13], [20, 21, 22, 23]]
+            assert accepted == [-1, -1]
+            return drafts
+
+    def propose(self, *args):
+        self._draft_probs = None
+        return native
+
+    monkeypatch.setattr(torch.Tensor, "tolist", lambda self: [[10, 11, 12, 13], [20, 21, 22, 23]])
+    monkeypatch.setattr(torch, "as_tensor", lambda *a, **k: torch.tensor(*a, **k))
+    monkeypatch.setattr(torch.Tensor, "clone", lambda self, *a, **k: (_ for _ in ()).throw(
+        AssertionError("fast path must not clone draft probs")))
+    fn = wrap._wrap_propose(propose, Mixer)
+    out = invoke(fn, r)
+    assert out.tolist() == [[10, 11, 12, 13], [20, 21, 22, 23]]
+    assert r._suffix_hybrid_calls == 1
+    assert r._suffix_hybrid_cost_ns >= 0
+
+
+def test_log_interval_env_read_once_not_per_call(monkeypatch):
+    """SUFFIX_HYBRID_LOG_INTERVAL is read once, not once per propose (~300ns)."""
+    monkeypatch.delenv("SUFFIX_HYBRID_LOG_INTERVAL", raising=False)
+    r = runner()
+
+    class Mixer:
+        def __init__(self, *args): pass
+        def mix_numpy(self, *args): return [[10, 11, 12, 13], [20, 21, 22, 23]]
+
+    def propose(self, *args):
+        self._draft_probs = None
+        return torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+
+    reads = []
+    real_getenv = __import__("os").environ.get
+
+    def counting_get(key, default=None):
+        if key == "SUFFIX_HYBRID_LOG_INTERVAL":
+            reads.append(1)
+        return real_getenv(key, default) if not isinstance(real_getenv, str) else default
+
+    import os as _os
+    monkeypatch.setattr(_os.environ, "get", counting_get)
+    fn = wrap._wrap_propose(propose, Mixer)
+    invoke(fn, r)
+    invoke(fn, r)
+    invoke(fn, r)
+    assert len(reads) == 1
 
 
 def test_unaudited_drafter_subclass_rejected():
