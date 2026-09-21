@@ -18,7 +18,7 @@ def runner():
         input_batch=NS(req_ids=["a", "b"], num_tokens_no_spec=np.array([3, 2]),
                        token_ids_cpu=np.array([[1, 2, 3, 0], [7, 8, 0, 0]])),
         rejection_sampler=NS(synthetic_mode=False),
-        drafter=type("EagleProposer", (), {"__module__": "vllm.v1.spec_decode.eagle"})(),
+        drafter=type("MtpProposer", (), {"__module__": "vllm.v1.spec_decode.eagle"})(),
     )
 
 
@@ -56,6 +56,24 @@ def test_native_runs_first_and_rust_mixes_with_authoritative_context():
     assert calls == ["native", "rust"]
     assert result == [[10, 11, 12, 99], [20, 21, 22, 23]]
     assert native.tolist() == [[10, 11, 12, 13], [20, 21, 22, 23]]
+
+
+def test_mtp_drafter_class_accepted_like_eagle():
+    r = runner()
+    class Mixer:
+        def __init__(self, *args): pass
+        def mix_numpy(self, ids, counts, tokens, drafts, *args): return drafts
+    def native(self, *args):
+        self._draft_probs = None
+        return torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+    assert invoke(wrap._wrap_propose(native, Mixer), r) == [[10, 11, 12, 13], [20, 21, 22, 23]]
+
+
+def test_unknown_drafter_class_rejected():
+    r = runner()
+    r.drafter = type("WeirdProposer", (), {"__module__": "vllm.v1.spec_decode.eagle"})()
+    with pytest.raises(RuntimeError, match="drafter"):
+        invoke(wrap._wrap_propose(lambda *a: pytest.fail("must not run"), None), r)
 
 
 @pytest.mark.parametrize("case", ["stochastic", "async", "padded", "pipeline", "recurrent", "synthetic", "wrong_method", "tensor_sampled"])

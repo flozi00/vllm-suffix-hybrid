@@ -136,8 +136,14 @@ def _wrap_propose(original, mixer_factory):
         draft_config = getattr(spec, "draft_model_config", None)
         draft_type = getattr(getattr(draft_config, "hf_config", None), "model_type", None)
         drafter_type = type(self.drafter)
-        if (drafter_type.__module__, drafter_type.__name__) not in {
+        drafter_name = (drafter_type.__module__, drafter_type.__name__)
+        # MTP shares the llm_base chain with Eagle/DFlash but ships its own
+        # class name (EagleProposer on fresh checkouts, MtpProposer where the
+        # vendor split it out). Accept either; the chain-state reasoning is
+        # the same (draft proposals only, mixer never touches drafter KV).
+        if drafter_name not in {
                 ("vllm.v1.spec_decode.eagle", "EagleProposer"),
+                ("vllm.v1.spec_decode.eagle", "MtpProposer"),
                 ("vllm.v1.spec_decode.dflash", "DFlashProposer")}:
             raise RuntimeError("suffix hybrid unsupported drafter class/state contract")
         if (self.use_async_scheduling or not spec.disable_padded_drafter_batch
