@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Minimal glue for the vLLM 0.29 custom_class proposer contract.
+"""Wrap-mode first: suffix arbitration around a model-based drafter.
 
-The authoritative NumPy rows already contain this step's sampled tokens.
-Rust owns context continuity, cache, drafting, arbitration and counters.
-There is deliberately no Python fallback and no model-drafter wrapping.
+The primary serving shape is MTP/dflash/dspark native drafting with the
+Rust mixer arbitrating per-row suffix tails into the native draft lists
+(see wrap.py install()). Standalone suffix-only serving (custom_class
+with no drafter) is a dev fallback only: it forces the V1 runner, drops
+async scheduling, and measured SLOWER than plain decode on a dense
+distill (29.4 vs 47.1 tok/s) — never roll it out to production.
 """
 import json
 import logging
