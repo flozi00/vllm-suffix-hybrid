@@ -32,6 +32,7 @@ EngineCore fatal and kills the pod.
 """
 import functools
 import inspect
+import json
 import os
 import sys
 
@@ -86,7 +87,8 @@ def _check_speculator_capability(spec_cls):
 
 def _wrap_propose(runner, original, mixer, group, probabilistic=False):
     previous_widths = {}
-    state = {"skips": 0, "reason": ""}
+    state = {"skips": 0, "reason": "", "mixes": 0}
+    interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
 
     def _degrade_line(kind):
         state["skips"] += 1
@@ -170,6 +172,11 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False):
                             row, dtype=output.dtype, device=output.device)
                 previous_widths.clear()
                 previous_widths.update(zip(ids, map(len, mixed)))
+                state["mixes"] += 1
+                if interval and state["mixes"] % interval == 0:
+                    print("suffix_hybrid_native " + json.dumps(
+                        mixer.get_stats(), sort_keys=True),
+                        file=sys.stderr, flush=True)
             return group.broadcast(output, src=0)
         except Exception as exc:
             state["reason"] = f"{type(exc).__name__}: {exc}"
