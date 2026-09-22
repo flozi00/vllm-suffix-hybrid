@@ -3,4 +3,4 @@
     "--kernel-config.ir_op_priority",
     "{\"rms_norm\": [\"vllm_c\", \"suffix_kernels\", \"native\"], \"fused_add_rms_norm\": [\"vllm_c\", \"suffix_kernels\", \"native\"]}"
   ]
-]
+]              
