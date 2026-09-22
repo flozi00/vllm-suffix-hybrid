@@ -1,9 +1,10 @@
 """dev_args splice semantics: override-in-place, append-new, remove, guardrails."""
 import os
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
+# No sys.path manipulation: the package resolves via the installed wheel in
+# CI and via pytest's rootdir insertion locally. Inserting the repo root
+# here would shadow the wheel with the source dir (no compiled .so) and
+# break every native test module that imports after this one.
 from suffix_hybrid.dev_args import splice  # noqa: E402
 
 BASE = ["vllm", "serve", "s3://model-weights/m/", "--load-format",
