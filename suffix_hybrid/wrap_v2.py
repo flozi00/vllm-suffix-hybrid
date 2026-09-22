@@ -289,6 +289,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
           "stream": None, "prod_ev": None, "ev": None,
           "pending": None,          # None | "SYNC" | [req_id, ...]
           "sync_ids": [],
+          "gate": {},               # req_id -> full-path mixes since last win
           "fallback": False, "fallback_logged": False}
 
     def _tp_mode():
@@ -366,6 +367,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         live = set(ids)
         for rid in [r for r in mirror if r not in live]:
             del mirror[rid]
+            st["gate"].pop(rid, None)   # gone request: drop gate state too
         cuda = torch.cuda.is_available()
         if cuda:
             # Order the side-stream copies behind the postprocess producer
@@ -511,6 +513,18 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         # keep native tails, so an all-native mix is a no-op).
         changed = any(row and row != native_rows[i][:len(row)]
                       for i, row in enumerate(eff))
+        # ADAPTIVE GATE bookkeeping (p14): count consecutive full-path mixes
+        # without a WON row per request. A win is a row whose prefix
+        # DISAGREES with native (the same predicate as `changed`) — the
+        # mixer's echo path returns the native row verbatim on losing
+        # steps, and counting those as wins would never cool down.
+        gate = st["gate"]
+        for i, row in enumerate(eff):
+            rid = ids[i]
+            if row and row != native_rows[i][:len(row)]:
+                gate[rid] = 0          # won: reset the miss counter
+            else:
+                gate[rid] = gate.get(rid, 0) + 1
         if not changed:
             _note_skip("skips_unchanged")
             # previous_widths keeps the sync-body contract (mixed widths,
@@ -588,6 +602,16 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         except ValueError:
             return 8
 
+    def _probe_cooldown():
+        # ADAPTIVE GATE (p14): consecutive full-path mixes without a suffix
+        # win after which a request stops forcing the full path (probe can
+        # then gate it). 0 disables the adaptive gate entirely.
+        try:
+            return int(os.environ.get(
+                "SUFFIX_HYBRID_PROBE_COOLDOWN", "4") or 4)
+        except ValueError:
+            return 4
+
     def _mirror_probe(ids, k_slots):
         # ZERO-SYNC GATE (p12): decide whether suffix evidence exists BEFORE
         # paying the native [n,K] D2H. CPU state only: the one-step-stale
@@ -627,6 +651,8 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         w = st["w"] or (k_slots + 2)
         n_gram = _cache_n_gram()
         mirror = st["mirror"]
+        gate = st["gate"]
+        cooldown = _probe_cooldown()
         for rid in ids:
             row = mirror.get(rid)
             if row is None:
@@ -641,8 +667,14 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
             except Exception:
                 return True     # probe itself failed: full path
             if len(suffix) >= min_len:
-                return True     # strong continuation exists: arbitrate
-        # Every row probed, no strong continuation anywhere: native echo.
+                # ADAPTIVE GATE (p14): evidence exists, but a request whose
+                # last COOLDOWN full-path mixes produced no written suffix
+                # row (evidence-but-no-win, the p13 finding) no longer
+                # forces arbitration. Wins reset the counter, so a request
+                # that starts winning fires again. COOLDOWN<=0 disables.
+                if cooldown <= 0 or gate.get(rid, 0) < cooldown:
+                    return True
+        # Every row probed, no row both evidenced AND trusted: native echo.
         return False
 
     def _fast_body(native, input_batch, num_sampled, num_rejected,

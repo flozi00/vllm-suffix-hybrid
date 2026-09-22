@@ -454,6 +454,15 @@ class ProbeMix(CacheMix):
         return [], 0.0, 0
 
 
+class WinningMix(ProbeMix):
+    """ProbeMix whose mix WINS rows: mix_numpy returns suffix rows."""
+
+    def mix_numpy(self, ids, counts, history, native, accepted):
+        self.calls.append((list(ids), counts.copy(), history.copy(),
+                           [list(r) for r in native], list(accepted)))
+        return [[42, 43] for _ in ids]
+
+
 def _probe_fixture(native, history_rows=None):
     states = NS(total_len=NS(gpu=torch.tensor([8, 2])),
                 all_token_ids=NS(gpu=torch.tensor(
@@ -519,3 +528,44 @@ def test_probe_never_gates_cold_corpus(monkeypatch):
     for _ in range(4):
         invoke(wrapped, calls)
     assert len(mixer.calls) == 4
+
+
+def test_adaptive_gate_cools_down_after_misses(monkeypatch):
+    # COOLDOWN=2: two full-path mixes that find evidence but never WIN the
+    # row -> from the 3rd evidenced step on, the request no longer forces
+    # arbitration (probe gate fires despite cache.speculate returning a
+    # strong continuation).
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_COOLDOWN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_HEARTBEAT", "0")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = ProbeMix([[9, 10, 11, 12, 99]], tokens=1000, hit=True)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    # step 1: un-mirrored -> full path (seed); misses := 1
+    invoke(wrapped, None)
+    # step 2: evidenced + trusted (misses 1 < 2) -> full path; misses := 2
+    invoke(wrapped, None)
+    assert len(mixer.calls) == 2
+    # step 3: evidenced but misses 2 >= cooldown 2 -> GATED (native echo).
+    got3 = invoke(wrapped, None)
+    assert got3 is native
+    assert len(mixer.calls) == 2
+    assert mixer.probe_calls >= 1
+
+
+def test_adaptive_gate_rearms_on_win(monkeypatch):
+    # A WINNING mixer never cools down: every step stays on the full path.
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_COOLDOWN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_HEARTBEAT", "0")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = WinningMix([[9, 10, 11, 12, 99]], tokens=1000, hit=True)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    for _ in range(5):
+        got = invoke(wrapped, None)
+        assert got is not native        # a win writes a row every time
+    assert len(mixer.calls) == 5
