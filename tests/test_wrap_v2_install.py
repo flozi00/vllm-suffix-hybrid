@@ -225,3 +225,211 @@ def test_install_v2_absent_module_returns_false(monkeypatch):
     # sitecustomize falls through to the V1 hook, never raise.
     monkeypatch.setenv("SUFFIX_HYBRID_WRAP", "1")
     assert wrap_v2.install_v2() is False
+
+
+# ---------------------------------------------------------------------------
+# Async mirror fast path: cold skip, unchanged skip, write-back, env switches.
+# The fake runner has plain CPU tensors on .gpu attributes, so the mirror
+# path must work with torch.cuda absent (synchronous copies into the same
+# pinned-shaped staging). Fake mixers expose cache_tokens() (the Rust
+# accessor landing in parallel); _cache_tokens also accepts the older
+# get_stats()['cache']['cached_tokens'] shape.
+# ---------------------------------------------------------------------------
+
+class CacheMix:
+    """Fake mixer with a cache_tokens() accessor and scripted mix output."""
+
+    def __init__(self, rows, tokens=5):
+        self.rows = rows
+        self.tokens = tokens
+        self.calls = []
+
+    def cache_tokens(self):
+        return self.tokens
+
+    def get_stats(self):
+        return {"cache": {"cached_tokens": self.tokens}}
+
+    def mix_numpy(self, ids, counts, history, native, accepted):
+        self.calls.append((list(ids), counts.copy(), history.copy(),
+                           [list(r) for r in native], list(accepted)))
+        return [list(r) for r in self.rows]
+
+
+class StatsOnlyMix(CacheMix):
+    """Pre-accessor build: cache size only via get_stats()['cache'].
+
+    The prebuilt .so predates cache_tokens(); shadow the accessor with None
+    so the fallback branch of _cache_tokens is what actually runs.
+    """
+
+    cache_tokens = None  # not callable -> getattr guard falls through
+
+
+def test_cold_skip_returns_exact_native_object(monkeypatch):
+    monkeypatch.delenv("SUFFIX_HYBRID_SYNC_HOOK", raising=False)
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _fixture(native)
+
+    class Boom:
+        def cache_tokens(self):
+            return 0
+
+        def get_stats(self):
+            return {"cache": {"cached_tokens": 0}}
+
+        def mix_numpy(self, *a, **k):
+            raise AssertionError("cold cache provably echoes native: the "
+                                 "fast path must not mix at all")
+
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    Boom(), TP())
+    got = invoke(wrapped, None)
+    assert got is native  # exact object: no clone, no broadcast copy
+
+
+def test_cold_skip_uses_stats_fallback_for_pre_accessor_builds(monkeypatch):
+    monkeypatch.delenv("SUFFIX_HYBRID_SYNC_HOOK", raising=False)
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _fixture(native)
+    mixer = StatsOnlyMix([[1, 2, 3, 4, 5]], tokens=0)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    got = invoke(wrapped, None)
+    assert got is native
+    assert mixer.calls == []  # stats fallback proved cold, no mix
+
+
+def test_unchanged_mix_returns_native_without_rewrite(monkeypatch):
+    monkeypatch.delenv("SUFFIX_HYBRID_SYNC_HOOK", raising=False)
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _fixture(native)
+    # Mix identical to native: nothing to write, nothing to broadcast.
+    mixer = CacheMix([[9, 10, 11, 12, 99]])
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    got = invoke(wrapped, None)
+    assert got is native
+    assert len(mixer.calls) == 1  # the mixer DID run (cache warm)
+
+
+def test_changed_mix_rewrites_rows(monkeypatch):
+    monkeypatch.delenv("SUFFIX_HYBRID_SYNC_HOOK", raising=False)
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _fixture(native)
+    mixer = CacheMix([[7, 8, 9]])   # suffix extends from token 9
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    got = invoke(wrapped, None)
+    assert got is not native
+    assert got.tolist() == [[7, 8, 9, 12, 99]]     # fixed width, native tail
+    assert got.shape == native.shape
+    ids, counts, history, native_rows, accepted = mixer.calls[0]
+    # Mirror-driven: counts/history come from the CPU mirror, not a
+    # per-step GPU history D2H. Seeded from all_token_ids row 0.
+    assert ids == ['a'] and counts.tolist() == [8]
+    assert history[0, :8].tolist() == list(range(1, 9))
+    assert native_rows == [[9, 10, 11, 12, 99]]
+    # First step has no previous proposal: the accepted gate must be -1.
+    assert accepted == [-1]
+
+
+def test_mirror_extends_across_steps(monkeypatch):
+    # Two steps: the fake "engine" (running between propose calls, like the
+    # real sample_tokens postprocess before propose) advances total_len and
+    # appends a token; the mirror must absorb the bounded window so step
+    # 2's mix sees the longer history without any full-buffer re-read.
+    monkeypatch.delenv("SUFFIX_HYBRID_SYNC_HOOK", raising=False)
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _fixture(native)
+    mixer = CacheMix([[9, 10, 11, 12, 99]])   # echo: skip write-back noise
+
+    step = {"n": 0}
+
+    def original(*a, **k):
+        if step["n"] == 1:
+            # Engine advanced the row BEFORE this propose call.
+            runner.req_states.total_len.gpu += 1
+            runner.req_states.all_token_ids.gpu[0, 8] = 4242
+        step["n"] += 1
+        return native
+
+    wrapped = wrap_v2._wrap_propose(runner, original, mixer, TP())
+    invoke(wrapped, None)
+    invoke(wrapped, None)
+    assert mixer.calls[-1][1].tolist() == [9]                 # grew by 1
+    assert mixer.calls[-1][2][0, :9].tolist() == (            # tail absorbed
+        list(range(1, 9)) + [4242])
+
+
+def test_sync_hook_env_forces_old_body(monkeypatch):
+    # SUFFIX_HYBRID_SYNC_HOOK=1 must run the OLD body even when the fast
+    # path would cold-skip: the old body has no cold gate, so the mixer is
+    # invoked and the result is a clone+broadcast copy, never the native
+    # object itself.
+    monkeypatch.setenv("SUFFIX_HYBRID_SYNC_HOOK", "1")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _fixture(native)
+    mixer = CacheMix([[9, 10, 11, 12, 99]], tokens=0)  # cold: fast skips
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    got = invoke(wrapped, None)
+    assert len(mixer.calls) == 1     # old body mixed despite cold cache
+    assert got is not native         # old body: clone + broadcast
+    assert got.tolist() == native.tolist()
+
+
+def test_fast_path_crash_falls_back_stickily_to_sync(monkeypatch):
+    # A fast-path raise (here: the mirror's first read of the GPU history
+    # row explodes once) must log once and route every later step through
+    # the synchronous body.
+    monkeypatch.delenv("SUFFIX_HYBRID_SYNC_HOOK", raising=False)
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _fixture(native)
+    mixer = CacheMix([[9, 10, 11, 12, 99]], tokens=5)  # warm: reach the mix
+
+    good_ats = runner.req_states.all_token_ids
+
+    class FlakyATS:
+        def __init__(self):
+            self.n = 0
+
+        @property
+        def gpu(self):
+            self.n += 1
+            if self.n == 1:
+                # First fast-path seed read: blow up inside the mirror.
+                raise RuntimeError("mirror staging exploded")
+            return good_ats.gpu
+
+    runner.req_states.all_token_ids = FlakyATS()
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    got = invoke(wrapped, None)          # first call: fallback triggers
+    assert got is not native             # sync body re-ran and cloned
+    assert got.tolist() == native.tolist()
+    # Later steps keep using the sync body (sticky flag): the fast path
+    # would now succeed against the healed buffer, but must not be retried.
+    got2 = invoke(wrapped, None)
+    assert got2 is not native
+    assert got2.tolist() == native.tolist()
+
+
+def test_replay_mode_skips_collective(monkeypatch):
+    # TP_MODE=replay: every rank mirrors+mixes locally, no broadcast ever.
+    monkeypatch.delenv("SUFFIX_HYBRID_SYNC_HOOK", raising=False)
+    monkeypatch.setenv("SUFFIX_HYBRID_TP_MODE", "replay")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _fixture(native)
+
+    class NoCast(TP):
+        world_size = 8
+
+        def broadcast(self, value, src=0):
+            raise AssertionError("replay mode must never hit a collective")
+
+    mixer = CacheMix([[7, 8, 9]])
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, NoCast())
+    got = invoke(wrapped, None)
+    assert got.tolist() == [[7, 8, 9, 12, 99]]
