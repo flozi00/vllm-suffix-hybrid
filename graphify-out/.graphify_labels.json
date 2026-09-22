@@ -1,17 +1,1 @@
-{
-  "0": "SuffixCache",
-  "1": "HybridProposer",
-  "2": "TestSuffixCache",
-  "3": "compare.py",
-  "4": "Engine",
-  "5": "HybridMixer",
-  "6": "test_native_wrap.py",
-  "7": "MixerTests",
-  "8": "vllm-suffix-hybrid",
-  "9": "Native hybrid design",
-  "10": "BundleTest",
-  "11": "runtime_bundle.py",
-  "12": "__init__.py",
-  "13": "suffix-hybrid",
-  "14": "wrap.py"
-}
+{"0": "Rust cache core (lib.rs)", "1": "vLLM wrap contract tests", "2": "Python adapter & integration glue", "3": "Native cache contract tests", "4": "Benchmarks (bench.py, compare.py)", "5": "HybridMixer incremental paths", "6": "Weight-free Engine (engine.rs)", "7": "Scale benchmark (scale_bench.py)", "8": "Docs & CI workflow", "9": "wrap_v2 feedback tests", "10": "Incremental NumPy path tests", "11": "Mixer behavior tests", "12": "Design rationale (DESIGN.md)", "13": "Runtime bundle tests", "14": "Package init", "15": "Crate manifest", "16": "Std HashMap type", "17": "Std HashMap type (dup)", "18": "Generic type param", "19": "Pytest conftest"}

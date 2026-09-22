@@ -1,121 +1,131 @@
-# Graph Report - vllm-suffix-hybrid  (2026-09-20)
+# Graph Report - .  (2026-09-22)
 
 ## Corpus Check
-- 21 files · ~9,152 words
+- 27 files · ~17,423 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 193 nodes · 310 edges · 15 communities (11 shown, 4 thin omitted)
-- Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 5 edges (avg confidence: 0.74)
+- 280 nodes · 468 edges · 20 communities (13 shown, 7 thin omitted)
+- Extraction: 97% EXTRACTED · 3% INFERRED · 0% AMBIGUOUS · INFERRED: 13 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
-## Graph Freshness
-- Built from commit: `d1af3b7d`
-- Run `git rev-parse HEAD` and compare to check if the graph is stale.
-- Run `graphify update .` after code changes (no API cost).
-
 ## Community Hubs (Navigation)
-- [[_COMMUNITY_SuffixCache|SuffixCache]]
-- [[_COMMUNITY_HybridProposer|HybridProposer]]
-- [[_COMMUNITY_TestSuffixCache|TestSuffixCache]]
-- [[_COMMUNITY_compare.py|compare.py]]
-- [[_COMMUNITY_Engine|Engine]]
-- [[_COMMUNITY_HybridMixer|HybridMixer]]
-- [[_COMMUNITY_test_native_wrap.py|test_native_wrap.py]]
-- [[_COMMUNITY_MixerTests|MixerTests]]
-- [[_COMMUNITY_vllm-suffix-hybrid|vllm-suffix-hybrid]]
-- [[_COMMUNITY_Native hybrid design|Native hybrid design]]
-- [[_COMMUNITY_BundleTest|BundleTest]]
-- [[_COMMUNITY___init__.py|__init__.py]]
-- [[_COMMUNITY_suffix-hybrid|suffix-hybrid]]
-- [[_COMMUNITY_wrap.py|wrap.py]]
+- [[_COMMUNITY_Rust cache core (lib.rs)|Rust cache core (lib.rs)]]
+- [[_COMMUNITY_vLLM wrap contract tests|vLLM wrap contract tests]]
+- [[_COMMUNITY_Python adapter & integration glue|Python adapter & integration glue]]
+- [[_COMMUNITY_Native cache contract tests|Native cache contract tests]]
+- [[_COMMUNITY_Benchmarks (bench.py, compare.py)|Benchmarks (bench.py, compare.py)]]
+- [[_COMMUNITY_HybridMixer incremental paths|HybridMixer incremental paths]]
+- [[_COMMUNITY_Weight-free Engine (engine.rs)|Weight-free Engine (engine.rs)]]
+- [[_COMMUNITY_Scale benchmark (scale_bench.py)|Scale benchmark (scale_bench.py)]]
+- [[_COMMUNITY_Docs & CI workflow|Docs & CI workflow]]
+- [[_COMMUNITY_wrap_v2 feedback tests|wrap_v2 feedback tests]]
+- [[_COMMUNITY_Incremental NumPy path tests|Incremental NumPy path tests]]
+- [[_COMMUNITY_Mixer behavior tests|Mixer behavior tests]]
+- [[_COMMUNITY_Design rationale (DESIGN.md)|Design rationale (DESIGN.md)]]
+- [[_COMMUNITY_Runtime bundle tests|Runtime bundle tests]]
+- [[_COMMUNITY_Package init|Package init]]
+- [[_COMMUNITY_Crate manifest|Crate manifest]]
+- [[_COMMUNITY_Std HashMap type|Std HashMap type]]
+- [[_COMMUNITY_Std HashMap type (dup)|Std HashMap type (dup)]]
+- [[_COMMUNITY_Generic type param|Generic type param]]
 
 ## God Nodes (most connected - your core abstractions)
-1. `HybridProposer` - 19 edges
-2. `TestHybridProposer` - 17 edges
-3. `TestSuffixCache` - 16 edges
-4. `config()` - 14 edges
-5. `SuffixCache` - 13 edges
-6. `HybridMixer` - 13 edges
-7. `Engine` - 11 edges
-8. `Cache` - 11 edges
-9. `runner()` - 10 edges
-10. `invoke()` - 10 edges
+1. `invoke()` - 23 edges
+2. `HybridProposer` - 19 edges
+3. `runner()` - 19 edges
+4. `TestHybridProposer` - 17 edges
+5. `TestSuffixCache` - 16 edges
+6. `SuffixCache` - 14 edges
+7. `HybridMixer` - 14 edges
+8. `config()` - 14 edges
+9. `Cache` - 12 edges
+10. `Engine` - 11 edges
 
 ## Surprising Connections (you probably didn't know these)
+- `High-concurrency hot paths and crash safety` --references--> `ngram()`  [INFERRED]
+  README.md → src/engine.rs
+- `High-concurrency hot paths and crash safety` --references--> `lock_cache()`  [EXTRACTED]
+  README.md → src/lib.rs
+- `Native plugin CI workflow` --references--> `bundle()`  [EXTRACTED]
+  .github/workflows/native.yml → scripts/runtime_bundle.py
+- `High-concurrency hot paths and crash safety` --references--> `guard_py()`  [EXTRACTED]
+  README.md → src/lib.rs
 - `TestHybridProposer` --uses--> `HybridProposer`  [INFERRED]
   tests/test_hybrid_proposer.py → suffix_hybrid/hybrid_proposer.py
-- `run_one()` --calls--> `make_prompt()`  [INFERRED]
-  bench/compare.py → bench/bench.py
-- `Engine` --references--> `SuffixCache`  [EXTRACTED]
-  src/engine.rs → src/lib.rs
-- `HybridMixer` --references--> `SuffixCache`  [EXTRACTED]
-  src/mixer.rs → src/lib.rs
 
 ## Import Cycles
 - None detected.
 
-## Communities (15 total, 4 thin omitted)
+## Communities (20 total, 7 thin omitted)
 
-### Community 0 - "SuffixCache"
-Cohesion: 0.12
-Nodes (17): Arc, Default, Mutex, PyModule, Cache, Config, env_float(), env_usize() (+9 more)
+### Community 0 - "Rust cache core (lib.rs)"
+Cohesion: 0.09
+Nodes (20): Arc, Default, Hasher, HashMap, K, Mutex, MutexGuard, Cache (+12 more)
 
-### Community 1 - "HybridProposer"
-Cohesion: 0.26
-Nodes (4): HybridProposer, config(), vLLM 0.29 custom_class contract: rows ALREADY include sampled IDs.  Legacy fake-, TestHybridProposer
+### Community 1 - "vLLM wrap contract tests"
+Cohesion: 0.11
+Nodes (31): as_lists(), invoke(), Contract tests with real tensors; vLLM/CUDA execution is a deployment gate., Normalize the wrapper return: Tensor on the live path, list on the list path., Wrapper overhead on the live all-greedy path must not touch torch.      Monkeypa, SUFFIX_HYBRID_LOG_INTERVAL is read once, not once per propose (~300ns)., Regression: the scheduler verifying MORE slots than our last mixed     proposal, A mixer/adapter raise AFTER the native drafter ran must never kill     EngineCor (+23 more)
 
-### Community 2 - "TestSuffixCache"
-Cohesion: 0.10
+### Community 2 - "Python adapter & integration glue"
+Cohesion: 0.14
+Nodes (12): HybridProposer, _check_runner_capability(), _fingerprint_sources(), install(), Fail closed when the live runner lacks the hooked shape.      Raises RuntimeErro, Compare live sources against the audited pin; warn, never raise.      Returns th, Legacy name kept for tests/callers: log drift, do not raise., _verify_sources() (+4 more)
+
+### Community 3 - "Native cache contract tests"
+Cohesion: 0.09
 Nodes (4): NativeCacheTests, Native contract tests use real NumPy buffers, not fake tensor APIs., set_env(), TestSuffixCache
 
-### Community 3 - "compare.py"
+### Community 4 - "Benchmarks (bench.py, compare.py)"
 Cohesion: 0.12
 Nodes (13): make_prompt(), run_one(), consume_stream(), main(), metric_snapshot(), Parse SSE data fields, including comments, CRLF and multiline events., run_one(), sse_events() (+5 more)
 
-### Community 4 - "Engine"
+### Community 5 - "HybridMixer incremental paths"
+Cohesion: 0.20
+Nodes (15): Decide, Map, Option, boundary_matches(), Continuity, HybridMixer, Previous, Bound (+7 more)
+
+### Community 6 - "Weight-free Engine (engine.rs)"
 Cohesion: 0.15
 Nodes (11): ArrayView2, Engine, ngram(), Bound, PyAny, PyDict, PyResult, Python (+3 more)
 
-### Community 5 - "HybridMixer"
-Cohesion: 0.20
-Nodes (12): Option, HybridMixer, Previous, Bound, HashMap, PyAny, PyDict, PyResult (+4 more)
+### Community 7 - "Scale benchmark (scale_bench.py)"
+Cohesion: 0.19
+Nodes (13): _batch(), bench_engine(), bench_mixer(), main(), A steady-state batch: rows requests, each with ctx_len tokens of history.      T, F, PyModule, High-concurrency hot paths and crash safety (+5 more)
 
-### Community 6 - "test_native_wrap.py"
-Cohesion: 0.28
-Nodes (12): invoke(), Contract tests with real tensors; vLLM/CUDA execution is a deployment gate., runner(), test_feedback_uses_accepted_and_scheduled_counts_with_discard_censoring(), test_native_list_not_mutated_and_short_mixed_lists_not_padded(), test_native_probabilities_preserved_suffix_tail_is_one_hot(), test_native_runs_first_and_rust_mixes_with_authoritative_context(), test_qwen35_full_attention_mtp_allowed_with_hybrid_target() (+4 more)
+### Community 8 - "Docs & CI workflow"
+Cohesion: 0.17
+Nodes (9): Native plugin CI workflow, Auxiliary weight-free mode, Benchmarking, Build and deliver, Correctness and isolation, License, Native model + suffix usage, vllm-suffix-hybrid (+1 more)
 
-### Community 8 - "vllm-suffix-hybrid"
-Cohesion: 0.25
-Nodes (7): Auxiliary weight-free mode, Benchmarking, Build and deliver, Correctness and isolation, License, Native model + suffix usage, vllm-suffix-hybrid
+### Community 9 - "wrap_v2 feedback tests"
+Cohesion: 0.27
+Nodes (8): _wrap_propose(), fixture(), _mixer(), CPU contract tests: real Torch tensors and the compiled Rust mixer.  The vLLM ru, test_feedback_follows_request_ids_after_slot_reorder(), test_native_then_full_width_mix_stochastic_target(), test_truncated_success_and_zero_sample_are_censored(), TP
 
-### Community 9 - "Native hybrid design"
+### Community 10 - "Incremental NumPy path tests"
+Cohesion: 0.24
+Nodes (3): IncrementalNumpyTests, Incremental mix_numpy: steady-state decode must match the list API.  The NumPy p, _tokens()
+
+### Community 12 - "Design rationale (DESIGN.md)"
 Cohesion: 0.33
 Nodes (5): Components, Correctness boundaries, Learning the allocation, Native hybrid design, Required behavior
 
-### Community 14 - "wrap.py"
-Cohesion: 0.48
-Nodes (3): install(), _verify_sources(), _wrap_propose()
-
 ## Knowledge Gaps
-- **11 isolated node(s):** `suffix-hybrid`, `Native model + suffix usage`, `Auxiliary weight-free mode`, `Build and deliver`, `Correctness and isolation` (+6 more)
+- **8 isolated node(s):** `suffix-hybrid`, `Continuity`, `Native model + suffix usage`, `Auxiliary weight-free mode`, `Correctness and isolation` (+3 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **4 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **7 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `SuffixCache` connect `SuffixCache` to `Engine`, `HybridMixer`?**
-  _High betweenness centrality (0.085) - this node is a cross-community bridge._
-- **Why does `HybridMixer` connect `HybridMixer` to `SuffixCache`?**
+- **Why does `SuffixCache` connect `Rust cache core (lib.rs)` to `HybridMixer incremental paths`, `Weight-free Engine (engine.rs)`?**
+  _High betweenness centrality (0.055) - this node is a cross-community bridge._
+- **Why does `High-concurrency hot paths and crash safety` connect `Scale benchmark (scale_bench.py)` to `Rust cache core (lib.rs)`, `Docs & CI workflow`, `HybridMixer incremental paths`, `Weight-free Engine (engine.rs)`?**
   _High betweenness centrality (0.053) - this node is a cross-community bridge._
-- **Why does `Engine` connect `Engine` to `SuffixCache`?**
-  _High betweenness centrality (0.049) - this node is a cross-community bridge._
-- **What connects `Parse SSE data fields, including comments, CRLF and multiline events.`, `Synthetic local fixtures only; these are not benchmark results.`, `suffix-hybrid` to the rest of the system?**
-  _17 weakly-connected nodes found - possible documentation gaps or missing edges._
-- **Should `SuffixCache` be split into smaller, more focused modules?**
-  _Cohesion score 0.11724137931034483 - nodes in this community are weakly interconnected._
-- **Should `TestSuffixCache` be split into smaller, more focused modules?**
-  _Cohesion score 0.09666666666666666 - nodes in this community are weakly interconnected._
-- **Should `compare.py` be split into smaller, more focused modules?**
-  _Cohesion score 0.11857707509881422 - nodes in this community are weakly interconnected._
+- **Why does `HybridMixer` connect `HybridMixer incremental paths` to `Rust cache core (lib.rs)`?**
+  _High betweenness centrality (0.036) - this node is a cross-community bridge._
+- **Are the 4 inferred relationships involving `invoke()` (e.g. with `fixture()` and `test_feedback_follows_request_ids_after_slot_reorder()`) actually correct?**
+  _`invoke()` has 4 INFERRED edges - model-reasoned connections that need verification._
+- **What connects `Parse SSE data fields, including comments, CRLF and multiline events.`, `A steady-state batch: rows requests, each with ctx_len tokens of history.      T`, `Synthetic local fixtures only; these are not benchmark results.` to the rest of the system?**
+  _32 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **Should `Rust cache core (lib.rs)` be split into smaller, more focused modules?**
+  _Cohesion score 0.09358974358974359 - nodes in this community are weakly interconnected._
+- **Should `vLLM wrap contract tests` be split into smaller, more focused modules?**
+  _Cohesion score 0.10661268556005399 - nodes in this community are weakly interconnected._
