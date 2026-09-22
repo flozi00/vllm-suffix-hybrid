@@ -24,7 +24,7 @@ jobs:
           python -m pip install dist/*.whl numpy pytest
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           cd "$RUNNER_TEMP"
-          python -m pytest "$GITHUB_WORKSPACE/tests" -q --import-mode=importlib
+          python -m pytest "$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/sm120/tests" -q --import-mode=importlib
       - name: Create directly mountable runtime bundle
         run: python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA"
       - uses: actions/upload-artifact@v4
