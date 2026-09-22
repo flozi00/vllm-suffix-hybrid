@@ -228,12 +228,14 @@ def test_install_v2_absent_module_returns_false(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Async mirror fast path: cold skip, unchanged skip, write-back, env switches.
+# Async mirror fast path: unchanged skip, write-back, env switches.
 # The fake runner has plain CPU tensors on .gpu attributes, so the mirror
 # path must work with torch.cuda absent (synchronous copies into the same
-# pinned-shaped staging). Fake mixers expose cache_tokens() (the Rust
-# accessor landing in parallel); _cache_tokens also accepts the older
-# get_stats()['cache']['cached_tokens'] shape.
+# pinned-shaped staging). Regression rule: the cache-size gate was REMOVED
+# from the fast path — mix_numpy is the only corpus ingestion path, so a
+# cold cache must still be absorbed, enqueued and mixed (live-pod
+# self-lock, 2026-09-22: cold skip before mix meant nothing ever ingested
+# and suffix_hybrid_native never printed once).
 # ---------------------------------------------------------------------------
 
 class CacheMix:
@@ -259,36 +261,29 @@ class CacheMix:
 class StatsOnlyMix(CacheMix):
     """Pre-accessor build: cache size only via get_stats()['cache'].
 
-    The prebuilt .so predates cache_tokens(); shadow the accessor with None
-    so the fallback branch of _cache_tokens is what actually runs.
+    Kept so the wrapper is exercised against mixer builds that predate the
+    cache_tokens() accessor — the fast path must not depend on it existing.
     """
 
-    cache_tokens = None  # not callable -> getattr guard falls through
+    cache_tokens = None  # not callable
 
 
-def test_cold_skip_returns_exact_native_object(monkeypatch):
+def test_cold_cache_still_mixes_and_returns_native(monkeypatch):
+    # Anti-self-lock regression (live-pod, 2026-09-22): with an empty cache
+    # the fast path MUST still run the mix (that IS the ingestion path);
+    # the echo mix then publishes the native object untouched.
     monkeypatch.delenv("SUFFIX_HYBRID_SYNC_HOOK", raising=False)
     native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
     runner, batch, invoke = _fixture(native)
-
-    class Boom:
-        def cache_tokens(self):
-            return 0
-
-        def get_stats(self):
-            return {"cache": {"cached_tokens": 0}}
-
-        def mix_numpy(self, *a, **k):
-            raise AssertionError("cold cache provably echoes native: the "
-                                 "fast path must not mix at all")
-
+    mixer = CacheMix([[9, 10, 11, 12, 99]], tokens=0)  # cold + echo
     wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
-                                    Boom(), TP())
+                                    mixer, TP())
     got = invoke(wrapped, None)
-    assert got is native  # exact object: no clone, no broadcast copy
+    assert len(mixer.calls) == 1        # cold cache still ingests
+    assert got is native                # echo mix: native, no clone
 
 
-def test_cold_skip_uses_stats_fallback_for_pre_accessor_builds(monkeypatch):
+def test_pre_accessor_mixer_shape_still_ingests(monkeypatch):
     monkeypatch.delenv("SUFFIX_HYBRID_SYNC_HOOK", raising=False)
     native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
     runner, batch, invoke = _fixture(native)
@@ -296,8 +291,9 @@ def test_cold_skip_uses_stats_fallback_for_pre_accessor_builds(monkeypatch):
     wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
                                     mixer, TP())
     got = invoke(wrapped, None)
-    assert got is native
-    assert mixer.calls == []  # stats fallback proved cold, no mix
+    assert len(mixer.calls) == 1        # no accessor -> still mixes
+    assert got is not native            # scripted mix differs -> rewritten
+    assert got.tolist() == [[1, 2, 3, 4, 5]]
 
 
 def test_unchanged_mix_returns_native_without_rewrite(monkeypatch):

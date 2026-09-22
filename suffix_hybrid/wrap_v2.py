@@ -29,20 +29,22 @@ overrun or a row reset re-seeds from position 0. This removes both mid-step
 host syncs, the 16-100 MB/step full-buffer D2H, and the per-step per-row
 tensor allocations that halved TP=8 throughput when the hook was live.
 
-Cold skip: ``tokens == 0`` in the shared suffix cache (``cache_tokens()``,
-falling back to ``get_stats()['cache']['cached_tokens']``) is exactly the
-mixer's native-echo predicate, so before ANY mixer work — no clone, no
-mirror copy, no mix — the wrapper publishes the native draft verbatim.
+Ingestion rule: ``mix_numpy`` IS the corpus ingestion path (mix_core
+inserts the observed history on every call), so NO cache-size gate may run
+before it — gating on ``cache_tokens() == 0`` before the mix keeps the
+cache cold forever (nothing ingests → tokens never leave 0; live-pod
+regression, 2026-09-22). The cold mix provably echoes native, and the
+unchanged-publish path below returns native untouched.
 Write-back skip: when the written rows equal the native rows the wrapper
-likewise publishes native untouched. Both skips are counted (skips_cold /
-skips_unchanged). Skipping the TP broadcast itself is only collective-safe
+likewise publishes native untouched (counted as skips_unchanged).
+Skipping the TP broadcast itself is only collective-safe
 when every rank makes the same decision from rank-invariant inputs: that
 holds for a single-rank group (no collective exists) and in replay mode
 (every rank mirrors + mixes locally), so those paths return the native
 object with no broadcast at all. In multi-rank broadcast mode the non-owner
-mixer cache is never fed (only rank 0 mixes), so rank 0's cold/unchanged
-predicates are NOT visible to the slaves; there the skip still publishes via
-``group.broadcast(native, src=0)`` — no clone, no mix, no D2H, but the
+mixer cache is never fed (only rank 0 mixes), so rank 0's unchanged
+predicate is NOT visible to the slaves; there the skip still publishes via
+``group.broadcast(native, src=0)`` — no clone, no D2H, but the
 slaves' blocking receive must never be orphaned or the engine deadlocks.
 
 Temperature gate (d05da62e9 rejection_sampler_utils): with
@@ -128,24 +130,6 @@ def _check_speculator_capability(spec_cls):
             f"suffix hybrid V2 unsupported speculator: "
             f"{spec_cls.__name__}.propose missing params {missing}")
     return propose
-
-
-def _cache_tokens(mixer):
-    """Cached-token count of the shared suffix cache, or None if unknowable.
-
-    Prefers the dedicated Rust accessor; falls back to the stats dict for
-    builds predating it (the accessor lands in parallel — either works).
-    None means "cannot prove cold, do not skip"; the mixer itself still
-    proves the echo internally, so the cold skip is a pure optimization,
-    never a correctness branch.
-    """
-    try:
-        fn = getattr(mixer, "cache_tokens", None)
-        if callable(fn):
-            return int(fn())
-        return int(mixer.get_stats()["cache"]["cached_tokens"])
-    except Exception:
-        return None
 
 
 def _sync_body(runner, mixer, group, probabilistic, previous_widths,
@@ -264,7 +248,7 @@ def _wrap_propose_sync(runner, original, mixer, group, probabilistic=False):
 def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
     previous_widths = {}
     state = {"skips": 0, "reason": "", "mixes": 0,
-             "skips_cold": 0, "skips_unchanged": 0}
+             "skips_unchanged": 0}
     interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
     profile = os.environ.get("SUFFIX_HYBRID_PROFILE", "").strip() == "1"
     hook_times = {"absorb": [0.0, 0], "mix": [0.0, 0],
@@ -572,15 +556,16 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
 
     def _fast_body(native, input_batch, num_sampled, num_rejected,
                    temperature):
-        # 1. COLD SKIP FIRST: an empty suffix cache provably echoes native
-        # for every row — skip clone/mirror/mix (and the broadcast where
-        # that is collective-safe, see _can_skip_collective).
-        tokens = _cache_tokens(mixer)
-        if tokens is not None and tokens <= 0:
-            _note_skip("skips_cold")
-            if _can_skip_collective():
-                return native
-            return group.broadcast(native, src=0)
+        # NO cold early-return: mix_numpy IS the corpus ingestion path
+        # (mix_core inserts the observed history on every call), so a
+        # cache-size gate placed before it would keep the cache cold
+        # forever — nothing ever ingests, so cache_tokens() never leaves
+        # zero (live-pod bug, 2026-09-22: skips_cold climbing while
+        # suffix_hybrid_native never printed once). The cold mix provably
+        # echoes native; _publish's unchanged path then returns native
+        # with no clone and no collective where that is safe. The cost
+        # this saves us is one small native [n, K] D2H and a bounded
+        # window copy per step.
         replay = _replay()
         # Broadcast mode: non-owner ranks contribute nothing but the
         # broadcast receive (they never mix, never mirror — same posture
