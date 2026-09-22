@@ -1,50 +1,50 @@
 {
   "p0": {
-    "sha256": "feccb42c0cede251",
-    "chars": 358,
-    "secs": 1.12,
-    "text": "\n\nSunlight contains all colors, but as it passes through Earth's atmosphere, shorter wavelengths like blue and violet are scattered far more strongly by nitrogen and oxygen molecules than longer wavelengths like red. We perceive the sky as blue rather than violet because our eyes are more sensitive to blue light and the Sun emits less violet to begin with."
+    "sha256": "1221876668f09ba4",
+    "chars": 431,
+    "secs": 1.58,
+    "text": "\n\nSunlight contains all colors, but as it passes through Earth's atmosphere, shorter wavelengths (blue and violet) are scattered far more strongly by gas molecules than longer wavelengths (red and orange) in a process called Rayleigh scattering. This scattered blue light reaches our eyes from every direction, making the sky appear blue, while our eyes are also more sensitive to blue than to the similarly scattered violet light."
   },
   "p1": {
     "sha256": "743ab87194996441",
     "chars": 256,
-    "secs": 0.99,
+    "secs": 0.96,
     "text": "\n\n```python\ndef fibonacci(n, memo={}):\n    if n < 0:\n        raise ValueError(\"n must be a non-negative integer\")\n    if n <= 1:\n        return n\n    if n not in memo:\n        memo[n] = fibonacci(n - 1, memo) + fibonacci(n - 2, memo)\n    return memo[n]\n```"
   },
   "p2": {
     "sha256": "017ba5ef1b904848",
     "chars": 20,
-    "secs": 1.26,
+    "secs": 1.04,
     "text": "<NONE finish=length>"
   },
   "p3": {
     "sha256": "017ba5ef1b904848",
     "chars": 20,
-    "secs": 1.71,
+    "secs": 1.21,
     "text": "<NONE finish=length>"
   },
   "p4": {
     "sha256": "017ba5ef1b904848",
     "chars": 20,
-    "secs": 0.83,
+    "secs": 0.7,
     "text": "<NONE finish=length>"
   },
   "p5": {
-    "sha256": "347e54285037df0f",
-    "chars": 455,
-    "secs": 1.63,
-    "text": "\n\n## Refactored: O(n\u00b2) \u2192 O(n) with a Hash Map\n\nThe nested loop is the classic **Two Sum** problem. You can eliminate the inner loop by tracking complements in a dictionary as you go.\n\n```python\ndef two_sum(a, t):\n    seen = {}  # value \u2192 index\n    for i, val in enumerate(a):\n        complement = t - val\n        if complement in seen:\n            return (seen[complement], i)\n        seen[val] = i\n    return None  # no pair found\n```\n\n### Why it works\n\n"
+    "sha256": "15d64d720de7aa02",
+    "chars": 360,
+    "secs": 1.24,
+    "text": "\n\n## O(n\u00b2) \u2192 O(n) with a Hash Map\n\nThe nested loop checks every pair. Instead, for each element you only need to ask: *\"Have I already seen the complement (`t - a[i]`)?\"* A dictionary answers that in O(1).\n\n```python\ndef two_sum(a, t):\n    seen = {}                        # value \u2192 index\n    for i, val in enumerate(a):\n        complement = t - val\n        if"
   },
   "p6": {
     "sha256": "91c15255a467fb95",
     "chars": 143,
-    "secs": 0.74,
+    "secs": 0.64,
     "text": "\n\n**Step 1: Multiply**\n\n17 \u00d7 23 = **391**\n\n**Step 2: Divide by 7**\n\n391 \u00f7 7 = 55.857142857\u2026\n\n**Step 3: Round to two decimal places**\n\n**55.86**"
   },
   "p7": {
-    "sha256": "ea43ca074e279a8e",
-    "chars": 773,
-    "secs": 2.43,
-    "text": "\n\n\u2022 A solitary lighthouse keeper named Elias, stationed on a remote rocky island, discovers a weathered glass bottle wedged in the tide pools one stormy morning, containing a faded letter written in a language he cannot read but which bears the seal of a ship that sank over a century ago.\n\n\u2022 Obsessed with uncovering the letter's meaning, Elias travels to the mainland and consults a retired linguist, who deciphers the message as a desperate plea from a dying sailor asking that his final words of love be delivered to his daughter in a coastal village\u2014words that were never sent.\n\n\u2022 Elias tracks down the sailor's great-great-granddaughter, an elderly woman living in that same village, and reads the letter aloud to her; she weeps, thanks him, and from that day forward"
+    "sha256": "83256b6a7848b67c",
+    "chars": 660,
+    "secs": 1.83,
+    "text": "\n\n\u2022 Old lighthouse keeper Elias finds a weathered bottle wedged in the rocks below his tower during a storm, containing a faded letter written in a language he doesn't recognize\u2014except for a single line in English: \"The light must never go dark, or they will come back.\"\n\n\u2022 Driven by curiosity and a growing dread, Elias traces the letter's origin to a shipwreck from 1887, discovering that the lighthouse was built specifically to keep something beneath the waves at bay, and that his predecessor had been maintaining the light not as a job but as a duty passed down through generations.\n\n\u2022 On the night the lighthouse's ancient lamp finally flickers and dies"
   }
 }
