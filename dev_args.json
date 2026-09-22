@@ -1,0 +1,1 @@
+[["--ir-op-priority", "{\"rms_norm\":[\"suffix_kernels\",\"vllm_c\",\"native\"],\"fused_add_rms_norm\":[\"suffix_kernels\",\"vllm_c\",\"native\"]}"]]
