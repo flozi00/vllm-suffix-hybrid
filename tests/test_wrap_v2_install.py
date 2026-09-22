@@ -555,6 +555,81 @@ def test_adaptive_gate_cools_down_after_misses(monkeypatch):
     assert mixer.probe_calls >= 1
 
 
+def test_frozen_fast_path_skips_all_machinery(monkeypatch):
+    # COOLDOWN=2, HEARTBEAT=0: once the request is cooled AND mirrored AND
+    # the corpus is warm, the wrapper must echo native WITHOUT calling
+    # absorb/enqueue/probe/mix (probe_calls and mixer.calls frozen).
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_COOLDOWN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_HEARTBEAT", "0")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = ProbeMix([[9, 10, 11, 12, 99]], tokens=1000, hit=True)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    invoke(wrapped, None)          # step 1: seed (full path)
+    invoke(wrapped, None)          # step 2: evidenced, trusted (full path)
+    assert len(mixer.calls) == 2
+    calls_before = len(mixer.calls)
+    probes_before = mixer.probe_calls
+    # steps 3..6: cooled. Mirror exists, corpus warm, hb disabled ->
+    # frozen echo: no mixes, no probes.
+    for _ in range(4):
+        got = invoke(wrapped, None)
+        assert got is native
+    assert len(mixer.calls) == calls_before
+    assert mixer.probe_calls == probes_before
+
+
+def test_frozen_path_thaws_for_new_request(monkeypatch):
+    # A new request entering a frozen batch must break the freeze: the
+    # mirror miss forces the full path (seed), so suffix arbitration can
+    # still reach the newcomer.
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_COOLDOWN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_HEARTBEAT", "0")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = ProbeMix([[9, 10, 11, 12, 99]], tokens=1000, hit=True)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    for _ in range(4):             # cool request r0 fully down
+        invoke(wrapped, None)
+    assert len(mixer.calls) >= 2
+    calls_before = len(mixer.calls)
+    # New request appears: batch.req_ids becomes [r0, r1].
+    batch.req_ids = list(batch.req_ids) + ["r1"]
+    invoke(wrapped, None)
+    assert len(mixer.calls) == calls_before + 1   # full path ran
+
+
+def test_frozen_path_respects_heartbeat(monkeypatch):
+    # HEARTBEAT=3: the freeze must thaw every 3rd step so the corpus
+    # keeps ingesting even when all requests are cooled.
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_COOLDOWN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_HEARTBEAT", "3")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = ProbeMix([[9, 10, 11, 12, 99]], tokens=1000, hit=True)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    for _ in range(4):             # cool down (steps advance on full path)
+        invoke(wrapped, None)
+    assert len(mixer.calls) >= 2
+    # Frozen steps tick state["steps"]; every hb-th step runs the full
+    # path again regardless of the freeze.
+    calls_before = len(mixer.calls)
+    ran = 0
+    for _ in range(6):
+        invoke(wrapped, None)
+        if len(mixer.calls) > calls_before:
+            ran += 1
+            calls_before = len(mixer.calls)
+    assert ran >= 1                 # heartbeat thawed at least once
+    assert ran < 6                  # ...but not on every step
+
+
 def test_adaptive_gate_rearms_on_win(monkeypatch):
     # A WINNING mixer never cools down: every step stays on the full path.
     monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")

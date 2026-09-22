@@ -248,7 +248,8 @@ def _wrap_propose_sync(runner, original, mixer, group, probabilistic=False):
 def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
     previous_widths = {}
     state = {"skips": 0, "reason": "", "mixes": 0,
-             "skips_unchanged": 0, "skips_probe": 0, "steps": 0}
+             "skips_unchanged": 0, "skips_probe": 0, "skips_frozen": 0,
+             "steps": 0}
     interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
     profile = os.environ.get("SUFFIX_HYBRID_PROFILE", "").strip() == "1"
     hook_times = {"absorb": [0.0, 0], "mix": [0.0, 0],
@@ -602,6 +603,11 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         except ValueError:
             return 8
 
+    def _hb_due(hb, state):
+        # True when this step is a forced full-mix heartbeat step (the
+        # corpus-ingestion safety net). hb<=0 disables heartbeats.
+        return hb > 0 and state["steps"] % hb == 0
+
     def _probe_cooldown():
         # ADAPTIVE GATE (p14): consecutive full-path mixes without a suffix
         # win after which a request stops forcing the full path (probe can
@@ -700,6 +706,43 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
             _bump("bcast", t)
             return out
         ids = list(input_batch.req_ids)
+        # FROZEN FAST PATH (p17): when the corpus is warm AND every live
+        # request has already earned the cooldown veto AND this step is
+        # not a heartbeat step, the probe decision tree provably reduces
+        # to "gate" (mirror rows only grow, the probe sees the same or a
+        # longer tail, wins would have reset the counter). Skipping
+        # absorb/enqueue/probe entirely makes cooled steady-state cost
+        # ~a dict lookup per step instead of the event sync + copy
+        # launches + speculate calls. Identical outputs by construction;
+        # new requests (mirror miss -> full path) and heartbeat steps
+        # thaw the freeze.
+        cooldown = _probe_cooldown()
+        hb = _probe_heartbeat()
+        try:
+            warm = mixer.cache_tokens() > 0
+        except Exception:
+            warm = False
+        gate = st["gate"]
+        if (cooldown > 0 and warm
+                and all(gate.get(rid, 0) >= cooldown for rid in ids)
+                and all(rid in st["mirror"] for rid in ids)):
+            # Advance the step counter here so the heartbeat modulo keeps
+            # ticking during long frozen stretches — otherwise a lone
+            # cooled request would freeze forever and never re-arm via
+            # the heartbeat full-mix (the p14 re-arm cycle).
+            state["steps"] += 1
+            if _hb_due(hb, state):
+                # Heartbeat step: undo the pre-increment so the full path's
+                # own steps++ lands exactly on the hb multiple and
+                # _mirror_probe (which re-checks steps%hb==0) honors the
+                # forced full-mix. Without this, the double increment skips
+                # the multiple and the corpus never ingests on thaw steps.
+                state["steps"] -= 1
+            else:
+                _note_skip("skips_frozen")
+                previous_widths.update(
+                    zip(ids, [int(native.shape[1])] * len(ids)))
+                return native
         idx_cpu = _lut_index(input_batch, ids)
         t = time.perf_counter()
         # Absorb last step's async copies (one engine step old: the event
