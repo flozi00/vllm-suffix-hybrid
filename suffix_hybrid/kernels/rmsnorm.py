@@ -121,6 +121,10 @@ def register_impls():
         tl.store(res_ptr + row * stride_r + offs, s.to(dtype), mask=mask)
         var = tl.sum(s * s, axis=0) / hidden
         normed = s * tl.rsqrt(var + eps)
+        # Mirror native exactly: x.to(weight.dtype) * weight, i.e. round the
+        # normed value to the STORE dtype BEFORE the weight multiply (torch
+        # bf16 elementwise mul computes in fp32 and rounds once — the .to
+        # above is the extra rounding native performs via x.to(weight.dtype)).
         out = normed.to(dtype)
         if HAS_W:
             w = tl.load(w_ptr + offs, mask=mask, other=0.0)
@@ -174,7 +178,8 @@ def register_impls():
         PROVIDER, supports_args=_supports_fused_add, supported=True, inplace=True
     )
     def fused_add_rms_norm(x: Tensor, x_residual: Tensor, weight: Tensor | None,
-                           epsilon: float, variance_size: int | None = None):
+                           epsilon: float,
+                           variance_size: int | None = None) -> tuple[Tensor, Tensor]:
         assert variance_size is None
         hidden = x.shape[-1]
         rows = x.numel() // hidden
