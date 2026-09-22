@@ -68,3 +68,27 @@ if os.path.isdir("/plugins/deep_gemm"):
               "(SUFFIX_SM120 unset; delegates to vendored DeepGEMM)",
               file=sys.stderr, flush=True)
 
+# FlashInfer autotune cache seed/harvest (SM120 MoE tactic persistence).
+# SUFFIX_FICACHE=seed|dump|both; inert otherwise. seed = write bundled
+# autotune_configs.json before warmup if missing (config-hash keyed, so a
+# mismatch can only no-op). dump = log the cache file as a marker line so the
+# console log reader can harvest it for the next bundle seed. A failure here
+# must never kill a healthy pool: degrade to stock vLLM cache behaviour.
+# Loaded by file location (/plugins is on PYTHONPATH but `sm120` is a repo
+# namespace, not a bundle package — the module ships flat at /plugins/ficache.py).
+_ficache = os.environ.get("SUFFIX_FICACHE", "").strip().lower()
+if _ficache in ("seed", "dump", "both"):
+    try:
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            "suffix_ficache", "/plugins/ficache.py")
+        if _spec is None or _spec.loader is None:
+            raise ImportError("/plugins/ficache.py not found in bundle")
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _mod.install(_ficache)
+    except BaseException as exc:  # noqa: BLE001 - degrade by design
+        import sys
+        print(f"suffix ficache installation FAILED (stock autotune cache "
+              f"path stays in use): {exc}", file=sys.stderr, flush=True)
+

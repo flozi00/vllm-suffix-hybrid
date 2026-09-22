@@ -49,6 +49,27 @@ def bundle(wheel, output, revision):
         hashes[str(rel)] = hashlib.sha256(data).hexdigest()
     if not (output / 'deep_gemm' / '__init__.py').exists():
         raise ValueError('runtime bundle requires the sm120 deep_gemm shim')
+    # sm120 ficache: FlashInfer autotune cache seed/harvest, shipped FLAT as
+    # <output>/ficache.py (sitecustomize loads it by file location), plus the
+    # optional seed payloads sm120/ficache/seeds/* -> <output>/ficache/seeds/*.
+    ficache_root = Path(__file__).resolve().parents[1] / 'sm120' / 'ficache'
+    ficache_mod = ficache_root / '__init__.py'
+    if not ficache_mod.is_file():
+        raise ValueError('runtime bundle requires the sm120 ficache module')
+    data = ficache_mod.read_bytes()
+    (output / 'ficache.py').write_bytes(data)
+    hashes['ficache.py'] = hashlib.sha256(data).hexdigest()
+    seeds_root = ficache_root / 'seeds'
+    if seeds_root.is_dir():
+        for src in sorted(seeds_root.rglob('*')):
+            if src.is_dir():
+                continue
+            rel = PurePosixPath('ficache/seeds', src.name)
+            data = src.read_bytes()
+            dest = output / PurePosixPath(*rel.parts)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            hashes[str(rel)] = hashlib.sha256(data).hexdigest()
     (output / 'BUILD.json').write_text(json.dumps({
         'source_revision': revision,
         'wheel': Path(wheel).name,
