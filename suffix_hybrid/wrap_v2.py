@@ -1,18 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in, source-pinned V2 standard-MTP dense-row wire-up.
 
-Native propose ALWAYS runs first on every TP rank. 0bfc7a15d model_runner
-sample_tokens postprocesses GPU history before calling propose (~2114), then
-persists our full-width output into req_states.draft_tokens (~2149) and hands
-it to the scheduler (~2158). The next AR prefill recomputes verified positions
-from target history/hidden states; no native forward or KV repair is skipped.
-Never stitch a stale native tail onto suffix.
+Native propose ALWAYS runs first on every TP rank. d05da62e9 model_runner
+sample_tokens postprocesses GPU history before calling propose (~2124), then
+persists our full-width output into req_states.draft_tokens (~2151) and hands
+it to the scheduler via DraftTokensHandler (~2173). The next AR prefill
+recomputes verified positions from target history/hidden states; no native
+forward or KV repair is skipped. Never stitch a stale native tail onto suffix.
 
 Synchronous owner-only D2H history transfer is intentional prototype overhead,
-not a speed claim. Target temperatures are unrestricted: standard rejection
-supports deterministic proposals with draft_logits=None. No vocabulary-sized
-probabilities are allocated. CUDA/TP correctness and throughput remain live
-benchmark gates.
+not a speed claim. No vocabulary-sized probabilities are allocated. CUDA/TP
+correctness and throughput remain live benchmark gates.
+
+Temperature gate (d05da62e9 rejection_sampler_utils): with
+draft_sample_method="greedy" (draft_logits=None) the sampler treats the draft
+as a point mass AT the proposed token, so replacing rows is statistically
+consistent at any temperature. With draft_sample_method="probabilistic"
+(draft_logits is a live [max_num_reqs, K, V] buffer the sampler reads for the
+accept ratio) a replaced row at temperature>0 would be graded against the
+NATIVE drafter's distribution — wrong statistics. In that mode we arbitrate
+ONLY the temperature==0 rows (the sampler skips draft_logits entirely when
+temp==0) and pass stochastic rows through native.
 
 Install shape: install_v2() patches the V2 GPUModelRunner.load_model BEFORE
 the engine builds it; after init_speculator resolved the concrete method
@@ -76,7 +84,7 @@ def _check_speculator_capability(spec_cls):
     return propose
 
 
-def _wrap_propose(runner, original, mixer, group):
+def _wrap_propose(runner, original, mixer, group, probabilistic=False):
     previous_widths = {}
     state = {"skips": 0, "reason": ""}
 
@@ -120,6 +128,19 @@ def _wrap_propose(runner, original, mixer, group):
                 ids = list(input_batch.req_ids)
                 sampled = num_sampled.detach().cpu().tolist()
                 rejected = num_rejected.detach().cpu().tolist()
+                # Probabilistic rejection sampling grades each draft token
+                # against the NATIVE drafter's stored logits; a suffix token
+                # was not sampled from that q, so replacing a stochastic row
+                # breaks the accept-ratio statistics. The sampler ignores
+                # draft_logits entirely at temp==0 (greedy accept/resample),
+                # so arbitrate only the temperature==0 rows in that mode.
+                # Greedy mode (draft_logits=None) treats the draft as a point
+                # mass at the proposed token — replacement is consistent at
+                # any temperature, no per-row gate needed.
+                greedy_rows = None
+                if probabilistic:
+                    greedy_rows = [t == 0.0 for t in
+                                   temperature[idx].detach().cpu().tolist()]
                 accepted = []
                 for req_id, ns, nr in zip(ids, sampled, rejected):
                     a, verified = ns - 1, ns + nr - 1
@@ -144,7 +165,7 @@ def _wrap_propose(runner, original, mixer, group):
                     if len(row) > k:
                         raise ValueError(
                             f"mixed row {i} length {len(row)} exceeds K={k}")
-                    if row:
+                    if row and (greedy_rows is None or greedy_rows[i]):
                         output[i, :len(row)] = torch.tensor(
                             row, dtype=output.dtype, device=output.device)
                 previous_widths.clear()
@@ -216,17 +237,27 @@ def install_v2():
             group = get_tp_group()
             if getattr(speculator.propose, "_suffix_hybrid_hook", False):
                 return result
+            # draft_logits is allocated only for draft_sample_method=
+            # "probabilistic" (d05da62e9 speculator.__init__): its presence
+            # means the rejection sampler will grade every draft token
+            # against the native drafter's stored distribution, so the
+            # wrapper must pass stochastic rows through untouched.
+            probabilistic = getattr(speculator, "draft_logits", None) \
+                is not None
             # Instance-attribute bind: the runner calls
             # self.speculator.propose(input_batch=..., ...) with keywords, so
             # the wrapper closes over the speculator's BOUND class function
             # (self included) plus this runner/mixer/tp-group.
             bound = type(speculator).propose.__get__(speculator,
                                                      type(speculator))
-            wrapped = _wrap_propose(self, bound, mixer, group)
+            wrapped = _wrap_propose(self, bound, mixer, group,
+                                    probabilistic=probabilistic)
             wrapped._suffix_hybrid_hook = True
             speculator.propose = wrapped
             print(f"suffix_hybrid v2 installed speculator={cls_name} "
-                  f"k={k} tp={group.world_size}",
+                  f"k={k} tp={group.world_size} "
+                  f"draft_sample_method="
+                  f"{'probabilistic' if probabilistic else 'greedy'}",
                   file=sys.stderr, flush=True)
         except Exception as exc:
             # load_model failure must not crash the worker: the hook is an

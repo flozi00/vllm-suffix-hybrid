@@ -89,6 +89,59 @@ def test_overlong_mixed_row_degrades_to_native():
     assert got.tolist() == native.tolist()
 
 
+def test_probabilistic_gates_stochastic_rows_to_native():
+    # draft_sample_method=probabilistic: rows with temperature>0 must keep
+    # the NATIVE draft (the sampler grades them against native draft_logits);
+    # temperature==0 rows are arbitrated normally.
+    native = torch.tensor([[9, 10, 11, 12, 99],
+                           [8, 8, 8, 8, 88]], dtype=torch.int64)
+    states = NS(total_len=NS(gpu=torch.tensor([8, 8])),
+                all_token_ids=NS(gpu=torch.tensor([list(range(1, 33)),
+                                                   list(range(101, 133))])))
+    runner = NS(req_states=states)
+    batch = NS(req_ids=['a', 'b'], num_reqs=2, idx_mapping=torch.tensor([0, 1]))
+    temperature = torch.tensor([0.0, 0.7, 0.0, 0.0])
+
+    class Short:
+        def mix_numpy(self, *a, **k):
+            return [[9, 10], [7, 7]]
+
+    wrapped = wrap_v2._wrap_propose(runner, lambda *x, **k: native,
+                                    Short(), TP(), probabilistic=True)
+    got = wrapped(batch, {}, {}, torch.zeros(1), None,
+                  torch.tensor([1, 1]), torch.tensor([0, 0]),
+                  torch.zeros(2), torch.zeros(1, 2),
+                  temperature, torch.ones(2))
+    # row 0 (temp 0): suffix [9,10] written over native head.
+    assert got[0].tolist() == [9, 10, 11, 12, 99]
+    # row 1 (temp 0.7): native untouched despite mixer proposing [7,7].
+    assert got[1].tolist() == [8, 8, 8, 8, 88]
+
+
+def test_greedy_mode_writes_all_rows_regardless_of_temperature():
+    native = torch.tensor([[9, 10, 11, 12, 99],
+                           [8, 8, 8, 8, 88]], dtype=torch.int64)
+    states = NS(total_len=NS(gpu=torch.tensor([8, 8])),
+                all_token_ids=NS(gpu=torch.tensor([list(range(1, 33)),
+                                                   list(range(101, 133))])))
+    runner = NS(req_states=states)
+    batch = NS(req_ids=['a', 'b'], num_reqs=2, idx_mapping=torch.tensor([0, 1]))
+    temperature = torch.tensor([0.9, 0.7, 0.0, 0.0])
+
+    class Short:
+        def mix_numpy(self, *a, **k):
+            return [[9, 10], [7, 7]]
+
+    wrapped = wrap_v2._wrap_propose(runner, lambda *x, **k: native,
+                                    Short(), TP(), probabilistic=False)
+    got = wrapped(batch, {}, {}, torch.zeros(1), None,
+                  torch.tensor([1, 1]), torch.tensor([0, 0]),
+                  torch.zeros(2), torch.zeros(1, 2),
+                  temperature, torch.ones(2))
+    assert got[0].tolist() == [9, 10, 11, 12, 99]
+    assert got[1].tolist() == [7, 7, 8, 8, 88]
+
+
 def test_mixer_raise_degrades_to_native_not_propagates():
     native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
     runner, batch, invoke = _fixture(native)

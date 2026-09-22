@@ -342,10 +342,10 @@ def install():
     # accelerator must never crash a serving pod).
     v2 = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "").strip()
     if v2 == "1":
-        print("suffix_hybrid WARNING: VLLM_USE_V2_MODEL_RUNNER=1 — the V2 "
-              "runner drafts via speculator.propose() and never calls the "
-              "hooked propose_draft_token_ids; the suffix hybrid accelerator "
-              "is DORMANT. Set VLLM_USE_V2_MODEL_RUNNER=0 to activate.",
+        print("suffix_hybrid WARNING: VLLM_USE_RUST_FRONTEND/V2 runner is "
+              "active but the V2 runner module is NOT importable in this "
+              "vLLM — the V1 hook below is dormant there. The deployment "
+              "runs plain native spec decode.",
               file=sys.stderr, flush=True)
     print(f"suffix_hybrid installed hook={runner.__module__}.{runner.__name__} "
           f"drift={json.dumps(sorted(drifted))}",
