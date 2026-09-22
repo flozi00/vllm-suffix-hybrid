@@ -1,5 +1,6 @@
 [
-  ["--kernel-config", "{\"ir_op_priority\": {\"rms_norm\": [\"suffix_kernels\", \"vllm_c\", \"native\"], \"fused_add_rms_norm\": [\"suffix_kernels\", \"vllm_c\", \"native\"]}}"],
-  ["--attention-backend", "FLASHINFER"],
-  ["--kv-cache-dtype", "nvfp4"]
+  [
+    "--kernel-config.ir_op_priority",
+    "{\"rms_norm\": [\"suffix_kernels\", \"vllm_c\", \"native\"], \"fused_add_rms_norm\": [\"suffix_kernels\", \"vllm_c\", \"native\"]}"
+  ]
 ]
