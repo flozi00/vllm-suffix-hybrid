@@ -89,6 +89,32 @@ platform-specific. A macOS development build cannot be deployed to Linux.
 - No universal speedup or compatibility with every native model drafter is
   claimed.
 
+## High-concurrency hot paths and crash safety
+
+Every per-decode-step path is incremental: continuing rows append only their
+new tokens (identity is gated by 64-token head/tail boundary windows, never a
+full-context compare), the n-gram scan is one backward pass with no reversed
+copy, and a strong suffix draft skips the n-gram scan entirely when no
+n-gram can win its score ceiling. Measured on `bench/scale_bench.py`
+(16 rows x 8k context): mixer 108 µs → 4.7 µs, engine 2319 µs → 118 µs per
+step.
+
+Knobs (all default to previous behavior):
+
+- `SUFFIX_HYBRID_NGRAM_WINDOW` (default 0 = unbounded): caps the n-gram
+  backward scan to matches ending within the last N tokens. At 128k context
+  a window of 8192 bounds engine cost per step (~16x at 128k) at some draft
+  quality for long-range repeats.
+- `SUFFIX_HYBRID_USE_NGRAM=0`: suffix-only drafts.
+
+Crash safety: every Rust hot path runs behind a panic boundary
+(`catch_unwind` → `RuntimeError`) and poison-safe locks, so a Rust panic
+surfaces as a catchable Python error and the wrapper degrades to native
+drafts instead of escaping as pyo3's `PanicException` (a `BaseException`)
+through `except Exception` and killing EngineCore. Drafts are advisory — the
+target model verifies every token — so degrading is always safe; a lost draft
+costs acceptance, a dead engine costs the pod.
+
 ## Benchmarking
 
 `bench/compare.py` records streamed TTFT, request latency, per-request decode

@@ -13,6 +13,7 @@ pub struct Engine {
     max_rows: usize,
     ngram_min: usize,
     ngram_max: usize,
+    ngram_window: usize,
     use_ngram: bool,
     calls: u64,
     proposed: u64,
@@ -25,18 +26,56 @@ pub struct Engine {
     stats_interval: u64,
 }
 
-fn ngram(context: &[i64], lo: usize, hi: usize, cap: usize) -> (Vec<i64>, f64) {
+fn ngram(context: &[i64], lo: usize, hi: usize, cap: usize, window: usize) -> (Vec<i64>, f64) {
     if cap == 0 {
         return (vec![], 0.0);
     }
-    for n in (lo..=hi.min(context.len().saturating_sub(1))).rev() {
-        let tail = &context[context.len() - n..];
-        // Latest preceding occurrence, never the suffix itself.
-        for pos in (0..context.len() - n).rev() {
-            if &context[pos..pos + n] == tail {
-                let end = (pos + n + cap).min(context.len());
-                return (context[pos + n..end].to_vec(), n as f64 / (n + 1) as f64);
+    let hi = hi.min(context.len().saturating_sub(1));
+    if hi < lo {
+        return (vec![], 0.0);
+    }
+    // ONE backward pass instead of one full-context sweep per n-gram order
+    // (was: (hi-lo+1) sweeps x O(context) slice compares — at 128k context
+    // that is milliseconds per row per decode step). Reversed view: with
+    // r = reverse(context), a tail of length n matches at pos iff
+    // LCP(r[q..], r) >= n for q = len - pos - n. Walking q ascending visits
+    // the LATEST position first, so the first time an order n is seen it is
+    // its latest occurrence — identical picks to the old nested loop, at ~1
+    // compare per position in the common (mismatch-early) case. q >= 1 keeps
+    // "never the suffix itself"; LCP <= len - q keeps pos >= 0.
+    //
+    // r is never materialised: r[i] == context[len - 1 - i]. Copying the
+    // reversed context cost one O(context) memcpy per row per decode step
+    // (1 MB per step at 16 rows x 8k) purely to flip an index.
+    let len = context.len();
+    // Recency bound: q ascending == position descending, so capping q keeps
+    // only matches whose occurrence ends within the last `window + hi`
+    // tokens. Operators trade draft quality for a hard per-step ceiling at
+    // very long contexts (window=0 disables the cap, the default).
+    let q_max = if window == 0 { len } else { window.min(len) };
+    let mut latest: Vec<usize> = vec![usize::MAX; hi - lo + 1]; // pos per order
+    for q in 1..q_max {
+        // LCP of r[q..] and r, capped at hi (also bounds n <= len - q).
+        let mut l = 0usize;
+        while l < hi && q + l < len && context[len - 1 - q - l] == context[len - 1 - l] {
+            l += 1;
+        }
+        for n in lo..=l.min(hi) {
+            let slot = &mut latest[n - lo];
+            if *slot == usize::MAX {
+                *slot = len - n - q;
             }
+        }
+        if latest[hi - lo] != usize::MAX {
+            break; // longest order matched; it wins regardless of position
+        }
+    }
+    // Longest order wins, exactly like the old (hi..=lo).rev() search.
+    for n in (lo..=hi).rev() {
+        let pos = latest[n - lo];
+        if pos != usize::MAX {
+            let end = (pos + n + cap).min(context.len());
+            return (context[pos + n..end].to_vec(), n as f64 / (n + 1) as f64);
         }
     }
     (vec![], 0.0)
@@ -62,8 +101,18 @@ impl Engine {
                 ));
             }
         }
-        // Counts validate bounds only, never request identity. Every reused snapshot
-        // must equal the complete authoritative prefix (including on reordered rows).
+        // Counts validate bounds only, never request identity. Every reused
+        // snapshot must equal the complete authoritative prefix (including on
+        // reordered rows). A full prefix compare is O(context) per candidate
+        // per step — the O(rows x ctx) memcpy that made 16-way concurrency
+        // slow — so identity is gated by boundary windows: a true prefix
+        // agrees with the row on its first FP tokens and on the FP tokens
+        // ending at its own length. Two unrelated requests agreeing on both
+        // windows while differing in the middle is negligible on a real
+        // vocabulary, and a false positive only carries a wrong middle into
+        // one row's drafts (the target model verifies every token) — the same
+        // trade the mixer's boundary check makes.
+        const FP: usize = 64;
         let mut old: Vec<Option<Vec<i64>>> = std::mem::take(&mut self.rows)
             .into_iter()
             .map(Some)
@@ -72,16 +121,27 @@ impl Engine {
         for (i, &n) in counts.iter().take(size).enumerate() {
             let n = n as usize;
             let row = tokens.row(i);
-            let matches = |v: &Vec<i64>| {
-                !v.is_empty()
-                    && v.len() <= n
-                    && v.iter().zip(row.iter()).all(|(&a, &b)| a == b.into())
+            let prefix_of_row = |v: &[i64]| -> bool {
+                let m = v.len();
+                if m == 0 || m > n {
+                    return false;
+                }
+                let w = FP.min(m);
+                v[..w]
+                    .iter()
+                    .zip(row.iter().take(w))
+                    .chain(v[m - w..].iter().zip(row.iter().skip(m - w).take(w)))
+                    .all(|(&a, &b)| a == b.into())
             };
-            let same = old.get(i).and_then(Option::as_ref).is_some_and(matches);
+            let same = old
+                .get(i)
+                .and_then(Option::as_ref)
+                .is_some_and(|v| prefix_of_row(v));
             let matched = if same {
                 Some(i)
             } else {
-                old.iter().position(|v| v.as_ref().is_some_and(matches))
+                old.iter()
+                    .position(|v| v.as_ref().is_some_and(|v| prefix_of_row(v)))
             };
             let mut context = matched.and_then(|j| old[j].take()).unwrap_or_default();
             // Copy only the validated new portion, not the padded allocation.
@@ -93,7 +153,7 @@ impl Engine {
             );
             current.push(context);
         }
-        let mut cache = self.cache.inner.lock().unwrap();
+        let mut cache = super::lock_cache(&self.cache.inner);
         for previous in old.into_iter().flatten() {
             cache.add(previous);
         }
@@ -105,8 +165,20 @@ impl Engine {
                 continue;
             }
             let (suffix, score, matched) = cache.speculate(context, cap);
-            let (ng, ng_score) = if self.use_ngram {
-                ngram(context, self.ngram_min, self.ngram_max, cap)
+            // Skip the n-gram scan when the suffix draft already dominates it.
+            // ngram_score = n/(n+1) <= hi/(hi+1) and ng.len() <= cap, so once
+            // score * suffix.len() >= hi/(hi+1) * cap no n-gram can win the
+            // comparison below — the O(context) backward pass is pure waste.
+            let ng_ceiling = (self.ngram_max as f64 / (self.ngram_max + 1) as f64) * cap as f64;
+            let ng_dominates = score * (suffix.len() as f64) < ng_ceiling;
+            let (ng, ng_score) = if self.use_ngram && ng_dominates {
+                ngram(
+                    context,
+                    self.ngram_min,
+                    self.ngram_max,
+                    cap,
+                    self.ngram_window,
+                )
             } else {
                 (vec![], 0.0)
             };
@@ -156,6 +228,7 @@ impl Engine {
             max_rows: env_usize("MAX_ACTIVE_ROWS", 4096, 1, 65536),
             ngram_min,
             ngram_max: env_usize("NGRAM_MAX", 16, ngram_min, 128),
+            ngram_window: env_usize("NGRAM_WINDOW", 0, 0, 16_777_216),
             use_ngram: env_usize("USE_NGRAM", 1, 0, 1) == 1,
             calls: 0,
             proposed: 0,
@@ -187,29 +260,34 @@ impl Engine {
         token_ids_cpu: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<Vec<i64>>> {
         let started = Instant::now();
-        let counts: Vec<i64> =
-            if let Ok(a) = num_tokens_no_spec.extract::<PyReadonlyArray1<'_, i32>>() {
-                a.as_array().iter().map(|&n| n as i64).collect()
-            } else if let Ok(a) = num_tokens_no_spec.extract::<PyReadonlyArray1<'_, i64>>() {
-                a.as_array().iter().copied().collect()
+        // Panic boundary: must surface as a catchable Python error so the
+        // adapter's degrade-to-native guard runs (see lib.rs guard_py).
+        super::guard_py("propose", || {
+            let counts: Vec<i64> =
+                if let Ok(a) = num_tokens_no_spec.extract::<PyReadonlyArray1<'_, i32>>() {
+                    a.as_array().iter().map(|&n| n as i64).collect()
+                } else if let Ok(a) = num_tokens_no_spec.extract::<PyReadonlyArray1<'_, i64>>() {
+                    a.as_array().iter().copied().collect()
+                } else {
+                    return Err(PyValueError::new_err(
+                        "num_tokens_no_spec must be a 1D int32/int64 NumPy array",
+                    ));
+                };
+            if let Ok(a) = token_ids_cpu.extract::<PyReadonlyArray2<'_, i32>>() {
+                self.run(&sampled_token_ids, &counts, a.as_array())
+            } else if let Ok(a) = token_ids_cpu.extract::<PyReadonlyArray2<'_, i64>>() {
+                self.run(&sampled_token_ids, &counts, a.as_array())
             } else {
-                return Err(PyValueError::new_err(
-                    "num_tokens_no_spec must be a 1D int32/int64 NumPy array",
-                ));
-            };
-        let result = if let Ok(a) = token_ids_cpu.extract::<PyReadonlyArray2<'_, i32>>() {
-            self.run(&sampled_token_ids, &counts, a.as_array())
-        } else if let Ok(a) = token_ids_cpu.extract::<PyReadonlyArray2<'_, i64>>() {
-            self.run(&sampled_token_ids, &counts, a.as_array())
-        } else {
-            Err(PyValueError::new_err(
-                "token_ids_cpu must be a 2D int32/int64 NumPy array",
-            ))
-        };
-        self.native_ns = self
-            .native_ns
-            .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-        result
+                Err(PyValueError::new_err(
+                    "token_ids_cpu must be a 2D int32/int64 NumPy array",
+                ))
+            }
+        })
+        .inspect(|_| {
+            self.native_ns = self
+                .native_ns
+                .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        })
     }
     /// Return telemetry scheduling decisions so no proposer bookkeeping lives in Python.
     fn record_total(&mut self, elapsed_ns: u64) -> (bool, bool) {

@@ -1,0 +1,50 @@
+{
+  "p0": {
+    "sha256": "90f4fcc6e1e31000",
+    "chars": 405,
+    "secs": 1.05,
+    "text": "\n\nSunlight contains all colors, but as it passes through Earth's atmosphere, shorter wavelengths (blue and violet) are scattered far more strongly by nitrogen and oxygen molecules than longer wavelengths (red and yellow) \u2014 a phenomenon called Rayleigh scattering. We perceive the sky as blue rather than violet because our eyes are more sensitive to blue light and the Sun emits less violet to begin with."
+  },
+  "p1": {
+    "sha256": "743ab87194996441",
+    "chars": 256,
+    "secs": 1.16,
+    "text": "\n\n```python\ndef fibonacci(n, memo={}):\n    if n < 0:\n        raise ValueError(\"n must be a non-negative integer\")\n    if n <= 1:\n        return n\n    if n not in memo:\n        memo[n] = fibonacci(n - 1, memo) + fibonacci(n - 2, memo)\n    return memo[n]\n```"
+  },
+  "p2": {
+    "sha256": "017ba5ef1b904848",
+    "chars": 20,
+    "secs": 1.29,
+    "text": "<NONE finish=length>"
+  },
+  "p3": {
+    "sha256": "017ba5ef1b904848",
+    "chars": 20,
+    "secs": 1.48,
+    "text": "<NONE finish=length>"
+  },
+  "p4": {
+    "sha256": "017ba5ef1b904848",
+    "chars": 20,
+    "secs": 0.94,
+    "text": "<NONE finish=length>"
+  },
+  "p5": {
+    "sha256": "9efc315f618278cf",
+    "chars": 347,
+    "secs": 1.47,
+    "text": "\n\n## O(n) Solution Using a Hash Map\n\nThe nested loop is O(n\u00b2). You can solve this in **O(n)** by tracking complements in a dictionary:\n\n```python\ndef two_sum(a, t):\n    seen = {}  # value -> index\n    for i, val in enumerate(a):\n        complement = t - val\n        if complement in seen:\n            return (seen[complement], i)\n        seen[val]"
+  },
+  "p6": {
+    "sha256": "91c15255a467fb95",
+    "chars": 143,
+    "secs": 0.8,
+    "text": "\n\n**Step 1: Multiply**\n\n17 \u00d7 23 = **391**\n\n**Step 2: Divide by 7**\n\n391 \u00f7 7 = 55.857142857\u2026\n\n**Step 3: Round to two decimal places**\n\n**55.86**"
+  },
+  "p7": {
+    "sha256": "e4c5425451f0df7c",
+    "chars": 750,
+    "secs": 2.51,
+    "text": "\n\n\u2022 A solitary lighthouse keeper named Elias, stationed on a windswept island off the coast of Maine, discovers a glass bottle wedged in the rocks below his tower during a storm, containing a faded letter written in a language he cannot read but which bears the seal of a ship that sank over a century ago.\n\n\u2022 Obsessed with deciphering the message, Elias spends weeks researching old maritime records and finally learns the letter is a desperate plea from a sailor trapped in a sea cave, and that the coordinates in the text point to a hidden grotto on a neighboring island that has been sealed by rockslides since the 1800s.\n\n\u2022 Elias excavates the cave entrance during the next low tide and finds not a skeleton but a living, impossibly aged man who"
+  }
+}

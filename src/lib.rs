@@ -1,7 +1,84 @@
 // SPDX-License-Identifier: Apache-2.0
 use pyo3::prelude::*;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// FxHash: the index maps are hit once per n-gram position on every add and
+/// once per speculate; SipHash (std default) costs more than the bucket work
+/// it guards. Keys are token IDs and short token windows — not adversarial
+/// input (they come from the engine's own CPU buffers), so a non-cryptographic
+/// hasher is the right trade.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.add(b as u64);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, n: u8) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+type Map<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+fn map<K, V>() -> Map<K, V> {
+    Map::with_hasher(BuildHasherDefault::default())
+}
+
+/// Poison-safe lock: a panic anywhere while the cache lock is held would
+/// otherwise poison the mutex permanently, and every later `lock().unwrap()`
+/// panics too — inside a `#[pymethods]` fn that surfaces as pyo3's
+/// PanicException, which subclasses BaseException and therefore ESCAPES
+/// wrap.py's `except Exception` degrade-to-native guard, killing EngineCore
+/// on every subsequent step (the 2026-09-21 GLM cascade shape). Drafts are
+/// advisory — the target model verifies every token — so recovering the
+/// guard from a poisoned mutex is strictly safer than propagating.
+fn lock_cache(cache: &Arc<Mutex<Cache>>) -> MutexGuard<'_, Cache> {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Run hot-path Rust work with a panic boundary. A panic inside `#[pymethods]`
+/// surfaces as pyo3's PanicException, which subclasses BaseException and
+/// therefore ESCAPES wrap.py's `except Exception` degrade-to-native guard —
+/// the exact EngineCore-killer class from the 2026-09-21 GLM crash. Converting
+/// a panic to a regular RuntimeError routes it into the wrapper's native
+/// fallback instead: a lost draft costs acceptance, a dead engine costs the
+/// pod. State touched mid-panic is plain HashMaps/Vecs (no invariants a later
+/// call can violate), so recovering is safe.
+fn guard_py<T, F: FnOnce() -> PyResult<T>>(what: &str, f: F) -> PyResult<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "suffix_hybrid {what} panicked; caller must degrade to native drafts"
+        ))
+    })?
+}
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(format!("SUFFIX_HYBRID_{name}"))
@@ -18,7 +95,7 @@ fn env_float(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 #[derive(Clone)]
-struct Config {
+pub(crate) struct Config {
     n: usize,
     depth: usize,
     sequences: usize,
@@ -47,10 +124,10 @@ impl Default for Config {
     }
 }
 pub struct Cache {
-    pub cfg: Config,
-    sequences: HashMap<u64, Vec<i64>>,
+    pub(crate) cfg: Config,
+    sequences: Map<u64, Vec<i64>>,
     fifo: VecDeque<u64>,
-    index: HashMap<Vec<i64>, VecDeque<(u64, usize)>>,
+    index: Map<Vec<i64>, VecDeque<(u64, usize)>>,
     next: u64,
     tokens: usize,
 }
@@ -58,9 +135,9 @@ impl Cache {
     fn new(cfg: Config) -> Self {
         Self {
             cfg,
-            sequences: HashMap::new(),
+            sequences: map(),
             fifo: VecDeque::new(),
-            index: HashMap::new(),
+            index: map(),
             next: 0,
             tokens: 0,
         }
@@ -87,7 +164,10 @@ impl Cache {
         if tokens.len() > self.cfg.tokens {
             tokens = tokens.split_off(tokens.len() - self.cfg.tokens);
         }
-        tokens.shrink_to_fit();
+        // No shrink_to_fit here: it reallocs and copies the whole sequence on
+        // EVERY add (O(context) per finished request), and the bounded token
+        // budget already caps total retention. The slack is one Vec per cached
+        // sequence, bounded by MAX_CACHED_REQUESTS.
         if tokens.len() <= self.cfg.n {
             return;
         }
@@ -141,7 +221,7 @@ impl Cache {
         let mut result = Vec::new();
         let mut score = 1.0;
         for step in 0..cap {
-            let mut counts: HashMap<i64, (usize, u64, usize)> = HashMap::new();
+            let mut counts: Map<i64, (usize, u64, usize)> = map();
             for &(id, pos) in &ends {
                 if let Some(&tok) = self.sequences[&id].get(pos + step) {
                     let item = counts.entry(tok).or_insert((0, id, pos));
@@ -202,28 +282,25 @@ impl SuffixCache {
         }
     }
     fn add_sequence(&self, tokens: Vec<i64>) {
-        self.inner.lock().unwrap().add(tokens);
+        lock_cache(&self.inner).add(tokens);
     }
     fn add_prompt(&self, tokens: Vec<i64>) {
-        let mut cache = self.inner.lock().unwrap();
+        let mut cache = lock_cache(&self.inner);
         if cache.cfg.prompts {
             cache.add(tokens);
         }
     }
     fn speculate(&self, context_tokens: Vec<i64>, max_tokens: isize) -> (Vec<i64>, f64, usize) {
-        self.inner
-            .lock()
-            .unwrap()
-            .speculate(&context_tokens, max_tokens.max(0) as usize)
+        lock_cache(&self.inner).speculate(&context_tokens, max_tokens.max(0) as usize)
     }
     /// Test seam: pin the n-gram order for deterministic unit tests,
     /// independent of process env and pytest file order. Production code
     /// never calls this (n comes from SUFFIX_HYBRID_INDEX_N, default 8).
     fn set_test_n(&self, n: usize) {
-        self.inner.lock().unwrap().cfg.n = n.clamp(1, 128);
+        lock_cache(&self.inner).cfg.n = n.clamp(1, 128);
     }
     fn stats(&self) -> HashMap<String, usize> {
-        self.inner.lock().unwrap().stats()
+        lock_cache(&self.inner).stats()
     }
 }
 mod engine;
