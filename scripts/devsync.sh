@@ -48,6 +48,11 @@ elif [[ -d "$BUNDLE" ]]; then
   kubectl -n "$NS" cp "$BUNDLE/sitecustomize.py" "$POD:/plugins/sitecustomize.py"
   kubectl -n "$NS" cp "$BUNDLE/BUILD.json"      "$POD:/plugins/BUILD.json"
   kubectl -n "$NS" cp "$BUNDLE/suffix_hybrid"   "$POD:/plugins/suffix_hybrid"
+  # sm120 deep_gemm shim (present in every bundle since sm120-support; the
+  # shim self-gates, so copying it onto a non-SM120 pool stays inert).
+  if [[ -d "$BUNDLE/deep_gemm" ]]; then
+    kubectl -n "$NS" cp "$BUNDLE/deep_gemm" "$POD:/plugins/deep_gemm"
+  fi
   echo "bundle synced: $(tr -d '\n ' < "$BUNDLE/BUILD.json" | head -c 120)"
 fi
 
