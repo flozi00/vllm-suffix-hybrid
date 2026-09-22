@@ -429,3 +429,93 @@ def test_replay_mode_skips_collective(monkeypatch):
                                     mixer, NoCast())
     got = invoke(wrapped, None)
     assert got.tolist() == [[7, 8, 9, 12, 99]]
+
+
+class ProbeMix(CacheMix):
+    """Mixer exposing a suffix_cache handle whose speculate() is scripted.
+
+    Scripts the probe contract: `hit` rows yield a strong continuation
+    (len >= PROBE_MIN_LEN), `miss` rows yield nothing.
+    """
+
+    def __init__(self, rows, tokens=5, hit=False):
+        super().__init__(rows, tokens)
+        self.hit = hit
+        self.probe_calls = 0
+
+    @property
+    def suffix_cache(self):
+        return NS(speculate=self._spec)
+
+    def _spec(self, tail, w):
+        self.probe_calls += 1
+        if self.hit:
+            return [42, 43, 44], 1.0, 8
+        return [], 0.0, 0
+
+
+def _probe_fixture(native, history_rows=None):
+    states = NS(total_len=NS(gpu=torch.tensor([8, 2])),
+                all_token_ids=NS(gpu=torch.tensor(
+                    history_rows or [list(range(1, 33)), [700] * 32])))
+    runner = NS(req_states=states)
+    batch = NS(req_ids=['a'], num_reqs=1, idx_mapping=torch.tensor([0]))
+
+    def invoke(wrapped, calls, num_sampled=torch.tensor([1]),
+               num_rejected=torch.tensor([0]), **kw):
+        return wrapped(batch, {}, {}, torch.zeros(1), None,
+                       num_sampled, num_rejected,
+                       torch.zeros(2), torch.zeros(1, 2),
+                       torch.tensor([0.8, 0.8]), torch.ones(2), **kw)
+
+    return runner, batch, invoke
+
+
+def test_probe_gate_skips_mix_when_no_suffix_evidence(monkeypatch):
+    # Warm corpus + probe finds NO strong continuation -> native returned
+    # UNTOUCHED (identity) and mix_numpy never runs.
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = ProbeMix([[9, 10, 11, 12, 99]], tokens=1000, hit=False)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    calls = []
+    # Two steps: step 1 seeds the mirror (row is None -> full path), step 2
+    # has a mirrored row and the probe misses -> gate fires.
+    got1 = invoke(wrapped, calls)
+    assert got1 is not None
+    got2 = invoke(wrapped, calls)
+    assert got2 is native
+    assert mixer.probe_calls >= 1
+    # mix ran at most once (step 1); the gated step never reached it.
+    assert len(mixer.calls) <= 1
+
+
+def test_probe_gate_fires_full_path_on_strong_suffix(monkeypatch):
+    # Warm corpus + probe finds a strong continuation -> full arbitrate
+    # path runs (mix_numpy called on the second step too).
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = ProbeMix([[9, 10, 11, 12, 99]], tokens=1000, hit=True)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    calls = []
+    invoke(wrapped, calls)
+    invoke(wrapped, calls)
+    assert len(mixer.calls) == 2
+
+
+def test_probe_never_gates_cold_corpus(monkeypatch):
+    # cache_tokens()==0 -> full path every step (self-lock rule).
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = ProbeMix([[9, 10, 11, 12, 99]], tokens=0, hit=False)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    calls = []
+    for _ in range(4):
+        invoke(wrapped, calls)
+    assert len(mixer.calls) == 4

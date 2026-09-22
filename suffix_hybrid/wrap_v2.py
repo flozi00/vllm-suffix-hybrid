@@ -248,7 +248,7 @@ def _wrap_propose_sync(runner, original, mixer, group, probabilistic=False):
 def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
     previous_widths = {}
     state = {"skips": 0, "reason": "", "mixes": 0,
-             "skips_unchanged": 0}
+             "skips_unchanged": 0, "skips_probe": 0, "steps": 0}
     interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
     profile = os.environ.get("SUFFIX_HYBRID_PROFILE", "").strip() == "1"
     hook_times = {"absorb": [0.0, 0], "mix": [0.0, 0],
@@ -554,6 +554,97 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
                   file=sys.stderr, flush=True)
         return output
 
+    def _lut_index(input_batch, ids):
+        # CPU row indices WITHOUT the old idx_mapping.long().tolist() D2H:
+        # req_states.req_id_to_index is the plain CPU dict the engine itself
+        # maps req_ids through to BUILD idx_mapping (gpu/model_runner.py:
+        # `map(self.req_states.req_id_to_index.__getitem__, req_ids)`), so it
+        # is exactly the mapping that D2H produced. Fall back to the tensor
+        # read only when the dict is unavailable/incomplete — correctness
+        # over speed.
+        lut = getattr(runner.req_states, "req_id_to_index", None)
+        if lut is not None:
+            try:
+                return [lut[rid] for rid in ids]
+            except KeyError:
+                pass
+        return input_batch.idx_mapping.long().tolist()
+
+    def _cache_n_gram():
+        # The cache's index n-gram order (SUFFIX_HYBRID_INDEX_N, default 8).
+        try:
+            return int(os.environ.get("SUFFIX_HYBRID_INDEX_N", "8") or 8)
+        except ValueError:
+            return 8
+
+    def _probe_heartbeat():
+        # Full-path mix at least every N steps even when the probe keeps
+        # gating: mix_core is the corpus ingestion path (gone-ID eviction +
+        # Reset finalize live inside it), so unconditional gating would
+        # starve the corpus — the probe would then never fire again.
+        try:
+            return int(os.environ.get(
+                "SUFFIX_HYBRID_PROBE_HEARTBEAT", "8") or 8)
+        except ValueError:
+            return 8
+
+    def _mirror_probe(ids, k_slots):
+        # ZERO-SYNC GATE (p12): decide whether suffix evidence exists BEFORE
+        # paying the native [n,K] D2H. CPU state only: the one-step-stale
+        # mirror tail + the cache's own speculate(). When no row has a
+        # strong continuation, publishing native verbatim is byte-identical
+        # to what the full arbitrate path would output (mix_core echoes
+        # native when the cache has nothing to contribute), so the D2H,
+        # mix, compare and (where skippable) collective are all skipped.
+        # NEVER gates a cold corpus: cache_tokens()==0 means mix_numpy has
+        # not fed anything yet, and skipping it would keep it at zero
+        # forever — the 64793d98 self-lock in a new disguise. The
+        # heartbeat keeps corpus + estimates fed on long gated stretches;
+        # boundary-matching makes skipped steps safe (append-only rows keep
+        # the tracked context a strict prefix, so the next ungated mix
+        # classifies as Continuing with the accumulated delta).
+        # Probe preconditions: mixer must expose cache_tokens() and a
+        # suffix_cache handle. Test fakes / future variants without them
+        # simply never gate (full path every step — the safe default).
+        try:
+            if mixer.cache_tokens() == 0:
+                return True
+        except Exception:
+            return True
+        hb = _probe_heartbeat()
+        if hb > 0 and state["steps"] % hb == 0:
+            return True
+        cache = getattr(mixer, "suffix_cache", None)
+        if cache is None or not ids:
+            return True
+        try:
+            depth = int(os.environ.get(
+                "SUFFIX_HYBRID_PROBE_DEPTH", "64") or 64)
+            min_len = int(os.environ.get(
+                "SUFFIX_HYBRID_PROBE_MIN_LEN", "2") or 2)
+        except ValueError:
+            depth, min_len = 64, 2
+        w = st["w"] or (k_slots + 2)
+        n_gram = _cache_n_gram()
+        mirror = st["mirror"]
+        for rid in ids:
+            row = mirror.get(rid)
+            if row is None:
+                # Un-mirrored (fresh request): full path — the first suffix
+                # hit often happens right at prompt-echo time.
+                return True
+            tail = row[-depth:]
+            if len(tail) < n_gram:
+                continue        # shorter than the index n-gram: no lookup
+            try:
+                suffix, _score, _matched = cache.speculate(list(tail), w)
+            except Exception:
+                return True     # probe itself failed: full path
+            if len(suffix) >= min_len:
+                return True     # strong continuation exists: arbitrate
+        # Every row probed, no strong continuation anywhere: native echo.
+        return False
+
     def _fast_body(native, input_batch, num_sampled, num_rejected,
                    temperature):
         # NO cold early-return: mix_numpy IS the corpus ingestion path
@@ -562,7 +653,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         # forever — nothing ever ingests, so cache_tokens() never leaves
         # zero (live-pod bug, 2026-09-22: skips_cold climbing while
         # suffix_hybrid_native never printed once). The cold mix provably
-        # echoes native; _publish's unchanged path then returns native
+        # echoes native and _publish's unchanged path then returns native
         # with no clone and no collective where that is safe. The cost
         # this saves us is one small native [n, K] D2H and a bounded
         # window copy per step.
@@ -576,12 +667,11 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
             out = group.broadcast(native.clone(), src=0)
             _bump("bcast", t)
             return out
-        idx = input_batch.idx_mapping.long()
-        idx_cpu = idx.tolist()
         ids = list(input_batch.req_ids)
+        idx_cpu = _lut_index(input_batch, ids)
         t = time.perf_counter()
-        # 2. Absorb last step's async copies (one engine step old: the
-        # event wait is nearly free), then enqueue this step's window +
+        # Absorb last step's async copies (one engine step old: the event
+        # wait is nearly free), then enqueue this step's window +
         # sampler-feedback copies for NEXT step. The mirror lags at most
         # one step, so the FIRST real step for a request may legitimately
         # pass through native; every draft is target-verified anyway.
@@ -591,12 +681,27 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         if not torch.cuda.is_available():
             _absorb_pending()      # CPU-only: copies already landed
         _bump("absorb", t)
+        state["steps"] += 1
+        if not _mirror_probe(ids, int(native.shape[1])):
+            # No suffix evidence on any row and the corpus is warm: the
+            # native echo is byte-identical to the mix's output. Publish
+            # verbatim — zero GPU reads, no clone, no mix. Keep the
+            # feedback contract: previous_widths records the width we
+            # actually published (full-width native rows).
+            _note_skip("skips_probe")
+            previous_widths.update(
+                zip(ids, [int(native.shape[1])] * len(ids)))
+            return native
         t = time.perf_counter()
-        # 3. Mix purely from the CPU mirror.
+        # Mix purely from the CPU mirror. Greedy mode never touches idx;
+        # probabilistic mode needs a tensor for temperature[idx] (CPU
+        # tensor built from the LUT — a sync only in probabilistic mode).
+        idx_for_greedy = (torch.tensor(idx_cpu, dtype=torch.long)
+                          if probabilistic else None)
         mixed, native_rows, greedy_rows = _mix_from_mirror(
-            native, ids, idx, temperature)
+            native, ids, idx_for_greedy, temperature)
         _bump("mix", t)
-        # 4. Write-back + collective only when the mix actually differs.
+        # Write-back + collective only when the mix actually differs.
         return _publish(mixed, native, native_rows, greedy_rows, ids)
 
     @functools.wraps(original)
