@@ -304,6 +304,14 @@ impl HybridMixer {
     fn last_native_counts(&self) -> Vec<usize> {
         self.last_native.clone()
     }
+    /// Cached-token count of the shared suffix cache. `tokens == 0` is
+    /// exactly the `fed == false` predicate in `mix_core`, so a Python
+    /// wrapper that sees 0 here can skip all per-step mixer work and
+    /// publish the native drafts verbatim with provably identical output
+    /// to the native-echo path (no cache to speculate from).
+    fn cache_tokens(&self) -> usize {
+        super::lock_cache(&self.cache.inner).tokens
+    }
     fn get_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
         d.set_item("calls", self.calls)?;

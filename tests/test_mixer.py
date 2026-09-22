@@ -88,5 +88,26 @@ class MixerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mixer.mix(['a', 'a'], [[1], [1]], [[2], [2]], None)
 
+    def test_cache_tokens_zero_on_fresh_mixer(self):
+        # tokens == 0 is exactly the fed == False predicate in mix_core, so
+        # the Python wrapper can skip all per-step work and echo native.
+        mixer = _native.HybridMixer(4, 64)
+        self.assertEqual(mixer.cache_tokens(), 0)
+
+    def test_cache_tokens_grows_when_departed_rows_finalize(self):
+        # mix() finalizes a dropped request's context into the corpus, which
+        # raises the cached-token count off zero.
+        mixer = _native.HybridMixer(4, 128)
+        accepted = None
+        for step in range(4):
+            ctx = list(range(1, 10 + step))
+            mixer.mix(['a', 'b'], [ctx, [x + 100 for x in ctx]],
+                      [[10, 11, 12, 13], [14, 15, 16, 17]], accepted)
+            accepted = [2, 2]
+        self.assertEqual(mixer.cache_tokens(), 0)
+        # 'b' departs: mix_core finalizes its context into the corpus.
+        mixer.mix(['a'], [list(range(1, 14))], [[10, 11, 12, 13]], [2, 2][:1])
+        self.assertGreater(mixer.cache_tokens(), 0)
+
 if __name__ == '__main__':
     unittest.main()
