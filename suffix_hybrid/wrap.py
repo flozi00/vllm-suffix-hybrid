@@ -333,6 +333,20 @@ def install():
         wrapped._suffix_hybrid_hook = True
         module.GPUModelRunner.propose_draft_token_ids = wrapped
     runner = module.GPUModelRunner
+    # The hook lives on the V1 GPUModelRunner. With Model Runner V2
+    # (VLLM_USE_V2_MODEL_RUNNER=1, or the platform default on Triton
+    # platforms) the worker runs vllm.v1.worker.gpu.model_runner and
+    # drafts via speculator.propose() instead — this hook installs fine
+    # but is never called, silently reducing the deployment to plain
+    # native spec decode. Warn loudly; do not fail closed (a dormant
+    # accelerator must never crash a serving pod).
+    v2 = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "").strip()
+    if v2 == "1":
+        print("suffix_hybrid WARNING: VLLM_USE_V2_MODEL_RUNNER=1 — the V2 "
+              "runner drafts via speculator.propose() and never calls the "
+              "hooked propose_draft_token_ids; the suffix hybrid accelerator "
+              "is DORMANT. Set VLLM_USE_V2_MODEL_RUNNER=0 to activate.",
+              file=sys.stderr, flush=True)
     print(f"suffix_hybrid installed hook={runner.__module__}.{runner.__name__} "
           f"drift={json.dumps(sorted(drifted))}",
           file=sys.stderr, flush=True)
