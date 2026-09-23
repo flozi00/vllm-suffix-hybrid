@@ -291,6 +291,9 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
           "pending": None,          # None | "SYNC" | [req_id, ...]
           "sync_ids": [],
           "gate": {},               # req_id -> full-path mixes since last win
+          "draft": {},              # req_id -> one-step-stale native row (CPU)
+          "draft_buf": None,        # pinned [cap, w] D2H landing buffer
+          "draft_pending": False, "draft_k": 0,
           "fallback": False, "fallback_logged": False}
 
     def _tp_mode():
@@ -357,7 +360,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         s = min(max(int(L), 0), w)
         return gpu_row[s:min(w, s + st["w"])]
 
-    def _enqueue(ids, idx, num_sampled, num_rejected, k_slots):
+    def _enqueue(ids, idx, num_sampled, num_rejected, k_slots, native=None):
         _ensure_staging(max(len(ids), 1), k_slots)
         bufs = st["staging"]
         mirror = st["mirror"]
@@ -369,6 +372,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         for rid in [r for r in mirror if r not in live]:
             del mirror[rid]
             st["gate"].pop(rid, None)   # gone request: drop gate state too
+            st["draft"].pop(rid, None)  # ...and the staged draft row
         cuda = torch.cuda.is_available()
         if cuda:
             # Order the side-stream copies behind the postprocess producer
@@ -381,6 +385,21 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         with ctx:
             if cuda:
                 st["prod_ev"].wait()
+            # p20: also stage THIS step's native draft rows (one-step-stale
+            # landing for the full path's mix). Same side stream, same event
+            # — the absorb one engine step later is already nearly free.
+            if cuda and native is not None:
+                st["draft_pending"] = True
+                st["draft_k"] = native.shape[1]
+                nr = min(native.shape[0], len(ids))
+                kk = native.shape[1]
+                if st["draft_buf"] is None or st["draft_buf"].shape[1] < kk:
+                    st["draft_buf"] = torch.empty(
+                        (max(st["cap"], len(ids)), max(kk, st["w"])),
+                        dtype=native.dtype, pin_memory=True)
+                db = st["draft_buf"]
+                if nr:
+                    db[:nr, :kk].copy_(native[:nr, :kk], non_blocking=True)
             for i, (rid, j) in enumerate(zip(ids, idx)):
                 if rid not in mirror:
                     _seed_row(rid, ats[j], int(total_gpu[j]))
@@ -423,6 +442,14 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
             return
         counts = bufs["counts"][:len(ids_now)].tolist()
         tails = bufs["tail"][:len(ids_now)].tolist()
+        # p20: land the staged draft rows (same absorb event — one engine
+        # step has passed, the copies have long finished).
+        if st["draft_buf"] is not None and st.get("draft_pending"):
+            kk = st["draft_k"]
+            rows = st["draft_buf"][:len(ids_now), :kk].tolist()
+            st["draft"] = {rid: [int(t) for t in row]
+                           for rid, row in zip(ids_now, rows)}
+            st["draft_pending"] = False
         mirror = st["mirror"]
         for rid, new_len, tail_row in zip(ids_now, counts, tails):
             toks = mirror.get(rid)
@@ -436,6 +463,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
                     # re-seeds the whole row from the authoritative GPU
                     # buffer (an emptied list would not retrigger seeding).
                     mirror.pop(rid, None)
+                    st["draft"].pop(rid, None)
                 continue
             if new_len - last > st["w"]:
                 # Window overshot: same full re-seed path from position 0.
@@ -492,10 +520,25 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
             toks = mirror.get(rid)
             if toks:
                 history_np[i, :len(toks)] = toks
-        # ONE small D2H for the whole step (the native draft rows). Replaces
-        # the old clone + full-history blocking buffer read + two small
-        # blocking sampler-feedback reads.
-        native_rows = native.detach().cpu().tolist()
+        # p20: ZERO blocking D2H. The native draft rows were pre-staged on
+        # the side stream one engine step ago (st["draft"], per-rid); this
+        # reads a CPU-resident one-step-stale copy. Rows missing from the
+        # staging (fresh requests, first steps) fall back to a direct read —
+        # correct, just slower, and only until the next absorb lands them.
+        draft = st["draft"]
+        native_rows = []
+        missing = []
+        for i, rid in enumerate(ids):
+            row = draft.get(rid)
+            if row is None or len(row) < native.shape[1]:
+                missing.append(i)
+            native_rows.append(row if row is not None else [])
+        if missing:
+            staged = native.detach().cpu().tolist()
+            for i in missing:
+                native_rows[i] = staged[i]
+        if len(native_rows) != n or any(len(r) != native.shape[1] for r in native_rows):
+            native_rows = native.detach().cpu().tolist()
         sampled = bufs["sampled"][:n].tolist() if n else []
         rejected = bufs["rejected"][:n].tolist() if n else []
         greedy_rows = _greedy_rows(temperature, idx)
@@ -752,7 +795,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         # pass through native; every draft is target-verified anyway.
         _absorb_pending()
         _enqueue(ids, idx_cpu, num_sampled, num_rejected,
-                 int(native.shape[1]))
+                 int(native.shape[1]), native=native)
         if not torch.cuda.is_available():
             _absorb_pending()      # CPU-only: copies already landed
         _bump("absorb", t)
