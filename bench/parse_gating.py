@@ -33,6 +33,83 @@ COUNTER = re.compile(
 STATS = re.compile(r"suffix_hybrid v2 mixer pid=(\d+) mixes=(\d+)")
 STATS_JSON = re.compile(
     r"suffix_hybrid_native (\{.*\"mixes\": ?(\d+).*\})")
+# RFC3339 k8s timestamp at line start: 2026-09-22T21:38:48.225796327Z
+TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+
+
+def _parse_ts(line):
+    m = TS.match(line)
+    return m.group(1) if m else None
+
+
+def window_report(log, pod):
+    """Per-minute full-path share from timestamped cumulative counters.
+
+    Tests H1 (frozen-share mis-measurement): cumulative counters over the pod's
+    whole life can hide a much higher full-path share inside the bench window.
+    Counters tick on disjoint steps, so per-minute steps = sum of counter
+    deltas; full-path = delta of skips_unchanged + delta of mixes.
+    """
+    # series[rank][counter] -> {minute: max_N}  (max within minute: prints
+    # are cadenced, but re-prints of the same value collapse via max)
+    series = {}
+    mixes = {}  # minute -> max mixes value seen
+    for line in log.splitlines():
+        ts = _parse_ts(line)
+        if ts is None:
+            continue
+        m = COUNTER.search(line)
+        if m:
+            rank, kind, n = int(m.group(1)), m.group(2), int(m.group(3))
+            d = series.setdefault(rank, {}).setdefault(kind, {})
+            d[ts] = max(d.get(ts, 0), n)
+            continue
+        m = STATS.search(line)
+        if m:
+            mixes[ts] = max(mixes.get(ts, 0), int(m.group(2)))
+            continue
+        m = STATS_JSON.search(line)
+        if m:
+            try:
+                obj = json.loads(m.group(1))
+                mixes[ts] = max(mixes.get(ts, 0), int(obj["mixes"]))
+            except (json.JSONDecodeError, ValueError, KeyError):
+                pass
+    if not series:
+        print(f"{pod}: no timestamped counters for window analysis")
+        return 1
+    for rank in sorted(series):
+        kinds = series[rank]
+        minutes = sorted({ts for d in kinds.values() for ts in d} |
+                         set(mixes))
+        if len(minutes) < 2:
+            print(f"  TP{rank}: need >=2 minutes of counters, have "
+                  f"{len(minutes)}")
+            continue
+        prev = {}
+        print(f"  TP{rank} per-minute full-path share "
+              f"(steps=ΣΔcounters, full=Δunchanged+Δmixes):")
+        for ts in minutes:
+            cur = {k: d.get(ts, None) for k, d in kinds.items()}
+            cur["mixes"] = mixes.get(ts)
+            # carry forward last known value within this minute set
+            deltas = {}
+            for k, v in cur.items():
+                if v is None:
+                    continue
+                if k in prev and v >= prev[k]:
+                    deltas[k] = v - prev[k]
+                prev[k] = v
+            skip_d = sum(v for k, v in deltas.items()
+                         if k.startswith("skips_"))
+            full_d = deltas.get("skips_unchanged", 0) + \
+                (deltas.get("mixes", 0) or 0)
+            steps_d = skip_d + (deltas.get("mixes", 0) or 0)
+            share = (full_d / steps_d) if steps_d else 0.0
+            bar = "#" * int(share * 40)
+            print(f"    {ts} steps={steps_d:5d} full={full_d:5d} "
+                  f"share={share:6.1%} {bar}")
+    return 0
 
 
 def extract_log(path):
@@ -55,8 +132,13 @@ def extract_log(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("file")
+    ap.add_argument("--window", action="store_true",
+                    help="per-minute full-path share (tests H1: bench-window "
+                         "share vs cumulative share)")
     args = ap.parse_args()
     log, pod = extract_log(args.file)
+    if args.window:
+        return window_report(log, pod)
     per_rank = {}   # rank -> {counter: max N}
     for line in log.splitlines():
         m = COUNTER.search(line)
