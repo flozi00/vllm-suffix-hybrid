@@ -33,6 +33,8 @@ COUNTER = re.compile(
 STATS = re.compile(r"suffix_hybrid v2 mixer pid=(\d+) mixes=(\d+)")
 STATS_JSON = re.compile(
     r"suffix_hybrid_native (\{.*\"mixes\": ?(\d+).*\})")
+CALLS_RE = re.compile(
+    r"suffix_hybrid_native \{.*\"calls\": (\d+)")
 # RFC3339 k8s timestamp at line start: 2026-09-22T21:38:48.225796327Z
 TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
 
@@ -54,6 +56,10 @@ def window_report(log, pod):
     # are cadenced, but re-prints of the same value collapse via max)
     series = {}
     mixes = {}  # minute -> max mixes value seen
+    calls = {}  # minute -> max mix_core "calls" value seen
+    nat_acc = {}   # minute -> max native_accepted
+    suf_acc = {}   # minute -> max suffix_accepted
+    suf_test = {}  # minute -> max suffix_tested
     for line in log.splitlines():
         ts = _parse_ts(line)
         if ts is None:
@@ -75,20 +81,35 @@ def window_report(log, pod):
                 mixes[ts] = max(mixes.get(ts, 0), int(obj["mixes"]))
             except (json.JSONDecodeError, ValueError, KeyError):
                 pass
+        m = CALLS_RE.search(line)
+        if m:
+            # "calls" = cumulative mix_core invocations = TRUE full-path
+            # steps (mixes/unchanged split inside them). More reliable
+            # than skips_unchanged deltas: it ticks on every full-path
+            # step regardless of publish outcome.
+            calls[ts] = max(calls.get(ts, 0), int(m.group(1)))
+        for field, store in (("native_accepted", nat_acc),
+                             ("suffix_accepted", suf_acc),
+                             ("suffix_tested", suf_test)):
+            m2 = re.search(rf'"{field}": (\d+)', line)
+            if m2:
+                store[ts] = max(store.get(ts, 0), int(m2.group(1)))
     if not series:
         print(f"{pod}: no timestamped counters for window analysis")
         return 1
     for rank in sorted(series):
         kinds = series[rank]
         minutes = sorted({ts for d in kinds.values() for ts in d} |
-                         set(mixes))
+                         set(mixes) | set(calls))
         if len(minutes) < 2:
             print(f"  TP{rank}: need >=2 minutes of counters, have "
                   f"{len(minutes)}")
             continue
         prev = {}
+        prev_calls = None
+        prev_na = prev_sa = prev_st = None
         print(f"  TP{rank} per-minute full-path share "
-              f"(steps=ΣΔcounters, full=Δunchanged+Δmixes):")
+              f"(steps=ΣΔcounters+Δcalls, full=Δcalls):")
         for ts in minutes:
             cur = {k: d.get(ts, None) for k, d in kinds.items()}
             cur["mixes"] = mixes.get(ts)
@@ -100,15 +121,43 @@ def window_report(log, pod):
                 if k in prev and v >= prev[k]:
                     deltas[k] = v - prev[k]
                 prev[k] = v
+            c = calls.get(ts)
+            call_d = (c - prev_calls) if (c is not None
+                                          and prev_calls is not None
+                                          and c >= prev_calls) else None
+            if c is not None:
+                prev_calls = c
+            na, sa, st = (nat_acc.get(ts), suf_acc.get(ts),
+                          suf_test.get(ts))
+            econ = ""
+            if sa is not None and prev_sa is not None and sa >= prev_sa:
+                dsa, dst = sa - prev_sa, (st - prev_st) if (
+                    st is not None and prev_st is not None
+                    and st >= prev_st) else None
+                econ = (f" suffix: {dsa}+"
+                        f"/{dst if dst is not None else '?'} tested")
+            if na is not None:
+                prev_na = na
+            if sa is not None:
+                prev_sa = sa
+            if st is not None:
+                prev_st = st
             skip_d = sum(v for k, v in deltas.items()
                          if k.startswith("skips_"))
-            full_d = deltas.get("skips_unchanged", 0) + \
-                (deltas.get("mixes", 0) or 0)
-            steps_d = skip_d + (deltas.get("mixes", 0) or 0)
+            # FULL-PATH truth: Δcalls when available; else the
+            # unchanged+mixes fallback (undercounts changed publishes).
+            if call_d is not None:
+                full_d = call_d
+                steps_d = skip_d + call_d
+            else:
+                full_d = deltas.get("skips_unchanged", 0) + \
+                    (deltas.get("mixes", 0) or 0)
+                steps_d = skip_d + (deltas.get("mixes", 0) or 0)
             share = (full_d / steps_d) if steps_d else 0.0
             bar = "#" * int(share * 40)
+            src = "calls" if call_d is not None else "old"
             print(f"    {ts} steps={steps_d:5d} full={full_d:5d} "
-                  f"share={share:6.1%} {bar}")
+                  f"share={share:6.1%} [{src}]{econ} {bar}")
     return 0
 
 
