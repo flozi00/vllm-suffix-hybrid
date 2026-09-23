@@ -1,0 +1,9 @@
+{"arm": "p8-native-baseline", "pod": "(p8)", "c1": [469], "c8": [1908], "share": 0.0, "note": "vllm_c-first arm, wrap off \u2014 THE baseline", "date": "2026-09-22"}
+{"arm": "p18-inert", "pod": "p4wvq", "c1": [477.5, 479.8, 484.9], "c8": [1833.8, 1926.5], "share": 0.0, "note": "plugin fully inert; baseline reproduced", "date": "2026-09-22"}
+{"arm": "p12-zerosync", "pod": "z8v8n", "c1": [387.1, 354.6], "c8": [1532.5, 1530.2], "share": 0.711, "note": "true share (calls-based)", "date": "2026-09-22"}
+{"arm": "p13-probe-strict", "pod": "s5bpn", "c1": [424.8, 375.3, 375.0], "c8": [1509.6, 1520.7], "share": 0.728, "note": "true share (calls-based)", "date": "2026-09-22"}
+{"arm": "p14-adaptive", "pod": "vsvbm", "c1": [392.5, 408.4, 401.6], "c8": [1615.5, 1555.8], "share": 0.244, "note": "true share (calls-based)", "date": "2026-09-22"}
+{"arm": "p15-cd2", "pod": "kjl2v", "c1": [398.8, 408.8, 409.9], "c8": [1662.9, 1585.0], "share": 0.178, "note": "true share (calls-based)", "date": "2026-09-22"}
+{"arm": "p17-frozen", "pod": "v9scw", "c1": [407.0, 419.5], "c8": [1713.0, 1605.0], "share": 0.264, "note": "true share (calls-based)", "date": "2026-09-22"}
+{"arm": "p19-wraponly", "pod": "rsjsz", "c1": [412.8, 408.5, 410.0], "c8": [1682.4, 1574.7], "share": null, "note": "kernels off; share not captured", "date": "2026-09-23"}
+{"arm": "p17-rollback-recovery", "pod": "pjvkw", "c1": [414.9, 359.1], "c8": [1656.3, 1574.0], "share": 0.263, "note": "recovery verified", "date": "2026-09-23"}
