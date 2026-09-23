@@ -255,6 +255,13 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
     # Read ONCE at wrapper construction: the per-step zero-op check below is
     # a single closed-over bool, no environ access in the hot path.
     zero_op = os.environ.get("SUFFIX_HYBRID_ZERO_OP", "").strip() == "1"
+    # p24-verifierwin: gate wins must be EARNED from the target verifier's
+    # verdict (accepted feedback), not from publication-time differences.
+    # Self-match rows publish a difference then get rejected; counting those
+    # as wins keeps the cooldown gate reset forever under c8 churn (the 58%
+    # bench-window share, wakeup #23). Default OFF = p17 semantics.
+    verifier_win = os.environ.get(
+        "SUFFIX_HYBRID_VERIFIER_WIN", "").strip() == "1"
     hook_times = {"absorb": [0.0, 0], "mix": [0.0, 0],
                   "write": [0.0, 0], "bcast": [0.0, 0]}
     sync_run = _sync_body(runner, mixer, group, probabilistic,
@@ -294,6 +301,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
           "pending": None,          # None | "SYNC" | [req_id, ...]
           "sync_ids": [],
           "gate": {},               # req_id -> full-path mixes since last win
+          "pending_wins": {},       # rid -> True: published-diff row, verdict pending
           "fallback": False, "fallback_logged": False}
 
     def _tp_mode():
@@ -503,6 +511,30 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         rejected = bufs["rejected"][:n].tolist() if n else []
         greedy_rows = _greedy_rows(temperature, idx)
         accepted = _accepted_lengths(ids, sampled, rejected)
+        if verifier_win and st["pending_wins"]:
+            # Resolve last step's published-diff rows with the verifier's
+            # verdict (one-step-late feedback): a row that was actually
+            # accepted earns the gate reset; a published-but-rejected row
+            # was a false win — count it as a miss so the cooldown veto
+            # can finally engage under self-match churn.
+            gate = st["gate"]
+            for i, rid in enumerate(ids):
+                if rid in st["pending_wins"]:
+                    if accepted[i] == -1:
+                        # Unknown feedback (stale split guess / no prior
+                        # width): neither win nor miss — keep the counter,
+                        # drop the pending marker (verdict never arrives).
+                        pass
+                    elif accepted[i] >= 1:
+                        gate[rid] = 0     # verified win: reset the counter
+                    else:
+                        gate[rid] = gate.get(rid, 0) + 1  # false win: miss
+                    st["pending_wins"].pop(rid, None)
+            # rids no longer in the batch (gone mid-verdict): their feedback
+            # never arrives; treat as unresolved and drop (no reset).
+            gone = set(st["pending_wins"]) - set(ids)
+            for rid in gone:
+                st["pending_wins"].pop(rid, None)
         mixed = mixer.mix_numpy(ids, counts_np, history_np, native_rows,
                                 accepted)
         _check_widths(mixed, native.shape[1])
@@ -523,12 +555,19 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         # mixer's echo path returns the native row verbatim on losing
         # steps, and counting those as wins would never cool down.
         gate = st["gate"]
+        pending_wins = st["pending_wins"]
         for i, row in enumerate(eff):
             rid = ids[i]
             if row and row != native_rows[i][:len(row)]:
-                gate[rid] = 0          # won: reset the miss counter
+                if verifier_win:
+                    # Published a difference: the verdict arrives next step.
+                    # Never reset the counter on publication alone.
+                    pending_wins[rid] = True
+                else:
+                    gate[rid] = 0      # won: reset the miss counter
             else:
                 gate[rid] = gate.get(rid, 0) + 1
+                pending_wins.pop(rid, None)
         if not changed:
             _note_skip("skips_unchanged")
             # previous_widths keeps the sync-body contract (mixed widths,

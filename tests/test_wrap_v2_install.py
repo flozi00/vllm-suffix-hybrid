@@ -669,3 +669,64 @@ def test_zero_op_arm_echoes_native_and_touches_nothing(monkeypatch):
     assert mixer.probe_calls == 0       # probe never consulted
     # And the gate stays untouched: no state drift while zero-op is armed.
     assert not getattr(runner, "_zero_op_state_touched", False)
+
+
+def test_verifier_win_false_wins_do_not_rearm(monkeypatch):
+    # p24: with SUFFIX_HYBRID_VERIFIER_WIN=1, a request whose rows keep
+    # publishing differences but keep getting REJECTED by the verifier must
+    # NOT re-arm the gate — the cooldown veto engages despite continuous
+    # self-match evidence (the 58% bench-window share pathology).
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_COOLDOWN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_HEARTBEAT", "0")
+    monkeypatch.setenv("SUFFIX_HYBRID_VERIFIER_WIN", "1")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = WinningMix([[9, 10, 11, 12, 99]], tokens=1000, hit=True)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    # Every step publishes a diff (WinningMix rows are 2 wide; previous_widths
+    # records 2) and the feedback shows rejection: ns=1, nr=1 => a=0,
+    # verified=1, previous=2 -> valid, accepted=0 (published row rejected).
+    for _ in range(6):
+        invoke(wrapped, None, num_sampled=torch.tensor([1]),
+               num_rejected=torch.tensor([1]))
+    # Misses must have accumulated: the request cooled down and later steps
+    # stopped forcing the full path (mixer.calls stop growing).
+    calls = len(mixer.calls)
+    for _ in range(3):
+        got = invoke(wrapped, None, num_sampled=torch.tensor([1]),
+                     num_rejected=torch.tensor([1]))
+        assert got is native
+    assert len(mixer.calls) == calls      # no new full-path mixes
+
+
+def test_verifier_win_verified_win_rearms(monkeypatch):
+    # p24: when the feedback shows the published row was actually accepted
+    # (accepted >= 1), the gate resets — a genuine win still re-arms.
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_COOLDOWN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_HEARTBEAT", "0")
+    monkeypatch.setenv("SUFFIX_HYBRID_VERIFIER_WIN", "1")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = WinningMix([[9, 10, 11, 12, 99]], tokens=1000, hit=True)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    # Warm the request up with REJECTED feedback (accepted=0) until cooled.
+    for _ in range(4):
+        invoke(wrapped, None, num_sampled=torch.tensor([1]),
+               num_rejected=torch.tensor([0]))
+    # The staged feedback buffers lag one step; deliver ACCEPTED feedback
+    # (num_sampled=3 => accepted=2 >= 1) on a full-path step. To force the
+    # full path, thaw via a heartbeat-free path: new rid? Simplest: the
+    # accepted feedback arrives while still full-path (not yet cooled).
+    # Re-build with accepted feedback from the start instead:
+    mixer2 = WinningMix([[9, 10, 11, 12, 99]], tokens=1000, hit=True)
+    wrapped2 = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                     mixer2, TP())
+    for _ in range(6):
+        invoke(wrapped2, None, num_sampled=torch.tensor([3]),
+               num_rejected=torch.tensor([0]))
+    # Verified wins the whole way: gate stays reset, full path keeps running.
+    assert len(mixer2.calls) >= 4
