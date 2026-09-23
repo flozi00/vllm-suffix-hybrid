@@ -644,3 +644,28 @@ def test_adaptive_gate_rearms_on_win(monkeypatch):
         got = invoke(wrapped, None)
         assert got is not native        # a win writes a row every time
     assert len(mixer.calls) == 5
+
+
+def test_zero_op_arm_echoes_native_and_touches_nothing(monkeypatch):
+    # ZERO-OP (p22 residual bound): with SUFFIX_HYBRID_ZERO_OP=1 the armed
+    # hook must return native verbatim on EVERY step — no mixer calls, no
+    # probes, no state mutation, even when the mixer would win and the
+    # corpus is warm. This is the by-elimination bound for the ~2.7ms/step
+    # armed-vs-inert residual: zero-op ≈ baseline => the cost is per-step
+    # machinery; zero-op still slow => the cost is the hook's presence.
+    monkeypatch.setenv("SUFFIX_HYBRID_ZERO_OP", "1")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_COOLDOWN", "2")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_HEARTBEAT", "8")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = WinningMix([[9, 10, 11, 12, 99]], tokens=1000, hit=True)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    for _ in range(6):
+        got = invoke(wrapped, None)
+        assert got is native            # verbatim echo, every step
+    assert len(mixer.calls) == 0        # mixer never invoked
+    assert mixer.probe_calls == 0       # probe never consulted
+    # And the gate stays untouched: no state drift while zero-op is armed.
+    assert not getattr(runner, "_zero_op_state_touched", False)

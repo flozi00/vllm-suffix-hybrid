@@ -252,6 +252,9 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
              "steps": 0}
     interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
     profile = os.environ.get("SUFFIX_HYBRID_PROFILE", "").strip() == "1"
+    # Read ONCE at wrapper construction: the per-step zero-op check below is
+    # a single closed-over bool, no environ access in the hot path.
+    zero_op = os.environ.get("SUFFIX_HYBRID_ZERO_OP", "").strip() == "1"
     hook_times = {"absorb": [0.0, 0], "mix": [0.0, 0],
                   "write": [0.0, 0], "bcast": [0.0, 0]}
     sync_run = _sync_body(runner, mixer, group, probabilistic,
@@ -796,6 +799,19 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         # untouched: no CPU sync, no collectives, no state mutation inside a
         # captured region.
         if dummy_run or is_profile or skip_attn_for_dummy_run:
+            return native
+        # ZERO-OP ARM (p22): the armed hook does literally nothing per step —
+        # no state dict, no environ reads, no timers, no try/except. The
+        # log-archaeology residual (~2.7ms/step armed-vs-inert at 8% stall
+        # share, p16≈p17 within noise) is not explained by stall, per-step
+        # Python, fused-decode, FE or kernels; this arm bounds the residual
+        # BY ELIMINATION. If c1 recovers to ~baseline with ZERO_OP=1, the
+        # cost is in the per-step machinery and p17's frozen path must get
+        # cheaper; if it does NOT recover, the cost is the hook's mere
+        # presence (bound-method dispatch, torch dispatcher re-entry on the
+        # returned tensor, GC pressure) and the mix must move out of the
+        # per-step path entirely (engine patch, not wrapper).
+        if zero_op:
             return native
         try:
             if (not st["fallback"]
