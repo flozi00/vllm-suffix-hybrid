@@ -380,6 +380,10 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         for rid in [r for r in mirror if r not in live]:
             del mirror[rid]
             st["gate"].pop(rid, None)   # gone request: drop gate state too
+            # p24: a pending verdict for a gone request can never resolve
+            # (its feedback buffers left the batch with it) — drop it so
+            # pending_wins cannot grow unboundedly under churn.
+            st["pending_wins"].pop(rid, None)
         cuda = torch.cuda.is_available()
         if cuda:
             # Order the side-stream copies behind the postprocess producer
