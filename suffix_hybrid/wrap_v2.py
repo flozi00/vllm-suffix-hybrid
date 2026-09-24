@@ -529,7 +529,10 @@ def _patch_get_draft_tokens(runner, widths_table):
                 rows.append(real_rows[i][:width])
             else:
                 rows.append([-1] * width)
-        if verify_on and verify_budget[0] > 0 and any(rows):
+        # Fire on EVERY step while budget lasts (wake #13): all-empty rows
+        # are the signature of a dead widths source — gating on
+        # any(rows) silently swallowed exactly that failure mode.
+        if verify_on and verify_budget[0] > 0 and self.req_ids:
             verify_budget[0] -= 1
             print(f"suffix_hybrid VERIFYTRACE rid0={self.req_ids[0]!r} "
                   f"widths={[len(r) for r in rows]} nreqs={len(rows)} "
@@ -1297,8 +1300,15 @@ def install_v2():
                 speculator.propose = wrapped
                 # Ragged per-row widths: patch the CPU-side DraftTokenIds
                 # the scheduler consumes (miss rows -> plain 1x decode).
+                # widths_table is a PyO3 @getter building a FRESH dict on
+                # every attribute access — binding its value directly
+                # freezes an empty snapshot at install time and the ragged
+                # path goes permanently dead (the wake-#13 root cause of
+                # silent pad_spec_decode scheduling). Bind the accessor.
+                proposer = getattr(wrapped, "_suffix_proposer", None)
                 patched = _patch_get_draft_tokens(
-                    self, wrapped._suffix_proposer.widths_table)
+                    self, (lambda: proposer.widths_table)
+                    if proposer is not None else None)
                 v2 = _wrap_rejection_sampler(self, wrapped, k)
                 print(f"suffix_hybrid v2 SUFFIX-ONLY installed "
                       f"speculator={cls_name} k={k} tp={group.world_size} "
