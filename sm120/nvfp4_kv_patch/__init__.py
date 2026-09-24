@@ -117,6 +117,38 @@ def allow_drift() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# NVFP4 KV layout contract (reference implementations matching the pinned
+# vLLM 0.30.0 store kernel, csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu,
+# and vllm/utils/torch_utils.py:547 nvfp4_kv_cache_full_dim). Kept here so
+# the CPU test suite can byte-verify the layout FI's FA2 kernels assume:
+#   * elements are e2m1 packed fp4x2 (hs/2 bytes per head per token),
+#   * scales are e4m3 with ONE byte per 16-element block within a head
+#     (hs/16 bytes) — block size 16, NOT 32,
+#   * page = [K_data | K_scale | V_data | V_scale] (per KV side, contiguous),
+#   * K scales linear (t,s); V scales 4-token swizzled (the trtllm
+#     swizzle in swizzle_scale_offset) — FI prefill.cuh de-swizzles with the
+#     exact inverse behind FLASHINFER_PAGED_V_SF_DESWIZZLE.
+# ---------------------------------------------------------------------------
+
+SF_VEC_SIZE = 16  # fp4 elements per e4m3 scale block (kernel CVT_FP4_SF_VEC_SIZE)
+
+
+def nvfp4_full_dim(head_size: int) -> int:
+    """packed last dim = fp4 data (hs/2B) + e4m3 scales (hs/16B)."""
+    if head_size % 16:
+        raise ValueError("head_size must be divisible by 16 for NVFP4 KV")
+    return head_size // 2 + head_size // 16
+
+
+def swizzle_scale_offset(t: int, s: int, scale_dim: int) -> int:
+    """V-SF store swizzle (nvfp4_kv_cache_kernels.cu:42-48)."""
+    s_group = scale_dim // 4
+    swizzled_t = (t // 4) * 4 + (s // s_group)
+    swizzled_s = (s % s_group) * 4 + (t % 4)
+    return swizzled_t * scale_dim + swizzled_s
+
+
+# ---------------------------------------------------------------------------
 # FlashInfer header/codegen probe. All overlay header patches (01-03) are
 # subsumed by 0.6.18.post1; this proves it on the *installed* package instead
 # of overwriting it. Takes the four feature files so it runs on CPU against
