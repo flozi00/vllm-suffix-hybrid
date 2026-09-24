@@ -418,6 +418,14 @@ def _patch_get_draft_tokens(runner, widths_table):
     if handler is None:
         return False
 
+    # Verify-side TRACE (wake #12): publish exactly what the rejection
+    # sampler will consume, from inside the engine process. Closes the
+    # last gap between "drafts provably correct" (adapter TRACE 8/8) and
+    # "engine accepts 0 of them" — the widths/rows the VERIFY call sees.
+    verify_on = os.environ.get("SUFFIX_HYBRID_TRACE_VERIFY", "").strip() != ""
+    verify_budget = [int(os.environ.get("SUFFIX_HYBRID_TRACE_VERIFY_MAX",
+                                        "12") or 12)]
+
     def get_draft_tokens(self):
         from vllm.v1.outputs import DraftTokenIds
         if self.draft_tokens_np is not None:
@@ -438,6 +446,12 @@ def _patch_get_draft_tokens(runner, widths_table):
                 rows.append(real_rows[i][:width])
             else:
                 rows.append([-1] * width)
+        if verify_on and verify_budget[0] > 0 and any(rows):
+            verify_budget[0] -= 1
+            print(f"suffix_hybrid VERIFYTRACE rid0={self.req_ids[0]!r} "
+                  f"widths={[len(r) for r in rows]} nreqs={len(rows)} "
+                  f"ndraft={self.num_draft_tokens}", file=sys.stderr,
+                  flush=True)
         return DraftTokenIds(self.req_ids, rows)
 
     import types
