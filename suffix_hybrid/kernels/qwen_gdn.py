@@ -302,6 +302,11 @@ def install_prebuilt(native, H, HV, K, act, device=None) -> int:
     if n == 0:
         raise RuntimeError(f"K-GDN1 manifest has no cubins for H={H} HV={HV} K={K} "
                            f"act={act}")
+    # Startup self-check: every installed cubin must load through the CUDA
+    # driver here (driver/toolchain skew = clear error now, not a tileiras
+    # JIT attempt on the first launch).
+    native.cubin_store_driver_check(
+        torch.cuda.current_device() if device is None else device)
     done[key] = n
     _log(f"K-GDN1 prebuilt: {n} cubins installed ({gpu}, tileiras "
          f"{man['tileiras_version'].splitlines()[-1] if man['tileiras_version'] else '?'}, "

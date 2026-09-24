@@ -890,12 +890,53 @@ mod device {
                     qk_scale_log2,
                     v_scale,
                     stream_ptr,
+                    false,
                 )
+                .map(|_| ())
                 .map_err(|e| PyRuntimeError::new_err(format!("K2-NVFP4 launch failed: {e}")))
             })
         })
     }
 
+    // SAFETY contract of `tensors!` (borrow_raw_parts): every (ptr, shape,
+    // strides) is either a validated live torch tensor re-expressed over the
+    // same bytes (launch; the 16-rounded leading dims are bounds only — the
+    // grid indexes real rows exclusively), or metadata that is never
+    // dereferenced (specialize / key emulation touch no device memory).
+    macro_rules! tensors {
+        ($pm:expr, $mm:expr, $ord:expr) => {{
+            macro_rules! t {
+                ($ty:ty, $m:expr) => {
+                    unsafe {
+                        Tensor::<$ty>::borrow_raw_parts(
+                            $m.ptr,
+                            $ord,
+                            i32s(&$m.shape),
+                            i32s(&$m.strides),
+                        )
+                    }
+                };
+            }
+            (
+                t!(bf16, $pm[0]),
+                t!(f4e2m1fnx2, $pm[1]),
+                t!(f8e4m3fn, $pm[2]),
+                t!(f4e2m1fnx2, $pm[3]),
+                t!(f8e4m3fn, $pm[4]),
+                t!(i32, $pm[5]),
+                t!(i32, $pm[6]),
+                t!(i32, $pm[7]),
+                t!(bf16, $pm[8]),
+                t!(f32, $pm[9]),
+                t!(bf16, $mm[0]),
+            )
+        }};
+    }
+
+    /// Launch, or (`specialize`) resolve the EXACT cutile L2 keys this launch
+    /// would look up — through the same op construction, via the generated
+    /// launcher's own `specialize_on` (no compile, no launch; syncs the
+    /// stream, so never under graph capture).
     #[allow(clippy::too_many_arguments)]
     fn launch(
         s: &Served,
@@ -906,7 +947,8 @@ mod device {
         qk_scale_log2: f32,
         v_scale: f32,
         stream_ptr: usize,
-    ) -> Result<(), String> {
+        specialize: bool,
+    ) -> Result<Option<(String, String)>, String> {
         let device = device(ord)?;
         // SAFETY: stream_ptr is torch's live current stream on this device;
         // borrowed (never destroyed by us).
@@ -914,29 +956,7 @@ mod device {
             unsafe { Stream::borrow_raw(stream_ptr as *mut std::ffi::c_void, &device) };
         let pm = partial_layout(s, p, live, ptrs);
         let mm = merge_layout(s, p, live, ptrs);
-        // SAFETY (borrow_raw_parts): every (ptr, shape, strides) below is a
-        // validated live torch tensor re-expressed over the same bytes; the
-        // 16-rounded leading dims are bounds only — the grid indexes real
-        // rows exclusively. torch keeps the memory alive past these
-        // stream-ordered launches.
-        macro_rules! t {
-            ($ty:ty, $m:expr) => {
-                unsafe {
-                    Tensor::<$ty>::borrow_raw_parts($m.ptr, ord, i32s(&$m.shape), i32s(&$m.strides))
-                }
-            };
-        }
-        let q5 = t!(bf16, pm[0]);
-        let kd4 = t!(f4e2m1fnx2, pm[1]);
-        let ks4 = t!(f8e4m3fn, pm[2]);
-        let vd4 = t!(f4e2m1fnx2, pm[3]);
-        let vs6 = t!(f8e4m3fn, pm[4]);
-        let bt1 = t!(i32, pm[5]);
-        let mt1 = t!(i32, pm[6]);
-        let sl1 = t!(i32, pm[7]);
-        let op4 = t!(bf16, pm[8]);
-        let lp3 = t!(f32, pm[9]);
-        let out5 = t!(bf16, mm[0]);
+        let (q5, kd4, ks4, vd4, vs6, bt1, mt1, sl1, op4, lp3, out5) = tensors!(pm, mm, ord);
         // SAFETY (unsafe entries): the partial kernel writes o_part/lse_part
         // only at its own [r, s] slot (grid == (rows, ns)); the merge writes
         // only out rows of its own (b, qt, h, dc) tile. No two CTAs alias.
@@ -966,12 +986,206 @@ mod device {
             unsafe { nvfp4_attn_merge(&out5, &op4, &lp3, s.hkv as i32, p.nqt as i32, v_scale) }
                 .generics(merge_generics(p))
                 .grid((p.rows as u32, (s.d / p.dt) as u32, 1));
+        if specialize {
+            let kp = partial
+                .specialize_on(&stream)
+                .map_err(|e| format!("partial specialize: {e:?}"))?
+                .l2_cache_key()
+                .map_err(|e| format!("partial key: {e:?}"))?;
+            let km = merge
+                .specialize_on(&stream)
+                .map_err(|e| format!("merge specialize: {e:?}"))?
+                .l2_cache_key()
+                .map_err(|e| format!("merge key: {e:?}"))?;
+            return Ok(Some((kp, km)));
+        }
         // SAFETY (async_on): outputs are torch-owned and only read by later
         // work on the same stream; the merge is ordered after the partial on
-        // that stream; no host access before a torch sync.
-        unsafe { partial.async_on(&stream) }.map_err(|e| format!("partial: {e:?}"))?;
-        unsafe { merge.async_on(&stream) }.map_err(|e| format!("merge: {e:?}"))?;
-        Ok(())
+        // that stream; no host access before a torch sync. A cutile fallthrough
+        // to tileiras (absent on pods) is reported as OUR classified error.
+        let before = crate::cubin_store::jit_snapshot();
+        unsafe { partial.async_on(&stream) }.map_err(|e| {
+            crate::cubin_store::explain_launch_failure("K2-NVFP4 partial", before, format!("{e:?}"))
+        })?;
+        let before = crate::cubin_store::jit_snapshot();
+        unsafe { merge.async_on(&stream) }.map_err(|e| {
+            crate::cubin_store::explain_launch_failure("K2-NVFP4 merge", before, format!("{e:?}"))
+        })?;
+        Ok(None)
+    }
+
+    /// CPU re-derivation of the launch key the way the generated launcher +
+    /// `Specialization::l2_cache_key` do it (cutile tile_kernel.rs:284-318,
+    /// 330-360): specs straight from real cutile `Tensor` objects (not our
+    /// `specs_of`), integer-scalar hints via `DivHint::from_value`, default
+    /// `CompileOptions`, `KernelCompiler::l2_cache_key`. Independent of the
+    /// install path (`variant_bytecode` + our own `l2_key` call).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn emulated_launch_key(
+        s: &Served,
+        ns: usize,
+        kernel: &str,
+        gpu_name: &str,
+    ) -> Result<String, String> {
+        let p = variant_plan(s, ns)?;
+        let live = rep_live(s);
+        // any 16-aligned address; never dereferenced
+        let a = 0x7f00_0000_0000u64;
+        let x = Ptrs {
+            q: a,
+            out: a,
+            kd: a,
+            ks: a,
+            vd: a,
+            vs: a,
+            bt: a,
+            meta: a,
+            sl: a,
+            op: a,
+            lp: a,
+        };
+        let pm = partial_layout(s, &p, &live, &x);
+        let mm = merge_layout(s, &p, &live, &x);
+        let (q5, kd4, ks4, vd4, vs6, bt1, mt1, sl1, op4, lp3, out5) = tensors!(pm, mm, 0);
+        let (names, specs, generics, hints): (
+            Vec<&str>,
+            Vec<SpecializationBits>,
+            _,
+            Vec<(&str, DivHint)>,
+        ) = match kernel {
+            "nvfp4_attn_partial" => (
+                vec![
+                    "q",
+                    "k_data",
+                    "k_sf",
+                    "v_data",
+                    "v_sf",
+                    "block_table",
+                    "meta",
+                    "seq_lens",
+                    "o_part",
+                    "lse_part",
+                ],
+                vec![
+                    q5.spec().clone(),
+                    kd4.spec().clone(),
+                    ks4.spec().clone(),
+                    vd4.spec().clone(),
+                    vs6.spec().clone(),
+                    bt1.spec().clone(),
+                    mt1.spec().clone(),
+                    sl1.spec().clone(),
+                    op4.spec().clone(),
+                    lp3.spec().clone(),
+                ],
+                partial_generics(s, &p),
+                vec![
+                    ("hkv", DivHint::from_value(s.hkv as i32)),
+                    ("nqt", DivHint::from_value(p.nqt as i32)),
+                    ("q_len", DivHint::from_value(s.q_len as i32)),
+                    ("page_size", DivHint::from_value(s.page as i32)),
+                    ("window_left", DivHint::from_value(s.window_left)),
+                ],
+            ),
+            "nvfp4_attn_merge" => (
+                vec!["out", "o_part", "lse_part"],
+                vec![out5.spec().clone(), op4.spec().clone(), lp3.spec().clone()],
+                merge_generics(&p),
+                vec![
+                    ("hkv", DivHint::from_value(s.hkv as i32)),
+                    ("nqt", DivHint::from_value(p.nqt as i32)),
+                ],
+            ),
+            other => return Err(format!("unknown kernel {other}")),
+        };
+        let strides: Vec<Vec<i32>> = specs
+            .iter()
+            .map(|sp| {
+                sp.stride_one
+                    .iter()
+                    .map(|&one| if one { 1 } else { -1 })
+                    .collect()
+            })
+            .collect();
+        let sref: Vec<(&str, &[i32])> = names
+            .iter()
+            .zip(&strides)
+            .map(|(n, v)| (*n, v.as_slice()))
+            .collect();
+        let pref: Vec<(&str, SpecializationBits)> =
+            names.iter().zip(specs).map(|(n, v)| (*n, v)).collect();
+        KernelCompiler::new(
+            nvfp4_attn_kernels::__module_ast_self,
+            "nvfp4_attn_kernels",
+            kernel,
+        )
+        .target(gpu_name)
+        .generics(generics)
+        .strides(&sref)
+        .spec_args(&pref)
+        .scalar_hints(&hints)
+        .options(cutile::cutile_compiler::hints::CompileOptions::default())
+        .l2_cache_key()
+        .map_err(|e| format!("emulated launch key: {e}"))
+    }
+
+    /// Startup self-check (one real lookup per kernel of a variant): resolve
+    /// the launch keys through cutile's own launcher (`specialize_on`) with
+    /// tensors borrowing `scratch_ptr` (metadata only), require both in the
+    /// shared store, then load every installed cubin through the driver.
+    /// Returns (partial_key, merge_key, cubins_loaded). Eager only.
+    #[pyfunction]
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvfp4_attn_selfcheck(
+        py: Python<'_>,
+        d: usize,
+        hq: usize,
+        hkv: usize,
+        page: usize,
+        q_len: usize,
+        window_left: i32,
+        ns: usize,
+        device_ordinal: usize,
+        scratch_ptr: u64,
+        stream_ptr: usize,
+    ) -> PyResult<(String, String, usize)> {
+        if scratch_ptr % 16 != 0 {
+            return Err(PyValueError::new_err("scratch_ptr must be 16-byte aligned"));
+        }
+        let s = served(d, hq, hkv, page, q_len, window_left);
+        let p = variant_plan(&s, ns).map_err(PyValueError::new_err)?;
+        let x = Ptrs {
+            q: scratch_ptr,
+            out: scratch_ptr,
+            kd: scratch_ptr,
+            ks: scratch_ptr,
+            vd: scratch_ptr,
+            vs: scratch_ptr,
+            bt: scratch_ptr,
+            meta: scratch_ptr,
+            sl: scratch_ptr,
+            op: scratch_ptr,
+            lp: scratch_ptr,
+        };
+        py.detach(move || {
+            crate::guard_py("nvfp4_attn_selfcheck", move || {
+                let run = || -> Result<(String, String, usize), String> {
+                    let (kp, km) = launch(&s, &p, &rep_live(&s), &x, device_ordinal, 1.0, 1.0, stream_ptr, true)?
+                        .ok_or("specialize returned no keys")?;
+                    for (k, name) in [(&kp, "nvfp4_attn_partial"), (&km, "nvfp4_attn_merge")] {
+                        if !crate::cubin_store::contains(k) {
+                            return Err(format!(
+                                "K2-NVFP4 self-check: launch key {k} for {name} {s:?} ns={ns} is NOT \
+                                 in the prebuilt store (install/launch key drift) — refusing to serve"
+                            ));
+                        }
+                    }
+                    let n = crate::cubin_store::driver_load_all(device_ordinal)?;
+                    Ok((kp, km, n))
+                };
+                run().map_err(PyRuntimeError::new_err)
+            })
+        })
     }
 
     // =====================================================================
@@ -1122,6 +1336,40 @@ mod device {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The key cutile's launcher will look up (re-derived the launcher's
+        /// way from real cutile Tensors) equals the key we install under, for
+        /// EVERY variant the CI prebuild ships (scripts/nvfp4_attn_prebuild.py
+        /// SERVED, batch 1..256 split sets). No GPU/driver/tileiras needed.
+        #[test]
+        fn launch_key_equals_installed_key_for_every_served_variant() {
+            if std::env::var_os("CUTILE_BYTECODE_VERSION").is_none() {
+                std::env::set_var("CUTILE_BYTECODE_VERSION", "13.3");
+            }
+            let mut n = 0;
+            for (d, hq, hkv, page, q_lens, wl) in [
+                (512, 16, 2, 16, (1..=9).collect::<Vec<_>>(), -1),
+                (256, 16, 8, 16, (1..=9).collect(), 1023),
+                (512, 16, 2, 64, vec![1, 9], -1),
+                (256, 16, 8, 64, vec![1, 9], 1023),
+                (256, 24, 4, 2816, vec![1], -1),
+                (256, 24, 4, 64, vec![1], -1),
+            ] {
+                for q_len in q_lens {
+                    let s = served(d, hq, hkv, page, q_len, wl);
+                    for ns in split_set(q_len, hq, hkv, d, page, 188, 256).unwrap() {
+                        for kernel in KERNELS {
+                            let (_, _, installed) =
+                                variant_bytecode(&s, ns, kernel, "sm_120").unwrap();
+                            let launch = emulated_launch_key(&s, ns, kernel, "sm_120").unwrap();
+                            assert_eq!(launch, installed, "{kernel} {s:?} ns={ns}");
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(n, 336);
+        }
 
         /// Both kernels -> Tile IR -> bytecode for sm_120 at every served
         /// variant family (gemma-4 hd512 16/2 + SWA hd256 16/8 with window,

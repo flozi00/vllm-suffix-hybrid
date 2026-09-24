@@ -354,6 +354,21 @@ fn nvfp4_attn_plan(
     ]))
 }
 
+/// Startup self-check shared by every prebuilt-cubin lane: load each
+/// installed cubin through the CUDA driver; a toolchain/driver skew surfaces
+/// here with the driver's error instead of as a tileiras JIT attempt on the
+/// first launch. Returns the number of cubins loaded.
+#[cfg(any(feature = "qwen-gdn-kernels", feature = "nvfp4-attn-kernels"))]
+#[pyfunction]
+fn cubin_store_driver_check(py: Python<'_>, device_ordinal: usize) -> PyResult<usize> {
+    py.detach(|| {
+        guard_py("cubin_store_driver_check", || {
+            cubin_store::driver_load_all(device_ordinal)
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+        })
+    })
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SuffixCache>()?;
@@ -408,11 +423,14 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
             wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_gpu_name, m)?,
             wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_install_cubin, m)?,
             wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_allow_jit, m)?,
+            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_selfcheck, m)?,
         ] {
             m.add_function(f)?;
         }
         m.add_function(wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_jit_stats, m)?)?;
     }
+    #[cfg(any(feature = "qwen-gdn-kernels", feature = "nvfp4-attn-kernels"))]
+    m.add_function(wrap_pyfunction!(cubin_store_driver_check, m)?)?;
     m.add("VERSION", "0.2.0-rust-v1")?;
     Ok(())
 }

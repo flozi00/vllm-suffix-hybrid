@@ -467,7 +467,12 @@ mod device {
         .generics(generics);
         // SAFETY (async_on): outputs are torch-owned and only read by later
         // work on the same stream; no host access before a torch sync.
-        unsafe { op.async_on(&stream) }.map_err(|e| format!("{e:?}"))?;
+        // A cutile fallthrough to tileiras (absent on pods) becomes OUR
+        // classified error (store miss vs driver-rejected cubin).
+        let before = crate::cubin_store::jit_snapshot();
+        unsafe { op.async_on(&stream) }.map_err(|e| {
+            crate::cubin_store::explain_launch_failure("K-GDN1", before, format!("{e:?}"))
+        })?;
         Ok(())
     }
 

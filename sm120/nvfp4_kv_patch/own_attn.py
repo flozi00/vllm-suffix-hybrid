@@ -156,9 +156,34 @@ def prepare(nat, served, q_lens) -> str:
         return "JIT allowed (dev only)"
     import torch
 
-    gpu = nat.nvfp4_attn_gpu_name(torch.cuda.current_device())
+    dev = torch.cuda.current_device()
+    gpu = nat.nvfp4_attn_gpu_name(dev)
     n = install_cubins(nat, served, q_lens, gpu)
-    return f"{n} prebuilt {gpu} cubins installed, JIT off"
+    selfcheck(nat, served, max(q_lens), dev)
+    return f"{n} prebuilt {gpu} cubins installed + self-checked, JIT off"
+
+
+_CHECKED: set = set()
+
+
+def selfcheck(nat, served, q_len, device) -> None:
+    """One REAL lookup per kernel before serving: resolve the launch keys
+    through cutile's own launcher (specialize_on, metadata only) and require
+    them in the store, then load every installed cubin through the driver.
+    Raises with the specific cause (key drift vs driver rejection)."""
+    import torch
+
+    d, hq, hkv, page, wl = served
+    ns = nat.nvfp4_attn_split_set(d, hq, hkv, page, q_len, num_sms(device), 1)[0]
+    key = (served, q_len, ns)
+    if key in _CHECKED:
+        return
+    scratch = torch.empty(4096, dtype=torch.uint8, device=device)
+    nat.nvfp4_attn_selfcheck(d, hq, hkv, page, q_len, wl, ns, device,
+                             scratch.data_ptr(),
+                             torch.cuda.current_stream(device).cuda_stream)
+    torch.cuda.synchronize(device)
+    _CHECKED.add(key)
 
 
 def _same_div(a: int, b: int) -> bool:
