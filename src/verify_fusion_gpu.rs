@@ -54,7 +54,11 @@
 //! route into another path.
 
 #[cfg(feature = "cutile-kernels")]
+pub use device::*;
+
+#[cfg(feature = "cutile-kernels")]
 mod device {
+    use cutile::cuda_core::Stream;
     use cutile::prelude::*;
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
@@ -85,24 +89,24 @@ mod device {
 
             let cu_part = cu_num_draft_tokens.partition(const_shape![1]);
             // Inclusive cumsum: this request owns rows [cu[b-1], cu[b]).
-            let start_i64: i64 = if b == 0i32 {
-                0i64
+            // Tile IR lowers neither scalar i32<->i64 casts nor scalar
+            // i64->i32 conversion: narrow cu values as TILES (trunci), then
+            // clamp in i32 (host guarantees num_tokens < 2^31).
+            let start: i32 = if b == 0i32 {
+                0i32
             } else {
                 let prev: Tile<i64, { [1] }> = cu_part.load([b - 1i32]);
+                let prev: Tile<i32, { [1] }> = trunci(prev, overflow::NoSignedWrap);
                 tile_to_scalar(prev.reshape(const_shape![]))
             };
-            let end_i64: i64 = {
+            let mut end: i32 = {
                 let cur: Tile<i64, { [1] }> = cu_part.load([b]);
-                let cur: i64 = tile_to_scalar(cur.reshape(const_shape![]));
-                if cur > (num_tokens as i64) {
-                    num_tokens as i64
-                } else {
-                    cur
-                }
+                let cur: Tile<i32, { [1] }> = trunci(cur, overflow::NoSignedWrap);
+                tile_to_scalar(cur.reshape(const_shape![]))
             };
-
-            let start: i32 = convert_scalar(start_i64);
-            let end: i32 = convert_scalar(end_i64);
+            if end > num_tokens {
+                end = num_tokens;
+            }
             let mut owned: i32 = end - start;
             if owned < 0i32 {
                 owned = 0i32;
@@ -117,21 +121,28 @@ mod device {
             // Keep-while-match prefix over this request's draft slots. A
             // padded (-1) draft mismatches and stops the run, exactly like
             // the CPU oracle and rejection_sampler.py:761.
+            // (Tile IR lowers no short-circuit `&&`: bounded `for` + flags.)
             let mut count: i32 = 0i32;
-            let mut p: i32 = 0i32;
             let mut accept: i32 = 1i32;
-            while p < owned && accept == 1i32 {
-                let idx: i32 = start + p;
-                let d_tile: Tile<i64, { [1] }> = draft_part.load([idx]);
-                let d: i64 = tile_to_scalar(d_tile.reshape(const_shape![]));
-                let a_tile: Tile<i64, { [1] }> = argmax_part.load([idx]);
-                let a: i64 = tile_to_scalar(a_tile.reshape(const_shape![]));
-                if d >= 0i64 && d == a {
-                    count += 1i32;
-                } else {
-                    accept = 0i32;
+            for p in 0i32..owned {
+                if accept == 1i32 {
+                    let idx: i32 = start + p;
+                    let d_tile: Tile<i64, { [1] }> = draft_part.load([idx]);
+                    let d: i64 = tile_to_scalar(d_tile.reshape(const_shape![]));
+                    let a_tile: Tile<i64, { [1] }> = argmax_part.load([idx]);
+                    let a: i64 = tile_to_scalar(a_tile.reshape(const_shape![]));
+                    let mut hit: i32 = 0i32;
+                    if d >= 0i64 {
+                        if d == a {
+                            hit = 1i32;
+                        }
+                    }
+                    if hit == 1i32 {
+                        count = count + 1i32;
+                    } else {
+                        accept = 0i32;
+                    }
                 }
-                p += 1i32;
             }
 
             // accept_count[b]
@@ -142,8 +153,7 @@ mod device {
             // emit_mask[b, 0..WIDTH] = 1 for positions 0..=count, else 0.
             let offs: Tile<i32, { [WIDTH] }> = iota(const_shape![WIDTH]);
             let offs: Tile<i32, { [1, WIDTH] }> = offs.reshape(const_shape![1, WIDTH]);
-            let thresh: Tile<i32, { [1, WIDTH] }> =
-                scalar_to_tile(count).broadcast(const_shape![1, WIDTH]);
+            let thresh: Tile<i32, { [1, WIDTH] }> = broadcast_scalar(count, const_shape![1, WIDTH]);
             let keep: Tile<bool, { [1, WIDTH] }> = le_tile(offs, thresh);
             let one: Tile<i32, { [1, WIDTH] }> = constant(1i32, const_shape![1, WIDTH]);
             let zero: Tile<i32, { [1, WIDTH] }> = constant(0i32, const_shape![1, WIDTH]);
@@ -300,7 +310,7 @@ mod device {
         }
 
         // All Python interaction ends here: the launch runs GIL-free.
-        py.allow_threads(|| {
+        py.detach(|| {
             crate::guard_py("rejection_greedy_accept_cuda", move || {
                 run_kernel(
                     d_info.data_ptr,
@@ -334,7 +344,7 @@ mod device {
         device_ordinal: usize,
         max_spec_len: usize,
         stream_ptr: usize,
-    ) -> Result<(), cutile::Error> {
+    ) -> Result<(), String> {
         // Fail loud on cu inconsistency before touching the GPU: cu must be
         // a monotone inclusive cumsum bounded by num_tokens. The kernel
         // additionally clamps defensively, but a malformed cu is a caller
@@ -342,7 +352,7 @@ mod device {
         // (Validation of VALUES needs device reads; here we validate shape
         // bounds only — value validation is the identity-oracle's job.)
 
-        let device = Device::new(device_ordinal)?;
+        let device = Device::new(device_ordinal).map_err(|e| format!("{e:?}"))?;
         // Borrow torch's current stream: all work lands on the caller's
         // stream, so downstream torch ops observe the writes without an
         // extra event/sync.
@@ -356,10 +366,10 @@ mod device {
         // SAFETY (borrow_raw_parts): each dptr points at `shape` contiguous
         // elements on `device_ordinal` that stay alive and unmutated-by-
         // third-parties until the launched kernel completes on `stream`
-        // below (sync_on); outputs are written only by this kernel.
+        // below (stream-ordered async_on); outputs are written only by this kernel.
         let draft = unsafe {
             Tensor::<i64>::borrow_raw_parts(
-                cuda_core::sys::CUdeviceptr(draft_ptr as u64),
+                draft_ptr as u64,
                 device_ordinal,
                 vec![num_tokens_i32],
                 vec![1],
@@ -367,7 +377,7 @@ mod device {
         };
         let argmax = unsafe {
             Tensor::<i64>::borrow_raw_parts(
-                cuda_core::sys::CUdeviceptr(argmax_ptr as u64),
+                argmax_ptr as u64,
                 device_ordinal,
                 vec![num_tokens_i32],
                 vec![1],
@@ -375,7 +385,7 @@ mod device {
         };
         let cu = unsafe {
             Tensor::<i64>::borrow_raw_parts(
-                cuda_core::sys::CUdeviceptr(cu_ptr as u64),
+                cu_ptr as u64,
                 device_ordinal,
                 vec![batch as i32],
                 vec![1],
@@ -383,7 +393,7 @@ mod device {
         };
         let count = unsafe {
             Tensor::<i32>::borrow_raw_parts(
-                cuda_core::sys::CUdeviceptr(count_ptr as u64),
+                count_ptr as u64,
                 device_ordinal,
                 vec![batch as i32],
                 vec![1],
@@ -391,7 +401,7 @@ mod device {
         };
         let mask = unsafe {
             Tensor::<i32>::borrow_raw_parts(
-                cuda_core::sys::CUdeviceptr(mask_ptr as u64),
+                mask_ptr as u64,
                 device_ordinal,
                 vec![batch as i32, width_i32],
                 vec![width_i32, 1],
@@ -402,11 +412,11 @@ mod device {
         let argmax: Arc<Tensor<i64>> = Arc::new(argmax);
         let cu: Arc<Tensor<i64>> = Arc::new(cu);
         let count_part = count.partition([1]);
-        let mask_part = mask.partition([1, width_i32]);
+        let mask_part = mask.partition([1, max_spec_len + 1]);
 
         // Instantiate WIDTH = k + 1 (the only const generic); grid is
         // inferred from the two output partitions -> (batch, 1, 1).
-        rejection_greedy_accept_k1(
+        let op = rejection_greedy_accept_k1(
             draft,
             argmax,
             cu,
@@ -415,8 +425,45 @@ mod device {
             num_tokens_i32,
             k_i32,
         )
-        .generics(vec![width_i32.to_string()])
-        .sync_on(&stream)?;
+        .generics(vec![width_i32.to_string()]);
+        // Stream-ordered, capture-safe launch: `sync_on` would block the host
+        // on cuStreamSynchronize after every launch (cuda-async-0.3.1
+        // device_operation.rs:428-436) and is illegal inside CUDA-graph
+        // capture. SAFETY: all buffers are torch-owned and outlive the
+        // stream-ordered kernel; torch readers are ordered on the same stream.
+        unsafe { op.async_on(&stream) }.map_err(|e| format!("{e:?}"))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::verify_fusion_greedy;
+        use cutile::compile_api::KernelCompiler;
+
+        /// K1 lowers to Tile IR bytecode for sm_120 (k = 8). No GPU/driver.
+        #[test]
+        fn k1_lowers_to_tile_ir_for_sm120() {
+            if std::env::var_os("CUTILE_BYTECODE_VERSION").is_none() {
+                std::env::set_var("CUTILE_BYTECODE_VERSION", "13.2");
+            }
+            let art = KernelCompiler::new(
+                verify_fusion_greedy::__module_ast_self,
+                "verify_fusion_greedy",
+                "rejection_greedy_accept_k1",
+            )
+            .generics(vec!["9".into()])
+            .strides(&[
+                ("draft_token_ids", &[1]),
+                ("target_argmax", &[1]),
+                ("cu_num_draft_tokens", &[1]),
+                ("accept_count", &[1]),
+                ("emit_mask", &[-1, 1]),
+            ])
+            .target("sm_120")
+            .compile()
+            .expect("K1 must lower to Tile IR");
+            let bc = art.bytecode().expect("bytecode");
+            assert_eq!(&bc[..8], &[0x7F, b'T', b'i', b'l', b'e', b'I', b'R', 0x00]);
+        }
     }
 }
