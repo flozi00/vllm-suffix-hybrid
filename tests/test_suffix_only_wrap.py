@@ -34,7 +34,7 @@ def suffix_env(monkeypatch):
                 "SUFFIX_HYBRID_UNIFORM_K", "SUFFIX_HYBRID_TRACE",
                 "SUFFIX_HYBRID_TRACE_VERIFY", "SUFFIX_HYBRID_TRACE_VERIFY2",
                 "SUFFIX_HYBRID_SCHEDTRACE", "SUFFIX_HYBRID_LOG_INTERVAL",
-                "SUFFIX_HYBRID_ZERO_OP"):
+                "SUFFIX_HYBRID_ZERO_OP", "SUFFIX_HYBRID_W0_FASTPATH"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -268,3 +268,303 @@ def test_exception_retracts_widths(suffix_env):
         or all(w == 0 for w in proposer.widths_table.values())
     st = proposer.get_stats()
     assert st["steps"] == 2                  # the failed step never ran
+
+
+# ---------------------------------------------------------------------------
+# (g) W0 fast path: bit-for-bit publish equivalence across arms
+# ---------------------------------------------------------------------------
+
+def _arm_env(monkeypatch, fast, trace=None, interval=None):
+    """Env for one arm: W0_FASTPATH on/off (+ optional MTRACE knobs)."""
+    monkeypatch.setenv("SUFFIX_HYBRID_W0_FASTPATH", "1" if fast else "0")
+    if trace is not None:
+        monkeypatch.setenv("SUFFIX_HYBRID_TRACE", trace)
+    if interval is not None:
+        monkeypatch.setenv("SUFFIX_HYBRID_LOG_INTERVAL", str(interval))
+
+
+def _w0_runner():
+    """Runner for the W0 scenarios: 'a' (12 tokens) row 2, 'b' (unrelated,
+    6 tokens) row 3, replay request 'c' (SEQ_A[:10]) at row 1."""
+    runner, ats, totals = make_runner()
+    ats[1, :] = 0
+    ats[1, :10] = np.array(SEQ_A[:10], dtype=np.int32)
+    totals.t[1] = 10
+    runner.req_states.req_id_to_index["c"] = 1
+    return runner, ats, totals
+
+
+def _w0_scenario(wrapped, runner):
+    """Live/depart/replay script exercising stock steps, a fast step, a
+    departure and a repeat hit. Returns (outputs, widths snapshots)."""
+    outs, widths = [], []
+    for ids in (["a", "b"], ["a"], ["a"], [], ["c"], ["c"]):
+        o = propose(wrapped, runner, ids)
+        outs.append(o.tolist())
+        widths.append(dict(wrapped._suffix_proposer.widths_table))
+    return outs, widths
+
+
+def test_w0_fastpath_default_on_and_fires(suffix_env, monkeypatch):
+    # No env set at all: the arm must be armed by default (gate value 0
+    # disables), and the cache-empty steady steps must take the fast path.
+    monkeypatch.delenv("SUFFIX_HYBRID_W0_FASTPATH", raising=False)
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = wrap(runner)
+    assert wrapped._suffix_w0fp["enabled"] is True
+    _w0_scenario(wrapped, runner)
+    assert wrapped._suffix_w0fp["fast_steps"] >= 1
+    # The published [n,K] buffer stays correctly shaped.
+    assert spec.draft_tokens.shape == (NROWS, K)
+
+
+def test_w0_fastpath_off_reproduces_stock_widths_bit_for_bit(
+        suffix_env, monkeypatch):
+    # FASTPATH=0 is the stock arm (current behavior, pinned by the tests
+    # above): step-separated widths snapshots must equal the exact
+    # expected ragged publish -- miss/miss/miss/depart/hit/hit.
+    _arm_env(monkeypatch, fast=False)
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = wrap(runner)
+    outs, widths = _w0_scenario(wrapped, runner)
+    assert wrapped._suffix_w0fp["fast_steps"] == 0
+    # Widths semantics, step by step (stock arm):
+    assert widths[0] == {"a": 0, "b": 0}     # cold: both rows miss
+    assert widths[1] == {"a": 0}             # 'b' departed: width entry gone
+    assert widths[2] == {"a": 0}
+    assert widths[3] == {}                   # 'a' departed (ingested)
+    assert widths[4] == {"c": 2}              # repeat hit
+    assert widths[5] == {"c": 2}
+    # And the drafted continuation is the true suffix: SEQ_A[10:12] + pad
+    assert outs[4] == [[SEQ_A[10], SEQ_A[11], 0, 0]]
+
+
+def test_w0_fastpath_on_publishes_identical_widths_vs_slow(
+        suffix_env, monkeypatch):
+    # The fast arm must publish BIT-FOR-BIT the same draft rows and the
+    # same widths-table snapshots on every step as the stock arm.
+    results = {}
+    for arm, fast in (("slow", False), ("fast", True)):
+        _arm_env(monkeypatch, fast=fast)
+        runner, ats, totals = _w0_runner()
+        wrapped, spec = wrap(runner)
+        results[arm] = (wrapped,) + _w0_scenario(wrapped, runner)
+    slow_w, slow_outs, slow_widths = results["slow"]
+    fast_w, fast_outs, fast_widths = results["fast"]
+    assert fast_w._suffix_w0fp["fast_steps"] >= 1   # fast path actually fired
+    assert fast_outs == slow_outs                   # drafts bit-for-bit
+    assert fast_widths == slow_widths               # widths-table publication
+    # Proposal steps: it is fine for the two arms to differ (fast steps skip
+    # the Rust call); ingestion must not:
+    assert (fast_w._suffix_proposer.get_stats()["ingested"]
+            == slow_w._suffix_proposer.get_stats()["ingested"])
+
+
+# ---------------------------------------------------------------------------
+# (h) ingestion still happens when the fast path skips
+# ---------------------------------------------------------------------------
+
+def _growth_scenario(wrapped, runner, ats, totals):
+    """'a' grows 9 -> 12 tokens WHILE living through a fast step, then
+    departs (12 > 8 => ingestible); 'c' repeats its 10-token prefix."""
+    # step 1: cold cache, 'a' unknown to the Rust state -> stock call,
+    # mirror tracks 9 tokens.
+    propose(wrapped, runner, ["a"])
+    # step 2: 'a' appended 3 more tokens (engine wrote 9..11). Cache is
+    # still empty and 'a' is known -> fast step: the Rust call is skipped
+    # and its mirror goes STALE at 9 tokens.
+    ats[2, 9:12] = np.array(SEQ_A[9:12], dtype=np.int32)
+    totals.t[2] = 12
+    propose(wrapped, runner, ["a"])
+    # step 3: 'a' has departed; an empty batch forces the departure step.
+    propose(wrapped, runner, [])
+    # step 4: 'c' repeats 'a's 10-token prefix -> must hit the ingested
+    # history and draft the true continuation.
+    return propose(wrapped, runner, ["c"]).tolist()
+
+
+def test_ingestion_survives_fastpath_skips(suffix_env, monkeypatch):
+    # HARD GATE: the fast step (step 2) skips the Rust call, so 'a''s
+    # mirror is stale; the adapter must re-feed the missing prefix at
+    # departure so the gone-ingestion sees the FULL 12-token history
+    # (byte-identical to what the stock arm ingests) and the repeat
+    # request still hits.
+    _arm_env(monkeypatch, fast=True)
+    runner, ats, totals = _w0_runner()
+    ats[2, 9:] = 668
+    totals.t[2] = 9                      # 'a' starts with only 9 tokens
+    wrapped, spec = wrap(runner)
+    fp = wrapped._suffix_w0fp
+    out = _growth_scenario(wrapped, runner, ats, totals)
+    assert fp["fast_steps"] >= 1         # the skip actually happened
+    assert fp["ghosts_fed"] == 1         # departure re-fed the prefix
+    st = wrapped._suffix_proposer.get_stats()
+    assert st["ingested"] == 1           # full history ingested at departure
+    # IDENTICAL published draft to the stock arm on the same script:
+    _arm_env(monkeypatch, fast=False)
+    runner2, ats2, totals2 = _w0_runner()
+    ats2[2, 9:] = 668
+    totals2.t[2] = 9
+    wrapped2, spec2 = wrap(runner2)
+    out2 = _growth_scenario(wrapped2, runner2, ats2, totals2)
+    assert out == out2 == [[SEQ_A[10], SEQ_A[11], 0, 0]]
+    assert (wrapped2._suffix_proposer.get_stats()["ingested"]
+            == st["ingested"])
+    assert wrapped2._suffix_w0fp["ghosts_fed"] == 0   # stock needs no ghost
+
+
+# ---------------------------------------------------------------------------
+# (i) arm-M instrumentation: histogram accumulates + trace line at interval
+# ---------------------------------------------------------------------------
+
+def test_mtrace_histogram_accumulates_and_fires_at_interval(
+        suffix_env, monkeypatch, capsys):
+    # SUFFIX_HYBRID_TRACE arms the arm-M histogram (the existing trace
+    # env gate); SUFFIX_HYBRID_LOG_INTERVAL is its line cadence. After N
+    # steps the MTRACE line must carry the step / width-0 / batch-size
+    # counters and the split host-time histogram (t_d2h fence-inclusive,
+    # t_rust, t_upload) in microseconds -- the dossier decision-table
+    # discriminators -- all non-negative and step-accurate.
+    _arm_env(monkeypatch, fast=True, trace="1", interval=1)
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = wrap(runner)
+    _w0_scenario(wrapped, runner)
+    m = wrapped._suffix_mtrace
+    # Histogram counters saw every step (6 steps in the script; the fast
+    # step is counted too) with the split components populated.
+    assert m["steps"] == 6
+    assert m["steps_w0"] >= 1
+    assert m["batch"] == 6   # per-step scheduled batch size: 2+1+1+0+1+1
+    assert m["totals_us"] >= 0.0 and m["rust_us"] > 0.0
+    assert m["upload_us"] >= 0.0
+    assert m["fast_steps"] >= 1
+    lines = [ln for ln in capsys.readouterr().err.splitlines()
+             if ln.startswith("suffix_hybrid MTRACE ")]
+    assert lines, "MTRACE line must fire at LOG_INTERVAL cadence"
+    import json as _json
+    payload = _json.loads(lines[-1][len("suffix_hybrid MTRACE "):])
+    for key in ("steps", "steps_w0", "batch_tokens", "totals_us",
+                "rust_us", "upload_us"):
+        assert key in payload
+    # The final line reports the CURRENT histogram totals (interval=1).
+    assert payload["steps"] == m["steps"]
+    assert payload["steps_w0"] == m["steps_w0"]
+    assert payload["batch_tokens"] == m["batch"]
+
+
+# ---------------------------------------------------------------------------
+# (j) NIT-1: ghost records survive the exception path (no silent loss)
+# ---------------------------------------------------------------------------
+
+def _growth_setup(monkeypatch):
+    """Arm the fast path and drive 'a' through a stale-making fast step.
+
+    Returns everything needed to then depart 'a' as a dirty ghost."""
+    _arm_env(monkeypatch, fast=True)
+    runner, ats, totals = _w0_runner()
+    ats[2, 9:] = 668
+    totals.t[2] = 9
+    wrapped, spec = wrap(runner)
+    propose(wrapped, runner, ["a"])        # cold: stock, mirror tracks 9
+    ats[2, 9:12] = np.array(SEQ_A[9:12], dtype=np.int32)
+    totals.t[2] = 12
+    propose(wrapped, runner, ["a"])        # fast step: mirror goes stale
+    fp = wrapped._suffix_w0fp
+    assert fp["fast_steps"] >= 1
+    assert fp["seen"]["a"]["dirty"] is True
+    return wrapped, runner, ats, totals, fp
+
+
+def test_ghost_fingerprint_mismatch_counts_drop(suffix_env, monkeypatch):
+    # The engine reuses the departed row before the re-feed: the
+    # head4/tail1 fingerprint no longer matches, no provable recovery
+    # exists. The adapter must count it EXPLICITLY (ghosts_dropped) --
+    # never silently -- and the ledger entry must be gone.
+    wrapped, runner, ats, totals, fp = _growth_setup(monkeypatch)
+    # Corrupt the row's head: fingerprint check at departure must fail.
+    ats[2, :4] = 999
+    propose(wrapped, runner, [])            # 'a' departs -> ghost drop
+    # Explicitly counted, never silent; ledger entry consumed either way.
+    assert fp["ghosts_dropped"] == 1
+    assert fp["ghosts_fed"] == 0
+    assert fp["ghosts_pending"] == 0
+    assert "a" not in fp["seen"]
+
+
+def test_ghost_exception_restores_and_retries(suffix_env, monkeypatch):
+    # An exception DURING the ghost re-feed must not lose the ledger
+    # record: the except block re-inserts it and counts ghosts_pending;
+    # the next step re-attempts the re-feed and the gone-ingestion of
+    # the full 12-token history eventually happens (repeat request 'c'
+    # still hits). The pyo3 proposer's attributes are read-only, so the
+    # throw is injected via a poisoning head whose __eq__ raises at the
+    # fingerprint check -- the record is already popped at that point,
+    # exactly the loss window NIT-1 closes.
+    wrapped, runner, ats, totals, fp = _growth_setup(monkeypatch)
+    ingested_before = wrapped._suffix_proposer.get_stats()["ingested"]
+
+    class PoisonHead(list):
+        def __eq__(self, other):
+            raise RuntimeError("boom during ghost re-feed")
+
+        __hash__ = None
+
+    fp["seen"]["a"]["head"] = PoisonHead()
+    out = propose(wrapped, runner, [])     # departure: fingerprint throws
+    assert fp["ghosts_fed"] == 0
+    assert fp["ghosts_pending"] == 1
+    assert fp["seen"]["a"]["dirty"] is True
+    # Restore a sane fingerprint: the next departure step retries the
+    # re-feed and it succeeds now.
+    fp["seen"]["a"]["head"] = ats[2, :4].tolist()
+    out = propose(wrapped, runner, [])
+    assert fp["ghosts_fed"] == 1
+    assert "a" not in fp["seen"]
+    ingested = wrapped._suffix_proposer.get_stats()["ingested"]
+    assert ingested == ingested_before + 1
+    # Gone-ingestion saw the FULL 12-token history: the repeat request
+    # 'c' hits and drafts the true continuation.
+    out = propose(wrapped, runner, ["c"]).tolist()
+    assert out == [[SEQ_A[10], SEQ_A[11], 0, 0]]
+
+
+def test_two_ghosts_departed_same_step(suffix_env, monkeypatch):
+    # Two departed rids in ONE step: both dirty (each lived through a
+    # fast step), both re-fed, both gone-ingested; a replay of either
+    # prefix must hit. Uses the real Rust V2SuffixProposer.
+    _arm_env(monkeypatch, fast=True)
+    runner, ats, totals = make_runner()
+    # 'b' gets a unique 9-token prefix that later grows to 12.
+    seq_b = [301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312]
+    ats[3, :] = 668
+    ats[3, :9] = np.array(seq_b[:9], dtype=np.int32)
+    totals.t[3] = 9
+    wrapped, spec = wrap(runner)
+    propose(wrapped, runner, ["a", "b"])   # cold: stock, mirrors track 9
+    ats[2, 9:12] = np.array(SEQ_A[9:12], dtype=np.int32)
+    totals.t[2] = 12
+    ats[3, 9:12] = np.array(seq_b[9:12], dtype=np.int32)
+    totals.t[3] = 12
+    propose(wrapped, runner, ["a", "b"])   # fast step: both mirrors stale
+    fp = wrapped._suffix_w0fp
+    assert fp["fast_steps"] >= 1
+    assert fp["seen"]["a"]["dirty"] and fp["seen"]["b"]["dirty"]
+    propose(wrapped, runner, [])           # both depart in one step
+    assert fp["ghosts_fed"] == 2
+    assert "a" not in fp["seen"] and "b" not in fp["seen"]
+    # Ingestion accounting: each re-feed rebuilds a mirror, and a
+    # re-feed call ALSO gone-ingests previously-rebuilt ghosts (departed
+    # rows) -- so ingested is >= 2, exact count an internal detail.
+    assert wrapped._suffix_proposer.get_stats()["ingested"] >= 2
+    # Replays of either prefix hit and draft the true continuations
+    # (10-token replay prefix of a 12-token ingested history).
+    runner.req_states.req_id_to_index["ra"] = 2
+    ats[2, :10] = np.array(SEQ_A[:10], dtype=np.int32)
+    totals.t[2] = 10
+    assert propose(wrapped, runner, ["ra"]).tolist() \
+        == [[SEQ_A[10], SEQ_A[11], 0, 0]]
+    runner.req_states.req_id_to_index["rb"] = 3
+    ats[3, :10] = np.array(seq_b[:10], dtype=np.int32)
+    totals.t[3] = 10
+    assert propose(wrapped, runner, ["rb"]).tolist() \
+        == [[seq_b[10], seq_b[11], 0, 0]]

@@ -290,6 +290,105 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     lut = req_states.req_id_to_index
     max_reqs = int(getattr(speculator, "max_num_reqs", 32) or 32)
 
+    # ------------------------------------------------------------------
+    # W0 fast path (dossier: plugin-harness/dossiers/width0-shortcircuit.md
+    # §0c fix target). The chat-unique deficit is propose-side per-step
+    # HOST work (blocking [n] totals D2H + Rust propose_suffix_only +
+    # [n,K] upload) that runs on EVERY step even when every width is 0.
+    # Gate SUFFIX_HYBRID_W0_FASTPATH (default ON, value 0 disables the
+    # whole arm) enables two provably-publish-zero disjuncts:
+    #   (A) pre-mix: cache index empty and no departure bookkeeping ->
+    #       the mix provably publishes all-zero widths (nothing can hit;
+    #       mirror/ingest transitions are Rust-call side effects and
+    #       there is nothing to ingest) -> skip the Rust call + upload,
+    #       publish zeros with width retraction. The totals D2H stays:
+    #       it is the UVA fence and the instrumentation anchor.
+    #   (B) post-mix: ragged pallet and every live width 0 -> the packed
+    #       rows are provably all zeros; skip the [n,K] upload.
+    # INGESTION INVARIANT (hard constraint): the ONLY ingestion path on
+    # this arm is V2SuffixProposer.run()'s departure bookkeeping (gone
+    # mirror rows with len > 8 donate their full tracked history), so a
+    # fast step may never change what a FINISHED request ingests. The
+    # adapter keeps an attendance ledger (rid -> row index, total, 4-token
+    # head and tail fingerprints, dirty flag); a request that lived
+    # through fast steps departs with a stale Rust mirror and is re-fed
+    # ONCE as a "ghost attendee" on the first departure step --
+    # fingerprint-proven row identity, ledger-authoritative total -- so
+    # its mirror is rebuilt from the still-intact engine row to the
+    # byte-identical content the stock arm would have tracked, and the
+    # publish call in the SAME step then performs the stock
+    # gone-ingestion. Never-fast-pathed departures take the plain stock
+    # path untouched.
+    # Pipelined-D2H alternative (dossier §3.2 "async totals",
+    # non_blocking=True copy + CUDA event consumed one step later):
+    # EVALUATED AND REJECTED here because (1) the blocking copy is the
+    # pinned UVA fence (test_totals_now_blocking_and_indexed) and
+    # one-step-lag totals would require re-validating the whole
+    # mirror-continuity/ingest contract on the live pod; (2) the dossier
+    # ordering demands arm M measure the D2H vs Rust vs upload split
+    # empirically BEFORE totals-path surgery; (3) disjunct (A) already
+    # removes the Rust mix + upload on gated steps.
+    w0_fast = os.environ.get("SUFFIX_HYBRID_W0_FASTPATH", "1").strip() != "0"
+    fp = {"enabled": w0_fast, "seen": {}, "fast_steps": 0,
+          "ghosts_fed": 0, "ghosts_dropped": 0, "ghosts_pending": 0,
+          "skip_upload": 0}
+
+    # Arm-M instrumentation (dossier §3.1, arm A2): per-step host-time
+    # histogram of the corrected root cause -- totals D2H / Rust mix /
+    # upload in microseconds -- plus step count, width-0 step count and
+    # scheduled batch size. Gated by the existing SUFFIX_HYBRID_TRACE env
+    # family (read ONCE here; its per-rid trace budget does not disable
+    # this) and emitted every SUFFIX_HYBRID_LOG_INTERVAL steps like the
+    # existing stats line. This is the falsifier arm: run it with
+    # SUFFIX_HYBRID_W0_FASTPATH=0 to profile the stock arm.
+    m_on = os.environ.get("SUFFIX_HYBRID_TRACE", "").strip() != ""
+    m = {"steps": 0, "steps_w0": 0, "batch": 0, "totals_us": 0.0,
+         "rust_us": 0.0, "upload_us": 0.0, "fast_steps": 0}
+
+    def _cache_index_empty():
+        # Provable-zero oracle for disjunct (A): nothing indexed -> no
+        # speculate can yield a row. get_stats() builds small dicts; one
+        # call per gated step is negligible next to the totals D2H.
+        try:
+            cache = proposer.get_stats().get("cache") or {}
+            return (int(cache.get("num_index_keys", 0)) == 0
+                    and int(cache.get("cached_tokens", 0)) == 0)
+        except Exception:
+            return False       # unknown state: never fast-path it
+
+    def _ledger_refresh(ids_l, idx_l, totals_l, dirty):
+        # Attendance ledger. `dirty` marks rows the Rust mirror can be
+        # stale for (lived through fast steps); head4 + tail1 fingerprints
+        # prove row identity at ghost re-feed time (engine rows are
+        # append-only within total, so a live row's record stays valid).
+        if not w0_fast:
+            return
+        seen = fp["seen"]
+        for i, rid in enumerate(ids_l):
+            tot = int(totals_l[i])
+            if tot <= 0:
+                continue
+            j = int(idx_l[i])
+            row = ats_np[j]
+            seen[rid] = {"idx": j, "total": tot, "dirty": dirty,
+                         "head": row[:4].tolist(),
+                         "tail1": int(row[tot - 1])}
+
+    def _mtrace_maybe():
+        if not (m_on and interval and m["steps"] % interval == 0):
+            return
+        print("suffix_hybrid MTRACE " + json.dumps({
+            "steps": m["steps"], "steps_w0": m["steps_w0"],
+            "batch_tokens": m["batch"],
+            "totals_us": round(m["totals_us"], 1),
+            "rust_us": round(m["rust_us"], 1),
+            "upload_us": round(m["upload_us"], 1),
+            "fast_steps": m["fast_steps"],
+            "ghosts_fed": fp["ghosts_fed"],
+            "ghosts_dropped": fp["ghosts_dropped"],
+            "skip_upload": fp["skip_upload"],
+        }, sort_keys=True), file=sys.stderr, flush=True)
+
     # Per-step draft accounting trace (gemma wake #9): the engine rejected
     # ~96% of published drafts at position 1 even on verbatim-repeat
     # traffic, so either the drafted continuation is wrong (collisions) or
@@ -306,9 +405,20 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     trace_state = {}   # rid -> (total_at_publish, [draft tokens])
 
     # One pinned [max_reqs] totals buffer, reused every step.
+    # packed_pin: pinned [max_reqs, k] CPU staging for the upload. The
+    # Rust call returns a FRESH (pageable) numpy array, so the upload's
+    # non_blocking=pin on a pageable source is dead (dossier
+    # d2h-sync-cost-analysis.md §2.2 row 6: pageable H2D is
+    # pseudo-synchronous regardless). Copying packed into this pinned
+    # buffer first (a cheap CPU-to-CPU copy) makes the H2D genuinely
+    # async. Only used on the W0_FASTPATH arm so FASTPATH=0 stays
+    # bit-for-bit stock.
     pin = torch.cuda.is_available()
     totals_cpu = torch.zeros(
         (max_reqs,), dtype=torch.int64, pin_memory=pin)
+    packed_pin = (torch.zeros((max_reqs, int(k)), dtype=torch.int64,
+                              pin_memory=pin)
+                  if (w0_fast and pin) else None)
 
     def _totals_now(idx_np):
         # Indexed D2H gather of the totals for THIS step's request rows;
@@ -335,11 +445,88 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
         if dummy_run or is_profile:
             out.zero_()
             return out
+        # NIT-1 crash-safety: ledger records popped this step live here
+        # until their outcome is CONFIRMED (successful re-feed, explicit
+        # drop, or a survived stock call). If the step throws before
+        # that, the except block re-inserts them + counts ghosts_pending
+        # so the next step re-attempts the re-feed / gone-ingestion --
+        # a departed request's history can never be silently lost.
+        popped_ghosts = {}
         try:
             ids = list(input_batch.req_ids)
             idx_np = np.fromiter((lut[rid] for rid in ids),
                                  dtype=np.int64, count=n)
+            # ---- Ghost re-feed (ingestion-semantics guarantee). --------
+            # A REQUEST THAT HAS DEPARTED was ingesting fine while it was
+            # live (its every step went through propose_suffix_only, whose
+            # run() tracks mirror/widths and ingests departures). A
+            # request whose life contained FAST steps skipped the Rust
+            # call on those steps, so its run()-owned mirror stopped
+            # growing on them; published widths recorded for it during
+            # that time were provably 0 and it could not have hit, but its
+            # DELTA would be lost on departure. Detect it via the
+            # adapter-side attendance ledger and re-feed the missing
+            # prefix ONCE (fingerprint-proven row identity) as a ghost
+            # attendee with ledger-authoritative total = the exact
+            # history the engine row holds; run() then rebuilds and
+            # tracks it like before, and the ghost's later departure
+            # performs the stock gone-ingestion.
+            ghosts = []
+            if w0_fast and fp["seen"]:
+                ghosts = [rid for rid in fp["seen"] if rid not in ids]
+                for rid in ghosts:
+                    rec = fp["seen"].pop(rid, None)
+                    if rec is not None:
+                        # Every popped record is recoverable until the
+                        # step that performs its gone-ingestion
+                        # survives (re-feed above or the main stock
+                        # call below); the except block restores any
+                        # still-unconfirmed record.
+                        popped_ghosts[rid] = rec
+                    if rec is None or not rec.get("dirty"):
+                        # Clean ghost: its Rust mirror was kept current
+                        # by the stock path while it lived; the MAIN mix
+                        # call below performs the stock gone-ingestion
+                        # of that mirror -- nothing to re-feed.
+                        continue
+                    # Dirty ghost: the request lived through FAST steps,
+                    # so its run()-owned mirror stopped growing and the
+                    # main call would ingest a TRUNCATED history. Re-feed
+                    # the full prefix ONCE (fingerprint-proven row
+                    # identity, ledger-authoritative total = the exact
+                    # history the stock arm would have tracked); the
+                    # main call then ingests this rebuilt mirror --
+                    # byte-identical content to the stock arm.
+                    popped_ghosts[rid] = rec   # NIT-1: recoverable on throw
+                    g_idx = int(rec["idx"])
+                    g_tot = max(int(rec["total"]), 0)
+                    row = ats_np[g_idx]
+                    if (g_tot > 0 and g_tot <= row.shape[0]
+                            and row[:min(4, g_tot)].tolist() == rec["head"]
+                            and int(row[g_tot - 1]) == rec["tail1"]):
+                        proposer.propose_suffix_only(
+                            [rid], np.array([g_idx]),
+                            np.array([g_tot]), ats_np)
+                        fp["ghosts_fed"] += 1
+                        popped_ghosts.pop(rid, None)   # re-feed survived
+                    else:
+                        # Row fingerprint mismatch (engine reused the
+                        # row after departure): no provable recovery.
+                        # Keep a counter; with disjunct (A) requiring an
+                        # EMPTY cache index the dirty band exists only
+                        # on cold-start runs, so this cannot lose
+                        # already-indexed corpus content.
+                        fp["ghosts_dropped"] += 1
+                        popped_ghosts.pop(rid, None)   # explicit drop
+            # Ghost re-feed never modifies ids/idx_np: ghosts live in a
+            # SEPARATE single-row propose_suffix_only call with their own
+            # args; the main mix call below is the stock call, bit for
+            # bit.
+            # ---- (end ghost re-feed) --------------------------------
+            t_d2h0 = time.perf_counter()
             totals = _totals_now(idx_np)
+            t_d2h = (time.perf_counter() - t_d2h0) * 1e6
+
             # Draft accounting: compare last step's published drafts against
             # the engine's actual writes at those positions this step. The
             # engine writes the verified/sampled tokens at [p_total .. ]
@@ -368,8 +555,64 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                     trace_cfg["budget"] -= 1
                     if trace_cfg["budget"] <= 0:
                         trace_cfg["on"] = False   # fire once, then be quiet
+
+            # ---- W0 fast-path disjunct (A): provably publish-all-zero. --
+            # Gate order preserves ingestion semantics EXACTLY: ghost
+            # handling above already dealt with departed requests; with
+            # the cache index empty AND no ledger-known departure this
+            # step (any ghost needs the stock call, which is where
+            # gone-ingestion runs), the stock Rust call would ingest
+            # nothing, and its output is provably all-zero widths with
+            # zero row content (an empty index cannot yield a speculate
+            # hit). The `known` clause keeps widths publication
+            # BIT-FOR-BIT: the stock run rewrites every live rid's
+            # widths entry to 0 (empty cache), and clear_widths() does
+            # the identical rewrite — but it cannot INSERT entries for
+            # rids the Rust state has never seen, so a first-ever step
+            # for any rid must go stock. (At the consumer the two are
+            # equivalent — get_draft_tokens defaults missing to width 0
+            # — but byte-identical publication is the contract here.)
+            if w0_fast and not ghosts and _cache_index_empty():
+                known = proposer.widths_table
+                if all(rid in known for rid in ids):
+                # Mark every live row dirty: their Rust mirror content is
+                # from before this step; a later departure re-feeds the
+                # missing prefix (ghost path above).
+                    _ledger_refresh(ids, idx_np, totals, dirty=True)
+                    out.zero_()
+                    try:
+                        proposer.clear_widths()
+                    except Exception:
+                        pass
+                    fp["fast_steps"] += 1
+                    m["fast_steps"] += 1
+                    if m_on:
+                        m["steps"] += 1
+                        m["steps_w0"] += 1
+                        m["batch"] += int(n)
+                        m["totals_us"] += t_d2h
+                        _mtrace_maybe()
+                    if trace_cfg["on"]:
+                        for rid in ids:
+                            if rid in trace_state:
+                                del trace_state[rid]
+                    return out
+
+            # Stock path. Ledger-refresh live rows as CLEAN (their mirror
+            # will be current after this call); dirty ghosts were handled
+            # above. Disjunct (B) below opportunistically skips the H2D
+            # upload when every width is 0 and the packed rows are
+            # therefore provably zeros.
+            if w0_fast:
+                _ledger_refresh(ids, idx_np, totals, dirty=False)
+            t_rust0 = time.perf_counter()
             packed, widths_np = proposer.propose_suffix_only(
                 ids, idx_np, totals, ats_np)
+            t_rust = (time.perf_counter() - t_rust0) * 1e6
+            # The stock call survived: every popped ledger record is
+            # resolved this step (gone-ingestion ran inside the Rust
+            # call) -- NIT-1 no longer owes anything for this step.
+            popped_ghosts.clear()
             # Store drafts JUST published for next step's comparison.
             if trace_cfg["on"]:
                 packed_l = packed.tolist()
@@ -380,14 +623,56 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                     elif rid in trace_state:
                         del trace_state[rid]
             out.zero_()
-            out.copy_(torch.from_numpy(packed).to(
-                out.device, out.dtype), non_blocking=pin)
+            t_up0 = time.perf_counter()
+            if (w0_fast and packed.shape == (n, int(k))
+                    and int(widths_np.sum()) == 0):
+                # Disjunct (B): ragged pallet and every width 0 -> the
+                # packed rows are provably zeros; the out.zero_() above
+                # already IS the publish. Skip the H2D upload (its whole
+                # content would be zeros). The widths table was already
+                # set to the same zeros inside the Rust call --
+                # publication semantics unchanged.
+                fp["skip_upload"] += 1
+            else:
+                src = torch.from_numpy(packed)
+                if (w0_fast and packed_pin is not None
+                        and packed.shape[0] <= packed_pin.shape[0]
+                        and packed.shape[1] == packed_pin.shape[1]):
+                    # Pin the upload source (dossier d2h-sync-cost §3.2
+                    # cost note): packed is a fresh pageable numpy array,
+                    # so non_blocking=pin below is dead (pseudo-sync
+                    # H2D). Staging through the preallocated pinned
+                    # buffer makes the H2D genuinely async on the W0 arm.
+                    try:
+                        packed_pin[:packed.shape[0]].copy_(src)
+                        src = packed_pin[:packed.shape[0]]
+                    except Exception:
+                        src = torch.from_numpy(packed)   # stock on error
+                out.copy_(src.to(out.device, out.dtype), non_blocking=bool(pin))
+            t_up = (time.perf_counter() - t_up0) * 1e6
+            if m_on:
+                m["steps"] += 1
+                m["batch"] += int(n)
+                m["totals_us"] += t_d2h
+                m["rust_us"] += t_rust
+                m["upload_us"] += t_up
+                if n and not int(widths_np.sum()):
+                    m["steps_w0"] += 1
+                _mtrace_maybe()
             if interval and int(proposer.get_stats()["steps"]) % interval == 0:
                 print("suffix_hybrid suffix-only " + json.dumps(
                     proposer.get_stats(), sort_keys=True, default=str),
                     file=sys.stderr, flush=True)
             return out
         except Exception as exc:
+            # NIT-1: restore any ledger record popped this step whose
+            # outcome is unconfirmed (re-feed not yet survived, stock
+            # gone-ingestion not yet run) and count it, so the next step
+            # re-attempts the re-feed and nothing is silently lost.
+            for rid, rec in popped_ghosts.items():
+                fp["seen"][rid] = rec
+                fp["ghosts_pending"] += 1
+            popped_ghosts.clear()
             state["reason"] = f"{type(exc).__name__}: {exc}"
             state["skips"] += 1
             if state["skips"] <= 3 or state["skips"] % 100 == 0:
@@ -404,6 +689,9 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             out.zero_()
             return out
     propose._suffix_proposer = proposer
+    # Test/trace handle points: W0 fast-path counters + arm-M histogram.
+    setattr(propose, "_suffix_w0fp", fp)
+    setattr(propose, "_suffix_mtrace", m)
     # Token-level verify trace hook points (SUFFIX_HYBRID_TRACE_VERIFY2):
     # expose the per-rid published-drafts registry to the sampler wrap.
     setattr(propose, "_suffix_trace_state", trace_state)
