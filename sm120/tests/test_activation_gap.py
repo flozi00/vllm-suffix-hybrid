@@ -32,6 +32,9 @@ from pathlib import Path
 
 import pytest
 
+# CI runs pytest --import-mode=importlib, which does not put the test dir on
+# sys.path; the sibling import needs it explicitly.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_nvfp4_kv_patch import (  # noqa: E402 - same test dir
     FAKE_STACK,
     FIXTURES,
