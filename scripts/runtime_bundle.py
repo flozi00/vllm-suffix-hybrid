@@ -105,6 +105,26 @@ def bundle(wheel, output, revision):
             / 'entry_points.txt').exists():
         raise ValueError('runtime bundle requires warm-start dist-info '
                         'entry_points.txt')
+    # K-GDN1 (qwen3.8-27b fused GDN decode kernel): vllm.general_plugins
+    # entry point suffix_qwen_gdn = suffix_hybrid.kernels.qwen_gdn:register,
+    # discovered from this top-level dist-info. The plugin self-gates on
+    # SUFFIX_QWEN_GDN=1 (register() returns before importing anything), so
+    # shipping it unconditionally is safe. NOTE: if a pod sets VLLM_PLUGINS
+    # (allowlist), it must name suffix_qwen_gdn or the plugin never loads.
+    gdn_distinfo = repo / 'suffix_qwen_gdn_ep-1.0.dist-info'
+    for src in sorted(gdn_distinfo.glob('*')):
+        if not src.is_file():
+            continue
+        rel = PurePosixPath('suffix_qwen_gdn_ep-1.0.dist-info', src.name)
+        data = src.read_bytes()
+        dest = output / PurePosixPath(*rel.parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        hashes[str(rel)] = hashlib.sha256(data).hexdigest()
+    if not (output / 'suffix_qwen_gdn_ep-1.0.dist-info'
+            / 'entry_points.txt').exists():
+        raise ValueError('runtime bundle requires the suffix_qwen_gdn '
+                        'dist-info entry_points.txt')
     seeds_root = ficache_root / 'seeds'
     if seeds_root.is_dir():
         for src in sorted(seeds_root.rglob('*')):

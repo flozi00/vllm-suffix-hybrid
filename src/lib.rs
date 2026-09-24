@@ -309,6 +309,9 @@ mod mixer;
 mod verify_fusion;
 #[cfg(feature = "cutile-kernels")]
 mod verify_fusion_gpu;
+mod qwen_gdn;
+#[cfg(feature = "qwen-gdn-kernels")]
+mod qwen_gdn_gpu;
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -329,6 +332,17 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         verify_fusion_gpu::rejection_greedy_accept_cuda,
         m
     )?)?;
+    // K-GDN1 (qwen3.8-27b GDN decode): CPU reference always; the cutile GPU
+    // op only in `qwen-gdn-kernels` builds. HAS_QWEN_GDN_CUDA is what the
+    // SUFFIX_QWEN_GDN=1 startup assertion reads (absent op = hard error).
+    m.add_function(wrap_pyfunction!(qwen_gdn::gdn_decode_fused_ref, m)?)?;
+    #[cfg(feature = "qwen-gdn-kernels")]
+    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::gdn_decode_fused_cuda, m)?)?;
+    #[cfg(feature = "qwen-gdn-kernels")]
+    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_enable_jit_store, m)?)?;
+    #[cfg(feature = "qwen-gdn-kernels")]
+    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_jit_stats, m)?)?;
+    m.add("HAS_QWEN_GDN_CUDA", cfg!(feature = "qwen-gdn-kernels"))?;
     m.add("VERSION", "0.2.0-rust-v1")?;
     Ok(())
 }

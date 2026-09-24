@@ -1,0 +1,8 @@
+# PyO3 `extension-module` leaves libpython symbols unresolved; on macOS the
+# linker needs dynamic_lookup for `cargo test` binaries (PyO3 FAQ). Linux CI
+# builds (maturin, manylinux) are unaffected by these target-scoped flags.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
