@@ -541,6 +541,24 @@ def patch_backend_source(src: str) -> tuple[str, list[str]]:
 # -> source rewrite exec into the live module dict. Every step logs loudly.
 # ---------------------------------------------------------------------------
 
+def exec_patched_source(module, new_src: str, src_path: Path) -> None:
+    """exec the rewritten source into the live module, source-introspectable.
+
+    Triton's @jit reads kernel source via inspect.getsource. Compiled under
+    the ORIGINAL filename, that resolves against the on-disk file whose line
+    numbers no longer match the (longer) rewrite: late kernels raise "@jit
+    functions should be defined in a Python file" (gemma-spec-dev nvfp4 boot
+    2026-09-24), earlier ones would silently get the wrong source. Register
+    the rewrite in linecache under its own name (mtime None = never
+    invalidated by checkcache) and compile against that name."""
+    import linecache
+
+    fname = f"{src_path}.{PATCH_NAME}-{PATCH_REVISION}.py"
+    linecache.cache[fname] = (
+        len(new_src), None, new_src.splitlines(keepends=True), fname)
+    exec(compile(new_src, fname, "exec"), module.__dict__)
+
+
 def _fail(msg: str) -> None:
     raise RuntimeError(f"[suffix {PATCH_NAME}] {msg}")
 
@@ -640,8 +658,7 @@ def apply(module=None, *, force: bool = False) -> bool:
         setattr(module, MARKER_ATTR, PATCH_REVISION)
         return True
     new_src, applied = patch_backend_source(src)
-    code = compile(new_src, str(src_path), "exec")
-    exec(code, module.__dict__)  # in-place rebind of all module symbols
+    exec_patched_source(module, new_src, src_path)
     setattr(module, MARKER_ATTR, PATCH_REVISION)
 
     print(
