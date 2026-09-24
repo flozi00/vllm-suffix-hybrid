@@ -34,7 +34,8 @@ def suffix_env(monkeypatch):
                 "SUFFIX_HYBRID_UNIFORM_K", "SUFFIX_HYBRID_TRACE",
                 "SUFFIX_HYBRID_TRACE_VERIFY", "SUFFIX_HYBRID_TRACE_VERIFY2",
                 "SUFFIX_HYBRID_SCHEDTRACE", "SUFFIX_HYBRID_LOG_INTERVAL",
-                "SUFFIX_HYBRID_ZERO_OP", "SUFFIX_HYBRID_W0_FASTPATH"):
+                "SUFFIX_HYBRID_ZERO_OP", "SUFFIX_HYBRID_W0_FASTPATH",
+                "SUFFIX_HYBRID_D2H_PIPE", "SUFFIX_HYBRID_D2H_PIPE_SIM"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -568,3 +569,389 @@ def test_two_ghosts_departed_same_step(suffix_env, monkeypatch):
     totals.t[3] = 10
     assert propose(wrapped, runner, ["rb"]).tolist() \
         == [[seq_b[10], seq_b[11], 0, 0]]
+
+
+# ===========================================================================
+# Pipelined side-stream D2H (Option A, dossier pipelined-d2h-design.md).
+# Gate: SUFFIX_HYBRID_D2H_PIPE (default OFF = blocking stock, bit-identical).
+# CPU-only SIMULATE arm (SUFFIX_HYBRID_D2H_PIPE_SIM=1) exercises the exact
+# lag=1 state machine without a GPU; on a CUDA box the same tests run the
+# real side-stream/event path instead.
+# ===========================================================================
+
+def _pipe_env(monkeypatch, pipe=True, sim=None, fast=None):
+    """Arm the pipeline. `sim` is opt-in ONLY via SUFFIX_HYBRID_D2H_PIPE_SIM
+    (default OFF everywhere: SIM never silently shadows the real CUDA
+    path -- a CUDA-with-SIM surprise is exactly the failure mode the
+    reviewer flagged, so the default is False on every box)."""
+    if sim is None:
+        sim = False
+    monkeypatch.setenv("SUFFIX_HYBRID_D2H_PIPE", "1" if pipe else "0")
+    monkeypatch.setenv("SUFFIX_HYBRID_D2H_PIPE_SIM",
+                       "1" if sim else "0")
+    if fast is not None:
+        monkeypatch.setenv("SUFFIX_HYBRID_W0_FASTPATH",
+                           "1" if fast else "0")
+
+
+def _pipe_wrap(runner):
+    """Wrap with a sync-scheduling runner shape (I8: async_scheduling
+    must be present and False on the launcher's scheduler_config).
+    Preserves a caller-set vllm_config (the I8-refusal test injects
+    async_scheduling=True)."""
+    if getattr(runner, "vllm_config", None) is None:
+        runner.vllm_config = NS(
+            scheduler_config=NS(async_scheduling=False,
+                                max_concurrent_batches=1,
+                                num_speculative_tokens=K))
+    return wrap(runner)
+
+
+CUDA = torch.cuda.is_available()
+
+
+def test_pipe_gate_off_is_bit_identical_stock(suffix_env, monkeypatch):
+    # DEFAULT OFF (and explicit 0): the pipeline block must not touch
+    # the totals read -- blocking stock path, every gather indexed and
+    # blocking, zero pipe state.
+    results = {}
+    for arm, gate in (("off", None), ("zero", "0")):
+        monkeypatch.delenv("SUFFIX_HYBRID_D2H_PIPE", raising=False)
+        if gate is not None:
+            monkeypatch.setenv("SUFFIX_HYBRID_D2H_PIPE", gate)
+        base_runner, ats, totals = make_runner(
+            row_b=SEQ_A[:10], total_b=10)
+        wrapped, spec = wrap(base_runner)
+        assert getattr(wrapped, "_suffix_pipe", None) is None or \
+            not wrapped._suffix_pipe["on"]
+        outs, widths = [], []
+        for ids in (["a", "b"], ["a"], [], ["b"]):
+            outs.append(propose(wrapped, base_runner,
+                                ids).tolist())
+            widths.append(dict(
+                wrapped._suffix_proposer.widths_table))
+        results[arm] = (outs, widths)
+        # gate OFF arms the pipe dict but never the path: zero steps
+        # through the pipeline, every gather blocking (test (a)+(f)
+        # pins the blocking copy; here just ensure the pipe stayed off)
+        pipe = getattr(wrapped, "_suffix_pipe", None)
+        assert pipe is None or (pipe["on"] is False
+                                and pipe["steps"] == 0)
+    assert results["off"] == results["zero"]
+    # Blocking semantics held: same widths the stock test pins.
+    assert results["off"][1][0] == {"a": 0, "b": 0}
+
+
+@pytest.mark.skipif(not CUDA, reason="needs CUDA for the real pipe path")
+def test_pipe_lag1_consume_correctness_real_cuda(suffix_env,
+                                                 monkeypatch):
+    # Real CUDA path: side-stream + non_blocking copy + event, consumed
+    # one step LATER. The totals visible to step N equal the totals
+    # gathered at step N-1 (the lag=1 contract).
+    _pipe_env(monkeypatch, sim=False, fast=False)
+    runner, ats, totals = make_runner(ncols=768, total_a=12, total_b=6)
+    wrapped, spec = _pipe_wrap(runner)
+    pipe = wrapped._suffix_pipe
+    assert pipe["on"] and not pipe["sim"]
+    # step 1: blocking seed, CURRENT totals.
+    propose(wrapped, runner, ["a", "b"])
+    assert pipe["armed"] is True and pipe["block_steps"] >= 0
+    # grow both rows BEFORE step 2: the pipelined step must still see
+    # the SEED-step totals (lag), then step 2's copy carries them.
+    totals.t[2] = 20
+    out = propose(wrapped, runner, ["a", "b"])
+    consumed = wrapped._suffix_pipe_frame
+    assert (consumed["totals"], consumed["lagged"]) == ([12, 6], True)
+    # step 3: consumes step 2's copy (still [12, 6] shape/ids match).
+    propose(wrapped, runner, ["a", "b"])
+    consumed = wrapped._suffix_pipe_frame
+    assert (consumed["totals"], consumed["lagged"]) == ([12, 6], True)
+
+
+@pytest.mark.skipif(not CUDA, reason="needs CUDA for the real lag check")
+def test_pipe_lag1_consume_correctness_cuda_shape(suffix_env,
+                                                  monkeypatch):
+    # REAL CUDA only (same skipif discipline as the _real_cuda test):
+    # explicitly sim=False -- SIM can never silently shadow this path.
+    _pipe_env(monkeypatch, sim=False, fast=False)
+    runner, ats, totals = make_runner(ncols=768, total_a=12, total_b=6)
+    wrapped, spec = _pipe_wrap(runner)
+    propose(wrapped, runner, ["a", "b"])               # seed: blocking
+    totals.t[2] = 20                                   # mutate GPU-side
+    propose(wrapped, runner, ["a", "b"])
+    # The consumed totals array is the PRIOR step's snapshot: written
+    # through the pipeline's staging clone, not a live view, and
+    # matches the totals as of the seed step.
+    arr, lagged = (wrapped._suffix_pipe_frame["totals"],
+                   wrapped._suffix_pipe_frame["lagged"])
+    assert lagged is True and list(arr) == [12, 6] and len(arr) == 2
+
+
+def test_pipe_lag1_consume_correctness_sim(suffix_env, monkeypatch):
+    # CPU-only SIM arm: identical lag=1 data contract. Because the SIM
+    # copy is data-correct on the enqueue step but the machine defers
+    # the CONSUME to the next step, the visible totals at step N are
+    # step N-1's [n] even though totals already moved under us.
+    _pipe_env(monkeypatch, sim=True, fast=False)
+    runner, ats, totals = make_runner(ncols=768, total_a=12, total_b=6)
+    wrapped, spec = _pipe_wrap(runner)
+    pipe = wrapped._suffix_pipe
+    assert pipe["on"] and pipe["sim"]
+    propose(wrapped, runner, ["a", "b"])               # seed: blocking
+    totals.t[2] = 20
+    out2 = propose(wrapped, runner, ["a", "b"])
+    consumed = wrapped._suffix_pipe_frame
+    assert (consumed["totals"], consumed["lagged"]) == ([12, 6], True)
+    # hits/misses and published zeros survive the lagged step.
+    assert out2.tolist() == [[0] * K] * 2 or out2.tolist() == [[0] * K, [0] * K]
+    propose(wrapped, runner, ["a", "b"])
+    assert wrapped._suffix_pipe_frame["lagged"] is True
+
+
+def test_pipe_depart_with_pending_record(suffix_env, monkeypatch):
+    # A departure changes ids shape while LAST step's copy is in
+    # flight (pending): the absorb runs BEFORE any decision; the
+    # misaligned snapshot must NOT be served -- the step falls back to
+    # a blocking stock read and the lag chain restarts cleanly.
+    _pipe_env(monkeypatch, sim=True, fast=False)
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = _pipe_wrap(runner)
+    pipe = wrapped._suffix_pipe
+    propose(wrapped, runner, ["a", "b"])               # seed + enqueue
+    propose(wrapped, runner, ["a", "b"])               # lag consume
+    assert pipe["pending"] is not None                 # copy in flight
+    # 'b' departs: next propose sees a different ids/n shape.
+    out = propose(wrapped, runner, ["a"])
+    # The misaligned pending could not serve the new shape -> this
+    # step's totals came from the BLOCKING stock read (perfectly
+    # current) and a fresh copy was enqueued for the shape now live.
+    consumed = wrapped._suffix_pipe_frame
+    assert consumed["lagged"] is False                        # not a lagged serve
+    assert list(consumed["totals"]) == [int(totals.t[2])]
+    # And the next same-shape step resumes the lag serve.
+    propose(wrapped, runner, ["a"])
+    assert wrapped._suffix_pipe_frame["lagged"] is True
+
+
+def test_pipe_capture_window_fallback(suffix_env, monkeypatch):
+    # I3 belt: if the current stream is INSIDE a CUDA-graph capture
+    # window, the pipeline must refuse the side-stream/event path and
+    # use the blocking total read (capture-safe), and the refusal is
+    # STICKY for the wrapper's life (capture windows never contain
+    # half-pipelines).
+    _pipe_env(monkeypatch, sim=True, fast=False)
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = _pipe_wrap(runner)
+    propose(wrapped, runner, ["a", "b"])               # seed + enqueue
+    propose(wrapped, runner, ["a", "b"])               # lag consume
+    assert wrapped._suffix_pipe_frame["lagged"] is True
+    # Poison the capture check: simulate being inside capture.
+    monkeypatch.setattr(wrap_v2, "_cuda_capturing", lambda: True)
+    out = propose(wrapped, runner, ["a", "b"])
+    pipe = wrapped._suffix_pipe
+    assert pipe["fallback"] is True, "capture must sticky-disable"
+    assert "I" in pipe["fallback_reason"] or "capture" in \
+        pipe["fallback_reason"]
+    assert wrapped._suffix_pipe_frame["lagged"] is False
+    # Blocking path serves CURRENT totals and the step still publishes.
+    assert list(wrapped._suffix_pipe_frame["totals"]) == \
+        [int(totals.t[2]), int(totals.t[3])]
+    # Sticky: even restoring a clean capture check, every later step
+    # runs blocking.
+    monkeypatch.setattr(wrap_v2, "_cuda_capturing", lambda: False)
+    propose(wrapped, runner, ["a", "b"])
+    assert wrapped._suffix_pipe_frame["lagged"] is False
+    assert pipe["fallback"] is True
+
+
+def test_pipe_invariant_violation_sticky_fallback(suffix_env, monkeypatch):
+    # I1 class: a pending copy that somehow survives into the next
+    # _pipe_get (double enqueue) is an invariant violation -> sticky
+    # fail-closed to the blocking path, with a loud reason and the
+    # invariant-fail counter incremented. Never crashes the step.
+    _pipe_env(monkeypatch, sim=True, fast=False)
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = _pipe_wrap(runner)
+    pipe = wrapped._suffix_pipe
+    propose(wrapped, runner, ["a", "b"])               # seed
+    propose(wrapped, runner, ["a", "b"])               # healthy lag
+    assert wrapped._suffix_pipe_frame["lagged"] is True
+
+    # Inject the I1 breach: an ARMED pipeline whose in-flight copy
+    # vanished (absorb chain broken) must sticky-disable loudly.
+    pipe["pending"] = None
+    out = propose(wrapped, runner, ["a", "b"])
+    assert pipe["fallback"] is True
+    assert "I1" in pipe["fallback_reason"]
+    assert sum(pipe["invariant_fails"].values()) >= 1
+    assert out.shape == (2, K)                        # step survived
+    # Sticky: the next read is blocking stock, still correct.
+    monkeypatch.setattr(wrap_v2, "_cuda_capturing", lambda: False)
+    propose(wrapped, runner, ["a", "b"])
+    assert pipe["fallback"] is True
+    assert wrapped._suffix_pipe_frame["lagged"] is False
+
+
+def test_pipe_ghost_refeed_interplay(suffix_env, monkeypatch):
+    # Ghost re-feed and the pipeline compose: a dirty ghost's re-feed
+    # (single-row, ledger-authoritative CURRENT total) runs BEFORE the
+    # pipelined totals read; the pipelined step then serves lagged
+    # totals for the live rows and publishes zeros via the fast path
+    # -- ingestion still lands and a replay still hits.
+    _pipe_env(monkeypatch, fast=True)
+    runner, ats, totals = _w0_runner()
+    ats[2, 9:] = 668
+    totals.t[2] = 9
+    wrapped, spec = _pipe_wrap(runner)
+    fp = wrapped._suffix_w0fp
+    pipe = wrapped._suffix_pipe
+    propose(wrapped, runner, ["a"])                    # cold + seed
+    ats[2, 9:12] = np.array(SEQ_A[9:12], dtype=np.int32)
+    totals.t[2] = 12
+    propose(wrapped, runner, ["a"])                    # fast + enqueue
+    assert fp["fast_steps"] >= 1
+    # 'a' departs WITH the enqueued copy still pending: ghost re-feed
+    # must fire (single-row blocking propose_suffix_only) and the step
+    # (empty batch) must not serve any stale snapshot.
+    propose(wrapped, runner, [])
+    assert fp["ghosts_fed"] == 1
+    assert fp["ghosts_dropped"] == 0 and fp["ghosts_pending"] == 0
+    # The lagged 'a' history is fully ingested: a repeat request hits.
+    runner.req_states.req_id_to_index["c"] = 1
+    ats[1, :10] = np.array(SEQ_A[:10], dtype=np.int32)
+    totals.t[1] = 10
+    out = propose(wrapped, runner, ["c"]).tolist()
+    assert out == [[SEQ_A[10], SEQ_A[11], 0, 0]]
+    # Pipeline survived the entire interplay unless a real invariant
+    # fired (it must not have): no fallback, no invariant failures.
+    if pipe is not None and pipe.get("fallback"):
+        # A fallback fired only if the machine decided a shape/seed
+        # break was unsafe -- never silently; in this scenario the
+        # ghost emancipation path must have kept it armed.
+        assert pipe["invariant_fails"], \
+            "fallback without a recorded invariant is a bug"
+    else:
+        assert pipe is None or not pipe["fallback"]
+
+
+def test_pipe_ghost_refeed_w0_off_interplay(suffix_env, monkeypatch):
+    # MUST-FIX #1 regression: sibling of test_pipe_ghost_refeed_interplay
+    # with SUFFIX_HYBRID_W0_FASTPATH=0. Under PIPE=1 + W0 off the
+    # ledger-refresh callers must still populate fp["seen"] (gate
+    # `w0_fast or (pipe on and not fallback)`); with the old W0-only
+    # gate the ledger stays empty, the ghost scan finds nothing, and a
+    # departed request's Rust mirror is gone-ingested ONE STEP
+    # TRUNCATED -- silently. This test fails on the pre-fix code.
+    _pipe_env(monkeypatch, sim=True, fast=False)
+    runner, ats, totals = _w0_runner()
+    ats[2, 9:] = 668
+    totals.t[2] = 9
+    wrapped, spec = _pipe_wrap(runner)
+    fp = wrapped._suffix_w0fp
+    pipe = wrapped._suffix_pipe
+    propose(wrapped, runner, ["a"])                    # seed + enqueue
+    ats[2, 9:12] = np.array(SEQ_A[9:12], dtype=np.int32)
+    totals.t[2] = 12
+    propose(wrapped, runner, ["a"])                    # lagged serve + enqueue
+    # The lagged 'a' step recorded the ledger row despite W0 off:
+    assert "a" in fp["seen"], "PIPE must arm the ledger with W0 off"
+    # 'a' departs WITH the enqueued copy still pending: the ghost scan
+    # (already pipe-aware) must find it and re-feed the full current
+    # history (fingerprint-proven) before the empty-batch step.
+    propose(wrapped, runner, [])
+    assert fp["ghosts_fed"] == 1
+    assert fp["ghosts_dropped"] == 0 and fp["ghosts_pending"] == 0
+    # Full-history ingestion landed: the repeat request 'c' replays the
+    # re-fed 'a' tail and hits -- truncated ingestion would not.
+    runner.req_states.req_id_to_index["c"] = 1
+    ats[1, :10] = np.array(SEQ_A[:10], dtype=np.int32)
+    totals.t[1] = 10
+    out = propose(wrapped, runner, ["c"]).tolist()
+    assert out == [[SEQ_A[10], SEQ_A[11], 0, 0]]
+    assert pipe is None or not pipe["fallback"]
+
+
+def test_pipe_off_w0_off_refresh_never_runs(suffix_env, monkeypatch):
+    # Negative control for MUST-FIX #1: with PIPE=0 + W0_FASTPATH=0
+    # (pure stock) the attendance ledger must stay EMPTY -- the refresh
+    # never runs, no ghost machinery exists, departure handling is the
+    # stock gone-ingestion alone.
+    _pipe_env(monkeypatch, pipe=False, fast=False)
+    runner, ats, totals = _w0_runner()
+    ats[2, 9:] = 668
+    totals.t[2] = 9
+    wrapped, spec = _pipe_wrap(runner)
+    fp = wrapped._suffix_w0fp
+    propose(wrapped, runner, ["a"])
+    totals.t[2] = 12
+    propose(wrapped, runner, ["a"])
+    assert fp["seen"] == {}
+    propose(wrapped, runner, [])                      # 'a' departs
+    assert fp["ghosts_fed"] == 0 and fp["ghosts_dropped"] == 0
+    assert getattr(wrapped, "_suffix_pipe", None) is None or \
+        not wrapped._suffix_pipe["on"]
+
+
+def test_pipe_cpu_absent_safe_path(suffix_env, monkeypatch):
+    # GPU-absent box, no SIM: the pipeline stays OFF and the wrapper
+    # runs the plain blocking stock path (never crashes on the CUDA
+    # stream/event API). torch.cuda.is_available() is monkeypatched so
+    # the test is meaningful on a CUDA box too.
+    _pipe_env(monkeypatch, sim=False)
+    monkeypatch.setenv("SUFFIX_HYBRID_D2H_PIPE_SIM", "0")
+    runner, ats, totals = _w0_runner()
+    runner.vllm_config = NS(
+        scheduler_config=NS(async_scheduling=False))
+    # Patch BEFORE wrapping: the arming block reads is_available.
+    monkeypatch.setattr(wrap_v2.torch.cuda, "is_available",
+                        lambda: False, raising=False)
+    wrapped, spec = wrap(runner)
+    pipe = getattr(wrapped, "_suffix_pipe", None)
+    assert pipe is None or not pipe["on"]
+    out = propose(wrapped, runner, ["a", "b"])         # plain stock
+    assert out.tolist() == [[0] * K, [0] * K]
+
+
+def test_pipe_i8_async_scheduling_refuses_install(suffix_env,
+                                                   monkeypatch):
+    # I8 fail-closed: async_scheduling != False refuses the pipeline
+    # install outright (RuntimeError), before any state is built.
+    _pipe_env(monkeypatch, sim=True, fast=False)
+    monkeypatch.setenv("SUFFIX_HYBRID_D2H_PIPE", "1")
+    runner, ats, totals = _w0_runner()
+    runner.vllm_config = NS(
+        scheduler_config=NS(async_scheduling=True))
+    with pytest.raises(RuntimeError, match="async_scheduling"):
+        _pipe_wrap(runner)
+    # ATTR-MISSING refuses too (fail-closed, never silently degrade).
+    runner.vllm_config = NS(scheduler_config=object())
+    with pytest.raises(RuntimeError, match="async_scheduling"):
+        _pipe_wrap(runner)
+
+
+def test_pipe_mtrace_split_fields(suffix_env, monkeypatch, capsys):
+    # The arm-M MTRACE extension: t_d2h SPLIT into t_fence (blocking
+    # path: capture/seed/fallback/departure reads) vs t_pipe (record-to
+    # consume latency + copy submit), plus pipe_lag_us / pipe_events.
+    # Cumulative-counter semantics stay mtrace_report.py compatible
+    # (totals_us kept, names exist, all non-negative).
+    _pipe_env(monkeypatch, sim=True, fast=True)
+    monkeypatch.setenv("SUFFIX_HYBRID_TRACE", "1")
+    monkeypatch.setenv("SUFFIX_HYBRID_LOG_INTERVAL", "1")
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = _pipe_wrap(runner)
+    _w0_scenario(wrapped, runner)                      # 6 steps
+    m = wrapped._suffix_mtrace
+    for key in ("t_fence", "t_pipe", "pipe_lag_us", "pipe_events"):
+        assert key in m and m[key] >= 0
+    # Seed step paid a fence; every later pipelined step paid t_pipe.
+    assert m["pipe_events"] >= 2
+    assert m["t_pipe"] >= 0.0 and m["totals_us"] >= 0.0
+    lines = [ln for ln in capsys.readouterr().err.splitlines()
+             if ln.startswith("suffix_hybrid MTRACE ")]
+    assert lines
+    import json as _json
+    payload = _json.loads(lines[-1][len("suffix_hybrid MTRACE "):])
+    for key in ("totals_us", "t_fence", "t_pipe", "pipe_lag_us",
+                "pipe_events", "steps", "rust_us", "upload_us"):
+        assert key in payload

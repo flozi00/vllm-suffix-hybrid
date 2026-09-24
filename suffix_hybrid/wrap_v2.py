@@ -174,6 +174,98 @@ def _check_speculator_capability(spec_cls):
     return propose
 
 
+def _cuda_capturing():
+    """Belt-check for the pipelined D2H path (I3, dossier S4).
+
+    True when the calling thread's current stream is inside a CUDA-graph
+    capture window: the pipeline must never enqueue side-stream work or
+    event syncs there (capture happens in dummy_run, which propose
+    short-circuits before the pipeline, so a True here means an upstream
+    refactor moved real propose work into capture). Unknown states fail
+    CLOSED (treated as capturing) so the pipeline degrades to the
+    blocking path instead of corrupting a graph pool.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return False
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return True
+
+
+def _pipe_make_cuda():
+    """(dossier S1.3) pipe CUDA state: side stream + prod/consume events.
+
+    Returns (stream, prod_ev, st_ev) or None when CUDA is unavailable
+    (GPU-absent safe path: the pipeline then stays OFF and the blocking
+    stock totals read runs, bit-identical to stock).
+    """
+    try:
+        if not torch.cuda.is_available():
+            return None
+        return (torch.cuda.Stream(), torch.cuda.Event(),
+                torch.cuda.Event())
+    except Exception:
+        return None
+
+
+class _PipeSimEvent:
+    """No-op CUDA-event stub for the CPU-only SIMULATE mode.
+
+    Copies on CPU are inherently synchronous, so `synchronize()` is a
+    no-op; record/wait keep the Option-A call-shape identical so the
+    lag=1 state machine is exercised end-to-end without a GPU.
+    """
+
+    def record(self, stream=None):
+        pass
+
+    def wait(self, stream=None):
+        pass
+
+    def synchronize(self):
+        pass
+
+
+def _pipe_enqueue(staging, stream, prod_ev, st_ev, totals_gpu, idx_np):
+    """(dossier S1.3, invariants I2/I1) side-stream enqueue of the [n]
+    totals gather.
+
+    prod_ev.record() on the CURRENT (main compute) stream orders the
+    side-stream work behind ALL main-stream work already enqueued at
+    record time (this step's post_update included — S4); inside the
+    side-stream context prod_ev.wait() + the pinned non_blocking=True
+    copy make the D2H genuinely async; st_ev records its completion for
+    next step's lag=1 absorb. The staging buffer is double-buffered
+    against the served `totals_cpu` so only ONE copy is ever in flight.
+
+    SIM mode (CPU-only): `stream is None` -> the discipline collapses to
+    a plain synchronous copy through the same staging buffer, plus a
+    REAL is_current_stream_capturing belt that stays live in tests.
+    """
+    dst = staging[:int(idx_np.shape[0])]
+    if stream is None:                    # SIM: no side stream exists
+        dst.copy_(totals_gpu[torch.from_numpy(idx_np)], non_blocking=False)
+        return
+    prod_ev.record()
+    with torch.cuda.stream(stream):
+        prod_ev.wait()
+        dst.copy_(totals_gpu[torch.from_numpy(idx_np)], non_blocking=True)
+        st_ev.record(stream)
+
+
+class _PipeInvariantError(RuntimeError):
+    """Raised by the pipelined path on an I1-I10 invariant violation.
+
+    `.invariant` routes the sticky fail-closed log line to the right
+    row of the dossier table; everything else lands on I10.
+    """
+
+    def __init__(self, invariant, msg):
+        super().__init__(f"{invariant}: {msg}")
+        self.invariant = invariant
+
+
 def _sync_body(runner, mixer, group, probabilistic, previous_widths,
                state, interval):
     """Legacy per-step body, verbatim from the pre-mirror wire-up (A/B ref).
@@ -343,7 +435,220 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     # SUFFIX_HYBRID_W0_FASTPATH=0 to profile the stock arm.
     m_on = os.environ.get("SUFFIX_HYBRID_TRACE", "").strip() != ""
     m = {"steps": 0, "steps_w0": 0, "batch": 0, "totals_us": 0.0,
-         "rust_us": 0.0, "upload_us": 0.0, "fast_steps": 0}
+         "rust_us": 0.0, "upload_us": 0.0, "fast_steps": 0,
+         "t_fence": 0.0, "t_pipe": 0.0, "pipe_lag_us": 0.0,
+         "pipe_events": 0}
+
+    # --------------------------------------------------------------
+    # PIPE (Option A, dossier pipelined-d2h-design.md): side-stream
+    # production-event + pinned staging + non_blocking=True copy +
+    # CUDA event, consumed with lag=1 on the NEXT propose call. The
+    # blocking fence leaves the step's own critical path; the iterate
+    # opinion certifies nothing and every draft stays target-verified,
+    # so the one-step lag trades only lookup sharpness, never
+    # correctness. Gated by SUFFIX_HYBRID_D2H_PIPE (default OFF =
+    # bit-identical stock blocking behavior). ANY failure of ANY of
+    # the dossier invariants I1-I10 is fail-closed sticky: the wrapper
+    # falls back to the blocking stock path for the rest of its life.
+    # Written as pure-branch state so PIPE=0 shares this exact file
+    # provenance with the stock arm (A/B = one env flip).
+    # ==============================================================
+    # --------------------------------------------------------------
+    pipe_en = (os.environ.get("SUFFIX_HYBRID_D2H_PIPE", "0").strip() != "0")
+    pipe = {"on": False, "sim": False, "armed": False, "pending": None,
+            "lag": None, "steps": 0, "block_steps": 0, "fallback": False,
+            "fallback_reason": "",
+            "invariant_fails": {}, "stream": None, "prod_ev": None,
+            "st_ev": None, "staging_cpu": None}
+    if pipe_en:
+        # I8 (checked first, fail-closed at install like
+        # _check_speculator_capability): the pipeline's lag=1 consume
+        # contract rests on sync scheduling (post_step take fires every
+        # step). async_scheduling ON kills the per-step
+        # update_draft_token_ids take (wake #9) AND breaks the lagged
+        # publication provenance — refuse to install, never degrade
+        # silently.
+        _vc = getattr(runner, "vllm_config", None)
+        _scc = getattr(_vc, "scheduler_config", None) if _vc else None
+        _async = getattr(_scc, "async_scheduling", "ATTR-MISSING")
+        if _async is not False:
+            raise RuntimeError(
+                "SUFFIX-PIPE requires sync scheduling: "
+                f"scheduler_config.async_scheduling={_async!r} "
+                "(must be False); refusing pipelined D2H install")
+        sim = os.environ.get("SUFFIX_HYBRID_D2H_PIPE_SIM",
+                             "0").strip() in ("1", "true", "yes")
+        _pipe_cuda = _pipe_make_cuda()
+        if _pipe_cuda is not None:
+            (pipe["stream"], pipe["prod_ev"],
+             pipe["st_ev"]) = _pipe_cuda
+            pipe["staging_cpu"] = torch.zeros(
+                (max_reqs,), dtype=torch.int64, pin_memory=True)
+            pipe["on"] = True
+            print("suffix_hybrid v2 SUFFIX-PIPE armed (lag=1, "
+                  "seed=blocking, gate=SUFFIX_HYBRID_D2H_PIPE)",
+                  file=sys.stderr, flush=True)
+        elif sim:
+            # CPU-only SIMULATE mode (tests / GPU-absent boxes): the
+            # same lag=1 state machine with inherently-synchronous
+            # copies and no-op event stubs. Never armed on the live
+            # pod (no CUDA -> no side stream to pipeline).
+            pipe["sim"] = True
+            pipe["stream"] = None
+            pipe["prod_ev"] = _PipeSimEvent()
+            pipe["st_ev"] = _PipeSimEvent()
+            pipe["staging_cpu"] = torch.zeros(
+                (max_reqs,), dtype=torch.int64, pin_memory=False)
+            pipe["on"] = True
+            print("suffix_hybrid v2 SUFFIX-PIPE armed SIM (cpu-only "
+                  "lag=1 simulation, gate=SUFFIX_HYBRID_D2H_PIPE_SIM)",
+                  file=sys.stderr, flush=True)
+        else:
+            # GPU-absent safe path: pipeline stays OFF; the blocking
+            # stock totals read below runs, bit-identical to stock.
+            pipe["on"] = False
+            print("suffix_hybrid v2 SUFFIX-PIPE not armed (no CUDA): "
+                  "blocking stock totals path.", file=sys.stderr,
+                  flush=True)
+
+    def _pipe_fail(invariant, exc):
+        # Fail-closed sticky (dossier S2.5 I10): ONE invariant violation
+        # permanently disables the pipeline for this wrapper's life --
+        # the in-process rollback lane. The blocking path takes over on
+        # the very read that failed.
+        if not pipe["fallback"]:
+            pipe["fallback"] = True
+            pipe["fallback_reason"] = f"{invariant}: {exc}"
+            print(f"suffix_hybrid v2 SUFFIX-PIPE DISABLED fail-closed "
+                  f"({invariant}): {type(exc).__name__}: {exc} -- "
+                  f"blocking path from here on", file=sys.stderr,
+                  flush=True)
+        pipe["invariant_fails"][invariant] = \
+            pipe["invariant_fails"].get(invariant, 0) + 1
+
+    def _pipe_absorb():
+        # Consume LAST step's side-stream copy (dossier S1.3): fence the
+        # event, keep the snapshot as pipe["lag"]. The synchronize()
+        # fences last step's copy AND -- transitively, prod_ev was
+        # recorded on the main stream after that step's post_update was
+        # enqueued -- last step's post_update chain; exactly the fence
+        # `_totals_now` pays, now waited to a full step later.
+        # I1: absorb strictly precedes the next enqueue.
+        pend_ids, pend_idx, pend_n, ev = pipe["pending"]
+        t0 = time.perf_counter()
+        ev.synchronize()
+        t_wait = (time.perf_counter() - t0) * 1e6
+        # CLONE out of the staging buffer (dossier S1.3 double-buffer
+        # note): the very next statement block in _pipe_get enqueues a
+        # NEW copy through the same staging buffer, and the served
+        # snapshot must not alias storage an in-flight copy writes.
+        pipe["lag"] = {"ids": list(pend_ids),
+                       "idx": np.array(pend_idx, dtype=np.int64),
+                       "totals": pipe["staging_cpu"][:int(pend_n)]
+                       .clone().numpy(),
+                       "n": int(pend_n)}
+        pipe["pending"] = None
+        return t_wait
+
+    def _pipe_get(idx_np, n, ids):
+        # Pipelined totals read. Returns (totals, used_pipe_lag):
+        # used_pipe_lag=True means the returned array is the LAGGED
+        # step N-1 snapshot and every ats_np read in this step must be
+        # bounded by it (dossier S2.1/I7). All failure paths fail
+        # closed into the blocking stock read.
+        ids_l = list(ids)
+        try:
+            # I3 belt: NEVER touch stream/event APIs in a capture
+            # window; a True here means real propose work moved into
+            # capture. Sticky-disable + blocking (capture-safe: the
+            # stock gather has no stream API).
+            if _cuda_capturing():
+                raise _PipeInvariantError(
+                    "I3", "CUDA graph capture window reached the "
+                    "pipelined path")
+            t_wait = 0.0
+            t_enq = 0.0
+            if not pipe["armed"]:
+                # I6: FIRST propose after install seeds with ONE
+                # blocking CURRENT read, then arms. No step ever runs
+                # lagged without a seed.
+                t0 = time.perf_counter()
+                totals = _totals_now(idx_np)
+                t_blk = (time.perf_counter() - t0) * 1e6
+                pipe["armed"] = True
+                pipe["steps"] += 1
+                pipe["block_steps"] = pipe["block_steps"] + 1
+                if m_on:
+                    m["t_fence"] += t_blk
+                used_pipe_lag = False
+            elif pipe["pending"] is None:
+                # I1 breach (unreachable via this wrapper's own steps):
+                # an armed pipeline must always have exactly ONE copy
+                # in flight after its seed. Sticky-disable, blocking.
+                raise _PipeInvariantError(
+                    "I1", "armed pipeline has no in-flight copy to "
+                    "absorb (seed/absorb chain broken)")
+            else:
+                # I1 normal discipline: absorb the ONE in-flight copy
+                # BEFORE any new enqueue (the fence below drains last
+                # step's copy AND, transitively, its post_update).
+                t_wait = _pipe_absorb()
+                snap = pipe["lag"]
+                aligned = (snap is not None and snap["n"] == int(n)
+                           and snap["ids"] == ids_l
+                           and bool(np.array_equal(snap["idx"],
+                                                   idx_np)))
+                if aligned:
+                    # Lag=1 consume: the snapshot's totals/idx pair is
+                    # exactly THIS step's batch in the same order, so
+                    # serving it is generation-consistent.
+                    totals = snap["totals"]
+                    used_pipe_lag = True
+                else:
+                    # Any batch-shape change (departure, arrival,
+                    # reorder) breaks the lag serve contract -> serve
+                    # blocking CURRENT totals this step (I7 forbids
+                    # mixed-generation reads: THIS step's ats_np is
+                    # read with these CURRENT bounds, last step's
+                    # pending snapshot is discarded as unusable below;
+                    # a fresh lag chain starts with this step's
+                    # enqueue).
+                    t0 = time.perf_counter()
+                    totals = _totals_now(idx_np)
+                    t_blk = (time.perf_counter() - t0) * 1e6
+                    used_pipe_lag = False
+                    pipe["block_steps"] = pipe["block_steps"] + 1
+                    if m_on:
+                        m["t_fence"] += t_blk
+            # Enqueue THIS step's copy (seed step included) on the
+            # side stream, ordered behind the main-stream post_update
+            # chain via prod_ev (I2); consumed next propose (I1:
+            # exactly one in flight).
+            t_enq0 = time.perf_counter()
+            _pipe_enqueue(pipe["staging_cpu"], pipe["stream"],
+                          pipe["prod_ev"], pipe["st_ev"],
+                          totals_gpu, idx_np)
+            t_enq = (time.perf_counter() - t_enq0) * 1e6
+            pipe["pending"] = (ids_l, np.array(idx_np, copy=True),
+                               int(n), pipe["st_ev"])
+            pipe["steps"] += 1
+            if m_on:
+                m["t_pipe"] += t_wait + t_enq
+                m["pipe_lag_us"] += t_wait
+                m["pipe_events"] += 1
+            return totals, used_pipe_lag
+        except Exception as exc:
+            # I10: no half-absorbed snapshot, no orphaned pending may
+            # survive; sticky-disable and run blocking THIS step too.
+            pipe["pending"] = None
+            _pipe_fail(getattr(exc, "invariant", "I10"), exc)
+        t0 = time.perf_counter()
+        totals = _totals_now(idx_np)
+        t_blk = (time.perf_counter() - t0) * 1e6
+        pipe["block_steps"] = pipe["block_steps"] + 1
+        if m_on:
+            m["t_fence"] += t_blk
+        return totals, False
 
     def _cache_index_empty():
         # Provable-zero oracle for disjunct (A): nothing indexed -> no
@@ -358,10 +663,17 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
 
     def _ledger_refresh(ids_l, idx_l, totals_l, dirty):
         # Attendance ledger. `dirty` marks rows the Rust mirror can be
-        # stale for (lived through fast steps); head4 + tail1 fingerprints
-        # prove row identity at ghost re-feed time (engine rows are
-        # append-only within total, so a live row's record stays valid).
-        if not w0_fast:
+        # stale for (lived through fast steps); head4 + tail1
+        # fingerprints prove row identity at ghost re-feed time (engine
+        # rows are append-only within total, so a live row's record
+        # stays valid). Under the PIPELINED D2H arm the ledger is
+        # ALWAYS armed (the departure re-feed needs the records even
+        # with W0 off) and every row is recorded dirty-with-lag (the
+        # ledger's totals/row content sit one step behind whenever the
+        # step consumed a lagged snapshot; the re-feed re-reads the
+        # CURRENT total anyway, so the conservatism is free).
+        pipe_dirty = pipe["on"] and not pipe["fallback"]
+        if not (w0_fast or pipe_dirty):
             return
         seen = fp["seen"]
         for i, rid in enumerate(ids_l):
@@ -381,6 +693,10 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             "steps": m["steps"], "steps_w0": m["steps_w0"],
             "batch_tokens": m["batch"],
             "totals_us": round(m["totals_us"], 1),
+            "t_fence": round(m["t_fence"], 1),
+            "t_pipe": round(m["t_pipe"], 1),
+            "pipe_lag_us": round(m["pipe_lag_us"], 1),
+            "pipe_events": m["pipe_events"],
             "rust_us": round(m["rust_us"], 1),
             "upload_us": round(m["upload_us"], 1),
             "fast_steps": m["fast_steps"],
@@ -452,6 +768,17 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
         # so the next step re-attempts the re-feed / gone-ingestion --
         # a departed request's history can never be silently lost.
         popped_ghosts = {}
+        # Test/trace handle for the pipelined D2H tests: the totals
+        # array actually consumed this step + whether it was the lag=1
+        # snapshot (True) or a blocking CURRENT read (False). Written
+        # into the wrapper-level `_suffix_pipe_frame` dict so tests can
+        # read it after the call (a per-call local would be invisible).
+        consume_log = getattr(propose, "_suffix_pipe_frame", None)
+        if consume_log is None:
+            consume_log = {}
+        consume_log.clear()
+        consume_log["totals"] = []
+        consume_log["lagged"] = False
         try:
             ids = list(input_batch.req_ids)
             idx_np = np.fromiter((lut[rid] for rid in ids),
@@ -472,7 +799,8 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             # tracks it like before, and the ghost's later departure
             # performs the stock gone-ingestion.
             ghosts = []
-            if w0_fast and fp["seen"]:
+            pipe_dirty_all = pipe["on"] and not pipe["fallback"]
+            if (w0_fast or pipe_dirty_all) and fp["seen"]:
                 ghosts = [rid for rid in fp["seen"] if rid not in ids]
                 for rid in ghosts:
                     rec = fp["seen"].pop(rid, None)
@@ -483,27 +811,46 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                         # call below); the except block restores any
                         # still-unconfirmed record.
                         popped_ghosts[rid] = rec
-                    if rec is None or not rec.get("dirty"):
+                    if rec is None or (not rec.get("dirty")
+                                      and not pipe_dirty_all):
                         # Clean ghost: its Rust mirror was kept current
                         # by the stock path while it lived; the MAIN mix
                         # call below performs the stock gone-ingestion
                         # of that mirror -- nothing to re-feed.
                         continue
-                    # Dirty ghost: the request lived through FAST steps,
-                    # so its run()-owned mirror stopped growing and the
-                    # main call would ingest a TRUNCATED history. Re-feed
-                    # the full prefix ONCE (fingerprint-proven row
-                    # identity, ledger-authoritative total = the exact
-                    # history the stock arm would have tracked); the
-                    # main call then ingests this rebuilt mirror --
-                    # byte-identical content to the stock arm.
+                    # Dirty ghost: the request lived through FAST steps
+                    # or the PIPE is armed (dossier S2.2(a): a one-step
+                    # lagged totals serve leaves the Rust mirror one
+                    # step short, and under PIPE every refeed-eligible
+                    # ghost is treated dirty -- the ledger total itself
+                    # may be stale by the lag), so the main call would
+                    # ingest a TRUNCATED history. Re-feed the full
+                    # prefix ONCE (fingerprint-proven row identity,
+                    # ledger-authoritative total = the exact history
+                    # the stock arm would have tracked); the main call
+                    # then ingests this rebuilt mirror -- byte-identical
+                    # content to the stock arm.
                     popped_ghosts[rid] = rec   # NIT-1: recoverable on throw
                     g_idx = int(rec["idx"])
-                    g_tot = max(int(rec["total"]), 0)
+                    g_tot_rec = max(int(rec["total"]), 0)
+                    if pipe_dirty_all:
+                        # S2.2(a) fix: per-departure blocking scalar
+                        # read of the row's CURRENT total (departures
+                        # are rare; this also fences that row's UVA
+                        # writes). Row identity is still proven at the
+                        # RECORDED positions (append-only rows):
+                        # head4 + tail1-at-recorded-total.
+                        g_tot = int(_totals_now(
+                            np.array([g_idx], dtype=np.int64))[0])
+                    else:
+                        g_tot = g_tot_rec
                     row = ats_np[g_idx]
-                    if (g_tot > 0 and g_tot <= row.shape[0]
-                            and row[:min(4, g_tot)].tolist() == rec["head"]
-                            and int(row[g_tot - 1]) == rec["tail1"]):
+                    if (g_tot_rec > 0 and g_tot >= g_tot_rec
+                            and g_tot <= row.shape[0]
+                            and row[:min(4, g_tot_rec)].tolist()
+                            == rec["head"]
+                            and int(row[g_tot_rec - 1])
+                            == rec["tail1"]):
                         proposer.propose_suffix_only(
                             [rid], np.array([g_idx]),
                             np.array([g_tot]), ats_np)
@@ -511,11 +858,12 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                         popped_ghosts.pop(rid, None)   # re-feed survived
                     else:
                         # Row fingerprint mismatch (engine reused the
-                        # row after departure): no provable recovery.
-                        # Keep a counter; with disjunct (A) requiring an
-                        # EMPTY cache index the dirty band exists only
-                        # on cold-start runs, so this cannot lose
-                        # already-indexed corpus content.
+                        # row after departure, or a reset shrank the
+                        # row below its S2.3 lag bound): no provable
+                        # recovery. Keep a counter; with disjunct (A)
+                        # requiring an EMPTY cache index the dirty band
+                        # exists only on cold-start runs, so this cannot
+                        # lose already-indexed corpus content.
                         fp["ghosts_dropped"] += 1
                         popped_ghosts.pop(rid, None)   # explicit drop
             # Ghost re-feed never modifies ids/idx_np: ghosts live in a
@@ -523,9 +871,31 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             # args; the main mix call below is the stock call, bit for
             # bit.
             # ---- (end ghost re-feed) --------------------------------
-            t_d2h0 = time.perf_counter()
-            totals = _totals_now(idx_np)
-            t_d2h = (time.perf_counter() - t_d2h0) * 1e6
+            # ---- Pipelined D2H (Option A, SUFFIX_HYBRID_D2H_PIPE). ---
+            # Ghost/departure re-feed (above) already ran: it performs
+            # its OWN blocking current-total reads, so I4's ordering
+            # (absence-then-absorb, re-feed, THEN totals) is satisfied
+            # before any fast-path probe or pipeline work below.
+            if pipe["on"] and not pipe["fallback"]:
+                totals, pipe_lagged = _pipe_get(idx_np, n, ids)
+                t_d2h = 0.0   # t_pipe/t_fence accounted inside _pipe_get
+                consume_log["totals"] = totals.tolist()
+                consume_log["lagged"] = pipe_lagged
+            else:
+                # Blocking stock totals read (pipeline off, sticky
+                # fallback after an invariant violation, or GPU-absent
+                # box): counts into t_fence today (t_d2h keeps the
+                # cumulative-counter semantics mtrace_report.py
+                # relies on: total host time in the totals lane +
+                # SPLIT t_fence for the mechanism attribution).
+                t_d2h0 = time.perf_counter()
+                totals = _totals_now(idx_np)
+                t_d2h = (time.perf_counter() - t_d2h0) * 1e6
+                pipe_lagged = False
+                consume_log["totals"] = totals.tolist()
+                consume_log["lagged"] = False
+                if m_on:
+                    m["t_fence"] += t_d2h
 
             # Draft accounting: compare last step's published drafts against
             # the engine's actual writes at those positions this step. The
@@ -572,12 +942,13 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             # for any rid must go stock. (At the consumer the two are
             # equivalent — get_draft_tokens defaults missing to width 0
             # — but byte-identical publication is the contract here.)
-            if w0_fast and not ghosts and _cache_index_empty():
+            if (w0_fast or (pipe["on"] and not pipe["fallback"])) \
+                    and not ghosts and _cache_index_empty():
                 known = proposer.widths_table
                 if all(rid in known for rid in ids):
-                # Mark every live row dirty: their Rust mirror content is
-                # from before this step; a later departure re-feeds the
-                # missing prefix (ghost path above).
+                    # Mark every live row dirty: their Rust mirror content is
+                    # from before this step; a later departure re-feeds the
+                    # missing prefix (ghost path above).
                     _ledger_refresh(ids, idx_np, totals, dirty=True)
                     out.zero_()
                     try:
@@ -601,9 +972,12 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             # Stock path. Ledger-refresh live rows as CLEAN (their mirror
             # will be current after this call); dirty ghosts were handled
             # above. Disjunct (B) below opportunistically skips the H2D
-            # upload when every width is 0 and the packed rows are
-            # therefore provably zeros.
-            if w0_fast:
+            # Upload when every width is 0 and the packed rows are
+            # therefore provably zeros. (Ledger refresh: under the
+            # pipelined arm the ledger must stay populated even with
+            # W0 off -- departed requests need their records for the
+            # dirty re-feed, dossier S2.2(a)/§7.)
+            if w0_fast or (pipe["on"] and not pipe["fallback"]):
                 _ledger_refresh(ids, idx_np, totals, dirty=False)
             t_rust0 = time.perf_counter()
             packed, widths_np = proposer.propose_suffix_only(
@@ -692,6 +1066,10 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     # Test/trace handle points: W0 fast-path counters + arm-M histogram.
     setattr(propose, "_suffix_w0fp", fp)
     setattr(propose, "_suffix_mtrace", m)
+    # Pipelined-D2H test handles: pipe state dict + the per-step
+    # consumed-totals frame (lag vs blocking) owned by the latest call.
+    setattr(propose, "_suffix_pipe", pipe)
+    setattr(propose, "_suffix_pipe_frame", {})
     # Token-level verify trace hook points (SUFFIX_HYBRID_TRACE_VERIFY2):
     # expose the per-rid published-drafts registry to the sampler wrap.
     setattr(propose, "_suffix_trace_state", trace_state)
