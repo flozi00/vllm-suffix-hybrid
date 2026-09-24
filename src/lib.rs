@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 /// FxHash: the index maps are hit once per n-gram position on every add and
 /// once per speculate; SipHash (std default) costs more than the bucket work
@@ -311,6 +312,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SuffixCache>()?;
     m.add_class::<engine::Engine>()?;
     m.add_class::<mixer::HybridMixer>()?;
+    m.add_class::<mixer::V2SuffixProposer>()?;
     m.add("VERSION", "0.2.0-rust-v1")?;
     Ok(())
 }

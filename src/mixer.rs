@@ -2,6 +2,7 @@
 //! One coherent chain: a native prefix followed by a conditional suffix tail.
 //! The verifier's accepted-prefix lengths train a discounted split-bandit.
 use super::*;
+use numpy::ndarray::ArrayView2;
 use pyo3::{exceptions::PyValueError, types::PyDict};
 use std::collections::HashSet;
 
@@ -703,5 +704,292 @@ impl HybridMixer {
             .elapsed_ns
             .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         Ok(result)
+    }
+}
+
+
+// ===================== V2 suffix-only proposer =====================
+// Drafter-free speculative decoding for the V2 runner (gemma lane, wake
+// #6-7): the wrapper never calls the native drafter forward, so a step
+// costs one target forward of width (drafts + 1) — the 10x step cost of
+// MTP is gone. ALL per-step algorithm work lives here in Rust (language
+// contract, hard rule #3): the Python adapter gathers batch-order request
+// ids, row indices, and total lengths (pure vLLM-contract wiring), then
+// hands ONE zero-copy view of vLLM's host-resident token buffer
+// (RequestState.all_token_ids — UVA pinned memory, int32) to a single
+// call. Row reads, continuity proof, cache lookups, ingestion on
+// departure, and width tracking are all Rust.
+//
+// State:
+//   mirror: per-request FULL token history. Fresh rows copy the whole row
+//     once (same cost class as engine.rs / mix_numpy Fresh); continuing
+//     rows prove continuity with head+tail boundary windows and append
+//     only the delta (<= K+1 per decode step).
+//   widths: TRUE draft width published per request last step; the
+//     adapter's get_draft_tokens patch reads this table (ragged rows:
+//     width-0 -> plain 1-token decode at 1x cost).
+#[pyclass(module = "suffix_hybrid._native")]
+pub struct V2SuffixProposer {
+    cache: SuffixCache,
+    mirror: Map<String, Vec<i64>>,
+    widths: Map<String, usize>,
+    k: usize,
+    max_model_len: usize,
+    min_len: usize,
+    steps: u64,
+    hits: u64,
+    hit_tokens: u64,
+    ingested: u64,
+    resets: u64,
+    elapsed_ns: u64,
+}
+
+struct SuffixRowOut {
+    tokens: Vec<i64>,
+    width: usize,
+}
+
+impl V2SuffixProposer {
+    /// Core per-batch algorithm, generic over the buffer dtype (live
+    /// all_token_ids is int32; int64 accepted for tests).
+    fn run<T: Copy + Into<i64>>(
+        &mut self,
+        request_ids: &[String],
+        indices: &[usize],
+        tokens: ArrayView2<'_, T>,
+        totals: &dyn Fn(usize) -> i64,
+    ) -> PyResult<Vec<SuffixRowOut>> {
+        let n = request_ids.len();
+        if indices.len() < n {
+            return Err(PyValueError::new_err(
+                "suffix-only batch dimension mismatch",
+            ));
+        }
+        let ncols = tokens.ncols();
+        // 1) Ingestion: rows that left the batch donate their FULL tracked
+        // history (prompt + generation) to the shared corpus — the ONLY
+        // ingestion path in this mode. Echo traffic then hits from the
+        // first decode steps of the next request repeating the passage.
+        let live: HashSet<&str> = request_ids.iter().map(|s| s.as_str()).collect();
+        let gone: Vec<String> = self
+            .mirror
+            .keys()
+            .filter(|rid| !live.contains(rid.as_str()))
+            .cloned()
+            .collect();
+        for rid in gone {
+            if let Some(row) = self.mirror.remove(&rid) {
+                self.widths.remove(&rid);
+                if row.len() > 8 {
+                    lock_cache(&self.cache.inner).add(row);
+                    self.ingested += 1;
+                }
+            }
+        }
+        // 2) Per-row: continuity proof, incremental extend, cache lookup.
+        let k = self.k;
+        let min_len = self.min_len;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let rid = &request_ids[i];
+            let total = totals(i);
+            if total < 0 || total as usize > ncols || total as usize > self.max_model_len {
+                return Err(PyValueError::new_err("suffix-only row bounds"));
+            }
+            let total = total as usize;
+            let row = tokens.row(indices[i]);
+            let tracked = self.mirror.get(rid);
+            // Boundary proof on the VIEW (no full copy to prove identity):
+            // the tracked prefix's head and the tokens where it ends must
+            // match. Same 64-token windows as mix_numpy's boundary check.
+            let cont = match tracked {
+                Some(t) if total >= t.len() => {
+                    let l = t.len();
+                    let w = BOUNDARY.min(l);
+                    (t[..w].iter().zip(row.iter().take(w)).all(|(&a, &b)| a == b.into()))
+                        && (t[l - w..].iter().zip(row.iter().skip(l - w).take(w)).all(
+                            |(&a, &b)| a == b.into(),
+                        ))
+                }
+                _ => false,
+            };
+            let tokens_row: Vec<i64> = if cont {
+                let t = tracked.unwrap();
+                let mut v = t.clone();
+                v.extend(
+                    row.iter()
+                        .skip(t.len())
+                        .take(total - t.len())
+                        .map(|&x| x.into()),
+                );
+                v
+            } else {
+                if tracked.is_some() {
+                    self.resets += 1;
+                }
+                row.iter().take(total).map(|&x| x.into()).collect()
+            };
+            // Cache lookup: the continuation starts at the true next token
+            // (the buffer read happens AFTER postprocess_sampled wrote the
+            // last sampled token — the mirror is EXACT, no shift needed).
+            let (suffix, _score, _matched) =
+                lock_cache(&self.cache.inner).speculate(&tokens_row, k);
+            let out_row = if !suffix.is_empty() && suffix.len() >= min_len {
+                let w = suffix.len().min(k);
+                SuffixRowOut {
+                    tokens: suffix[..w].to_vec(),
+                    width: w,
+                }
+            } else {
+                SuffixRowOut {
+                    tokens: vec![],
+                    width: 0,
+                }
+            };
+            if out_row.width > 0 {
+                self.hits += 1;
+                self.hit_tokens += out_row.width as u64;
+            }
+            self.mirror.insert(rid.clone(), tokens_row);
+            self.widths.insert(rid.clone(), out_row.width);
+            out.push(out_row);
+        }
+        self.steps += 1;
+        Ok(out)
+    }
+}
+
+#[pymethods]
+impl V2SuffixProposer {
+    #[new]
+    #[pyo3(signature = (num_speculative_tokens, max_model_len, min_len=1))]
+    fn new(num_speculative_tokens: usize, max_model_len: usize, min_len: usize) -> PyResult<Self> {
+        if !(1..=64).contains(&num_speculative_tokens) || !(1..=16_777_216).contains(&max_model_len)
+        {
+            return Err(PyValueError::new_err(
+                "suffix-only k must be 1..64 and context 1..16777216",
+            ));
+        }
+        Ok(Self {
+            cache: SuffixCache::new(),
+            mirror: map(),
+            widths: map(),
+            k: num_speculative_tokens,
+            max_model_len,
+            min_len: min_len.max(1),
+            steps: 0,
+            hits: 0,
+            hit_tokens: 0,
+            ingested: 0,
+            resets: 0,
+            elapsed_ns: 0,
+        })
+    }
+
+    /// Batch entry from the adapter. All state transitions live here.
+    ///
+    /// - `request_ids`: batch-order engine request ids (list[str])
+    /// - `indices`:     batch-order req-state row indices (int64 1D NumPy
+    ///                  or list), from RequestState.req_id_to_index
+    /// - `totals`:      batch-order authoritative total lengths (int64 1D
+    ///                  NumPy), read after the blocking D2H that fences
+    ///                  the UVA buffer writes
+    /// - `tokens`:      ZERO-COPY view of the full host-resident
+    ///                  [max_num_reqs, max_model_len] token buffer
+    ///                  (int32 live; int64 accepted)
+    /// Returns (packed [rows, k] int64 drafts, [rows] int64 true widths).
+    #[pyo3(signature = (request_ids, indices, totals, tokens))]
+    fn propose_suffix_only(
+        &mut self,
+        py: Python<'_>,
+        request_ids: Vec<String>,
+        indices: &Bound<'_, PyAny>,
+        totals: &Bound<'_, PyAny>,
+        tokens: &Bound<'_, PyAny>,
+    ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+        use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
+        let started = Instant::now();
+        // Panic boundary guards the algorithm; numpy packing runs after
+        // with the held GIL token (no unsafe re-acquisition).
+        let rows = super::guard_py("propose_suffix_only", || {
+            let totals = totals
+                .extract::<PyReadonlyArray1<'_, i64>>()
+                .map_err(|_| PyValueError::new_err("totals must be int64 1D NumPy"))?;
+            let n = request_ids.len();
+            if totals.as_array().len() < n {
+                return Err(PyValueError::new_err("totals shorter than request ids"));
+            }
+            let t_vec: Vec<i64> = match totals.as_array().as_slice() {
+                Some(_) => Vec::new(),
+                None => totals.as_array().iter().copied().collect(),
+            };
+            let t_at = move |i: usize| -> i64 {
+                if t_vec.is_empty() {
+                    totals.as_array()[i]
+                } else {
+                    t_vec[i]
+                }
+            };
+            let idx: Vec<i64> = indices
+                .extract::<Vec<i64>>()
+                .map_err(|_| PyValueError::new_err("indices must be ints"))?;
+            if idx.len() < n {
+                return Err(PyValueError::new_err("indices shorter than request ids"));
+            }
+            let idx_usize: Vec<usize> = idx.iter().map(|&x| x.max(0) as usize).collect();
+            if let Ok(a) = tokens.extract::<PyReadonlyArray2<'_, i32>>() {
+                self.run(&request_ids, &idx_usize, a.as_array(), &t_at)
+            } else if let Ok(a) = tokens.extract::<PyReadonlyArray2<'_, i64>>() {
+                self.run(&request_ids, &idx_usize, a.as_array(), &t_at)
+            } else {
+                Err(PyValueError::new_err(
+                    "tokens must be int32/int64 2D NumPy",
+                ))
+            }
+        })?;
+        // Pack [n, k] drafts and [n] widths into numpy (contiguous,
+        // C-order; tiny: n x k <= 32 x 64).
+        let n = rows.len();
+        let k = self.k;
+        let mut packed: Vec<i64> = vec![0; n * k];
+        let mut widths_np: Vec<i64> = vec![0; n];
+        for (i, r) in rows.iter().enumerate() {
+            widths_np[i] = r.width as i64;
+            for (j, &tok) in r.tokens.iter().enumerate() {
+                if j < k {
+                    packed[i * k + j] = tok;
+                }
+            }
+        }
+        self.elapsed_ns = self
+            .elapsed_ns
+            .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        let packed_np = packed.into_pyarray(py);
+        let widths_arr = widths_np.into_pyarray(py);
+        Ok((packed_np.into_any().unbind(), widths_arr.into_any().unbind()))
+    }
+
+    /// True width published per request id at the last propose call. The
+    /// adapter's get_draft_tokens patch consumes this for ragged rows.
+    #[getter]
+    fn widths_table<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        for (rid, &w) in &self.widths {
+            d.set_item(rid, w)?;
+        }
+        Ok(d)
+    }
+
+    fn get_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("steps", self.steps)?;
+        d.set_item("hits", self.hits)?;
+        d.set_item("hit_tokens", self.hit_tokens)?;
+        d.set_item("ingested", self.ingested)?;
+        d.set_item("resets", self.resets)?;
+        d.set_item("active", self.mirror.len())?;
+        d.set_item("elapsed_ns", self.elapsed_ns)?;
+        d.set_item("cache", self.cache.stats())?;
+        Ok(d)
     }
 }

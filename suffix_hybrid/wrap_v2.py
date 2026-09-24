@@ -66,13 +66,55 @@ is measurement-only — broadcast stays authoritative. If the async fast path
 raises once it is permanently disabled for this wrapper and every later step
 runs the synchronous body (logged once).
 
-Install shape: install_v2() patches the V2 GPUModelRunner.load_model BEFORE
-the engine builds it; after init_speculator resolved the concrete method
-class, the speculator INSTANCE gets its propose wrapped once. Every per-step
-property that cannot be arbitrated (dummy/profile/capture calls, shape drift,
-any mixer raise) DEGRADES to the untouched native draft with a rate-limited
-stderr line — raising inside propose propagates through sample_tokens as an
-EngineCore fatal and kills the pod.
+- Install shape: install_v2() patches the V2 GPUModelRunner.load_model BEFORE
+  the engine builds it; after init_speculator resolved the concrete method
+  class, the speculator INSTANCE gets its propose wrapped once. Every per-step
+  property that cannot be arbitrated (dummy/profile/capture calls, shape drift,
+  any mixer raise) DEGRADES to the untouched native draft with a rate-limited
+  stderr line — raising inside propose propagates through sample_tokens as an
+  EngineCore fatal and kills the pod.
+
+SUFFIX-ONLY MODE (SUFFIX_HYBRID_SUFFIX_ONLY=1, gemma lane wake #6-7): the
+GPU-drafter forward is ECONOMICALLY DEAD on Gemma-4-26B-A4B @ SM120 (measured:
+k=4 spec-step = 10x native step cost, ceiling 5 tok/step -> max 0.50x even at
+99.95% acceptance; k=1 3.27x vs 2x -> 0.61x). The only surviving golden-rule
+path removes the drafter from the equation: the wrapper REPLACES propose()
+outright — no draft forward, no drafter KV work — and fills draft_tokens
+straight from the host-RAM suffix cache (suffix doctrine: zero VRAM).
+
+Contract honored (vLLM v0.30.0, sources pinned in
+bench/gemma-research/RESEARCH-vllm-v030-spec-contract.md):
+- propose returns the persistent [num_reqs, K] int64 GPU buffer
+  (speculator.draft_tokens); the runner scatters it into
+  req_states.draft_tokens (model_runner.py:2158) — full width mandatory.
+- draft_sample_method must be greedy (draft_logits stays None; the rejection
+  sampler at model_runner.py:1563 needs drafter logits otherwise).
+- dummy_run/is_profile calls must also return the correctly shaped buffer
+  (zeros are fine) — the captured target graphs never contained the drafter.
+- observe_verification stays native (no-op without adaptive verification).
+Ragged per-row widths (miss row -> plain 1-token decode at 1x native cost):
+the scheduler consumes request.spec_token_ids of ANY length per row
+(scheduler.py:812-827 trims, update_draft_token_ids:2404+ accepts ragged
+DraftTokenIds, prepare_inputs builds per-row cu_num_logits, rejection sampler
+kernels are per-row via cu_num_draft_tokens). The stock
+DraftTokensHandler.get_draft_tokens (spec_decode/utils.py:60-70) only D2Hs
+real rows under structured output; otherwise it publishes K-wide [-1]
+placeholders. The wrapper therefore ALSO patches get_draft_tokens to return
+our true per-row widths (tracked on the host alongside each proposal) —
+sync scheduling (async_scheduling defaults off; we do not pass it) calls it
+every step via EngineCore.post_step -> update_draft_token_ids.
+Rust-first (language contract): ALL per-step algorithm work lives in the
+Rust V2SuffixProposer (src/mixer.rs) — per-request full-history mirrors,
+64-token head+tail boundary continuity, cache lookups, ingestion on
+departure, true-width tracking. The adapter below is pure contract wiring:
+read totals (one blocking [n] D2H that also fences the UVA buffer writes
+postprocess_sampled issued), pass the ZERO-COPY host view of
+req_states.all_token_ids (UVA pinned memory, int32) plus ids/indices, and
+upload the packed [n,K] result. postprocess_sampled runs BEFORE propose,
+so the buffer read is the CURRENT authoritative row — no mirror lag, no
+shift correction; the cache continuation starts at the true next token.
+A miss simply proposes width 0 (ragged row -> 1x decode): correctness is
+never at risk because every draft is target-verified.
 """
 import contextlib
 import functools
@@ -206,6 +248,137 @@ def _sync_body(runner, mixer, group, probabilistic, previous_widths,
                     file=sys.stderr, flush=True)
         return group.broadcast(output, src=0)
     return run
+
+
+def _suffix_only_wrap(runner, speculator, mixer, group, k):
+    """Replace propose() with drafter-free, Rust-owned suffix drafting.
+
+    Language contract: NO per-step Python algorithm work. The adapter only
+    (a) reads the UVA host-resident token buffer + total lengths (one tiny
+    GPU event sync for total_len, then zero-copy CPU reads), (b) calls the
+    Rust V2SuffixProposer once, (c) uploads the packed [n,k] drafts. All
+    mirror bookkeeping, cache lookups, ingestion, and width tracking live
+    in Rust; this function is pure vLLM-contract wiring.
+
+    vLLM contract anchors (v0.30.0): postprocess_sampled runs BEFORE
+    propose and writes the last sampled tokens into req_states.all_token_ids
+    (UVA host buffer) + total_len (GPU StagedWriteTensor), so a read here
+    sees the CURRENT authoritative row. Sync-scheduler ragged widths go out
+    via the get_draft_tokens patch reading proposer.widths_table.
+    """
+    from suffix_hybrid._native import V2SuffixProposer
+    state = {"skips": 0, "reason": ""}
+    interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
+    min_len = max(int(os.environ.get(
+        "SUFFIX_HYBRID_SUFFIX_MIN", "1") or 1), 1)
+    proposer = V2SuffixProposer(
+        int(k), int(getattr(speculator, "max_model_len", 0) or 0) or 32768,
+        min_len)
+    draft_tokens = speculator.draft_tokens          # [max_num_reqs, K] GPU
+    req_states = runner.req_states
+    totals_gpu = req_states.total_len.gpu
+    # ZERO-COPY host view of the full [max_num_reqs, max_model_len] token
+    # buffer (UVA pinned memory, int32). Rust reads rows straight from it;
+    # the only GPU traffic per step is the [n] totals D2H that also fences
+    # the UVA writes (postprocess_sampled's post_update kernel completed).
+    ats_np = req_states.all_token_ids._uva_buf.np
+    lut = req_states.req_id_to_index
+    max_reqs = int(getattr(speculator, "max_num_reqs", 32) or 32)
+
+    # One pinned [max_reqs] totals buffer, reused every step.
+    pin = torch.cuda.is_available()
+    totals_cpu = torch.zeros(
+        (max_reqs,), dtype=torch.int64, pin_memory=pin)
+
+    def _totals_now(n):
+        # Blocking D2H of the first n totals; also acts as the fence for
+        # the UVA buffer writes (same stream ordering as post_update).
+        dst = totals_cpu[:n]
+        dst.copy_(totals_gpu[:n], non_blocking=False)
+        return dst.numpy()
+
+    @functools.wraps(type(speculator).propose)
+    def propose(input_batch, attn_metadata, slot_mappings, last_hidden_states,
+                aux_hidden_states, num_sampled, num_rejected, last_sampled,
+                next_prefill_tokens, temperature, seeds, dp_sync=None,
+                dummy_run=False, skip_attn_for_dummy_run=False, mm_inputs=None,
+                is_profile=False):
+        n = int(input_batch.num_reqs)
+        out = draft_tokens[:n]
+        if dummy_run or is_profile:
+            out.zero_()
+            return out
+        try:
+            ids = list(input_batch.req_ids)
+            totals = _totals_now(n)
+            idx = np.fromiter((lut[rid] for rid in ids),
+                              dtype=np.int64, count=n)
+            packed, widths_np = proposer.propose_suffix_only(
+                ids, idx, totals, ats_np)
+            out.zero_()
+            out.copy_(torch.from_numpy(packed).to(
+                out.device, out.dtype), non_blocking=pin)
+            if interval and int(proposer.get_stats()["steps"]) % interval == 0:
+                print("suffix_hybrid suffix-only " + json.dumps(
+                    proposer.get_stats(), sort_keys=True, default=str),
+                    file=sys.stderr, flush=True)
+            return out
+        except Exception as exc:
+            state["reason"] = f"{type(exc).__name__}: {exc}"
+            state["skips"] += 1
+            if state["skips"] <= 3 or state["skips"] % 100 == 0:
+                print(f"suffix_hybrid suffix-only passthrough "
+                      f"(#{state['skips']}): {state['reason']}",
+                      file=sys.stderr, flush=True)
+            out.zero_()
+            return out
+    propose._suffix_proposer = proposer
+    return propose
+
+
+def _patch_get_draft_tokens(runner, widths_table):
+    """Make DraftTokensHandler.get_draft_tokens return our ragged widths.
+
+    The stock handler (v0.30.0 spec_decode/utils.py) publishes K-wide [-1]
+    placeholder rows unless structured output forced a D2H. The scheduler
+    happily consumes ragged rows (that is exactly how V1 ngram/suffix
+    proposers feed it): only the LENGTH of each CPU row matters for
+    scheduling — the verification tokens themselves come from the GPU
+    req_states.draft_tokens via combine_sampled_and_draft_tokens. We trim
+    each row to the true width recorded at propose time; width-0 rows
+    become [] and schedule a plain 1-token decode for that request.
+    Under structured output the stock D2H rows are real tokens: keep them
+    (trimmed to width) so grammar validation still sees actual drafts.
+    """
+    handler = getattr(runner, "draft_tokens_handler", None)
+    if handler is None:
+        return False
+
+    def get_draft_tokens(self):
+        from vllm.v1.outputs import DraftTokenIds
+        if self.draft_tokens_np is not None:
+            self.copy_event.synchronize()
+            real_rows = self.draft_tokens_np.tolist()
+        else:
+            real_rows = None
+        widths = widths_table() if callable(widths_table) else widths_table
+        rows = []
+        for i, rid in enumerate(self.req_ids):
+            width = int(widths.get(rid, 0)) if isinstance(
+                widths, dict) else 0
+            if width <= 0 or self.num_draft_tokens <= 0:
+                rows.append([])
+                continue
+            width = min(width, self.num_draft_tokens)
+            if real_rows is not None and i < len(real_rows):
+                rows.append(real_rows[i][:width])
+            else:
+                rows.append([-1] * width)
+        return DraftTokenIds(self.req_ids, rows)
+
+    import types
+    handler.get_draft_tokens = types.MethodType(get_draft_tokens, handler)
+    return True
 
 
 def _wrap_propose_sync(runner, original, mixer, group, probabilistic=False):
@@ -950,6 +1123,26 @@ def install_v2():
             # wrapper must pass stochastic rows through untouched.
             probabilistic = getattr(speculator, "draft_logits", None) \
                 is not None
+            if os.environ.get(
+                    "SUFFIX_HYBRID_SUFFIX_ONLY", "").strip() == "1":
+                if probabilistic:
+                    print("suffix_hybrid v2 WARNING: suffix-only mode "
+                          "requires greedy draft sampling; staying native.",
+                          file=sys.stderr, flush=True)
+                    return result
+                wrapped = _suffix_only_wrap(
+                    self, speculator, mixer, group, k)
+                wrapped._suffix_hybrid_hook = True
+                speculator.propose = wrapped
+                # Ragged per-row widths: patch the CPU-side DraftTokenIds
+                # the scheduler consumes (miss rows -> plain 1x decode).
+                patched = _patch_get_draft_tokens(
+                    self, wrapped._suffix_proposer.widths_table)
+                print(f"suffix_hybrid v2 SUFFIX-ONLY installed "
+                      f"speculator={cls_name} k={k} tp={group.world_size} "
+                      f"ragged_handler={'yes' if patched else 'NO (uniform)'}",
+                      file=sys.stderr, flush=True)
+                return result
             # Instance-attribute bind: the runner calls
             # self.speculator.propose(input_batch=..., ...) with keywords, so
             # the wrapper closes over the speculator's BOUND class function
