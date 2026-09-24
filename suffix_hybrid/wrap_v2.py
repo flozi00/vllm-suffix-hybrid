@@ -310,11 +310,18 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     totals_cpu = torch.zeros(
         (max_reqs,), dtype=torch.int64, pin_memory=pin)
 
-    def _totals_now(n):
-        # Blocking D2H of the first n totals; also acts as the fence for
-        # the UVA buffer writes (same stream ordering as post_update).
+    def _totals_now(idx_np):
+        # Indexed D2H gather of the totals for THIS step's request rows;
+        # also acts as the fence for the UVA buffer writes (same stream
+        # ordering as post_update). INDEXED, never positional: req-state
+        # rows are handed out from the END of the free list
+        # (states.py add_request: free_indices.pop()), so live requests live
+        # at rows 31, 30, .. and a [:n] slice reads free/stale rows — the
+        # wake-#1/#2 freeze (mirror rows 9..16 tokens, num_index_keys=0,
+        # widths=0 forever) was exactly that slice reading row-0 garbage.
+        n = int(idx_np.shape[0])
         dst = totals_cpu[:n]
-        dst.copy_(totals_gpu[:n], non_blocking=False)
+        dst.copy_(totals_gpu[torch.from_numpy(idx_np)], non_blocking=False)
         return dst.numpy()
 
     @functools.wraps(type(speculator).propose)
@@ -330,9 +337,9 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             return out
         try:
             ids = list(input_batch.req_ids)
-            totals = _totals_now(n)
             idx_np = np.fromiter((lut[rid] for rid in ids),
-                                  dtype=np.int64, count=n)
+                                 dtype=np.int64, count=n)
+            totals = _totals_now(idx_np)
             # Draft accounting: compare last step's published drafts against
             # the engine's actual writes at those positions this step. The
             # engine writes the verified/sampled tokens at [p_total .. ]
