@@ -78,7 +78,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-24.8"
+PATCH_REVISION = "2026-09-24.9"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -503,6 +503,29 @@ def _nvfp4_kv_mm_prefill_mask(mm_ranges, req_offset, qo_indptr, kv_lens,
 # apply(); the patched backend never imports the bundle package itself.
 # Env unset => both helpers are inert (stock fa2 decode, byte-identical flow).
 _OWN_ATTN_HELPER_SRC = '''
+def _nvfp4_own_attn_graphs_ok() -> bool:
+    """UNIFORM_BATCH (FULL graphs for uniform 1+k verify) on the nvfp4 route,
+    only with K2-NVFP4 armed AND the V2 runner's dispatch invariant intact:
+    a batch holding ANY still-prefilling request is never uniform-decode
+    (vllm/v1/worker/utils.py get_uniform_decode_token_count: `not
+    has_prefill`), so an image-bearing prompt chunk can never replay a causal
+    decode graph — it always takes the piecewise path, where the builder's
+    H17 resplit sends it to the FA2 masked prefill. Invariant missing or
+    V1 runner -> single-token graphs (fail closed, loud)."""
+    import os
+
+    if os.environ.get("SUFFIX_SM120_NVP4KV_OWN_ATTN", "").strip() != "1":
+        return False
+    impl = globals().get("_nvfp4_own_attn")
+    if impl is None or not impl.uniform_decode_excludes_prefill():
+        logger.warning_once(
+            "suffix sm120 nvfp4-kv: UNIFORM_BATCH cudagraphs NOT enabled for "
+            "K2-NVFP4 (V2 runner has_prefill invariant not verified); spec "
+            "verify stays piecewise.")
+        return False
+    return True
+
+
 def _nvfp4_own_attn_gate(builder) -> bool:
     import os
 
@@ -848,7 +871,26 @@ _BACKEND_EDITS = [
         if (vllm_config.cache_config.cache_dtype or "").startswith(
             "nvfp4"
         ) and _use_fa2_for_nvfp4_kv_on_sm120():
+            # K2-NVFP4 decodes uniform (1+k) verify rows itself with a
+            # seq_lens-independent grid -> FULL graphs for spec verify.
+            # Without it (FA2 decode wrapper) stay single-token.
+            if _nvfp4_own_attn_graphs_ok():
+                return AttentionCGSupport.UNIFORM_BATCH
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE''',
+        1,
+    ),
+    # ---- H21: the K2-NVFP4 decode path reads block_table directly; skip the
+    # per-step FlashInfer paged_kv_indices build (host work + a Triton copy
+    # kernel outside the graph) when only our decode rows would need it.
+    (
+        "own_attn_no_paged_indices",
+        """        needs_native_paged_decode = (
+            num_decodes > 0 and not decode_with_flashinfer_trtllm_api
+        )""",
+        """        needs_native_paged_decode = (
+            num_decodes > 0 and not decode_with_flashinfer_trtllm_api
+            and not getattr(self, "use_own_nvfp4_attn", False)
+        )""",
         1,
     ),
     # ---- H16: per-KV-group mm mask decision at builder init (window_left

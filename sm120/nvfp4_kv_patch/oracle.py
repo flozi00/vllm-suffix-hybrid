@@ -204,12 +204,15 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
     dtypes = dict(q_data_type=torch.bfloat16, kv_data_type=torch.uint8,
                   o_data_type=torch.bfloat16)
     if wrapper_kind == "decode":
-        assert q_len == 1
+        # q_len > 1: FlashInfer's uniform multi-token decode (fa2 tensor-core
+        # path, causal within each request) — the candidate FA2 route for
+        # FULL-graph spec verify.
         w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             ws, "HND", use_tensor_cores=True, backend="fa2")
         w.plan(kv_indptr, kv_indices, kv_last, hq, hkv, d, page,
                pos_encoding_mode="NONE", sm_scale=sm_scale,
-               window_left=window - 1 if window > 0 else -1, **dtypes)
+               window_left=window - 1 if window > 0 else -1,
+               **(dict(q_len_per_req=q_len) if q_len > 1 else {}), **dtypes)
     else:
         w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             ws, "HND", backend="fa2")
@@ -357,6 +360,11 @@ OWN_CASES = (
      dict(own=True, graph=True)),
     ("own_graph_verify_k8", (130, 3001), 9, "prefill",
      dict(own=True, graph=True)),
+    # FA2 decode wrapper at q_len 9 (q_len_per_req) vs the torch reference:
+    # evidence for a graph-capturable FA2 verify path (no K2 involved).
+    ("fa2_decode_verify_k8", (9, 130, 700, 3001), 9, "decode"),
+    ("fa2_decode_verify_k8_swa", (9, 700, 3001), 9, "decode",
+     dict(window=128)),
 )
 PATTERNS = (("gauss", (1.0, 1.0)), ("gauss", (0.5, 2.0)),
             ("adversarial", (1.0, 1.0)))

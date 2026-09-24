@@ -169,6 +169,27 @@ def _same_div(a: int, b: int) -> bool:
     return div(a) == div(b)
 
 
+def uniform_decode_excludes_prefill(func=None) -> bool:
+    """The V2 runner property UNIFORM_BATCH relies on for multimodality: a
+    batch containing any still-prefilling request (e.g. a (1+k)-token prompt
+    chunk inside an image range) is never classified uniform-decode, hence
+    never replays a FULL (causal) decode graph. Checked on the installed
+    source (vllm/v1/worker/utils.py:740-746, fed by
+    gpu/model_runner.py:1249-1266 has_prefill = is_prefilling.any())."""
+    import inspect
+
+    if os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "").strip() != "1":
+        return False
+    try:
+        if func is None:
+            from vllm.v1.worker.utils import get_uniform_decode_token_count
+            func = get_uniform_decode_token_count
+        src = inspect.getsource(func)
+    except Exception:
+        return False
+    return "if not has_prefill and" in src
+
+
 def builder_gate(builder, window_left, logits_soft_cap) -> bool:
     """Patch H19: evaluated once per FlashInferMetadataBuilder (per KV group).
     False = stock fa2 decode; True = our kernel; raises when armed but not

@@ -174,7 +174,11 @@ class _FIDecode:
 def _helper_ns(**extra):
     from types import SimpleNamespace
 
-    ns = {"FIDecode": _FIDecode, "FlashInferImpl": None,
+    import logging
+
+    log = logging.getLogger("t")
+    log.warning_once = log.warning
+    ns = {"FIDecode": _FIDecode, "FlashInferImpl": None, "logger": log,
           "get_per_layer_parameters": lambda *a: None,
           "infer_global_hyperparameters": lambda _p: SimpleNamespace(
               window_left=-1, logits_soft_cap=None)}
@@ -307,3 +311,62 @@ def test_gpu_kernel_matches_reference():
     want = ref.reference(ref.bf16(q), cache, bt, sl, q_len, 1 / math.sqrt(d))
     got = out.float().cpu().numpy()
     assert _cos(got, want) >= 0.9995 and _rel(got, want) <= 2e-2
+
+
+# ---------------------------------------------------------------------------
+# UNIFORM_BATCH graphs (H13) + the multimodal guard
+# ---------------------------------------------------------------------------
+
+def test_h13_uniform_batch_only_behind_own_attn_and_h21():
+    new, applied = PATCH.patch_backend_source(FIXTURE.read_text())
+    i = new.index('"""Get the cudagraph support level for FlashInfer attention."""')
+    block = new[i:i + 700]
+    assert block.index("_nvfp4_own_attn_graphs_ok()") < block.index(
+        "return AttentionCGSupport.UNIFORM_BATCH") < block.index(
+        "return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE")
+    assert "own_attn_no_paged_indices" in applied
+    assert 'and not getattr(self, "use_own_nvfp4_attn", False)\n        )' in new
+
+
+def _uniform_ok(has_prefill_rule):
+    def get_uniform_decode_token_count(num_reqs, num_tokens, max_query_len,
+                                       has_prefill):
+        pass
+    src = ("def get_uniform_decode_token_count(n, t, q, has_prefill):\n"
+           + ("    if not has_prefill and is_uniform(n, t, q):\n"
+              if has_prefill_rule else "    if is_uniform(n, t, q):\n")
+           + "        return q\n    return None\n")
+    ns = {}
+    exec(compile(src, "<fake_utils>", "exec"), ns)
+    import linecache
+    linecache.cache["<fake_utils>"] = (len(src), None, src.splitlines(True),
+                                       "<fake_utils>")
+    return ns["get_uniform_decode_token_count"]
+
+
+def test_mm_guard_requires_v2_prefill_exclusion(monkeypatch):
+    """A uniform-shaped batch holding a still-prefilling (image) chunk must
+    never replay a causal FULL graph: UNIFORM_BATCH is only claimed when the
+    runner provably excludes prefilling batches from uniform-decode."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    assert own_attn.uniform_decode_excludes_prefill(_uniform_ok(True))
+    assert not own_attn.uniform_decode_excludes_prefill(_uniform_ok(False))
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    assert not own_attn.uniform_decode_excludes_prefill(_uniform_ok(True))
+    # pinned vLLM 0.30.0 text, if the source tree is around
+    real = Path("/tmp/vllm-src-kv/vllm/v1/worker/utils.py")
+    if real.is_file():
+        assert "if not has_prefill and is_uniform_query_len(" in real.read_text()
+
+
+def test_graphs_ok_helper_gates(monkeypatch):
+    monkeypatch.delenv(own_attn.ENV, raising=False)
+    ns = _helper_ns(_nvfp4_own_attn=own_attn)
+    assert ns["_nvfp4_own_attn_graphs_ok"]() is False  # K2 not armed
+    monkeypatch.setenv(own_attn.ENV, "1")
+    monkeypatch.setattr(own_attn, "uniform_decode_excludes_prefill",
+                        lambda: False)
+    assert ns["_nvfp4_own_attn_graphs_ok"]() is False  # invariant missing
+    monkeypatch.setattr(own_attn, "uniform_decode_excludes_prefill",
+                        lambda: True)
+    assert ns["_nvfp4_own_attn_graphs_ok"]() is True
