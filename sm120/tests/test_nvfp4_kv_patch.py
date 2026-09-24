@@ -180,6 +180,21 @@ def test_helper_env_gate_is_self_contained():
     assert "nvfp4_kv_patch" not in helper
 
 
+def test_head_dim_scope_gate(monkeypatch):
+    # 256 always; 512 only behind its own opt-in; anything else never.
+    new, _ = PATCH.patch_backend_source(BACKEND_FIXTURE.read_text())
+    helper = new[new.index("def _nvfp4_kv_head_dim_ok"):
+                 new.index("trtllm_workspace_buffer = None")]
+    ns = {}
+    exec(helper, ns)
+    ok = ns["_nvfp4_kv_head_dim_ok"]
+    monkeypatch.delenv("SUFFIX_SM120_NVP4KV_HD512", raising=False)
+    assert ok(128) and ok(256) and not ok(512) and not ok(384)
+    monkeypatch.setenv("SUFFIX_SM120_NVP4KV_HD512", "1")
+    assert ok(512) and not ok(384) and not ok(1024)
+    assert "if not _nvfp4_kv_head_dim_ok(self.head_dim):" in new
+
+
 # ---------------------------------------------------------------------------
 # FlashInfer header probe (0.6.11 overlay patches 01-03 => no-ops on 0.6.18)
 # ---------------------------------------------------------------------------

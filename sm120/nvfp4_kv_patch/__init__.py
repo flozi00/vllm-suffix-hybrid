@@ -52,7 +52,8 @@ Mechanics (why not file-shadowing or plain method rebinding)
   ``FLASHINFER_EXTRA_CUDAFLAGS`` (honoured by flashinfer.jit.cpp_ext for
   every JIT op) at apply() time — before any attention kernel is planned.
 
-Scope: GQA/MHA only, head_dim <= 256 (enforced). MLA never selects this
+Scope: GQA/MHA only, head_dim <= 256, or 512 with SUFFIX_SM120_NVP4KV_HD512=1
+(enforced; set only after ``python -m nvfp4_kv_patch.oracle`` passes). MLA never selects this
 backend; DCP, attention sinks, cascade and trtllm-gen/XQA paths stay strict.
 XQA NVFP4 decode exists in FI 0.6.18 but vLLM 0.30.0 does not plumb scale
 factors into the XQA call site, so the ``decode_with_xqa`` assert is kept.
@@ -65,7 +66,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-22.1"
+PATCH_REVISION = "2026-09-24.1"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -246,6 +247,18 @@ def _use_fa2_for_nvfp4_kv_on_sm120() -> bool:
     except Exception:
         return False
 
+
+# head_dim 512 (gemma-4 full-attn) is a separate opt-in: set it only after
+# the bundle's on-silicon oracle passed on this image (gemma-hd512 dossier c).
+def _nvfp4_kv_head_dim_ok(head_dim: int) -> bool:
+    import os
+
+    if head_dim <= 256:
+        return True
+    return head_dim == 512 and (
+        os.environ.get("SUFFIX_SM120_NVP4KV_HD512", "").strip() == "1"
+    )
+
 ''' % PATCH_REVISION
 
 _BACKEND_EDITS = [
@@ -276,7 +289,8 @@ _BACKEND_EDITS = [
         1,
     ),
     # ---- H3a: builder — record the fa2 route, bypass the trtllm-only raise,
-    # enforce the verified scope (head_dim<=256, no DCP).
+    # enforce the verified scope (head_dim<=256, 512 behind its oracle-gated
+    # opt-in; no DCP).
     (
         "builder_route_and_gate",
         '''            self.is_kvcache_nvfp4 = self.cache_dtype.startswith("nvfp4")
@@ -293,10 +307,12 @@ _BACKEND_EDITS = [
                         "suffix sm120 nvfp4-kv (fa2 route) does not support "
                         "decode context parallelism."
                     )
-                if self.head_dim > 256:
+                if not _nvfp4_kv_head_dim_ok(self.head_dim):
                     raise ValueError(
                         "suffix sm120 nvfp4-kv (fa2 route) supports "
-                        f"head_dim<=256 only, got {self.head_dim}."
+                        f"head_dim<=256 only, got {self.head_dim} (512 needs "
+                        "SUFFIX_SM120_NVP4KV_HD512=1 after the on-silicon "
+                        "oracle `python -m nvfp4_kv_patch.oracle` passed)."
                     )
                 logger.info_once(
                     "suffix sm120 nvfp4-kv ACTIVE: NVFP4 KV on SM120 routed "
