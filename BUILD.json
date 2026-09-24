@@ -1,0 +1,21 @@
+{
+  "source_revision": "f496e1dab8d11ddf52343f6d3189ed35d7eee860",
+  "wheel": "suffix_hybrid-0.2.0-cp39-abi3-manylinux_2_28_x86_64.whl",
+  "sha256": {
+    "suffix_hybrid/__init__.py": "d0a15448c7a8e3cc2783f2fdca7a9aa8a5d5f33edcd55ccb7979e20a9df76d2e",
+    "suffix_hybrid/_native.abi3.so": "1548c8d3197203b301db2e98bce741c3091922106d0ff2962360d3839c167af9",
+    "suffix_hybrid/dev_args.py": "a78981ad862f57c14242f7afedbdc52b98a618d04f28e15a175eef53f3117266",
+    "suffix_hybrid/hybrid_proposer.py": "f9874bb82636d6cab081087a578b5d587fd3d705e9457e9db5824e7be0d84813",
+    "suffix_hybrid/kernels/__init__.py": "b428fba65a89972286f42118dd562fb04c0466726920f2b1eafc2e3219530ca7",
+    "suffix_hybrid/kernels/install.py": "a96351fde00c12af9c593f438b68d39982afbc022758ef369c69a2dba15b0619",
+    "suffix_hybrid/kernels/rmsnorm.py": "e63252c2fa7f462e40fb7d05709b21e139fac30d0cdf158e69061de121f401a5",
+    "suffix_hybrid/suffix_cache.py": "52be810ac9b88109a7a3af3e46cbff9ca022f256c6a85ead64ef0eaf7556074d",
+    "suffix_hybrid/wrap.py": "662cb2ce6b847b54303410f334959f4a33b11aed028f0c0f77b033bcfcb3a7ab",
+    "suffix_hybrid/wrap_v2.py": "08388a1b2859cdd415da6ac1bb5a5bfbd36e4eea3ecc70a49cee0be5b59a7e1f",
+    "sitecustomize.py": "13e93a0f2082e4d78d7230bc3faf0bdbbbd925907d83af92e1c8a3862e47a97e",
+    "deep_gemm/__init__.py": "bfb1174724b5be4291431aafd4c2bc8eb03477a91c65c8ebd41806b32fccd6da",
+    "deep_gemm/sm120_fallback.py": "8aa6b709874e6826fa16ddabff90c97da47e5acf6aba4bf00707c12bae1c6bbc",
+    "nvfp4_kv_patch/__init__.py": "9345ad758d5fdbae1ec9d1653df31230191131ebe3c0b717492d4b6b4a17bbf6",
+    "ficache.py": "c782524b4e55e7ff350ee0674878e309759ca8d986e7434454659896ff63c6c5"
+  }
+}
