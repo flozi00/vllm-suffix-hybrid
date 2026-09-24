@@ -955,3 +955,182 @@ def test_pipe_mtrace_split_fields(suffix_env, monkeypatch, capsys):
     for key in ("totals_us", "t_fence", "t_pipe", "pipe_lag_us",
                 "pipe_events", "steps", "rust_us", "upload_us"):
         assert key in payload
+
+
+# ===========================================================================
+# Wake-29 attribution tiebreakers (audit wake29-pipe-falsification-audit.md
+# §3/§4): step_wall_us wall-cadence accumulator + ghost drop-reason split +
+# absorb wait/host split. All cumulative, mtrace_report.py-compatible.
+# ===========================================================================
+
+def test_pipe_step_wall_accumulates_and_is_monotone(suffix_env,
+                                                    monkeypatch):
+    # step_wall_us = perf_counter delta between consecutive _pipe_get
+    # ENTRIES. First entry anchors (no delta); N entries -> N-1 deltas.
+    _pipe_env(monkeypatch, sim=True, fast=False)
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = _pipe_wrap(runner)
+    m = wrapped._suffix_mtrace
+    assert m["step_wall_us"] == 0.0
+    offs = []
+    for _ in range(5):
+        propose(wrapped, runner, ["a", "b"])
+        offs.append(m["step_wall_us"])
+    # Monotone non-decreasing (perf_counter deltas are >= 0), and the
+    # seed entry anchored (no delta exists for it: offs[0] == 0.0)
+    # while every later entry added a strictly positive inter-propose
+    # wall delta (host work between proposes is real).
+    assert offs == sorted(offs)
+    assert offs[0] == 0.0
+    for prev, cur in zip(offs, offs[1:]):
+        assert cur >= prev and cur > 0.0      # deltas never negative
+    # 5 entries -> 4 deltas; 5 propose calls hit _pipe_get each time
+    # (SIM arm, real side-stream state machine; wall_t0 always set).
+    assert wrapped._suffix_pipe["wall_t0"] is not None
+    # Negative control: with the pipe OFF the accumulator never runs.
+    _pipe_env(monkeypatch, pipe=False, fast=False)
+    runner2, ats2, totals2 = _w0_runner()
+    wrapped2, spec2 = _pipe_wrap(runner2)
+    for _ in range(3):
+        propose(wrapped2, runner2, ["a", "b"])
+    assert wrapped2._suffix_mtrace["step_wall_us"] == 0.0
+
+
+def test_ghost_drop_reason_split_fingerprint(suffix_env, monkeypatch):
+    # Fingerprint-mismatch drop (engine reused the row): head4/tail1
+    # no longer match -> ghosts_drop_fp, NOT ghosts_drop_reset; the
+    # total ghosts_dropped still counts it (back-compat).
+    wrapped, runner, ats, totals, fp = _growth_setup(monkeypatch)
+    ats[2, :4] = 999                       # corrupt head: fp mismatch
+    propose(wrapped, runner, [])            # 'a' departs -> drop
+    assert fp["ghosts_dropped"] == 1
+    assert fp["ghosts_drop_fp"] == 1
+    assert fp["ghosts_drop_reset"] == 0
+    assert fp["ghosts_fed"] == 0
+
+
+def test_ghost_drop_reason_split_reset_shrink(suffix_env, monkeypatch):
+    # Reset-shrink drop (g_tot < g_tot_rec): the engine reset shrank
+    # the row below its S2.3 lag bound -> ghosts_drop_reset, NOT
+    # ghosts_drop_fp; fingerprint stays intact (head4/tail1 at the
+    # RECORDED positions still match). Only the PIPE arm re-reads the
+    # CURRENT total per departure (S2.2(a)), so only there can the
+    # reset-shrink wedge be observed; without the pipe the re-feed
+    # trusts the ledger total (g_tot == g_tot_rec) and the shrink
+    # path is unreachable by construction.
+    _pipe_env(monkeypatch, sim=True, fast=True)
+    runner, ats, totals = _w0_runner()
+    ats[2, 9:] = 668
+    totals.t[2] = 9
+    wrapped, spec = _pipe_wrap(runner)
+    fp = wrapped._suffix_w0fp
+    propose(wrapped, runner, ["a"])          # seed + ledger record (9)
+    totals.t[2] = 5                          # engine RESET shrank row 'a'
+    propose(wrapped, runner, [])             # 'a' departs -> drop
+    assert fp["ghosts_dropped"] == 1
+    assert fp["ghosts_drop_reset"] == 1
+    assert fp["ghosts_drop_fp"] == 0
+    # Back-compat total still counted once and once only.
+    assert fp["ghosts_drop_fp"] + fp["ghosts_drop_reset"] \
+        == fp["ghosts_dropped"]
+
+
+def test_ghost_drop_split_invariants_on_fed_and_stock(suffix_env,
+                                                     monkeypatch):
+    # Fed ghosts and the stock arm never touch the split counters.
+    wrapped, runner, ats, totals, fp = _growth_setup(monkeypatch)
+    ats[2, 9:12] = np.array(SEQ_A[9:12], dtype=np.int32)
+    totals.t[2] = 12
+    propose(wrapped, runner, ["a"])         # fast step: mirror stale
+    propose(wrapped, runner, [])            # 'a' departs -> re-feed
+    assert fp["ghosts_fed"] == 1
+    assert fp["ghosts_dropped"] == 0
+    assert fp["ghosts_drop_fp"] == 0 and fp["ghosts_drop_reset"] == 0
+    # Stock (fast OFF, pipe OFF): no ghost machinery at all.
+    _arm_env(monkeypatch, fast=False)
+    monkeypatch.delenv("SUFFIX_HYBRID_D2H_PIPE", raising=False)
+    monkeypatch.setenv("SUFFIX_HYBRID_D2H_PIPE", "0")
+    runner2, ats2, totals2 = _w0_runner()
+    ats2[2, 9:] = 668
+    totals2.t[2] = 9
+    wrapped2, spec2 = wrap(runner2)
+    propose(wrapped2, runner2, ["a"])
+    propose(wrapped2, runner2, [])
+    fp2 = wrapped2._suffix_w0fp
+    for k in ("ghosts_drop_fp", "ghosts_drop_reset",
+              "ghosts_dropped", "ghosts_fed"):
+        assert fp2[k] == 0
+
+
+def test_pipe_mtrace_wake29_fields(suffix_env, monkeypatch, capsys):
+    # Wake-29 MTRACE extension: the cumulative payload must ALSO carry
+    # step_wall_us, absorb_wait_us, absorb_host_us and the ghost
+    # drop-reason split, all non-negative, cumulative and parseable
+    # by plugin-harness/mtrace_report.py (cumulative mode keys intact:
+    # totals_us/rust_us/upload_us unchanged).
+    _pipe_env(monkeypatch, sim=True, fast=True)
+    monkeypatch.setenv("SUFFIX_HYBRID_TRACE", "1")
+    monkeypatch.setenv("SUFFIX_HYBRID_LOG_INTERVAL", "1")
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = _pipe_wrap(runner)
+    _w0_scenario(wrapped, runner)                     # 6 steps
+    m = wrapped._suffix_mtrace
+    for key in ("step_wall_us", "absorb_wait_us", "absorb_host_us"):
+        assert key in m and m[key] >= 0.0
+    # Absorb split is consistent with t_pipe's components: pipe_lag_us
+    # (pure sync-wait) equals absorb_wait_us exactly (same probe).
+    assert m["pipe_lag_us"] == m["absorb_wait_us"]
+    # Wall cadence: 6 entries -> 5 inter-entry deltas accumulated.
+    assert m["step_wall_us"] > 0.0
+    lines = [ln for ln in capsys.readouterr().err.splitlines()
+             if ln.startswith("suffix_hybrid MTRACE ")]
+    assert lines
+    import json as _json
+    payload = _json.loads(lines[-1][len("suffix_hybrid MTRACE "):])
+    for key in ("step_wall_us", "absorb_wait_us", "absorb_host_us",
+                "ghosts_drop_fp", "ghosts_drop_reset"):
+        assert key in payload and payload[key] >= 0
+    # Back-compat total preserved and split sums to it.
+    assert payload["ghosts_drop_fp"] + payload["ghosts_drop_reset"] \
+        <= payload["ghosts_dropped"]
+    assert payload["step_wall_us"] == round(m["step_wall_us"], 1)
+
+
+def test_mtrace_wake29_payload_parses_in_mtrace_report():
+    # Cross-repo contract: the enriched cumulative payload (with ALL
+    # wake-29 fields) must still classify as mode=cumulative in
+    # plugin-harness/mtrace_report.py and derive intervals. The
+    # parser ignores unknown keys, so the contract is: known cost
+    # fields unchanged + new keys ride along harmlessly.
+    import importlib.util as _ilu
+    import json as _json
+    import os as _os
+    _p = _os.path.expanduser(
+        "~/Documents/inference-console/plugin-harness/mtrace_report.py")
+    if not _os.path.exists(_p):
+        pytest.skip("plugin-harness mtrace_report.py not on this box")
+    _sp = _ilu.spec_from_file_location("mtrace_report_w29", _p)
+    assert _sp is not None and _sp.loader is not None
+    mr = _ilu.module_from_spec(_sp)
+    _sp.loader.exec_module(mr)
+    payload = _json.dumps({
+        "steps": 1000, "steps_w0": 100, "batch_tokens": 8,
+        "totals_us": 0.0, "t_fence": 8088.1, "t_pipe": 4655273.1,
+        "pipe_lag_us": 4328.2, "pipe_events": 1000,
+        "step_wall_us": 27000000.0, "absorb_wait_us": 4328200.0,
+        "absorb_host_us": 3200.0,
+        "rust_us": 10662.0, "upload_us": 10895.1,
+        "fast_steps": 18, "ghosts_fed": 33, "ghosts_dropped": 6,
+        "ghosts_drop_fp": 5, "ghosts_drop_reset": 1,
+        "skip_upload": 727}, sort_keys=True)
+    line = "INFO suffix_hybrid MTRACE " + payload
+    w = []
+    rec = mr.parse_mtrace_line(line, w)
+    assert rec is not None and rec["mode"] == "cumulative" and not w
+    recs = [rec, mr.parse_mtrace_line(
+        line.replace('"steps": 1000', '"steps": 2000')
+            .replace('"t_pipe": 4655273.1', '"t_pipe": 9310546.2')
+            .replace('"step_wall_us": 27000000.0',
+                     '"step_wall_us": 54000000.0'), w)]
+    ivs = mr.to_intervals(recs, 1000, w)
+    assert ivs and ivs[0]["steps"] == 1000.0

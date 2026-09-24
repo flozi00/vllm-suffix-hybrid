@@ -423,6 +423,13 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     w0_fast = os.environ.get("SUFFIX_HYBRID_W0_FASTPATH", "1").strip() != "0"
     fp = {"enabled": w0_fast, "seen": {}, "fast_steps": 0,
           "ghosts_fed": 0, "ghosts_dropped": 0, "ghosts_pending": 0,
+          # Wake-29 drop-reason split (audit §3 caveat): one total
+          # conflated engine row-reuse (fingerprint mismatch) with a
+          # reset shrinking the row below its S2.3 lag bound. The
+          # total ghosts_dropped stays for MTRACE/back-compat; the two
+          # split counters settle which cause dominates on bench-leg
+          # traffic.
+          "ghosts_drop_fp": 0, "ghosts_drop_reset": 0,
           "skip_upload": 0}
 
     # Arm-M instrumentation (dossier §3.1, arm A2): per-step host-time
@@ -437,7 +444,20 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     m = {"steps": 0, "steps_w0": 0, "batch": 0, "totals_us": 0.0,
          "rust_us": 0.0, "upload_us": 0.0, "fast_steps": 0,
          "t_fence": 0.0, "t_pipe": 0.0, "pipe_lag_us": 0.0,
-         "pipe_events": 0}
+         "pipe_events": 0,
+         # Wake-29 attribution tiebreaker (audit §4): per-step wall
+         # cadence = perf_counter delta between consecutive _pipe_get
+         # entries. GPU-idle ~= step_wall - t_pipe/(pipe_events) can
+         # then be computed from MTRACE alone: t_pipe ~= step-wall means
+         # the host was the one waiting on a busy GPU (overlap ok);
+         # t_pipe << step-wall means the absorb block sits mid-step.
+         # Cumulative bytes of wall between proposes; the first entry
+         # only sets the baseline (no delta exists yet).
+         "step_wall_us": 0.0,
+         # absorb-time split: host time spent in st_ev.synchronize()
+         # (wait_for_gpu) vs python-side handling around it, so the
+         # ordered-prefix component of the absorb can be isolated.
+         "absorb_wait_us": 0.0, "absorb_host_us": 0.0}
 
     # --------------------------------------------------------------
     # PIPE (Option A, dossier pipelined-d2h-design.md): side-stream
@@ -534,10 +554,17 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
         # enqueued -- last step's post_update chain; exactly the fence
         # `_totals_now` pays, now waited to a full step later.
         # I1: absorb strictly precedes the next enqueue.
+        # Wake-29: returns (t_wait, t_host) -- t_wait brackets ONLY the
+        # synchronize() call (wait-for-GPU, dominated by the
+        # prod_ev-ordered prefix drain), t_host brackets the
+        # python-side handling around it (ledger bookkeeping + staging
+        # clone), so the ordered-prefix component of the absorb can be
+        # isolated from MTRACE via absorb_wait_us vs absorb_host_us.
         pend_ids, pend_idx, pend_n, ev = pipe["pending"]
         t0 = time.perf_counter()
         ev.synchronize()
         t_wait = (time.perf_counter() - t0) * 1e6
+        t_h0 = time.perf_counter()
         # CLONE out of the staging buffer (dossier S1.3 double-buffer
         # note): the very next statement block in _pipe_get enqueues a
         # NEW copy through the same staging buffer, and the served
@@ -548,7 +575,8 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                        .clone().numpy(),
                        "n": int(pend_n)}
         pipe["pending"] = None
-        return t_wait
+        t_host = (time.perf_counter() - t_h0) * 1e6
+        return t_wait, t_host
 
     def _pipe_get(idx_np, n, ids):
         # Pipelined totals read. Returns (totals, used_pipe_lag):
@@ -557,6 +585,16 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
         # bounded by it (dossier S2.1/I7). All failure paths fail
         # closed into the blocking stock read.
         ids_l = list(ids)
+        # Wake-29 wall cadence: perf_counter delta between consecutive
+        # _pipe_get ENTRIES (the step's full host-side wall between
+        # proposes). The first entry only anchors the baseline
+        # timestamp; every later entry adds the inter-entry delta to
+        # m["step_wall_us"]. Two perf_counter calls per step, no other
+        # path touched. pipe["wall_t0"] carries the previous entry's
+        # timestamp across steps (None = next entry is the anchor).
+        _sw_now = time.perf_counter()
+        _sw_prev = pipe.get("wall_t0")
+        pipe["wall_t0"] = _sw_now
         try:
             # I3 belt: NEVER touch stream/event APIs in a capture
             # window; a True here means real propose work moved into
@@ -567,6 +605,7 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                     "I3", "CUDA graph capture window reached the "
                     "pipelined path")
             t_wait = 0.0
+            t_host = 0.0
             t_enq = 0.0
             if not pipe["armed"]:
                 # I6: FIRST propose after install seeds with ONE
@@ -592,7 +631,7 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                 # I1 normal discipline: absorb the ONE in-flight copy
                 # BEFORE any new enqueue (the fence below drains last
                 # step's copy AND, transitively, its post_update).
-                t_wait = _pipe_absorb()
+                t_wait, t_host = _pipe_absorb()
                 snap = pipe["lag"]
                 aligned = (snap is not None and snap["n"] == int(n)
                            and snap["ids"] == ids_l
@@ -632,10 +671,19 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             pipe["pending"] = (ids_l, np.array(idx_np, copy=True),
                                int(n), pipe["st_ev"])
             pipe["steps"] += 1
+            # Wake-29 wall cadence accumulates UNCONDITIONALLY (it
+            # costs two perf_counter calls; the TRACE gate only
+            # controls the emission path, not the counters -- the
+            # same discipline as fp/pipe counters, which never
+            # depend on m_on).
+            if _sw_prev is not None:
+                m["step_wall_us"] += (_sw_now - _sw_prev) * 1e6
             if m_on:
                 m["t_pipe"] += t_wait + t_enq
                 m["pipe_lag_us"] += t_wait
                 m["pipe_events"] += 1
+                m["absorb_wait_us"] += t_wait
+                m["absorb_host_us"] += t_host
             return totals, used_pipe_lag
         except Exception as exc:
             # I10: no half-absorbed snapshot, no orphaned pending may
@@ -697,11 +745,16 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             "t_pipe": round(m["t_pipe"], 1),
             "pipe_lag_us": round(m["pipe_lag_us"], 1),
             "pipe_events": m["pipe_events"],
+            "step_wall_us": round(m["step_wall_us"], 1),
+            "absorb_wait_us": round(m["absorb_wait_us"], 1),
+            "absorb_host_us": round(m["absorb_host_us"], 1),
             "rust_us": round(m["rust_us"], 1),
             "upload_us": round(m["upload_us"], 1),
             "fast_steps": m["fast_steps"],
             "ghosts_fed": fp["ghosts_fed"],
             "ghosts_dropped": fp["ghosts_dropped"],
+            "ghosts_drop_fp": fp["ghosts_drop_fp"],
+            "ghosts_drop_reset": fp["ghosts_drop_reset"],
             "skip_upload": fp["skip_upload"],
         }, sort_keys=True), file=sys.stderr, flush=True)
 
@@ -857,14 +910,22 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                         fp["ghosts_fed"] += 1
                         popped_ghosts.pop(rid, None)   # re-feed survived
                     else:
-                        # Row fingerprint mismatch (engine reused the
-                        # row after departure, or a reset shrank the
-                        # row below its S2.3 lag bound): no provable
-                        # recovery. Keep a counter; with disjunct (A)
-                        # requiring an EMPTY cache index the dirty band
-                        # exists only on cold-start runs, so this cannot
-                        # lose already-indexed corpus content.
+                        # Ghost drop, reason-split (wake-29 audit §3):
+                        # (a) reset-shrink: g_tot < g_tot_rec -- the
+                        # engine reset shrank the row below its S2.3
+                        # lag bound; (b) fingerprint mismatch: the
+                        # engine reused the row after departure (or
+                        # total outgrew the row). No provable recovery
+                        # in either case. Keep a counter; with
+                        # disjunct (A) requiring an EMPTY cache index
+                        # the dirty band exists only on cold-start
+                        # runs, so this cannot lose already-indexed
+                        # corpus content.
                         fp["ghosts_dropped"] += 1
+                        if (g_tot_rec <= 0 or g_tot < g_tot_rec):
+                            fp["ghosts_drop_reset"] += 1
+                        else:
+                            fp["ghosts_drop_fp"] += 1
                         popped_ghosts.pop(rid, None)   # explicit drop
             # Ghost re-feed never modifies ids/idx_np: ghosts live in a
             # SEPARATE single-row propose_suffix_only call with their own
