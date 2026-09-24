@@ -393,3 +393,94 @@ def register():
     _state["armed"] = True
     _log(f"K-GDN1 armed: {LAYER_NAME} OOT-registered (cc {cap[0]}.{cap[1]})")
     return _state
+
+
+# ---------------------------------------------------------------------------
+# on-silicon CLI: `python -m suffix_hybrid.kernels.qwen_gdn {oracle,bench}`
+# ---------------------------------------------------------------------------
+def bench(Ts=(1, 4, 8, 16), layers=48, iters=50, H=16, HV=48, K=128, eps=1e-6):
+    """Per-decode-step GPU time of the 48-layer GDN non-GEMM chain, stock vs
+    K-GDN1, each captured in ONE CUDA graph (= how decode replays in vLLM).
+    Stock = ba.chunk -> 2x .contiguous() + FLA packed recurrent decode + FLA
+    layer_norm_fwd (qwen_gdn_linear_attn.py:1657-1709, 1842-1874, 1912-1913).
+    causal_conv1d_update is identical in both arms and excluded.
+    Returns {T: (stock_us, kgdn1_us)}."""
+    import torch
+    from vllm.third_party.flash_linear_attention.ops import (
+        fused_recurrent_gated_delta_rule_packed_decode,
+    )
+    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import layer_norm_fwd
+
+    native = _native()
+    check_sm120()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    res = {}
+    for T in Ts:
+        inp = make_inputs(T, H, HV, K, slots=T + 1, device=dev, seed=T)
+        dt_bf16 = inp["dt_bias"].to(torch.bfloat16)  # stock param dtype
+        core = torch.zeros(T, HV, K, dtype=torch.bfloat16, device=dev)
+        out = torch.empty_like(core)
+        scale = K ** -0.5
+
+        def stock():
+            b, a = inp["ba"].chunk(2, dim=-1)
+            b, a = b.contiguous(), a.contiguous()
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv=inp["mixed_qkv"], a=a, b=b, A_log=inp["a_log"],
+                dt_bias=dt_bf16, scale=scale, initial_state=inp["state"],
+                out=core.unsqueeze(1), ssm_state_indices=inp["state_idx"],
+                use_qk_l2norm_in_kernel=True)
+            x2 = core.reshape(-1, K)
+            layer_norm_fwd(x2, inp["norm_w"], None, eps, z=inp["z"].reshape(-1, K),
+                           out=x2, group_size=K, norm_before_gate=True,
+                           is_rms_norm=True, activation="silu")
+
+        def ours():
+            native.gdn_decode_fused_cuda(
+                inp["mixed_qkv"], inp["z"], inp["ba"], inp["a_log"], inp["dt_bias"],
+                inp["norm_w"], inp["state"], inp["state_idx"], out, H, scale, eps, 0,
+                torch.cuda.current_stream(dev).cuda_stream)
+
+        times = []
+        for fn in (stock, ours):
+            fn()  # JIT / autotune outside capture
+            torch.cuda.synchronize(dev)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                for _ in range(layers):
+                    fn()
+            g.replay()
+            torch.cuda.synchronize(dev)
+            t0 = torch.cuda.Event(enable_timing=True)
+            t1 = torch.cuda.Event(enable_timing=True)
+            t0.record()
+            for _ in range(iters):
+                g.replay()
+            t1.record()
+            torch.cuda.synchronize(dev)
+            times.append(t0.elapsed_time(t1) * 1000.0 / iters)
+        res[T] = tuple(times)
+        _log(f"K-GDN1 bench T={T}: stock {times[0]:.1f} us/step, K-GDN1 "
+             f"{times[1]:.1f} us/step ({layers} layers) ratio {times[1] / times[0]:.3f}")
+    return res
+
+
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(prog="python -m suffix_hybrid.kernels.qwen_gdn")
+    ap.add_argument("cmd", choices=["oracle", "bench"])
+    args = ap.parse_args(argv)
+    if args.cmd == "oracle":
+        native = _native()
+        check_sm120()
+        for act in (0, 1):
+            w = run_gpu_oracle(native, 16, 48, 128, act, 1e-6)
+            _log(f"K-GDN1 oracle PASS act={act} max|d_out|={w['out']:.3e} "
+                 f"max|d_state|={w['state']:.3e} (+graph replay)")
+    else:
+        bench()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
