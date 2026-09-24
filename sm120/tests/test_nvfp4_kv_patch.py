@@ -38,7 +38,7 @@ FI_FIXTURE = FIXTURES / "flashinfer_0.6.18.post1"
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     for var in ("SUFFIX_SM120_NVP4KV", "SUFFIX_SM120_NVP4KV_ALLOW_DRIFT",
-                "FLASHINFER_EXTRA_CUDAFLAGS"):
+                "SUFFIX_SM120_NVP4KV_MM", "FLASHINFER_EXTRA_CUDAFLAGS"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -205,6 +205,8 @@ def _fi_fixture_files():
         "prefill.cuh": (FI_FIXTURE / "prefill.cuh").read_text(),
         "modules.py": (FI_FIXTURE / "jit_attention" / "modules.py").read_text(),
         "tvm_ffi_utils.h": (FI_FIXTURE / "tvm_ffi_utils.h").read_text(),
+        "variants.cuh": (FI_FIXTURE / "variants.cuh").read_text(),
+        "prefill.py": (FI_FIXTURE / "prefill.py").read_text(),
     }
 
 
@@ -412,6 +414,18 @@ FAKE_STACK = textwrap.dedent('''
     # flashinfer JIT env flag got the de-swizzle define
     assert "-DFLASHINFER_PAGED_V_SF_DESWIZZLE=1" in os.environ[
         "FLASHINFER_EXTRA_CUDAFLAGS"]
+    assert callable(backend._nvfp4_kv_mm_prefill_mask)
+    # mm-prefix opt-in: fail closed while the installed FI lacks the
+    # custom-mask probe files, pass once they are present.
+    os.environ["SUFFIX_SM120_NVP4KV_MM"] = "1"
+    try:
+        patch.apply(backend, force=True)
+        raise AssertionError("mm opt-in must fail closed without probe files")
+    except RuntimeError as exc:
+        assert "mm_variant_mask_layout" in str(exc), exc
+    shutil.copy(fx / "variants.cuh", fi_stage / "data" / "include" / "flashinfer" / "attention" / "variants.cuh")
+    shutil.copy(fx / "prefill.py", fi_stage / "prefill.py")
+    assert patch.apply(backend, force=True) is True
     print("E2E-OK")
 ''')
 
@@ -639,3 +653,210 @@ def test_nvfp4_route_forces_head_major_layout(monkeypatch):
     cfg["v"] = mk("nvfp4")
     monkeypatch.delenv("SUFFIX_SM120_NVP4KV")
     assert not sel()
+
+
+# ---------------------------------------------------------------------------
+# mm-prefix (gemma-4 vision bidirectional) on the fa2 route
+# ---------------------------------------------------------------------------
+
+def test_mm_prefix_anchors_and_gate(patched):
+    _src, new, applied = patched
+    for name in ("supports_mm_prefix_nvfp4", "builder_mm_prefix_mode",
+                 "build_mm_prefix_resplit", "prefill_mm_prefix_mask"):
+        assert name in applied
+    assert "return _nvfp4_kv_mm_enabled()" in new
+    # helper text injected verbatim (tests/oracle exec the same block)
+    assert PATCH._MM_HELPER_SRC in new
+    # mask installed only inside the fa2 (non-DCP) native prefill branch,
+    # after plan() and before the metadata captures the wrapper
+    plan = new.index("fixed_split_size=self.prefill_fixed_split_size,")
+    inst = new.index("prefill_wrapper._mask_indptr_buf) = _mm_mask")
+    assert plan < inst < new.index(
+        "attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)")
+
+
+def test_mm_enabled_needs_route_and_opt_in(monkeypatch):
+    sel = {"v": True}
+    ns = PATCH.mm_helper_namespace(_nvfp4_kv_cache_selected=lambda: sel["v"])
+    en = ns["_nvfp4_kv_mm_enabled"]
+    assert not en()                       # opt-in missing
+    monkeypatch.setenv("SUFFIX_SM120_NVP4KV_MM", "1")
+    assert en()
+    sel["v"] = False                      # route off / fp8 cache
+    assert not en()
+
+
+def _triton_allowed(q, k, kv_len, ranges, window, clamp):
+    """compute_kv_seq_mask (triton_attention_helpers.py) for one (q, k)."""
+    if k >= kv_len:
+        return False
+    sw = window <= 0 or (q - k) < window
+    ok = k <= q and sw
+    for s, e in ranges:
+        if s < e and s <= q <= e and s <= k <= e:
+            ok |= sw if (clamp and window > 0) else True
+    return ok
+
+
+def _unpack(packed, indptr, qo, kv):
+    import torch
+    bits = []
+    for j in range(len(kv)):
+        seg = packed[int(indptr[j]):int(indptr[j + 1])]
+        b = ((seg[:, None] >> torch.arange(8)) & 1).flatten().bool()
+        ql = qo[j + 1] - qo[j]
+        bits.append(b[:ql * kv[j]].view(ql, kv[j]))
+    return bits
+
+
+@pytest.mark.parametrize("block_bits", [1 << 24, 64, 8])
+@pytest.mark.parametrize("window,clamp", [(16, True), (-1, False)])
+def test_mm_mask_matches_triton_semantics(block_bits, window, clamp):
+    torch = pytest.importorskip("torch")
+    ns = PATCH.mm_helper_namespace()
+    ns["_NVFP4_MM_BLOCK_BITS"] = block_bits
+    build = ns["_nvfp4_kv_mm_prefill_mask"]
+    # (q_len, kv_len, ranges): split image across chunks, image longer than
+    # the window, range past kv_len (later chunk), odd kv lens (bits straddle
+    # bytes), a text-only row, a 1-token query inside a range, range ending
+    # exactly at the chunk end, degenerate s == e.
+    reqs = [
+        (5, 5, []),
+        (37, 61, [(20, 29), (40, 70)]),
+        (13, 13, [(0, 12)]),
+        (1, 50, [(40, 55)]),
+        (9, 30, [(21, 29), (3, 3)]),
+        (24, 100, [(60, 99)]),
+    ]
+    offset = 3  # prefill slice starts after 3 decode rows
+    ranges = {offset + j: r for j, (_q, _k, r) in enumerate(reqs)}
+    ranges[0] = [(0, 10)]  # decode rows' ranges must be ignored here
+    qo = [0]
+    for ql, _kv, _r in reqs:
+        qo.append(qo[-1] + ql)
+    kv = [k for _q, k, _r in reqs]
+    res = build(ranges, offset, torch.tensor(qo), torch.tensor(kv), "cpu")
+    assert res is not None
+    packed, indptr = res
+    assert indptr.dtype == torch.int32 and packed.dtype == torch.uint8
+    assert indptr.tolist() == [0] + list(
+        __import__("itertools").accumulate(
+            ((qo[j + 1] - qo[j]) * kv[j] + 7) // 8 for j in range(len(kv))))
+    for j, bits in enumerate(_unpack(packed, indptr, qo, kv)):
+        ql, kvl, rr = reqs[j]
+        ctx = kvl - ql
+        for i in range(ql):
+            q = ctx + i
+            for k in range(kvl):
+                kernel = bool(bits[i, k]) and (
+                    window <= 0 or k + ql + (window - 1) >= kvl + i)
+                assert kernel == _triton_allowed(q, k, kvl, rr, window, clamp), (
+                    j, q, k)
+
+
+def test_mm_mask_none_when_causal_is_exact():
+    torch = pytest.importorskip("torch")
+    build = PATCH.mm_helper_namespace()["_nvfp4_kv_mm_prefill_mask"]
+    qo, kv = torch.tensor([0, 4, 5]), torch.tensor([40, 90])
+    assert build(None, 0, qo, kv, "cpu") is None
+    assert build({}, 0, qo, kv, "cpu") is None
+    # image wholly in the cached context / 1 token of a range in the query /
+    # range starting at the last query token / degenerate range
+    assert build({0: [(0, 30)], 1: [(80, 89), (5, 5)]}, 0, qo, kv,
+                 "cpu") is None
+    assert build({0: [(36, 37)]}, 0, qo, kv, "cpu") is not None
+
+
+def _cm(qlens, prefilling, ranges):
+    import torch
+    import types as _t
+    qsl = [0]
+    for n in qlens:
+        qsl.append(qsl[-1] + n)
+    return _t.SimpleNamespace(
+        query_start_loc_cpu=torch.tensor(qsl), num_reqs=len(qlens),
+        num_actual_tokens=qsl[-1], mm_req_doc_ranges=ranges,
+        is_prefilling=None if prefilling is None else torch.tensor(prefilling))
+
+
+def test_mm_resplit_routes_short_extends_to_prefill():
+    pytest.importorskip("torch")
+    rs = PATCH.mm_helper_namespace()["_nvfp4_kv_mm_resplit"]
+    r = {0: [(0, 9)]}
+    # pure decodes / spec-verify rows (not prefilling): unchanged
+    assert rs(_cm([4, 4, 4], [False] * 3, r), 3) is None
+    # 1-token short extend: causal exact, unchanged
+    assert rs(_cm([4, 1, 4, 100], [False, True, False, True], r), 3) is None
+    # 3-token short extend at row 1 -> split moves to 1
+    assert rs(_cm([4, 3, 4, 100], [False, True, False, True], r), 3) == (
+        1, 3, 4, 107)
+    assert rs(_cm([4, 4], [False, False], {}), 2) is None
+    assert rs(_cm([4, 4], None, r), 0) is None
+    with pytest.raises(RuntimeError):
+        rs(_cm([4, 4], None, r), 2)
+
+
+def _mode_cfg(layers, *, mm=True, bidi="vision", layer_types=None):
+    import types as _t
+    text = _t.SimpleNamespace(use_bidirectional_attention=bidi,
+                              layer_types=layer_types)
+    return _t.SimpleNamespace(
+        model_config=_t.SimpleNamespace(is_mm_prefix_lm=mm,
+                                        hf_text_config=text),
+        compilation_config=_t.SimpleNamespace(static_forward_context=layers))
+
+
+def _layer(mm=True, clamp=False):
+    import types as _t
+    return _t.SimpleNamespace(use_mm_prefix=mm,
+                              mm_prefix_clamp_sliding_window=clamp)
+
+
+def test_mm_mode_per_kv_group(monkeypatch):
+    ns = PATCH.mm_helper_namespace()
+    mode = ns["_nvfp4_kv_mm_mode"]
+    lt = ["sliding_attention", "sliding_attention", "full_attention"]
+    layers = {
+        "model.language_model.layers.0.self_attn.attn": _layer(clamp=True),
+        "model.language_model.layers.1.self_attn.attn": _layer(clamp=True),
+        "model.language_model.layers.2.self_attn.attn": _layer(clamp=False),
+    }
+    swa, full = list(layers)[:2], list(layers)[2:]
+    cfg = _mode_cfg(layers, layer_types=lt)
+    # not the route / not an mm-prefix model: never
+    assert mode(cfg, swa, 1023, False) is False
+    assert mode(_mode_cfg(layers, mm=False, layer_types=lt), swa, 1023,
+                True) is False
+    with pytest.raises(ValueError, match="SUFFIX_SM120_NVP4KV_MM"):
+        mode(cfg, swa, 1023, True)
+    monkeypatch.setenv("SUFFIX_SM120_NVP4KV_MM", "1")
+    assert mode(cfg, swa, 1023, True) is True       # gemma-4 sliding: mask
+    assert mode(cfg, full, -1, True) is False       # gemma-4 full: cleared
+    # generic mm-prefix model, full attention, not cleared: causal OR mm
+    generic = _mode_cfg(layers, bidi=None)
+    assert mode(generic, full, -1, True) is True
+    # generic unclamped sliding window: inexpressible -> fail closed
+    with pytest.raises(ValueError, match="override the sliding window"):
+        mode(generic, full, 1023, True)
+    # gemma-4 MTP drafter (unclamped sliding) -> clamped mask, allowed
+    drafter = dict(layers)
+    drafter["draft_model.layers.0.self_attn.attn"] = _layer(clamp=False)
+    cfg_d = _mode_cfg(drafter, layer_types=lt)
+    assert mode(cfg_d, swa + ["draft_model.layers.0.self_attn.attn"],
+                1023, True) is True
+    # causal and mm layers in one group: refuse
+    with pytest.raises(ValueError, match="share one KV group"):
+        mode(cfg, swa + full, 1023, True)
+
+
+def test_header_probe_mm_checks_gated(monkeypatch):
+    files = _fi_fixture_files()
+    assert all(v for k, v in PATCH.probe_flashinfer_headers(files).items()
+               if k.startswith("mm_"))
+    files["variants.cuh"] = files["variants.cuh"].replace(
+        "maybe_mask_indptr[batch_idx]", "maybe_mask_indptr_bits[batch_idx]")
+    files.pop("prefill.py")
+    res = PATCH.probe_flashinfer_headers(files)
+    assert not res["mm_variant_mask_layout"]
+    assert not res["mm_wrapper_mask_buffers"]
+    assert res["prefill_cuh_sf_strides"]   # base route unaffected

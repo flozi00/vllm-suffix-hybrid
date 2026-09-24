@@ -6,7 +6,10 @@ that the SM120 NVFP4-KV overlay is a no-op against these exact versions:
 - `flashinfer_0.6.18.post1/` — fetched from GitHub raw at tag `v0.6.18.post1`
   (`include/flashinfer/page.cuh`, `include/flashinfer/attention/prefill.cuh`,
   `flashinfer/jit/attention/modules.py`, `flashinfer/jit/attention/utils.py`,
-  `csrc/tvm_ffi_utils.h`). The bundle's header probe reads the *installed*
+  `csrc/tvm_ffi_utils.h`, plus for the mm-prefix probe
+  `include/flashinfer/attention/variants.cuh` and `flashinfer/prefill.py`
+  — copied from an installed 0.6.18.post1 wheel whose prefill.cuh and
+  modules.py are byte-identical to the fixtures above). The bundle's header probe reads the *installed*
   copies of these paths; the fixtures let the probe logic run on CI with no
   GPU and no flashinfer wheel.
 - `vllm_0.30.0/flashinfer_backend.py` — `vllm/v1/attention/backends/flashinfer.py`

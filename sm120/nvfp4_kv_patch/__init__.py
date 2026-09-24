@@ -57,6 +57,18 @@ Scope: GQA/MHA only, head_dim <= 256, or 512 with SUFFIX_SM120_NVP4KV_HD512=1
 backend; DCP, attention sinks, cascade and trtllm-gen/XQA paths stay strict.
 XQA NVFP4 decode exists in FI 0.6.18 but vLLM 0.30.0 does not plumb scale
 factors into the XQA call site, so the ``decode_with_xqa`` assert is kept.
+
+mm-prefix LMs (gemma-4 vision: bidirectional attention inside each image
+range, sliding layers only, clamped to the window) are served WITH images
+behind SUFFIX_SM120_NVP4KV_MM=1 (set only after the oracle's mm_prefix cases
+pass). FI's fa2 NVFP4 paged prefill instantiates MaskMode::kCustom in the same
+JIT module (modules.py: mask_mode 0..3, DefaultAttention<use_custom_mask,...>);
+the builder hands it a packed bit mask only for prefill chunks holding >= 2
+scheduled tokens of one image range — the only case where the TRITON_ATTN
+semantics differ from causal. Text-only / decode steps keep the causal plan.
+Mask cost: sum(qo_len * kv_len) bits over the step's prefill rows (worst case
+max_num_batched_tokens x max_model_len / 8 = 128 MiB at 8192 x 128k), built
+in <= 2 MiB-bool row blocks (no O(q*kv) bool intermediate).
 """
 
 import importlib
@@ -66,7 +78,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-24.4"
+PATCH_REVISION = "2026-09-24.5"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -175,7 +187,38 @@ HEADER_CHECKS = {
     # csrc/tvm_ffi_utils.h: GetFP4ScaleStrides derives page/n/h strides from
     # the SF tensor views vLLM already passes (interleaved-cache aware).
     "ffi_sf_stride_derivation": ("tvm_ffi_utils.h", ("GetFP4ScaleStrides",)),
+    # ---- mm-prefix (enforced only with SUFFIX_SM120_NVP4KV_MM=1) ----
+    # fa2 codegen instantiates the custom-mask kernel next to causal.
+    "mm_fa2_custom_mask_codegen": (
+        "modules.py",
+        ("DefaultAttention<use_custom_mask,", '"maybe_mask_indptr"',
+         "for mask_mode in [0, 1, 2, 3]:"),
+    ),
+    # Mask layout the builder packs: per-request byte offset, row-major
+    # qo x kv little-endian bits, ANDed with the kernel's sliding window.
+    "mm_variant_mask_layout": (
+        "variants.cuh",
+        ("params.maybe_custom_mask + params.maybe_mask_indptr[batch_idx]",
+         "static_cast<uint64_t>(qo_idx) * kv_len + kv_idx",
+         "(custom_mask_ptr[offset / 8] >> (offset % 8)) & 1",
+         "mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx)"),
+    ),
+    # Wrapper attributes the builder sets after plan() (run() picks
+    # MaskMode.CUSTOM off _custom_mask_buf and passes _mask_indptr_buf).
+    "mm_wrapper_mask_buffers": (
+        "prefill.py",
+        ("if self._custom_mask_buf is not None:\n"
+         "            mask_mode = MaskMode.CUSTOM.value",
+         "self._mask_indptr_buf = mask_indptr.to(",
+         "self._mask_indptr_buf,"),
+    ),
 }
+
+MM_GATE_ENV = "SUFFIX_SM120_NVP4KV_MM"
+
+
+def mm_gate_enabled() -> bool:
+    return os.environ.get(MM_GATE_ENV, "").strip() == "1"
 
 
 def probe_flashinfer_headers(files: dict) -> dict:
@@ -196,6 +239,11 @@ def read_installed_flashinfer(fi_root: Path) -> dict:
         ),
         "modules.py": fi_root / "jit" / "attention" / "modules.py",
         "tvm_ffi_utils.h": fi_root / "data" / "csrc" / "tvm_ffi_utils.h",
+        "variants.cuh": (
+            fi_root / "data" / "include" / "flashinfer" / "attention"
+            / "variants.cuh"
+        ),
+        "prefill.py": fi_root / "prefill.py",
     }
     out = {}
     for name, p in paths.items():
@@ -269,7 +317,201 @@ def _nvfp4_kv_head_dim_ok(head_dim: int) -> bool:
 
 ''' % PATCH_REVISION
 
+# mm-prefix support, kept as its own block so the CPU tests and the oracle
+# exec the SAME text the backend gets (mm_helper_namespace()). Self-contained
+# on purpose: the patched backend must not import the bundle package.
+_MM_HELPER_SRC = '''
+# mm-prefix LMs (gemma-4 vision) on the fa2 route. TRITON_ATTN semantics:
+#   allowed(q, k) = k < kv_len and ((k <= q and SW(q, k))
+#                   or (q, k in one range [s, e] and SW(q, k) if clamped))
+# SW(q, k) = q - k < window (kernel window_left = window - 1). With clamping
+# (gemma-4 sliding layers) or no window (full attention) every row is ONE
+# interval [.., hi(q)]: hi = q, or min(e, kv_len - 1) inside a range. The
+# kernel ANDs its own window, so the packed bits only encode k <= hi(q).
+def _nvfp4_kv_mm_enabled() -> bool:
+    import os
+
+    return _nvfp4_kv_cache_selected() and (
+        os.environ.get("SUFFIX_SM120_NVP4KV_MM", "").strip() == "1"
+    )
+
+
+def _nvfp4_kv_mm_mode(vllm_config, layer_names, window_left, use_fa2) -> bool:
+    """Builder-init decision: does this KV group need the mm mask? Raises
+    for semantics one fa2 plan cannot reproduce (fail closed)."""
+    mc = vllm_config.model_config
+    if not (use_fa2 and getattr(mc, "is_mm_prefix_lm", False)):
+        return False
+    if not _nvfp4_kv_mm_enabled():
+        raise ValueError(
+            "suffix sm120 nvfp4-kv (fa2 route): mm-prefix model needs "
+            "SUFFIX_SM120_NVP4KV_MM=1 (after the oracle mm_prefix cases pass)."
+        )
+    text = mc.hf_text_config
+    # gemma-4 (use_bidirectional_attention == "vision"): the model clears
+    # mm ranges on full-attention layers by name (gemma4_mm
+    # _clear_mm_prefix_for_full_attn_layers); mirror that exactly.
+    gemma4 = getattr(text, "use_bidirectional_attention", None) == "vision"
+    cleared = set()
+    if gemma4:
+        cleared = {
+            i for i, t in enumerate(getattr(text, "layer_types", None) or [])
+            if t != "sliding_attention"
+        }
+    layers = vllm_config.compilation_config.static_forward_context
+    modes = set()
+    for name in layer_names:
+        layer = layers[name]
+        if not getattr(layer, "use_mm_prefix", False):
+            modes.add(False)
+            continue
+        idx = None
+        if ".layers." in name:
+            try:
+                idx = int(name.split(".layers.")[1].split(".")[0])
+            except (ValueError, IndexError):
+                idx = None
+        if idx in cleared:
+            modes.add(False)
+        elif window_left < 0 or getattr(
+            layer, "mm_prefix_clamp_sliding_window", False
+        ):
+            modes.add(True)
+        elif gemma4:
+            # Only gemma-4's MTP drafter has unclamped sliding mm layers; it
+            # gets the clamped mask (differs only for images longer than the
+            # window, and drafts are verified by the exact target).
+            logger.warning_once(
+                "suffix sm120 nvfp4-kv: unclamped mm-prefix sliding layer %s "
+                "(gemma-4 drafter) served with the clamped mask.", name
+            )
+            modes.add(True)
+        else:
+            raise ValueError(
+                "suffix sm120 nvfp4-kv (fa2 route): mm-prefix bidirectional "
+                f"ranges that override the sliding window ({name}) are not "
+                "expressible on one fa2 plan; use TRITON_ATTN."
+            )
+    if len(modes) > 1:
+        raise ValueError(
+            "suffix sm120 nvfp4-kv (fa2 route): mm-prefix and causal layers "
+            f"share one KV group ({layer_names[:4]}...); refusing."
+        )
+    return True in modes
+
+
+def _nvfp4_kv_mm_resplit(cm, num_decodes):
+    """Real decodes / spec-verify rows sit after the prompt, so no image
+    range (prompt positions) can hold their queries: causal is exact there.
+    Decode-classified rows that are still prefilling with >= 2 tokens (short
+    extends) may cover 2+ tokens of one range: move the split so they take
+    the masked prefill path (batch order is decode -> extend -> prefill).
+    Returns the new split tuple or None."""
+    if num_decodes == 0 or not any((cm.mm_req_doc_ranges or {}).values()):
+        return None  # text-only batch: zero work
+    if cm.is_prefilling is None:
+        raise RuntimeError(
+            "suffix sm120 nvfp4-kv mm-prefix: CommonAttentionMetadata has "
+            "mm ranges but no is_prefilling; cannot route short extends."
+        )
+    qsl = cm.query_start_loc_cpu[: num_decodes + 1]
+    hit = ((qsl[1:] - qsl[:-1]) >= 2) & cm.is_prefilling[:num_decodes].cpu()
+    if not bool(hit.any()):
+        return None
+    first = int(hit.int().argmax())
+    tok = int(qsl[first])
+    return first, cm.num_reqs - first, tok, cm.num_actual_tokens - tok
+
+
+_NVFP4_MM_BLOCK_BITS = 1 << 24  # per-block bool transient (16 MiB)
+
+
+def _nvfp4_kv_mm_prefill_mask(mm_ranges, req_offset, qo_indptr, kv_lens,
+                              device):
+    """FlashInfer packed custom mask for one prefill plan, or None when
+    causal is exact (no row holds >= 2 scheduled tokens of one range).
+    Returns (packed uint8 [sum ceil(qo*kv/8)], byte indptr int32 [B+1]) —
+    segment_packbits' layout; FI's plan() would store a BIT indptr for a
+    pre-packed mask, so the caller installs both buffers after plan()."""
+    if not mm_ranges:
+        return None
+    qo = [int(x) for x in qo_indptr.tolist()]
+    kv = [int(x) for x in kv_lens.tolist()]
+    spans = []
+    for j, kvl in enumerate(kv):
+        ctx = kvl - (qo[j + 1] - qo[j])
+        ext = []
+        for s, e in mm_ranges.get(req_offset + j) or ():
+            a, b = max(s, ctx), min(e, kvl - 1)
+            if s < e and b > a:
+                ext.append((a - ctx, b - ctx + 1, b))
+        spans.append(ext)
+    if not any(spans):
+        return None
+    import torch
+
+    indptr = [0]
+    for j, kvl in enumerate(kv):
+        indptr.append(indptr[-1] + ((qo[j + 1] - qo[j]) * kvl + 7) // 8)
+    if indptr[-1] >= 1 << 31:
+        raise RuntimeError(
+            f"suffix sm120 nvfp4-kv mm-prefix mask of {indptr[-1]} bytes "
+            "overflows FlashInfer's int32 mask_indptr."
+        )
+    out = torch.empty(indptr[-1], dtype=torch.uint8, device=device)
+    shifts = torch.arange(8, dtype=torch.uint8, device=device)
+    for j, kvl in enumerate(kv):
+        ql = qo[j + 1] - qo[j]
+        if ql == 0 or kvl == 0:
+            continue
+        hi = torch.arange(kvl - ql, kvl, device=device)
+        for a, b, h in spans[j]:
+            hi[a:b] = h
+        cols = torch.arange(kvl, device=device)
+        # Blocks of a multiple of 8 rows start byte-aligned.
+        rows = max(8, _NVFP4_MM_BLOCK_BITS // kvl // 8 * 8)
+        for r0 in range(0, ql, rows):
+            bits = (cols[None, :] <= hi[r0:r0 + rows, None]).flatten()
+            pad = -bits.numel() % 8
+            if pad:
+                bits = torch.cat((bits, bits.new_zeros(pad)))
+            packed = (bits.view(-1, 8).to(torch.uint8) << shifts).sum(
+                -1, dtype=torch.uint8)
+            o = indptr[j] + r0 * kvl // 8
+            out[o:o + packed.numel()] = packed
+    return out, torch.tensor(indptr, dtype=torch.int32, device=device)
+
+'''
+
+
+def mm_helper_namespace(**extra) -> dict:
+    """Exec _MM_HELPER_SRC standalone (tests/oracle). ``extra`` supplies the
+    backend-module globals it references (logger, _nvfp4_kv_cache_selected)."""
+    import logging
+
+    ns = {"logger": logging.getLogger(PATCH_NAME),
+          "_nvfp4_kv_cache_selected": lambda: True}
+    ns["logger"].warning_once = ns["logger"].warning
+    ns.update(extra)
+    exec(compile(_MM_HELPER_SRC, f"<{PATCH_NAME}-mm>", "exec"), ns)
+    return ns
+
+
 _BACKEND_EDITS = [
+    # ---- H15: mm-prefix (gemma-4 vision) accepted on the fa2 nvfp4 route
+    # behind its own oracle-gated opt-in; the builder applies the mask.
+    (
+        "supports_mm_prefix_nvfp4",
+        """    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:""",
+        """    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return _nvfp4_kv_mm_enabled()
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:""",
+        1,
+    ),
     # ---- H14: head-major KV layout on the fa2 nvfp4 route, as stock does
     # for SM100 trtllm-gen: the nvfp4 store kernel writes [K|K_sf|V|V_sf]
     # pages head-major, so NHD-family layouts (default LBNHC) corrupt reads.
@@ -285,7 +527,8 @@ _BACKEND_EDITS = [
     (
         "helper_after_logger",
         "logger = init_logger(__name__)\n\ntrtllm_workspace_buffer = None",
-        "logger = init_logger(__name__)\n" + _HELPER_SRC + "\n"
+        "logger = init_logger(__name__)\n" + _HELPER_SRC + _MM_HELPER_SRC
+        + "\n"
         "trtllm_workspace_buffer = None",
         1,
     ),
@@ -534,6 +777,59 @@ _BACKEND_EDITS = [
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE''',
         1,
     ),
+    # ---- H16: per-KV-group mm mask decision at builder init (window_left
+    # known here; fail closed on inexpressible semantics).
+    (
+        "builder_mm_prefix_mode",
+        "        self.window_left = self.global_hyperparameters.window_left\n",
+        """        self.window_left = self.global_hyperparameters.window_left
+        self.nvfp4_mm_prefix = _nvfp4_kv_mm_mode(
+            vllm_config, layer_names, self.window_left,
+            getattr(self, "use_fa2_nvfp4_kv", False),
+        )
+""",
+        1,
+    ),
+    # ---- H17: short extends that may hold 2+ image tokens leave the
+    # (causal) decode path for the masked prefill path.
+    (
+        "build_mm_prefix_resplit",
+        """            num_prefill_tokens = num_actual_tokens
+
+        page_size = self.page_size""",
+        """            num_prefill_tokens = num_actual_tokens
+        if getattr(self, "nvfp4_mm_prefix", False):
+            _mm_split = _nvfp4_kv_mm_resplit(common_attn_metadata, num_decodes)
+            if _mm_split is not None:
+                (num_decodes, num_prefills, num_decode_tokens,
+                 num_prefill_tokens) = _mm_split
+
+        page_size = self.page_size""",
+        1,
+    ),
+    # ---- H18: install the packed mask on the planned fa2 prefill wrapper
+    # (only when a row needs it; run() then dispatches MaskMode.CUSTOM).
+    (
+        "prefill_mm_prefix_mask",
+        """                        disable_split_kv=self.disable_split_kv,
+                    )
+                attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)""",
+        """                        disable_split_kv=self.disable_split_kv,
+                    )
+                    if getattr(self, "nvfp4_mm_prefix", False):
+                        _mm_mask = _nvfp4_kv_mm_prefill_mask(
+                            common_attn_metadata.mm_req_doc_ranges,
+                            prefill_start,
+                            qo_indptr_prefill_cpu,
+                            kv_lens_prefill_cpu,
+                            self.device,
+                        )
+                        if _mm_mask is not None:
+                            (prefill_wrapper._custom_mask_buf,
+                             prefill_wrapper._mask_indptr_buf) = _mm_mask
+                attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)""",
+        1,
+    ),
 ]
 
 
@@ -556,6 +852,9 @@ def patch_backend_source(src: str) -> tuple[str, list[str]]:
     applied = []
     out = src
     for name, old, new, count in _BACKEND_EDITS:
+        # An earlier edit must never have consumed a later anchor.
+        if out.count(old) != count:
+            raise PatchDriftError(f"internal error: anchor {name} overlaps")
         out = out.replace(old, new)
         applied.append(name)
     if "suffix sm120 nvfp4-kv patch" not in out:
@@ -654,7 +953,9 @@ def apply(module=None, *, force: bool = False) -> bool:
     # installed FlashInfer. Never write into the flashinfer package.
     files = read_installed_flashinfer(fi_root)
     probe = probe_flashinfer_headers(files)
-    missing = sorted(k for k, ok in probe.items() if not ok)
+    # mm_* checks gate only the mm-prefix capability (fail closed there).
+    missing = sorted(k for k, ok in probe.items()
+                     if not ok and (mm_gate_enabled() or not k.startswith("mm_")))
     if missing:
         _fail(
             "the installed FlashInfer lacks the upstream NVFP4-FA2 features "
