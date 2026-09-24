@@ -118,7 +118,8 @@ mod device {
                 // Trap (device assert -> loud CUDA error) on slot >= S BEFORE
                 // the unchecked load; the store below is checked as well.
                 check_partition_access_mut(&s_view, [slot, hv, 0i32, 0i32]);
-                let s0: Tile<f32, { [1, 1, K, K] }> = unsafe { s_view.load([slot, hv, 0i32, 0i32]) };
+                let s0: Tile<f32, { [1, 1, K, K] }> =
+                    unsafe { s_view.load([slot, hv, 0i32, 0i32]) };
                 let s: Tile<f32, { [K, K] }> =
                     s0.reshape(shape![K, K]) * decay.broadcast(shape![K, K]);
                 let kb: Tile<f32, { [K, K] }> = k.broadcast(shape![K, K]);
@@ -135,8 +136,10 @@ mod device {
                 let var: Tile<f32, { [1] }> = reduce_sum(o * o, 1i32);
                 let var: Tile<f32, { [1, 1] }> =
                     var.reshape(shape![1, 1]) * broadcast_scalar(inv_v, shape![1, 1]);
-                let rstd: Tile<f32, { [1, 1] }> =
-                    rsqrt(var + broadcast_scalar(norm_eps, shape![1, 1]), ftz::Disabled);
+                let rstd: Tile<f32, { [1, 1] }> = rsqrt(
+                    var + broadcast_scalar(norm_eps, shape![1, 1]),
+                    ftz::Disabled,
+                );
                 let w_part: Partition<f32, { [K] }> = norm_w.partition(shape![K]);
                 let w: Tile<f32, { [K] }> = w_part.load([0i32]);
                 let z_part: Partition<bf16, { [1, 1, K] }> = z.partition(shape![1, 1, K]);
@@ -191,13 +194,19 @@ mod device {
             shape: obj.call_method0("size")?.extract()?,
             stride: stride.into_iter().map(|s| s as usize).collect(),
             dtype: obj.getattr("dtype")?.str()?.to_string(),
-            device: dev.getattr("index")?.extract::<Option<usize>>()?.unwrap_or(0),
+            device: dev
+                .getattr("index")?
+                .extract::<Option<usize>>()?
+                .unwrap_or(0),
         })
     }
 
     fn need(name: &str, i: &TInfo, dtype: &str, shape: &[usize]) -> PyResult<()> {
         if i.dtype != dtype {
-            return Err(PyValueError::new_err(format!("{name}: dtype {} != {dtype}", i.dtype)));
+            return Err(PyValueError::new_err(format!(
+                "{name}: dtype {} != {dtype}",
+                i.dtype
+            )));
         }
         if i.shape != shape {
             return Err(PyValueError::new_err(format!(
@@ -206,7 +215,9 @@ mod device {
             )));
         }
         if i.stride.last().copied().unwrap_or(1) != 1 {
-            return Err(PyValueError::new_err(format!("{name}: last dim must be contiguous")));
+            return Err(PyValueError::new_err(format!(
+                "{name}: last dim must be contiguous"
+            )));
         }
         Ok(())
     }
@@ -281,7 +292,9 @@ mod device {
         };
         d.validate().map_err(PyValueError::new_err)?;
         if act != ACT_SILU && act != ACT_SIGMOID {
-            return Err(PyValueError::new_err(format!("unknown activation code {act}")));
+            return Err(PyValueError::new_err(format!(
+                "unknown activation code {act}"
+            )));
         }
         let zz = tinfo("z", z)?;
         let bb = tinfo("ba", ba)?;
@@ -293,7 +306,9 @@ mod device {
         need("mixed_qkv", &mq, "torch.bfloat16", &[d.t, d.qkv_width()])?;
         need("z", &zz, "torch.bfloat16", &[d.t, d.hv, d.v])?;
         if zz.stride[1] != d.v {
-            return Err(PyValueError::new_err("z: head dim must be dense (stride[1] == V)"));
+            return Err(PyValueError::new_err(
+                "z: head dim must be dense (stride[1] == V)",
+            ));
         }
         need("ba", &bb, "torch.bfloat16", &[d.t, 2 * d.hv])?;
         need("a_log", &al, "torch.float32", &[d.hv])?;
@@ -305,14 +320,27 @@ mod device {
         need("out", &oo, "torch.bfloat16", &[d.t, d.hv, d.v])?;
         contiguous("out", &oo)?;
         let dev = mq.device;
-        for (n, i) in [("z", &zz), ("ba", &bb), ("a_log", &al), ("dt_bias", &dt),
-                       ("norm_w", &nw), ("state", &st), ("state_idx", &si), ("out", &oo)] {
+        for (n, i) in [
+            ("z", &zz),
+            ("ba", &bb),
+            ("a_log", &al),
+            ("dt_bias", &dt),
+            ("norm_w", &nw),
+            ("state", &st),
+            ("state_idx", &si),
+            ("out", &oo),
+        ] {
             if i.device != dev {
-                return Err(PyValueError::new_err(format!("{n} on cuda:{} != cuda:{dev}", i.device)));
+                return Err(PyValueError::new_err(format!(
+                    "{n} on cuda:{} != cuda:{dev}",
+                    i.device
+                )));
             }
         }
         if stream_ptr == 0 {
-            return Err(PyValueError::new_err("stream_ptr must be torch's current CUDA stream"));
+            return Err(PyValueError::new_err(
+                "stream_ptr must be torch's current CUDA stream",
+            ));
         }
         if d.t == 0 {
             return Ok(());
@@ -323,8 +351,11 @@ mod device {
 
         py.detach(move || {
             crate::guard_py("gdn_decode_fused_cuda", move || {
-                launch(d, &mq, &zz, &bb, &al, &dt, &nw, &st, &si, &oo, scale, norm_eps, act, stream_ptr)
-                    .map_err(|e| PyRuntimeError::new_err(format!("K-GDN1 launch failed: {e}")))
+                launch(
+                    d, &mq, &zz, &bb, &al, &dt, &nw, &st, &si, &oo, scale, norm_eps, act,
+                    stream_ptr,
+                )
+                .map_err(|e| PyRuntimeError::new_err(format!("K-GDN1 launch failed: {e}")))
             })
         })
     }
@@ -389,8 +420,18 @@ mod device {
         // never written, and the store is bounds-checked against S.
         let op = unsafe {
             gdn_decode_fused_k1(
-                out_part, &mq_t, &z_t, &ba_t, &al_t, &dt_t, &nw_t, &st_t, &si_t,
-                scale, norm_eps, 1.0f32 / d.v as f32,
+                out_part,
+                &mq_t,
+                &z_t,
+                &ba_t,
+                &al_t,
+                &dt_t,
+                &nw_t,
+                &st_t,
+                &si_t,
+                scale,
+                norm_eps,
+                1.0f32 / d.v as f32,
             )
         }
         .generics(generics);
@@ -459,7 +500,10 @@ mod device {
                 .expect("K-GDN1 must lower to Tile IR");
                 let ir = artifacts.ir_text();
                 assert!(ir.contains("reduce"), "expected reductions in IR");
-                assert!(ir.contains("store_view_tko"), "expected state/out stores in IR");
+                assert!(
+                    ir.contains("store_view_tko"),
+                    "expected state/out stores in IR"
+                );
                 if let Some(dir) = std::env::var_os("QWEN_GDN_DUMP_IR") {
                     let p = std::path::Path::new(&dir).join(format!("k_gdn1_act{act}.mlir"));
                     std::fs::write(p, &ir).expect("dump IR");

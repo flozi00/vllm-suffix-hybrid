@@ -35,8 +35,8 @@
 //! numerics gate: the norm reads `o` in fp32 instead of the bf16-rounded
 //! `core_attn_out` the stock two-kernel chain round-trips through.
 
-use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray4};
 use numpy::{IntoPyArray, PyArray3, PyArrayMethods, PyUntypedArrayMethods};
+use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray4};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -111,7 +111,14 @@ pub fn gdn_decode_step_ref(
     act: i32,
 ) -> Result<Vec<f32>, String> {
     d.validate()?;
-    let GdnDims { t, h, hv, k, v, slots } = d;
+    let GdnDims {
+        t,
+        h,
+        hv,
+        k,
+        v,
+        slots,
+    } = d;
     let w = d.qkv_width();
     let checks = [
         ("mixed_qkv", mixed_qkv.len(), t * w),
@@ -144,7 +151,9 @@ pub fn gdn_decode_step_ref(
         }
         let slot = slot as usize;
         if slot >= slots {
-            return Err(format!("state_idx[{ti}]={slot} out of range (slots={slots})"));
+            return Err(format!(
+                "state_idx[{ti}]={slot} out of range (slots={slots})"
+            ));
         }
         let row = &mixed_qkv[ti * w..(ti + 1) * w];
         for hvi in 0..hv {
@@ -260,12 +269,21 @@ mod tests {
     use super::*;
 
     fn lcg(seed: &mut u64) -> f32 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((*seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
     }
 
     fn dims() -> GdnDims {
-        GdnDims { t: 3, h: 2, hv: 6, k: 8, v: 8, slots: 5 }
+        GdnDims {
+            t: 3,
+            h: 2,
+            hv: 6,
+            k: 8,
+            v: 8,
+            slots: 5,
+        }
     }
 
     #[test]
@@ -289,11 +307,15 @@ mod tests {
         let al = vec![0.1f32; d.hv];
         let dt = vec![0.2f32; d.hv];
         let nw = vec![1.0f32; d.v];
-        let mut st: Vec<f32> = (0..d.slots * d.hv * d.v * d.k).map(|_| lcg(&mut s)).collect();
+        let mut st: Vec<f32> = (0..d.slots * d.hv * d.v * d.k)
+            .map(|_| lcg(&mut s))
+            .collect();
         let before = st.clone();
         let idx = vec![0i32, -1, 0];
-        let out = gdn_decode_step_ref(d, &mq, &z, &ba, &al, &dt, &nw, &mut st, &idx, 0.35, 1e-6, ACT_SILU)
-            .unwrap();
+        let out = gdn_decode_step_ref(
+            d, &mq, &z, &ba, &al, &dt, &nw, &mut st, &idx, 0.35, 1e-6, ACT_SILU,
+        )
+        .unwrap();
         assert!(out.iter().all(|x| *x == 0.0));
         assert_eq!(st, before);
     }
@@ -302,7 +324,14 @@ mod tests {
     fn zero_state_zero_decay_rank_one() {
         // With S0 = 0 the step is closed-form: S1 = beta * v k^T and
         // o = beta * v * (k.q); check one head by hand.
-        let d = GdnDims { t: 1, h: 1, hv: 1, k: 4, v: 4, slots: 2 };
+        let d = GdnDims {
+            t: 1,
+            h: 1,
+            hv: 1,
+            k: 4,
+            v: 4,
+            slots: 2,
+        };
         let q = [1.0f32, 0.0, 0.0, 0.0];
         let k = [1.0f32, 0.0, 0.0, 0.0];
         let v = [1.0f32, 2.0, 3.0, 4.0];
@@ -311,7 +340,18 @@ mod tests {
         let ba = vec![0.0f32, 0.0]; // beta = 0.5
         let mut st = vec![0f32; 2 * 16];
         let out = gdn_decode_step_ref(
-            d, &mq, &z, &ba, &[0.0], &[0.0], &[1.0; 4], &mut st, &[1], 1.0, 0.0, ACT_SILU,
+            d,
+            &mq,
+            &z,
+            &ba,
+            &[0.0],
+            &[0.0],
+            &[1.0; 4],
+            &mut st,
+            &[1],
+            1.0,
+            0.0,
+            ACT_SILU,
         )
         .unwrap();
         // o = 0.5 * v ; rms(o) = 0.5*sqrt(7.5) ; out = o/rms * 100
