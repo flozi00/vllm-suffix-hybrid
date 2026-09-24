@@ -8,5 +8,19 @@ build/
 target/
 *.so
 *.dylib
+# bench/* stays ignored EXCEPT the harness-critical, session-proven tooling
+# (readiness primitive, canonical bench driver + quality leg, runbooks,
+# LOOP-STATUS, 552-row results ledger, hot-path scale bench). Without these
+# negations one `git clean` erases the whole dev harness (mined lesson H).
 bench/*
+!bench/gemma-research/
+!bench/gemma-research/**
+!bench/scale_bench.py
+!bench/golden_rule.py
+!bench/compare.py
+!bench/RUNBOOK*.md
+# junk that must stay ignored even inside the un-ignored dir
+bench/gemma-research/__pycache__/
+bench/gemma-research/*.1739
+bench/gemma-research/*.corrupt*
 results/*
