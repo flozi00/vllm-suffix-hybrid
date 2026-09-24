@@ -428,12 +428,32 @@ def _wrap_rejection_sampler(runner, propose_hook, k):
         return False
     budget = [int(os.environ.get("SUFFIX_HYBRID_TRACE_VERIFY2_MAX",
                                   "24") or 24)]
-    original = type(sampler).__call__
+    sampler_cls = type(sampler)
+    original = sampler_cls.__dict__.get("__call__")
+    if original is None:
+        print(f"suffix_hybrid VTRACE2 install failed: "
+              f"{sampler_cls.__name__} has no __call__ in class dict",
+              file=sys.stderr, flush=True)
+        return False
 
     trace_state = getattr(propose_hook, "_suffix_trace_state", None) or {}
+    calls = [0]
+    print(f"suffix_hybrid VTRACE2 wrapped "
+          f"{sampler_cls.__name__} methods our install-time "
+          f"sampler#{id(sampler):#x}: {sorted(k for k in dir(sampler) if not k.startswith('_'))[:12]}",
+          file=sys.stderr, flush=True)
 
     @functools.wraps(original)
     def call(self, logits, input_batch, draft_logits=None, *args, **kwargs):
+        calls[0] += 1
+        if calls[0] == 1:
+            print(f"suffix_hybrid VTRACE2 FIRST CALL "
+                  f"sampler#{id(self):#x} (wrapped class "
+                  f"{type(self).__name__})", file=sys.stderr,
+                  flush=True)
+        if calls[0] in (100, 1000, 10000):
+            print(f"suffix_hybrid VTRACE2 heartbeat call#{calls[0]}",
+                  file=sys.stderr, flush=True)
         out = original(self, logits, input_batch, draft_logits,
                        *args, **kwargs)
         if budget[0] <= 0 or not trace_state:
@@ -479,7 +499,7 @@ def _wrap_rejection_sampler(runner, propose_hook, k):
         return out
     # Special-method lookup: obj(...) resolves __call__ on the TYPE, so the
     # wrap must bind class-level (one sampler instance per process here).
-    type(sampler).__call__ = call
+    setattr(sampler_cls, "__call__", call)
     return True
 
 
@@ -506,6 +526,7 @@ def _patch_get_draft_tokens(runner, widths_table):
     # last gap between "drafts provably correct" (adapter TRACE 8/8) and
     # "engine accepts 0 of them" — the widths/rows the VERIFY call sees.
     verify_on = os.environ.get("SUFFIX_HYBRID_TRACE_VERIFY", "").strip() != ""
+    called = [0]
     verify_budget = [int(os.environ.get("SUFFIX_HYBRID_TRACE_VERIFY_MAX",
                                         "12") or 12)]
 
@@ -534,10 +555,16 @@ def _patch_get_draft_tokens(runner, widths_table):
         # any(rows) silently swallowed exactly that failure mode.
         if verify_on and verify_budget[0] > 0 and self.req_ids:
             verify_budget[0] -= 1
-            print(f"suffix_hybrid VERIFYTRACE rid0={self.req_ids[0]!r} "
+            print(f"suffix_hybrid VERIFYTRACE handler={id(self):#x} "
+                  f"rid0={self.req_ids[0]!r} "
                   f"widths={[len(r) for r in rows]} nreqs={len(rows)} "
                   f"ndraft={self.num_draft_tokens}", file=sys.stderr,
                   flush=True)
+        if verify_on:
+            called[0] += 1
+            if called[0] in (1, 100, 1000, 10000):
+                print(f"suffix_hybrid VERIFYTRACE heartbeat call#{called[0]} "
+                      f"handler={id(self):#x}", file=sys.stderr, flush=True)
         return DraftTokenIds(self.req_ids, rows)
 
     import types
