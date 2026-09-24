@@ -25,9 +25,20 @@ re-derived here from TRITON_ATTN's compute_kv_seq_mask (causal AND window, OR
 image-range bidirectional clamped to the window), and each case must also
 differ measurably from plain causal (proves the mask was applied).
 
+own_* cases (gate for SUFFIX_SM120_NVP4KV_OWN_ATTN=1, --own): the same store
+and views through OUR K2-NVFP4 kernel (own_attn.run: cutile-rs, src/
+nvfp4_attn_gpu.rs), gated against the same dequant reference AND compared to
+the FA2 route's output on identical inputs (cos_vs_fa2); graph cases capture
+our op once and replay it after changing seq_lens (grid must not depend on
+KV lengths). --bench prints microseconds per call, ours vs the FA2 route vLLM
+uses today (decode wrapper for q_len 1, paged prefill for spec verify).
+
 Run in the pod/CI image (PYTHONPATH=/plugins):
     python -m nvfp4_kv_patch.oracle [--shapes 512:16:2,256:16:8] [--json]
         [--cases mm_]   (substring filter on case names)
+        [--own]         (K2-NVFP4 cases instead of the FA2 cases)
+        [--bench [--batches 1,2,4,8,16,32] [--kvs 1024,4096,16384,65536,131072]
+                 [--q-lens 1,9] [--max-gb 6] [--iters 20]]
 Exit 0 = PASS, 1 = FAIL, 2 = could not run (no SM120 / import error).
 """
 
@@ -50,6 +61,7 @@ REL_KERNEL_MAX = 2e-2
 COS_DECODE_MIN = 0.98     # nvfp4 round-trip of gaussian data is ~0.99
 COS_E2E_MIN = 0.95        # attention output vs un-quantized inputs
 REL_MM_VS_CAUSAL_MIN = 0.05  # mm reference must differ from causal
+COS_VS_FA2_MIN = 0.999    # ours vs FA2 on identical bytes (both ~exact)
 
 
 def _cos(a, b):
@@ -130,9 +142,12 @@ def _make_kv(n_tok, hkv, d, pattern, gen):
 
 
 def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
-             page=PAGE, window=-1, mm=None):
+             page=PAGE, window=-1, mm=None, own=False, graph=False):
     """window: sliding window in tokens (-1 = full); mm: per-request lists of
-    inclusive image ranges (absolute positions), or None for plain causal."""
+    inclusive image ranges (absolute positions), or None for plain causal.
+    own: gate OUR kernel (K2-NVFP4) instead of FA2 (FA2 output is kept as
+    the cos_vs_fa2 comparison); graph: run ours via CUDA-graph replay with
+    seq_lens changed after capture."""
     import torch
     from vllm.utils.torch_utils import (nvfp4_kv_cache_full_dim,
                                         nvfp4_split_data_scale)
@@ -193,7 +208,8 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
         w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             ws, "HND", use_tensor_cores=True, backend="fa2")
         w.plan(kv_indptr, kv_indices, kv_last, hq, hkv, d, page,
-               pos_encoding_mode="NONE", sm_scale=sm_scale, **dtypes)
+               pos_encoding_mode="NONE", sm_scale=sm_scale,
+               window_left=window - 1 if window > 0 else -1, **dtypes)
     else:
         w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             ws, "HND", backend="fa2")
@@ -211,6 +227,11 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
     out = w.run(q, (k_data, v_data), k_scale=k_scale, v_scale=v_scale,
                 kv_cache_sf=(k_sf, v_sf))
     torch.cuda.synchronize()
+    fa2_out = None
+    if own:
+        fa2_out, out = out, _run_own(q, (k_data, k_sf, v_data, v_sf), indices,
+                                     kv_lens, q_len, window, sm_scale, scales,
+                                     graph)
 
     worst = {"cos_kernel": 1.0, "rel_kernel": 0.0, "cos_e2e": 1.0,
              "cos_decode": 1.0}
@@ -230,6 +251,9 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
                                _allowed(q_len, n, window, (), q.device))
             worst["rel_mm_vs_causal"] = max(worst["rel_mm_vs_causal"],
                                             _rel(ref, causal))
+        if fa2_out is not None:
+            worst["cos_vs_fa2"] = min(worst.get("cos_vs_fa2", 1.0), _cos(
+                o, fa2_out[i * q_len:(i + 1) * q_len]))
         worst["cos_kernel"] = min(worst["cos_kernel"], _cos(o, ref))
         worst["rel_kernel"] = max(worst["rel_kernel"], _rel(o, ref))
         worst["cos_e2e"] = min(worst["cos_e2e"], _cos(o, e2e))
@@ -244,8 +268,51 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
         and (not strict or worst["cos_decode"] >= COS_DECODE_MIN)
         and (not strict or worst["cos_e2e"] >= COS_E2E_MIN)
         and (mm is None
-             or worst["rel_mm_vs_causal"] >= REL_MM_VS_CAUSAL_MIN))
+             or worst["rel_mm_vs_causal"] >= REL_MM_VS_CAUSAL_MIN)
+        and worst.get("cos_vs_fa2", 1.0) >= COS_VS_FA2_MIN)
     return worst
+
+
+def _block_table(indices, device):
+    import torch
+
+    bt = torch.zeros(len(indices), max(len(i) for i in indices),
+                     dtype=torch.int32, device=device)
+    for r, ids in enumerate(indices):
+        bt[r, :len(ids)] = ids
+    return bt
+
+
+def _run_own(q, views, indices, kv_lens, q_len, window, sm_scale, scales,
+             graph):
+    """OUR kernel on the production views (own_attn.run = what the patched
+    backend's DecodeWrapper.run calls)."""
+    import torch
+
+    from . import own_attn
+
+    k_data, k_sf, v_data, v_sf = views
+    bt = _block_table(indices, q.device)
+    sl = torch.tensor(kv_lens, dtype=torch.int32, device=q.device)
+    out = torch.empty_like(q)
+    args = (q, k_data, k_sf, v_data, v_sf, bt, sl, out, q_len,
+            window - 1 if window > 0 else -1, sm_scale * scales[0], scales[1])
+    if not graph:
+        own_attn.run(*args)
+    else:
+        # Capture with DIFFERENT lengths, then replay with the real ones: the
+        # grid and workspace must not depend on seq_lens.
+        sl.copy_((sl - q_len).clamp(min=q_len))
+        own_attn.run(*args)  # eager warmup (module load outside capture)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            own_attn.run(*args)
+        sl.copy_(torch.tensor(kv_lens, dtype=torch.int32, device=q.device))
+        out.zero_()
+        g.replay()
+    torch.cuda.synchronize()
+    return out
 
 
 # (name, kv_lens, q_len, wrapper[, run_case kwargs]). kv lens hit: 1 token,
@@ -272,8 +339,132 @@ CASES = (
     ("mm_fresh_prefill", (900,), 900, "prefill",
      dict(window=128, mm=([(100, 400), (899, 950)],))),
 )
+# K2-NVFP4 (--own): decode q_len 1, MTP verify q_len 9 (uniform, as the H19
+# spec-as-decode route feeds it), SWA window, page 16, and graph replay.
+OWN_CASES = (
+    ("own_decode", (1, 64, 65, 300, 777, 1024, 2049, 4100), 1, "decode",
+     dict(own=True)),
+    ("own_spec_verify_k8", (9, 130, 700, 3001), 9, "prefill", dict(own=True)),
+    ("own_swa_verify_k8", (9, 700, 3001), 9, "prefill",
+     dict(own=True, window=128)),
+    ("own_swa_decode_p16", (1, 300, 2049), 1, "decode",
+     dict(own=True, window=128, page=16)),
+    ("own_graph_decode", (65, 777, 4100), 1, "decode",
+     dict(own=True, graph=True)),
+    ("own_graph_verify_k8", (130, 3001), 9, "prefill",
+     dict(own=True, graph=True)),
+)
 PATTERNS = (("gauss", (1.0, 1.0)), ("gauss", (0.5, 2.0)),
             ("adversarial", (1.0, 1.0)))
+
+
+def _bench_cache(batch, kv, shape, page, device):
+    """Random NVFP4 pages (valid 1.0 scales) + a shuffled page table."""
+    import torch
+    from vllm.utils.torch_utils import (nvfp4_kv_cache_full_dim,
+                                        nvfp4_split_data_scale)
+
+    d, _, hkv = shape
+    per = math.ceil(kv / page)
+    cache = torch.randint(0, 256, (batch * per + 1, 2 * hkv, page,
+                                   nvfp4_kv_cache_full_dim(d)),
+                          dtype=torch.uint8, device=device)
+    k_side, v_side = cache.split(hkv, dim=1)
+    k_data, k_sf = nvfp4_split_data_scale(k_side)
+    v_data, v_sf = nvfp4_split_data_scale(v_side)
+    for sf in (k_sf, v_sf):
+        sf.view(torch.uint8).fill_(0x38)  # e4m3 1.0
+    ids = torch.randperm(batch * per, device=device, dtype=torch.int64)
+    return (k_data, k_sf, v_data, v_sf), ids.view(batch, per).to(torch.int32)
+
+
+def _time_us(fn, iters):
+    import torch
+
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+        enable_timing=True)
+    a.record()
+    for _ in range(iters):
+        fn()
+    b.record()
+    torch.cuda.synchronize()
+    return a.elapsed_time(b) * 1e3 / iters
+
+
+def bench(shapes, batches, kvs, q_lens, max_gb, iters, page, as_json):
+    """us/call, ours (graph-replayed: pure GPU time, as served in FULL decode
+    graphs) vs the FA2 route vLLM runs today (decode wrapper, q_len 1; paged
+    prefill wrapper, spec verify — eager in production, timed eager here)."""
+    import torch
+
+    import flashinfer
+
+    from . import own_attn
+
+    dev = "cuda"
+    bw = 1792.0  # GB/s, RTX PRO 6000 Blackwell GDDR7 spec
+    ws = torch.empty(256 << 20, dtype=torch.uint8, device=dev)
+    i32 = dict(dtype=torch.int32, device=dev)
+    dt = dict(q_data_type=torch.bfloat16, kv_data_type=torch.uint8,
+              o_data_type=torch.bfloat16)
+    for shape in shapes:
+        d, hq, hkv = shape
+        for q_len in q_lens:
+            for batch in batches:
+                for kv in kvs:
+                    kv_bytes = batch * kv * hkv * 2 * (d // 2 + d // 16)
+                    if kv_bytes > max_gb * 2 ** 30:
+                        continue
+                    views, bt = _bench_cache(batch, kv, shape, page, dev)
+                    q = torch.randn(batch * q_len, hq, d, device=dev).to(
+                        torch.bfloat16)
+                    sl = torch.full((batch,), kv, **i32)
+                    per = bt.shape[1]
+                    indptr = torch.arange(batch + 1, **i32) * per
+                    last = torch.full((batch,), kv - (per - 1) * page, **i32)
+                    sm = 1.0 / math.sqrt(d)
+                    if q_len == 1:
+                        w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                            ws, "HND", use_tensor_cores=True, backend="fa2")
+                        w.plan(indptr, bt.flatten(), last, hq, hkv, d, page,
+                               pos_encoding_mode="NONE", sm_scale=sm, **dt)
+                    else:
+                        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                            ws, "HND", backend="fa2")
+                        w.plan(torch.arange(batch + 1, **i32) * q_len, indptr,
+                               bt.flatten(), last, hq, hkv, d, page,
+                               causal=True, sm_scale=sm, **dt)
+                    k_data, k_sf, v_data, v_sf = views
+                    fa2 = _time_us(lambda: w.run(
+                        q, (k_data, v_data), k_scale=1.0, v_scale=1.0,
+                        kv_cache_sf=(k_sf, v_sf)), iters)
+                    out = torch.empty_like(q)
+                    args = (q, k_data, k_sf, v_data, v_sf, bt, sl, out,
+                            q_len, -1, sm, 1.0)
+                    own_attn.run(*args)
+                    torch.cuda.synchronize()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        own_attn.run(*args)
+                    ours = _time_us(g.replay, iters)
+                    ours_eager = _time_us(lambda: own_attn.run(*args), iters)
+                    row = {"head_dim": d, "hq": hq, "hkv": hkv, "q_len": q_len,
+                           "batch": batch, "kv": kv, "fa2_us": round(fa2, 1),
+                           "own_us": round(ours, 1),
+                           "own_eager_us": round(ours_eager, 1),
+                           "speedup": round(fa2 / ours, 3),
+                           "own_pct_bw": round(
+                               100 * kv_bytes / (ours * 1e3) / bw, 1),
+                           "fa2_pct_bw": round(
+                               100 * kv_bytes / (fa2 * 1e3) / bw, 1)}
+                    print(json.dumps(row) if as_json else
+                          "BENCH " + " ".join(f"{k}={v}" for k, v in
+                                              row.items()), flush=True)
+                    del views, bt, g
+                    torch.cuda.empty_cache()
 
 
 def main(argv=None) -> int:
@@ -284,6 +475,17 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--cases", default="",
                     help="only run cases whose name contains this substring")
+    ap.add_argument("--own", action="store_true",
+                    help="run the K2-NVFP4 (own kernel) cases")
+    ap.add_argument("--bench", action="store_true",
+                    help="microbenchmark ours vs the FA2 route, then exit")
+    ap.add_argument("--batches", default="1,2,4,8,16,32")
+    ap.add_argument("--kvs", default="1024,4096,16384,65536,131072")
+    ap.add_argument("--q-lens", default="1,9")
+    ap.add_argument("--max-gb", type=float, default=6.0,
+                    help="skip bench configs whose KV bytes exceed this")
+    ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--page", type=int, default=PAGE)
     args = ap.parse_args(argv)
 
     if not is_sm120():
@@ -298,10 +500,17 @@ def main(argv=None) -> int:
         print(f"oracle: import failed: {exc}", file=sys.stderr)
         return 2
 
+    shapes = [tuple(int(x) for x in spec.split(":"))
+              for spec in args.shapes.split(",")]
+    if args.bench:
+        ints = lambda v: [int(x) for x in v.split(",")]  # noqa: E731
+        bench(shapes, ints(args.batches), ints(args.kvs), ints(args.q_lens),
+              args.max_gb, args.iters, args.page, args.json)
+        return 0
     ok = True
-    for spec in args.shapes.split(","):
-        shape = tuple(int(x) for x in spec.split(":"))
-        for name, kv_lens, q_len, kind, *kw in CASES:
+    for shape in shapes:
+        for name, kv_lens, q_len, kind, *kw in (OWN_CASES if args.own
+                                                else CASES):
             if args.cases not in name:
                 continue
             for pattern, scales in PATTERNS:
@@ -321,7 +530,7 @@ def main(argv=None) -> int:
                     detail = row.get("error") or " ".join(
                         f"{k}={row[k]:.5f}" for k in
                         ("cos_kernel", "rel_kernel", "cos_decode", "cos_e2e",
-                         "rel_mm_vs_causal") if k in row)
+                         "rel_mm_vs_causal", "cos_vs_fa2") if k in row)
                     print(f"{tag} hd={shape[0]} {name:<15} {pattern:<11} "
                           f"ks/vs={scales} {detail}", flush=True)
     print(f"oracle verdict: {'PASS' if ok else 'FAIL'}", flush=True)

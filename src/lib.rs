@@ -306,12 +306,51 @@ impl SuffixCache {
 }
 mod engine;
 mod mixer;
-mod verify_fusion;
-#[cfg(feature = "cutile-kernels")]
-mod verify_fusion_gpu;
+mod nvfp4_attn;
+#[cfg(feature = "nvfp4-attn-kernels")]
+mod nvfp4_attn_gpu;
 mod qwen_gdn;
 #[cfg(feature = "qwen-gdn-kernels")]
 mod qwen_gdn_gpu;
+mod verify_fusion;
+#[cfg(feature = "cutile-kernels")]
+mod verify_fusion_gpu;
+
+/// K2-NVFP4 launch plan (src/nvfp4_attn.rs) as a dict; ValueError when the
+/// shape is outside the kernel contract (the adapter must refuse, loudly).
+#[pyfunction]
+#[pyo3(signature = (batch, q_len, num_q_heads, num_kv_heads, head_dim, page_size, num_sms))]
+fn nvfp4_attn_plan(
+    batch: usize,
+    q_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    page_size: usize,
+    num_sms: usize,
+) -> PyResult<HashMap<String, usize>> {
+    let p = nvfp4_attn::plan(
+        batch,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        num_sms,
+    )
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok(HashMap::from([
+        ("g".to_string(), p.g),
+        ("gp".to_string(), p.gp),
+        ("qt".to_string(), p.qt),
+        ("nqt".to_string(), p.nqt),
+        ("m".to_string(), p.m),
+        ("tn".to_string(), p.tn),
+        ("ns".to_string(), p.ns),
+        ("dt".to_string(), p.dt),
+        ("rows".to_string(), p.rows),
+    ]))
+}
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -319,10 +358,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<engine::Engine>()?;
     m.add_class::<mixer::HybridMixer>()?;
     m.add_class::<mixer::V2SuffixProposer>()?;
-    m.add_function(wrap_pyfunction!(
-        verify_fusion::rejection_greedy_accept,
-        m
-    )?)?;
+    m.add_function(wrap_pyfunction!(verify_fusion::rejection_greedy_accept, m)?)?;
     // K1 GPU twin: present only in feature-on (CI CUDA-toolkitted) builds.
     // Its ABSENCE is part of the startup kernel-path assertion: a pod that
     // needs the fused path and finds this import missing must fail loud,
@@ -339,7 +375,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "qwen-gdn-kernels")]
     m.add_function(wrap_pyfunction!(qwen_gdn_gpu::gdn_decode_fused_cuda, m)?)?;
     #[cfg(feature = "qwen-gdn-kernels")]
-    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_variant_bytecode, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        qwen_gdn_gpu::qwen_gdn_variant_bytecode,
+        m
+    )?)?;
     #[cfg(feature = "qwen-gdn-kernels")]
     m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_compile_cubin, m)?)?;
     #[cfg(feature = "qwen-gdn-kernels")]
@@ -351,6 +390,21 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "qwen-gdn-kernels")]
     m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_jit_stats, m)?)?;
     m.add("HAS_QWEN_GDN_CUDA", cfg!(feature = "qwen-gdn-kernels"))?;
+    // K2-NVFP4 attention: the plan is always present (CPU, sizes the split-KV
+    // workspace); the CUDA op only in feature-on builds. HAS_NVFP4_ATTN_CUDA
+    // is the startup kernel-path assertion's probe — an armed pod without it
+    // refuses to start, it never silently keeps the FA2 decode route.
+    m.add_function(wrap_pyfunction!(nvfp4_attn_plan, m)?)?;
+    m.add("HAS_NVFP4_ATTN_CUDA", cfg!(feature = "nvfp4-attn-kernels"))?;
+    #[cfg(feature = "nvfp4-attn-kernels")]
+    {
+        m.add_function(wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_paged_attn_cuda, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            nvfp4_attn_gpu::nvfp4_attn_enable_jit_store,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_jit_stats, m)?)?;
+    }
     m.add("VERSION", "0.2.0-rust-v1")?;
     Ok(())
 }

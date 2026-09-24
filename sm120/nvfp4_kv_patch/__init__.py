@@ -498,6 +498,57 @@ def _nvfp4_kv_mm_prefill_mask(mm_ranges, req_offset, qo_indptr, kv_lens,
 '''
 
 
+# K2-NVFP4 (our SM120 decode/spec-verify kernel, own_attn.py) hooks. The
+# adapter object is injected as the module global ``_nvfp4_own_attn`` by
+# apply(); the patched backend never imports the bundle package itself.
+# Env unset => both helpers are inert (stock fa2 decode, byte-identical flow).
+_OWN_ATTN_HELPER_SRC = '''
+def _nvfp4_own_attn_gate(builder) -> bool:
+    import os
+
+    if os.environ.get("SUFFIX_SM120_NVP4KV_OWN_ATTN", "").strip() != "1":
+        return False
+    impl = globals().get("_nvfp4_own_attn")
+    if impl is None:
+        raise RuntimeError(
+            "SUFFIX_SM120_NVP4KV_OWN_ATTN=1 but the K2-NVFP4 adapter was not "
+            "injected (sm120 nvfp4-kv patch apply() did not run).")
+    return impl.builder_gate(builder)
+
+
+def _nvfp4_own_attn_decode(builder, block_table, seq_lens, qo_indptr_cpu,
+                           num_decodes):
+    q_lens = qo_indptr_cpu[1:num_decodes + 1] - qo_indptr_cpu[:num_decodes]
+    q_len = int(q_lens.max().item())
+    real = int((q_lens > 0).sum().item())
+    # Uniform rows first, CUDA-graph padding (q_len 0) only at the tail.
+    if q_len < 1 or not bool((q_lens[:real] == q_len).all().item()):
+        raise RuntimeError(
+            "K2-NVFP4 decode needs uniform decode rows, got q_lens="
+            f"{q_lens.tolist()}")
+    return FIDecode(wrapper=_nvfp4_own_attn.DecodeWrapper(
+        block_table[:num_decodes], seq_lens[:num_decodes], q_len,
+        builder.num_qo_heads, builder.num_kv_heads, builder.head_dim,
+        builder.page_size, builder.window_left, builder.sm_scale,
+        builder.logits_soft_cap))
+
+'''
+
+
+def own_attn_module():
+    """own_attn.py by path (the bundle and the CPU tests load this package
+    from a file location, not always as an importable package)."""
+    name = __name__ + ".own_attn"
+    mod = sys.modules.get(name)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(
+            name, Path(__file__).with_name("own_attn.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
 def mm_helper_namespace(**extra) -> dict:
     """Exec _MM_HELPER_SRC standalone (tests/oracle). ``extra`` supplies the
     backend-module globals it references (logger, _nvfp4_kv_cache_selected)."""
@@ -546,6 +597,7 @@ _BACKEND_EDITS = [
         "helper_after_logger",
         "logger = init_logger(__name__)\n\ntrtllm_workspace_buffer = None",
         "logger = init_logger(__name__)\n" + _HELPER_SRC + _MM_HELPER_SRC
+        + _OWN_ATTN_HELPER_SRC
         + "\n"
         "trtllm_workspace_buffer = None",
         1,
@@ -848,6 +900,41 @@ _BACKEND_EDITS = [
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)""",
         1,
     ),
+    # ---- H19: K2-NVFP4 armed => uniform spec-verify rows (q_len = 1+k) are
+    # decode rows (our kernel) instead of fa2 paged-prefill rows. Gate
+    # evaluated once per builder; env unset => False (stock threshold).
+    (
+        "own_attn_spec_as_decode",
+        """        self._init_reorder_batch_threshold(
+            1,
+            supports_spec_as_decode=(
+                self.flashinfer_trtllm_api_decode_kernel is not None
+            ),""",
+        """        self.use_own_nvfp4_attn = _nvfp4_own_attn_gate(self)
+        self._init_reorder_batch_threshold(
+            1,
+            supports_spec_as_decode=(
+                self.flashinfer_trtllm_api_decode_kernel is not None
+                or self.use_own_nvfp4_attn
+            ),""",
+        1,
+    ),
+    # ---- H20: decode rows -> our op. forward() keeps calling
+    # decode_wrapper.run(...); the wrapper is ours (FIDecode-compatible).
+    (
+        "own_attn_decode_wrapper",
+        """            else:
+                assert seq_lens_cpu is not None
+                pure_decode = num_prefills == 0""",
+        """            elif getattr(self, "use_own_nvfp4_attn", False):
+                attn_metadata.decode = _nvfp4_own_attn_decode(
+                    self, block_table_tensor, seq_lens, qo_indptr_cpu,
+                    num_decodes)
+            else:
+                assert seq_lens_cpu is not None
+                pure_decode = num_prefills == 0""",
+        1,
+    ),
 ]
 
 
@@ -1005,6 +1092,8 @@ def apply(module=None, *, force: bool = False) -> bool:
         setattr(module, MARKER_ATTR, PATCH_REVISION)
         return True
     new_src, applied = patch_backend_source(src)
+    # K2-NVFP4 adapter (inert unless SUFFIX_SM120_NVP4KV_OWN_ATTN=1).
+    module.__dict__["_nvfp4_own_attn"] = own_attn_module()
     exec_patched_source(module, new_src, src_path)
     setattr(module, MARKER_ATTR, PATCH_REVISION)
 

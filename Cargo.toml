@@ -30,6 +30,10 @@ cutile-kernels = ["dep:cutile", "dep:cuda-core"]
 # from `cutile-kernels` so this lane builds/ships independently of K1.
 # Same toolkit rule: CUDA 13.x headers at build time (CI), driver-only pods.
 qwen-gdn-kernels = ["dep:cutile", "dep:cuda-core", "dep:sha2"]
+# K2-NVFP4 SM120 paged decode / spec-verify attention over the NVFP4 KV cache
+# (src/nvfp4_attn_gpu.rs). Separate lane feature; same toolkit rule: CUDA
+# 13.x headers at build time (CI), driver-only pods.
+nvfp4-attn-kernels = ["dep:cutile", "dep:cuda-core"]
 
 [profile.release]
 lto = "thin"
