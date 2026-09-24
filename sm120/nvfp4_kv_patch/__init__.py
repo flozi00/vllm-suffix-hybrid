@@ -66,7 +66,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-24.1"
+PATCH_REVISION = "2026-09-24.2"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -259,9 +259,34 @@ def _nvfp4_kv_head_dim_ok(head_dim: int) -> bool:
         os.environ.get("SUFFIX_SM120_NVP4KV_HD512", "").strip() == "1"
     )
 
+
+# mm-prefix LMs (gemma-4: bidirectional attention over image-token ranges)
+# are not implemented on the fa2 route. Plain causal attention is exact only
+# when no multimodal input can ever arrive, i.e. --language-model-only.
+def _nvfp4_kv_text_only_mm() -> bool:
+    if not _use_fa2_for_nvfp4_kv_on_sm120():
+        return False
+    cfg = get_current_vllm_config_or_none()
+    mm = getattr(getattr(cfg, "model_config", None), "multimodal_config", None)
+    return bool(mm is not None and mm.language_model_only)
+
 ''' % PATCH_REVISION
 
 _BACKEND_EDITS = [
+    # ---- H0: mm-prefix (gemma-4 vision-bidirectional) accepted on the fa2
+    # route only under --language-model-only, where no mm range can exist.
+    (
+        "supports_mm_prefix_text_only",
+        """    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:""",
+        """    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return _nvfp4_kv_text_only_mm()
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:""",
+        1,
+    ),
     # ---- H1: module-level helper, right after logger/workspace globals.
     (
         "helper_after_logger",
