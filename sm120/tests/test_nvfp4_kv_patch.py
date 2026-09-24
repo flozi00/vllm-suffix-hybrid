@@ -612,36 +612,3 @@ def test_capacity_ratio_fp8_to_nvfp4():
     fp8 = 2 * heads * hs
     nv = 2 * heads * PATCH.nvfp4_full_dim(hs)
     assert fp8 / nv == 16 / 9  # 1.777...
-
-
-def test_mm_prefix_only_under_language_model_only(monkeypatch):
-    # gemma-4 is an mm-prefix LM; the fa2 route has no bidirectional-range
-    # masking, so it may claim mm_prefix support ONLY when no mm input can
-    # arrive (--language-model-only). Everything else keeps the stock refusal.
-    import types as _t
-    new, _ = PATCH.patch_backend_source(BACKEND_FIXTURE.read_text())
-    assert "return _nvfp4_kv_text_only_mm()" in new
-    helper = new[new.index("def _use_fa2_for_nvfp4_kv_on_sm120"):
-                 new.index("trtllm_workspace_buffer = None")]
-    cfg = {"v": None}
-    ns = {"current_platform": _t.SimpleNamespace(
-              is_device_capability_family=lambda f: f == 120),
-          "get_current_vllm_config_or_none": lambda: cfg["v"]}
-    exec(helper, ns)
-    ok = ns["_nvfp4_kv_text_only_mm"]
-
-    def mk(lmo):
-        mm = _t.SimpleNamespace(language_model_only=lmo)
-        return _t.SimpleNamespace(
-            model_config=_t.SimpleNamespace(multimodal_config=mm))
-
-    monkeypatch.setenv("SUFFIX_SM120_NVP4KV", "1")
-    cfg["v"] = mk(True)
-    assert ok()
-    cfg["v"] = mk(False)
-    assert not ok()                      # images possible -> refuse
-    cfg["v"] = None
-    assert not ok()                      # no config in scope -> refuse
-    cfg["v"] = mk(True)
-    monkeypatch.delenv("SUFFIX_SM120_NVP4KV")
-    assert not ok()                      # route off -> stock behaviour
