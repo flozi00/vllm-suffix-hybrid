@@ -854,17 +854,26 @@ impl V2SuffixProposer {
                 (vec![], 0)
             };
             // Uniform-k pallet (uniform_k mode): publish width=k for
-            // EVERY row — hit rows repeat a suffix already in `tokens`
-            // and miss rows pack -1 placeholders after the (possibly
-            // empty) real drafts. Greedy verification is self-correcting
-            // (rejected on mismatch, same contract as the scheduler's own
-            // pad_spec_decode), so correctness is identical to ragged;
-            // the win is that every step hits the compiled (k+1)-query
-            // uniform-decode CUDA graph instead of the ragged path.
+            // EVERY row — hit rows carry the real suffix, miss rows are
+            // padded so every step matches the compiled (k+1)-query
+            // uniform-decode CUDA graph. PAD VALIDITY IS A HARD CONTRACT
+            // (gemma wake #10 crash): v0.30.0 forwards draft token IDs
+            // through the target model's embedding during verification,
+            // so an out-of-range ID (-1) trips a device-side
+            // vectorized_gather assert and kills EngineCore. Pad with a
+            // token that is ALWAYS in-vocab: the row's own first context
+            // token (col 0 of the tracked history; every tracked row has
+            // >= 1 token). Greedy verification is self-correcting
+            // (rejected on mismatch) — validity is the only requirement,
+            // plausibility is irrelevant.
             let out_row = if self.uniform_k {
                 let mut t = tokens;
+                let pad = tokens_row
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
                 while t.len() < k {
-                    t.push(-1);
+                    t.push(pad);
                 }
                 SuffixRowOut { tokens: t, width: k, real_w }
             } else {

@@ -196,8 +196,11 @@ def test_clear_widths_retracts_all_published_widths():
 def test_uniform_k_publishes_width_k_for_all_rows():
     """Uniform-k pallet (wake #8 counter-arm): the engine compiles its
     uniform-decode CUDA graph at k+1 queries; publishing width=k for
-    EVERY row (misses padded with -1 placeholders, exact same contract
-    as the scheduler's own pad_spec_decode) makes every step match that
+    EVERY row (misses padded with VALID in-vocab tokens — wake #10:
+    v0.30.0 forwards draft IDs through the target embedding during
+    verify, so an out-of-range -1 trips a device-side
+    vectorized_gather assert; pads repeat the row's first context
+    token, which is always in-vocab) makes every step match that
     graph instead of falling to the ragged path."""
     p = V2SuffixProposer(4, 512, 1, True)
     tokens = _buf(8, 512)
@@ -207,7 +210,7 @@ def test_uniform_k_publishes_width_k_for_all_rows():
         ["a"], np.array([0], dtype=np.int64),
         np.array([22], dtype=np.int64), tokens)
     assert widths.tolist() == [4]           # uniform: even the COLD miss publishes k
-    assert (packed[0] == -1).all()          # padded with placeholders, not zeros
+    assert (packed[0] == seq[0]).all()      # padded with VALID tokens (row col-0), not -1
     # b repeats a's prefix -> real hit of width k, REAL tokens, no padding
     tokens[1, :10] = np.array(seq[:10], dtype=np.int32)
     packed, widths = p.propose_suffix_only(
@@ -241,7 +244,7 @@ def test_uniform_k_partial_hit_pads_tail_only():
         ["b"], np.array([1], dtype=np.int64),
         np.array([10], dtype=np.int64), tokens)
     assert widths.tolist() == [4]
-    assert packed[0].tolist() == seq[10:12] + [-1, -1]  # real, then pad
+    assert packed[0].tolist() == seq[10:12] + [seq[0]] * 2  # real, then valid pads
     st = p.get_stats()
     assert st["padded"] == 2      # the cold a-miss row + b's tail pad
     assert st["hits"] == 1 and st["hit_tokens"] == 2  # true-width stats
