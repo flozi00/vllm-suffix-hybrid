@@ -9,6 +9,8 @@ PYTHONPATH. Each section is independently gated:
   SUFFIX_HYBRID_WRAP=1      -> speculator wrap (fail closed on drift)
   SUFFIX_SM120_NVP4KV=1     -> arm the deferred SM120 NVFP4-KV backend patch
                                (fail closed on SM120, inert elsewhere)
+  SUFFIX_SM120_NVP4KV_ORACLE=1 -> run the NVFP4-KV on-silicon oracle once per
+                               pod before serving (fatal only with NVP4KV=1)
   SUFFIX_FICACHE=seed|dump|both -> FlashInfer autotune cache seed/harvest
                                (inert otherwise, degrades on failure)
 Prod sets none of them, so all five are inert there. The kernels gate lives
@@ -138,6 +140,28 @@ if os.environ.get("SUFFIX_SM120_NVP4KV", "").strip() == "1":
             ) from exc
         print(f"suffix sm120 nvfp4-kv: hook install failed (not SM120, "
               f"ignoring): {exc}", file=sys.stderr, flush=True)
+
+# NVFP4-KV pod warmup oracle (gemma-hd512 dossier c.4). The console pins the
+# pod command to `vllm serve`, so the on-silicon numerics gate runs here: once
+# per pod (the _DONE marker is inherited by every child), in a CHILD process so
+# its CUDA context is gone before vLLM sizes memory. Verdict goes to the pod
+# log. Fail-closed only when this pod actually serves NVFP4 KV; otherwise a
+# failing oracle is evidence, not an outage.
+if (os.environ.get("SUFFIX_SM120_NVP4KV_ORACLE", "").strip() == "1"
+        and not os.environ.get("SUFFIX_SM120_NVP4KV_ORACLE_DONE")):
+    import subprocess
+    import sys
+    os.environ["SUFFIX_SM120_NVP4KV_ORACLE_DONE"] = "1"
+    print("[suffix sm120-nvfp4-kv] oracle: running on-silicon numerics gate",
+          file=sys.stderr, flush=True)
+    _rc = subprocess.run([sys.executable, "-m", "nvfp4_kv_patch.oracle"]
+                         ).returncode
+    _verdict = {0: "PASS", 1: "FAIL"}.get(_rc, "NOT RUN")
+    print(f"[suffix sm120-nvfp4-kv] oracle: exit {_rc} ({_verdict})",
+          file=sys.stderr, flush=True)
+    if _rc != 0 and os.environ.get("SUFFIX_SM120_NVP4KV", "").strip() == "1":
+        raise SystemExit("suffix sm120 nvfp4-kv: on-silicon oracle did not "
+                         f"pass (exit {_rc}); refusing to serve NVFP4 KV")
 
 # NOTE: the WARM-START debug endpoint is NO LONGER armed here. The old
 # sys.meta_path build_app loader-proxy never attached on the live pod

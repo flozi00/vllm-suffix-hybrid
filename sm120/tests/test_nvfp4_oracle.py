@@ -39,3 +39,33 @@ def test_dequant_side_matches_store_layout(head_dim, swizzled):
     want = (torch.tensor(_E2M1)[codes]
             * sf.repeat_interleave(SF_VEC_SIZE, dim=-1) * 0.5)
     assert torch.equal(got, want)
+
+
+def test_sitecustomize_warmup_oracle(tmp_path):
+    # Off-SM120 the oracle exits 2 (NOT RUN): logged-only unless the pod
+    # serves NVFP4 KV, then fatal. Runs once: the child must not recurse.
+    import os
+    import shutil
+    import subprocess
+
+    repo = Path(__file__).resolve().parents[2]
+    bundle = tmp_path / "plugins"
+    shutil.copytree(repo / "sm120" / "nvfp4_kv_patch",
+                    bundle / "nvfp4_kv_patch")
+    shutil.copy(repo / "sitecustomize.py", bundle / "sitecustomize.py")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SUFFIX")}
+    env.update(PYTHONPATH=str(bundle), SUFFIX_SM120_NVP4KV_ORACLE="1")
+
+    def run():
+        return subprocess.run([sys.executable, "-c", "print('SERVING')"],
+                              capture_output=True, text=True, env=env,
+                              timeout=120)
+
+    soft = run()
+    assert soft.returncode == 0 and "SERVING" in soft.stdout, soft.stderr
+    assert soft.stderr.count("oracle: running") == 1       # no recursion
+    assert "oracle: exit 2 (NOT RUN)" in soft.stderr
+    env["SUFFIX_SM120_NVP4KV"] = "1"
+    hard = run()
+    assert hard.returncode != 0 and "SERVING" not in hard.stdout
+    assert "refusing to serve NVFP4 KV" in hard.stderr
