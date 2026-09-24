@@ -444,7 +444,7 @@ mod device {
         #[test]
         fn k1_lowers_to_tile_ir_for_sm120() {
             if std::env::var_os("CUTILE_BYTECODE_VERSION").is_none() {
-                std::env::set_var("CUTILE_BYTECODE_VERSION", "13.2");
+                std::env::set_var("CUTILE_BYTECODE_VERSION", "13.3");
             }
             let art = KernelCompiler::new(
                 verify_fusion_greedy::__module_ast_self,

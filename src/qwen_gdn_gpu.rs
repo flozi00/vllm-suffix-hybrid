@@ -939,7 +939,7 @@ mod device {
 
         fn pin_bc() {
             if std::env::var_os("CUTILE_BYTECODE_VERSION").is_none() {
-                std::env::set_var("CUTILE_BYTECODE_VERSION", "13.2");
+                std::env::set_var("CUTILE_BYTECODE_VERSION", "13.3");
             }
         }
 
@@ -956,7 +956,7 @@ mod device {
                         let (bc, ver, key) = variant_bytecode(d, act, "sm_120").unwrap();
                         assert_eq!(key.len(), 64);
                         assert_eq!(&bc[..8], &[0x7F, b'T', b'i', b'l', b'e', b'I', b'R', 0x00]);
-                        assert_eq!(ver, "13.2");
+                        assert_eq!(ver, std::env::var("CUTILE_BYTECODE_VERSION").unwrap());
                         shas.insert(sha256_hex(&bc));
                         if let Some(dir) = std::env::var_os("QWEN_GDN_DUMP_IR") {
                             let p = std::path::Path::new(&dir)

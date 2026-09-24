@@ -1131,7 +1131,7 @@ mod device {
         #[test]
         fn compiles_to_tile_ir_for_sm120() {
             if std::env::var_os("CUTILE_BYTECODE_VERSION").is_none() {
-                std::env::set_var("CUTILE_BYTECODE_VERSION", "13.4");
+                std::env::set_var("CUTILE_BYTECODE_VERSION", "13.3");
             }
             let dump = std::env::var_os("NVFP4_ATTN_DUMP_IR");
             for (d, hq, hkv, page, q_len, wl) in [

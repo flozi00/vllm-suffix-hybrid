@@ -16,8 +16,9 @@ env:
   CURAND_WHEEL_VERSION: '10.4.4.72'
   # Must be a bytecode version whose opcode set covers what cutile 0.3.1 emits:
   # 13.2 rejects opcode 112 ('unsupported opcode 112 for bytecode version 13.2',
-  # d057d457 CI, both K-GDN1 and K2). tileiras 13.4.92 == bytecode 13.4.
-  CUTILE_BYTECODE_VERSION: '13.4'
+  # d057d457 CI, both K-GDN1 and K2). cutile 0.3.1 clamps to 13.3 at most
+  # (asked for 13.4 it serialized 13.3, dff7803a CI), so pin its maximum.
+  CUTILE_BYTECODE_VERSION: '13.3'
 jobs:
   linux:
     runs-on: ubuntu-22.04
