@@ -78,7 +78,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-24.7"
+PATCH_REVISION = "2026-09-24.8"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
