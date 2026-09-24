@@ -1029,6 +1029,18 @@ impl V2SuffixProposer {
         Ok(d)
     }
 
+    /// Shared-handle view of the live suffix cache (WARM-START seam,
+    /// SUFFIX_HYBRID_WARMSTART): SuffixCache wraps the SAME
+    /// Arc<Mutex<Cache>> the proposer speculates/ingests against, so
+    /// `.suffix_cache.add_sequence(tokens)` here primes the exact cache
+    /// the next propose call looks up — identical to the proven offline
+    /// bench/scale_bench.py mixer.suffix_cache path. Mirror of the
+    /// HybridMixer getter (same name, same handle semantics).
+    #[getter]
+    fn suffix_cache(&self) -> SuffixCache {
+        self.cache.clone()
+    }
+
     /// Retract every published width (all rows -> miss). The adapter calls
     /// this on its exception path: run() may have already inserted widths
     /// for this batch while the packed upload failed, and the scheduler
