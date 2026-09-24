@@ -40,7 +40,7 @@ mod device {
         get_gpu_name, run_tileiras, serialize_tile_ir_bytecode, tileiras_fingerprint,
         TileirasOptions,
     };
-    use cutile::cutile_compiler::jit_cache::{encode_entry, l2_key, EntryParams, JitStore};
+    use cutile::cutile_compiler::jit_cache::l2_key;
     use cutile::cutile_compiler::specialization::{
         compute_spec, max_pow2_divisor, SpecializationBits,
     };
@@ -51,8 +51,7 @@ mod device {
     use pyo3::types::PyAny;
     use pyo3::types::PyBytes;
     use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
 
     #[cutile::module]
     pub mod qwen_gdn_kernels {
@@ -643,35 +642,6 @@ mod device {
             .collect()
     }
 
-    struct MemStore(Mutex<HashMap<String, Vec<u8>>>);
-
-    impl JitStore for MemStore {
-        fn get(&self, key: &str) -> std::io::Result<Option<Vec<u8>>> {
-            Ok(self
-                .0
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(key)
-                .cloned())
-        }
-        fn put(&self, key: &str, value: &[u8]) -> std::io::Result<()> {
-            self.0
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(key.to_string(), value.to_vec());
-            Ok(())
-        }
-        fn delete(&self, key: &str) -> std::io::Result<()> {
-            self.0.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
-            Ok(())
-        }
-        fn clear(&self) -> std::io::Result<()> {
-            self.0.lock().unwrap_or_else(|p| p.into_inner()).clear();
-            Ok(())
-        }
-    }
-
-    static STORE: OnceLock<Arc<MemStore>> = OnceLock::new();
     /// Installed variants: (h, hv, k, act, t_div, s_div).
     static INSTALLED: Mutex<Vec<(usize, usize, usize, i32, i32, i32)>> = Mutex::new(Vec::new());
 
@@ -758,7 +728,6 @@ mod device {
     ) -> PyResult<String> {
         let d = variant_dims(h, hv, k, t_div, s_div).map_err(PyValueError::new_err)?;
         let (bc, _, key) = variant_bytecode(d, act, gpu_name).map_err(PyRuntimeError::new_err)?;
-        let digest: [u8; 32] = Sha256::digest(&bc).into();
         let got = sha256_hex(&bc);
         if got != bc_sha256 {
             return Err(PyRuntimeError::new_err(format!(
@@ -766,28 +735,8 @@ mod device {
                  (act={act}, div(T)={t_div}, div(S)={s_div}; check CUTILE_BYTECODE_VERSION)"
             )));
         }
-        if cubin.is_empty() {
-            return Err(PyValueError::new_err("empty cubin"));
-        }
-        let opts = TileirasOptions::default();
-        let fp = tileiras_fingerprint();
-        let params = EntryParams {
-            bc_sha256: digest,
-            gpu_name,
-            opt_level: opts.opt_level,
-            flags: opts.flags_byte(),
-            tileiras_fp: fp,
-        };
-        let entry = encode_entry(&params, cubin)
-            .ok_or_else(|| PyRuntimeError::new_err("cubin entry encode failed"))?;
-        let store = STORE.get_or_init(|| {
-            let s = Arc::new(MemStore(Mutex::new(HashMap::new())));
-            cutile::jit_cache::enable(s.clone());
-            s
-        });
-        store
-            .put(&key, &entry)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Shared process-global store (K2-NVFP4 installs into it too).
+        crate::cubin_store::install(&key, &bc, gpu_name, cubin).map_err(PyRuntimeError::new_err)?;
         let mut inst = INSTALLED.lock().unwrap_or_else(|p| p.into_inner());
         let v = (h, hv, k, act, t_div, s_div);
         if !inst.contains(&v) {

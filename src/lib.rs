@@ -304,6 +304,8 @@ impl SuffixCache {
         lock_cache(&self.inner).stats()
     }
 }
+#[cfg(any(feature = "qwen-gdn-kernels", feature = "nvfp4-attn-kernels"))]
+mod cubin_store;
 mod engine;
 mod mixer;
 mod nvfp4_attn;
@@ -399,10 +401,16 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "nvfp4-attn-kernels")]
     {
         m.add_function(wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_paged_attn_cuda, m)?)?;
-        m.add_function(wrap_pyfunction!(
-            nvfp4_attn_gpu::nvfp4_attn_enable_jit_store,
-            m
-        )?)?;
+        for f in [
+            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_split_set, m)?,
+            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_variant_bytecode, m)?,
+            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_compile_cubin, m)?,
+            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_gpu_name, m)?,
+            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_install_cubin, m)?,
+            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_allow_jit, m)?,
+        ] {
+            m.add_function(f)?;
+        }
         m.add_function(wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_jit_stats, m)?)?;
     }
     m.add("VERSION", "0.2.0-rust-v1")?;

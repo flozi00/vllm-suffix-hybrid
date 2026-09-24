@@ -154,7 +154,12 @@ if (os.environ.get("SUFFIX_SM120_NVP4KV_ORACLE", "").strip() == "1"
     os.environ["SUFFIX_SM120_NVP4KV_ORACLE_DONE"] = "1"
     print("[suffix sm120-nvfp4-kv] oracle: running on-silicon numerics gate",
           file=sys.stderr, flush=True)
+    import shlex
+    # SUFFIX_SM120_NVP4KV_ORACLE_ARGS: extra oracle CLI, e.g. "--own" (K2-NVFP4
+    # cases) or "--bench --shapes 512:16:2" (microbenchmark, exit 0).
     _rc = subprocess.run([sys.executable, "-m", "nvfp4_kv_patch.oracle"]
+                         + shlex.split(os.environ.get(
+                             "SUFFIX_SM120_NVP4KV_ORACLE_ARGS", ""))
                          ).returncode
     _verdict = {0: "PASS", 1: "FAIL"}.get(_rc, "NOT RUN")
     print(f"[suffix sm120-nvfp4-kv] oracle: exit {_rc} ({_verdict})",

@@ -113,7 +113,7 @@ pub fn plan(
         .div_ceil(rows)
         .next_power_of_two()
         .clamp(1, MAX_SPLITS);
-    let dt = floor_pow2(MERGE_ELEMS / (ns * m)).clamp(1, d);
+    let dt = merge_dt(ns, m, d);
     Ok(AttnPlan {
         d,
         g,
@@ -126,6 +126,41 @@ pub fn plan(
         dt,
         rows,
     })
+}
+
+/// Merge D-chunk: NS*M*DT <= MERGE_ELEMS (powers of two throughout).
+pub fn merge_dt(ns: usize, m: usize, d: usize) -> usize {
+    floor_pow2(MERGE_ELEMS / (ns * m)).clamp(1, d)
+}
+
+/// Round up to a multiple of 16. Batch-, page- and row-count dims are handed
+/// to the kernel rounded up (views only ever index real rows), so cutile's
+/// divisibility specialization of those dims is constant (16): the prebuilt
+/// cubin set is independent of the live batch size and cache size.
+pub fn round16(x: usize) -> usize {
+    x.div_ceil(16) * 16
+}
+
+/// Every split count `plan` can pick for batch 1..=max_batch at this shape —
+/// the prebuilt-cubin variant axis (everything else is shape-determined).
+pub fn split_set(
+    q_len: usize,
+    hq: usize,
+    hkv: usize,
+    d: usize,
+    page_size: usize,
+    num_sms: usize,
+    max_batch: usize,
+) -> Result<Vec<usize>, String> {
+    let mut v = Vec::new();
+    for b in 1..=max_batch {
+        let ns = plan(b, q_len, hq, hkv, d, page_size, num_sms)?.ns;
+        if !v.contains(&ns) {
+            v.push(ns);
+        }
+    }
+    v.sort_unstable();
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -176,6 +211,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn split_set_is_small_and_covers_every_batch() {
+        let s = split_set(9, 16, 2, 512, 16, SMS, 256).unwrap();
+        assert!(s.len() <= 7, "{s:?}");
+        for b in 1..=256 {
+            assert!(s.contains(&plan(b, 9, 16, 2, 512, 16, SMS).unwrap().ns));
+        }
+        assert_eq!((round16(1), round16(16), round16(17)), (16, 16, 32));
     }
 
     #[test]

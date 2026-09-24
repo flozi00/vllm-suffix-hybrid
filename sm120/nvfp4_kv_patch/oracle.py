@@ -292,6 +292,10 @@ def _run_own(q, views, indices, kv_lens, q_len, window, sm_scale, scales,
     from . import own_attn
 
     k_data, k_sf, v_data, v_sf = views
+    d, hq, hkv = q.shape[2], q.shape[1], k_data.shape[1]
+    own_attn.prepare(own_attn.native(), (d, hq, hkv, k_data.shape[2],
+                                         window - 1 if window > 0 else -1),
+                     (q_len,))
     bt = _block_table(indices, q.device)
     sl = torch.tensor(kv_lens, dtype=torch.int32, device=q.device)
     out = torch.empty_like(q)
@@ -444,6 +448,8 @@ def bench(shapes, batches, kvs, q_lens, max_gb, iters, page, as_json):
                     out = torch.empty_like(q)
                     args = (q, k_data, k_sf, v_data, v_sf, bt, sl, out,
                             q_len, -1, sm, 1.0)
+                    own_attn.prepare(own_attn.native(),
+                                     (d, hq, hkv, page, -1), (q_len,))
                     own_attn.run(*args)
                     torch.cuda.synchronize()
                     g = torch.cuda.CUDAGraph()

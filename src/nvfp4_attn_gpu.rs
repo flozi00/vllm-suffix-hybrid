@@ -38,13 +38,22 @@ pub use device::*;
 
 #[cfg(feature = "nvfp4-attn-kernels")]
 mod device {
-    use crate::nvfp4_attn::{plan, AttnPlan};
+    use crate::nvfp4_attn::{plan, round16, split_set, AttnPlan};
+    use cutile::compile_api::KernelCompiler;
     use cutile::cuda_core::{f4e2m1fnx2, f8e4m3fn, Device, Stream};
+    use cutile::cutile_compiler::cuda_tile_runtime_utils::{
+        get_gpu_name, run_tileiras, serialize_tile_ir_bytecode, tileiras_fingerprint,
+        TileirasOptions,
+    };
+    use cutile::cutile_compiler::jit_cache::l2_key;
+    use cutile::cutile_compiler::specialization::{compute_spec, DivHint, SpecializationBits};
     use cutile::half::bf16;
     use cutile::prelude::*;
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::types::PyAny;
+    use pyo3::types::PyBytes;
+    use sha2::{Digest, Sha256};
     use std::sync::{Arc, Mutex};
 
     #[cutile::module]
@@ -72,7 +81,8 @@ mod device {
             k_sf: &Tensor<f8e4m3fn, { [-1, -1, -1, -1] }>,
             v_data: &Tensor<f4e2m1fnx2, { [-1, -1, -1, -1] }>,
             v_sf: &Tensor<f8e4m3fn, { [-1, -1, -1, -1, -1, -1] }>,
-            block_table: &Tensor<i32, { [-1, -1] }>,
+            block_table: &Tensor<i32, { [-1] }>,
+            meta: &Tensor<i32, { [-1] }>,
             seq_lens: &Tensor<i32, { [-1] }>,
             o_part: &Tensor<bf16, { [-1, -1, -1, -1] }>,
             lse_part: &Tensor<f32, { [-1, -1, -1] }>,
@@ -138,7 +148,13 @@ mod device {
             let mut l_i: Tile<f32, { [M, 1] }> = constant(0.0f32, shape![M, 1]);
             let mut acc: Tile<f32, { [M, D] }> = constant(0.0f32, shape![M, D]);
 
-            let bt_p: Partition<i32, { [1, 1] }> = block_table.partition(shape![1, 1]);
+            // Flat block table; its row stride comes from a device meta word
+            // (not a scalar arg) so it never enters the kernel's
+            // specialization key (prebuilt cubins stay config-independent).
+            let meta_p: Partition<i32, { [1] }> = meta.partition(shape![1]);
+            let bt_row_t: Tile<i32, { [1] }> = meta_p.load([0i32]);
+            let bt_row: i32 = tile_to_scalar(bt_row_t.reshape(shape![]));
+            let bt_p: Partition<i32, { [1] }> = block_table.partition(shape![1]);
             let kd_p: Partition<f4e2m1fnx2, { [1, 1, TN, DH] }> =
                 k_data.partition(shape![1, 1, TN, DH]);
             let ks_p: Partition<f8e4m3fn, { [1, 1, TN, SD] }> =
@@ -153,7 +169,7 @@ mod device {
                 let tok0: i32 = j * TN;
                 let page_slot: i32 = j / tiles_per_page;
                 let tip: i32 = j % tiles_per_page;
-                let pg_tile: Tile<i32, { [1, 1] }> = bt_p.load([b, page_slot]);
+                let pg_tile: Tile<i32, { [1] }> = bt_p.load([b * bt_row + page_slot]);
                 let page: i32 = tile_to_scalar(pg_tile.reshape(shape![]));
 
                 // ---- K: unpack e2m1, x e4m3 block scale (linear) -> bf16 --
@@ -314,8 +330,10 @@ mod device {
             )));
         }
         let stride: Vec<isize> = obj.call_method0("stride")?.extract()?;
-        if stride.iter().any(|s| *s < 0) {
-            return Err(PyValueError::new_err(format!("{name}: negative stride")));
+        if stride.iter().any(|s| *s < 0 || *s > i32::MAX as isize) {
+            return Err(PyValueError::new_err(format!(
+                "{name}: stride out of range"
+            )));
         }
         Ok(TInfo {
             ptr: obj.call_method0("data_ptr")?.extract()?,
@@ -330,25 +348,16 @@ mod device {
     }
 
     fn need(name: &str, i: &TInfo, dtype: &str, shape: &[usize]) -> PyResult<()> {
-        if i.dtype != dtype {
+        if i.dtype != dtype || i.shape != shape {
             return Err(PyValueError::new_err(format!(
-                "{name}: dtype {} != {dtype}",
-                i.dtype
-            )));
-        }
-        if i.shape != shape {
-            return Err(PyValueError::new_err(format!(
-                "{name}: shape {:?} != {shape:?}",
-                i.shape
+                "{name}: got {} {:?}, need {dtype} {shape:?}",
+                i.dtype, i.shape
             )));
         }
         if i.stride.last().copied().unwrap_or(1) != 1 {
             return Err(PyValueError::new_err(format!(
                 "{name}: last dim must be contiguous"
             )));
-        }
-        if i.stride.iter().any(|s| *s > i32::MAX as usize) {
-            return Err(PyValueError::new_err(format!("{name}: stride exceeds i32")));
         }
         Ok(())
     }
@@ -371,6 +380,328 @@ mod device {
         v.iter().map(|x| *x as i32).collect()
     }
 
+    // =====================================================================
+    // Launch layout = prebuilt-variant contract.
+    //
+    // cutile keys a compiled kernel on its generics, the stride-is-1 hints,
+    // the power-of-two divisibility (clamped to 16) of every tensor's shape,
+    // strides and base pointer, and of every integer scalar
+    // (cutile-compiler specialization.rs; cutile-macro launcher). The ONE
+    // function below produces the (name, ptr, shape, strides) of every
+    // tensor argument; the launch borrows exactly these views and the CI
+    // variant builder feeds the same function (ptr 0, representative sizes),
+    // so the pod's key equals the prebuilt cubin's by construction. Live-size
+    // dims (batch, pages, launch rows, block-table length) are rounded up to
+    // 16 (views only ever index real rows), strides are model constants with
+    // divisibility 16, the block-table row stride travels in a device meta
+    // word. What remains variable is the served shape + q_len + the split
+    // count NS — the variant axes of scripts/nvfp4_attn_prebuild.py.
+    // =====================================================================
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Served {
+        pub d: usize,
+        pub hq: usize,
+        pub hkv: usize,
+        pub page: usize,
+        pub q_len: usize,
+        pub window_left: i32,
+    }
+
+    struct Meta {
+        name: &'static str,
+        ptr: u64,
+        shape: Vec<usize>,
+        strides: Vec<usize>,
+    }
+
+    /// Live sizes (rounded to 16) + the model strides that reach the key.
+    #[derive(Clone, Copy)]
+    struct Live {
+        batch16: usize,
+        pages16: usize,
+        rows16: usize,
+        bt_len16: usize,
+        q_row: usize,
+        page_bytes: usize,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct Ptrs {
+        q: u64,
+        out: u64,
+        kd: u64,
+        ks: u64,
+        vd: u64,
+        vs: u64,
+        bt: u64,
+        meta: u64,
+        sl: u64,
+        op: u64,
+        lp: u64,
+    }
+
+    fn partial_layout(s: &Served, p: &AttnPlan, l: &Live, x: &Ptrs) -> Vec<Meta> {
+        let (d, g) = (s.d, s.hq / s.hkv);
+        let (dh, sd, sg) = (d / 2, d / 16, d / 64);
+        let kv = |name, ptr, w| Meta {
+            name,
+            ptr,
+            shape: vec![l.pages16, s.hkv, s.page, w],
+            strides: vec![l.page_bytes, s.page * w, w, 1],
+        };
+        vec![
+            Meta {
+                name: "q",
+                ptr: x.q,
+                shape: vec![l.batch16, s.q_len, s.hkv, g, d],
+                strides: vec![s.q_len * l.q_row, l.q_row, g * d, d, 1],
+            },
+            kv("k_data", x.kd, dh),
+            kv("k_sf", x.ks, sd),
+            kv("v_data", x.vd, dh),
+            // V scales [P,H,N,S] -> [P,H,N/4, 4 (g/SG), SG (g%SG), 4 (t%4)]
+            // (the store kernel's swizzle_scale_offset as a strided view).
+            Meta {
+                name: "v_sf",
+                ptr: x.vs,
+                shape: vec![l.pages16, s.hkv, s.page / 4, 4, sg, 4],
+                strides: vec![l.page_bytes, s.page * sd, 4 * sd, sd, 4, 1],
+            },
+            Meta {
+                name: "block_table",
+                ptr: x.bt,
+                shape: vec![l.bt_len16],
+                strides: vec![1],
+            },
+            Meta {
+                name: "meta",
+                ptr: x.meta,
+                shape: vec![16],
+                strides: vec![1],
+            },
+            Meta {
+                name: "seq_lens",
+                ptr: x.sl,
+                shape: vec![l.batch16],
+                strides: vec![1],
+            },
+            Meta {
+                name: "o_part",
+                ptr: x.op,
+                shape: vec![l.rows16, p.ns, p.m, d],
+                strides: vec![p.ns * p.m * d, p.m * d, d, 1],
+            },
+            Meta {
+                name: "lse_part",
+                ptr: x.lp,
+                shape: vec![l.rows16, p.ns, p.m],
+                strides: vec![p.ns * p.m, p.m, 1],
+            },
+        ]
+    }
+
+    fn merge_layout(s: &Served, p: &AttnPlan, l: &Live, x: &Ptrs) -> Vec<Meta> {
+        let (d, g) = (s.d, s.hq / s.hkv);
+        vec![
+            Meta {
+                name: "out",
+                ptr: x.out,
+                shape: vec![l.batch16, s.q_len, s.hkv, g, d],
+                strides: vec![s.q_len * s.hq * d, s.hq * d, g * d, d, 1],
+            },
+            Meta {
+                name: "o_part",
+                ptr: x.op,
+                shape: vec![l.rows16, p.ns, p.m, d],
+                strides: vec![p.ns * p.m * d, p.m * d, d, 1],
+            },
+            Meta {
+                name: "lse_part",
+                ptr: x.lp,
+                shape: vec![l.rows16, p.ns, p.m],
+                strides: vec![p.ns * p.m, p.m, 1],
+            },
+        ]
+    }
+
+    fn partial_generics(s: &Served, p: &AttnPlan) -> Vec<String> {
+        let d = s.d;
+        [
+            d,
+            d / 2,
+            d / 16,
+            d / 64,
+            p.gp,
+            p.qt,
+            p.m,
+            p.tn,
+            p.tn / 4,
+            p.ns,
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect()
+    }
+
+    fn merge_generics(p: &AttnPlan) -> Vec<String> {
+        [p.gp, p.qt, p.m, p.ns, p.dt]
+            .iter()
+            .map(|v| v.to_string())
+            .collect()
+    }
+
+    fn partial_scalars(s: &Served, p: &AttnPlan) -> Vec<(&'static str, DivHint)> {
+        vec![
+            ("hkv", DivHint::from_value(s.hkv as i32)),
+            ("nqt", DivHint::from_value(p.nqt as i32)),
+            ("q_len", DivHint::from_value(s.q_len as i32)),
+            ("page_size", DivHint::from_value(s.page as i32)),
+            ("window_left", DivHint::from_value(s.window_left)),
+        ]
+    }
+
+    fn merge_scalars(s: &Served, p: &AttnPlan) -> Vec<(&'static str, DivHint)> {
+        vec![
+            ("hkv", DivHint::from_value(s.hkv as i32)),
+            ("nqt", DivHint::from_value(p.nqt as i32)),
+        ]
+    }
+
+    type Specs = (Vec<(String, Vec<i32>)>, Vec<(String, SpecializationBits)>);
+
+    /// Exactly what the generated launcher passes: stride hints (1 / -1) and
+    /// `compute_spec` of each tensor, in parameter order.
+    fn specs_of(metas: &[Meta]) -> Specs {
+        let strides = metas
+            .iter()
+            .map(|m| {
+                let h = m
+                    .strides
+                    .iter()
+                    .map(|s| if *s == 1 { 1 } else { -1 })
+                    .collect();
+                (m.name.to_string(), h)
+            })
+            .collect();
+        let specs = metas
+            .iter()
+            .map(|m| {
+                (
+                    m.name.to_string(),
+                    compute_spec(m.ptr, &i32s(&m.shape), &i32s(&m.strides), 0),
+                )
+            })
+            .collect();
+        (strides, specs)
+    }
+
+    /// Representative live sizes for a variant (only divisibility matters).
+    fn rep_live(s: &Served) -> Live {
+        Live {
+            batch16: 16,
+            pages16: 16,
+            rows16: 16,
+            bt_len16: 16,
+            q_row: 16 * s.d,
+            page_bytes: 2 * s.hkv * s.page * (s.d / 2 + s.d / 16),
+        }
+    }
+
+    fn variant_plan(s: &Served, ns: usize) -> Result<AttnPlan, String> {
+        let mut p = plan(1, s.q_len, s.hq, s.hkv, s.d, s.page, 1)?;
+        if !ns.is_power_of_two() || ns > crate::nvfp4_attn::MAX_SPLITS {
+            return Err(format!("split count {ns} not a power of two <= MAX_SPLITS"));
+        }
+        p.ns = ns;
+        p.dt = crate::nvfp4_attn::merge_dt(ns, p.m, s.d);
+        Ok(p)
+    }
+
+    const KERNELS: [&str; 2] = ["nvfp4_attn_partial", "nvfp4_attn_merge"];
+
+    /// Tile IR bytecode + version + this process's L2 JIT key for one kernel
+    /// of one variant. GPU-free (CI prebuild and pod install share it).
+    fn variant_bytecode(
+        s: &Served,
+        ns: usize,
+        kernel: &str,
+        gpu_name: &str,
+    ) -> Result<(Vec<u8>, String, String), String> {
+        let p = variant_plan(s, ns)?;
+        let live = rep_live(s);
+        let (metas, generics, scalars) = match kernel {
+            "nvfp4_attn_partial" => (
+                partial_layout(s, &p, &live, &Ptrs::default()),
+                partial_generics(s, &p),
+                partial_scalars(s, &p),
+            ),
+            "nvfp4_attn_merge" => (
+                merge_layout(s, &p, &live, &Ptrs::default()),
+                merge_generics(&p),
+                merge_scalars(s, &p),
+            ),
+            other => return Err(format!("unknown kernel {other}")),
+        };
+        let (strides, specs) = specs_of(&metas);
+        let sref: Vec<(&str, &[i32])> = strides
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_slice()))
+            .collect();
+        let pref: Vec<(&str, SpecializationBits)> =
+            specs.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
+        let art = KernelCompiler::new(
+            nvfp4_attn_kernels::__module_ast_self,
+            "nvfp4_attn_kernels",
+            kernel,
+        )
+        .generics(generics)
+        .strides(&sref)
+        .spec_args(&pref)
+        .scalar_hints(&scalars)
+        .target(gpu_name)
+        .compile()
+        .map_err(|e| format!("K2-NVFP4 {kernel} Tile IR compile: {e}"))?;
+        let (bc, ver) = serialize_tile_ir_bytecode(art.module())
+            .map_err(|e| format!("K2-NVFP4 {kernel} bytecode: {e}"))?;
+        let key = l2_key(
+            &bc,
+            ver,
+            gpu_name,
+            &TileirasOptions::default(),
+            tileiras_fingerprint(),
+        );
+        Ok((bc, format!("{}.{}", ver.major, ver.minor), key))
+    }
+
+    fn sha256_hex(b: &[u8]) -> String {
+        Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect()
+    }
+
+    /// Installed (served, ns) variants (both kernels present).
+    static INSTALLED: Mutex<Vec<(Served, usize)>> = Mutex::new(Vec::new());
+    /// Dev/oracle escape hatch: allow cutile to JIT (needs `tileiras`).
+    static ALLOW_JIT: Mutex<bool> = Mutex::new(false);
+
+    fn require_prebuilt(s: &Served, ns: usize) -> Result<(), String> {
+        if *ALLOW_JIT.lock().unwrap_or_else(|p| p.into_inner()) {
+            return Ok(());
+        }
+        if !INSTALLED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&(*s, ns))
+        {
+            return Err(format!(
+                "no prebuilt K2-NVFP4 cubins for {s:?} ns={ns}; pods never JIT — the \
+                 bundle manifest must carry this variant"
+            ));
+        }
+        Ok(())
+    }
+
     /// Our NVFP4 paged decode / spec-verify attention (K2-NVFP4).
     ///
     /// q        [B*q_len, HQ, D] bf16 (row stride free, heads/dims dense)
@@ -378,14 +709,15 @@ mod device {
     /// k_sf     [P, HKV, PAGE, D/16] e4m3     } of the HND cache (any page
     /// v_data   [P, HKV, PAGE, D/2] uint8     } stride; (head, token, byte)
     /// v_sf     [P, HKV, PAGE, D/16] e4m3     } dense within a page side)
-    /// block_table [B, max_pages] int32, seq_lens [B] int32 (incl. the step)
+    /// block_table [>=B, W] int32 (row stride W), seq_lens [>=B] int32
+    /// meta     [16] int32 device word, meta[0] = block_table row stride
     /// out      [B*q_len, HQ, D] bf16, contiguous — fully written
-    /// o_part   [R, NS, M, D] bf16, lse_part [R, NS, M] f32: workspace sized
-    ///          from `nvfp4_attn_plan` (same args) — scratch, any contents.
+    /// o_part   [round16(R), NS, M, D] bf16, lse_part [round16(R), NS, M] f32:
+    ///          workspace sized from `nvfp4_attn_plan` — scratch contents.
     /// window_left: -1 = full attention, else FlashInfer semantics.
     /// qk_scale_log2 = sm_scale * k_scale * log2(e); v_scale = global V scale.
     #[pyfunction]
-    #[pyo3(signature = (q, k_data, k_sf, v_data, v_sf, block_table, seq_lens, out, o_part, lse_part, q_len, window_left, qk_scale_log2, v_scale, num_sms, stream_ptr))]
+    #[pyo3(signature = (q, k_data, k_sf, v_data, v_sf, block_table, meta, seq_lens, out, o_part, lse_part, q_len, window_left, qk_scale_log2, v_scale, num_sms, stream_ptr))]
     #[allow(clippy::too_many_arguments)]
     pub fn nvfp4_paged_attn_cuda<'py>(
         py: Python<'py>,
@@ -395,6 +727,7 @@ mod device {
         v_data: &Bound<'py, PyAny>,
         v_sf: &Bound<'py, PyAny>,
         block_table: &Bound<'py, PyAny>,
+        meta: &Bound<'py, PyAny>,
         seq_lens: &Bound<'py, PyAny>,
         out: &Bound<'py, PyAny>,
         o_part: &Bound<'py, PyAny>,
@@ -412,6 +745,7 @@ mod device {
         let vd = tinfo("v_data", v_data)?;
         let vs = tinfo("v_sf", v_sf)?;
         let bt = tinfo("block_table", block_table)?;
+        let mt = tinfo("meta", meta)?;
         let sl = tinfo("seq_lens", seq_lens)?;
         let oo = tinfo("out", out)?;
         let op = tinfo("o_part", o_part)?;
@@ -422,7 +756,7 @@ mod device {
             ));
         }
         let (tokens, hq, d) = (qi.shape[0], qi.shape[1], qi.shape[2]);
-        let (pages, hkv, page_size) = (kd.shape[0], kd.shape[1], kd.shape[2]);
+        let (pages, hkv, page) = (kd.shape[0], kd.shape[1], kd.shape[2]);
         if q_len == 0 || tokens % q_len != 0 {
             return Err(PyValueError::new_err(format!(
                 "q rows {tokens} not a multiple of q_len {q_len} (uniform batches only)"
@@ -433,7 +767,15 @@ mod device {
             return Ok(());
         }
         let p: AttnPlan =
-            plan(batch, q_len, hq, hkv, d, page_size, num_sms).map_err(PyValueError::new_err)?;
+            plan(batch, q_len, hq, hkv, d, page, num_sms).map_err(PyValueError::new_err)?;
+        let s = Served {
+            d,
+            hq,
+            hkv,
+            page,
+            q_len,
+            window_left,
+        };
         let (dh, sd) = (d / 2, d / 16);
         need("q", &qi, "torch.bfloat16", &[tokens, hq, d])?;
         if qi.stride[1] != d {
@@ -441,35 +783,44 @@ mod device {
                 "q: heads must be dense (stride[1] == D)",
             ));
         }
+        let page_bytes = kd.stride[0];
         for (n, i, w, dt) in [
             ("k_data", &kd, dh, "torch.uint8"),
             ("v_data", &vd, dh, "torch.uint8"),
             ("k_sf", &ks, sd, "torch.float8_e4m3fn"),
             ("v_sf", &vs, sd, "torch.float8_e4m3fn"),
         ] {
-            need(n, i, dt, &[pages, hkv, page_size, w])?;
-            if i.stride[2] != w || i.stride[1] != page_size * w {
+            need(n, i, dt, &[pages, hkv, page, w])?;
+            if i.stride[2] != w || i.stride[1] != page * w || i.stride[0] != page_bytes {
                 return Err(PyValueError::new_err(format!(
-                    "{n}: (head, token, byte) must be dense within a page side \
-                     (HND nvfp4 layout), got strides {:?}",
+                    "{n}: (head, token, byte) must be dense within a page side and all four \
+                     views share one page stride (HND nvfp4 layout), got strides {:?}",
                     i.stride
                 )));
             }
         }
-        need("block_table", &bt, "torch.int32", &[batch, bt.shape[1]])?;
-        need("seq_lens", &sl, "torch.int32", &[batch])?;
+        if bt.shape[0] < batch || bt.stride[1] != 1 || sl.shape.len() != 1 || sl.shape[0] < batch {
+            return Err(PyValueError::new_err(
+                "block_table [>=B, W] (row-contiguous) and seq_lens [>=B] required",
+            ));
+        }
+        need("block_table", &bt, "torch.int32", &bt.shape.clone())?;
+        need("seq_lens", &sl, "torch.int32", &sl.shape.clone())?;
+        need("meta", &mt, "torch.int32", &[16])?;
         need("out", &oo, "torch.bfloat16", &[tokens, hq, d])?;
         if oo.stride != [hq * d, d, 1] {
             return Err(PyValueError::new_err("out must be contiguous"));
         }
-        need("o_part", &op, "torch.bfloat16", &[p.rows, p.ns, p.m, d])?;
-        need("lse_part", &lp, "torch.float32", &[p.rows, p.ns, p.m])?;
+        let rows16 = round16(p.rows);
+        need("o_part", &op, "torch.bfloat16", &[rows16, p.ns, p.m, d])?;
+        need("lse_part", &lp, "torch.float32", &[rows16, p.ns, p.m])?;
         for (n, i) in [
             ("k_data", &kd),
             ("k_sf", &ks),
             ("v_data", &vd),
             ("v_sf", &vs),
             ("block_table", &bt),
+            ("meta", &mt),
             ("seq_lens", &sl),
             ("out", &oo),
             ("o_part", &op),
@@ -487,31 +838,56 @@ mod device {
                 "stream_ptr must be torch's current CUDA stream",
             ));
         }
-        let dims = Dims {
-            batch,
-            q_len,
-            hq,
-            hkv,
-            d,
-            pages,
-            page_size,
+        let live = Live {
+            batch16: round16(batch),
+            pages16: round16(pages),
+            rows16,
+            bt_len16: round16(batch) * bt.stride[0],
+            q_row: qi.stride[0],
+            page_bytes,
         };
+        let ptrs = Ptrs {
+            q: qi.ptr,
+            out: oo.ptr,
+            kd: kd.ptr,
+            ks: ks.ptr,
+            vd: vd.ptr,
+            vs: vs.ptr,
+            bt: bt.ptr,
+            meta: mt.ptr,
+            sl: sl.ptr,
+            op: op.ptr,
+            lp: lp.ptr,
+        };
+        // The live launch must carry the prebuilt variant's specialization
+        // (strides/alignment divisibility) — refuse before cutile could JIT.
+        let rep = rep_live(&s);
+        for (got, want) in [
+            (
+                specs_of(&partial_layout(&s, &p, &live, &ptrs)),
+                specs_of(&partial_layout(&s, &p, &rep, &Ptrs::default())),
+            ),
+            (
+                specs_of(&merge_layout(&s, &p, &live, &ptrs)),
+                specs_of(&merge_layout(&s, &p, &rep, &Ptrs::default())),
+            ),
+        ] {
+            if format!("{got:?}") != format!("{want:?}") {
+                return Err(PyValueError::new_err(format!(
+                    "K2-NVFP4 launch specialization differs from the prebuilt variant \
+                     (stride/alignment divisibility): got {got:?} want {want:?}"
+                )));
+            }
+        }
+        require_prebuilt(&s, p.ns).map_err(PyRuntimeError::new_err)?;
         py.detach(move || {
             crate::guard_py("nvfp4_paged_attn_cuda", move || {
                 launch(
+                    &s,
                     &p,
-                    &dims,
-                    &qi,
-                    &kd,
-                    &ks,
-                    &vd,
-                    &vs,
-                    &bt,
-                    &sl,
-                    &oo,
-                    &op,
-                    &lp,
-                    window_left,
+                    &live,
+                    &ptrs,
+                    qi.device,
                     qk_scale_log2,
                     v_scale,
                     stream_ptr,
@@ -521,92 +897,47 @@ mod device {
         })
     }
 
-    struct Dims {
-        batch: usize,
-        q_len: usize,
-        hq: usize,
-        hkv: usize,
-        d: usize,
-        pages: usize,
-        page_size: usize,
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn launch(
+        s: &Served,
         p: &AttnPlan,
-        x: &Dims,
-        qi: &TInfo,
-        kd: &TInfo,
-        ks: &TInfo,
-        vd: &TInfo,
-        vs: &TInfo,
-        bt: &TInfo,
-        sl: &TInfo,
-        oo: &TInfo,
-        op: &TInfo,
-        lp: &TInfo,
-        window_left: i32,
+        live: &Live,
+        ptrs: &Ptrs,
+        ord: usize,
         qk_scale_log2: f32,
         v_scale: f32,
         stream_ptr: usize,
     ) -> Result<(), String> {
-        let device = device(qi.device)?;
+        let device = device(ord)?;
         // SAFETY: stream_ptr is torch's live current stream on this device;
         // borrowed (never destroyed by us).
         let stream: Arc<Stream> =
             unsafe { Stream::borrow_raw(stream_ptr as *mut std::ffi::c_void, &device) };
-        let ord = qi.device;
-        let (g, sd, sg) = (x.hq / x.hkv, x.d / 16, x.d / 64);
-        let s = |v: &[usize]| i32s(v);
-        // SAFETY (borrow_raw_parts): every (ptr, shape, strides) triple below
-        // is a validated view of a live torch tensor (checked in the caller)
-        // re-expressed with more dims over the same bytes; torch keeps the
-        // memory alive past these stream-ordered launches.
-        let q5 = unsafe {
-            Tensor::<bf16>::borrow_raw_parts(
-                qi.ptr,
-                ord,
-                s(&[x.batch, x.q_len, x.hkv, g, x.d]),
-                s(&[x.q_len * qi.stride[0], qi.stride[0], g * x.d, x.d, 1]),
-            )
-        };
-        let out5 = unsafe {
-            Tensor::<bf16>::borrow_raw_parts(
-                oo.ptr,
-                ord,
-                s(&[x.batch, x.q_len, x.hkv, g, x.d]),
-                s(&[x.q_len * x.hq * x.d, x.hq * x.d, g * x.d, x.d, 1]),
-            )
-        };
-        let kd4 = unsafe {
-            Tensor::<f4e2m1fnx2>::borrow_raw_parts(kd.ptr, ord, s(&kd.shape), s(&kd.stride))
-        };
-        let vd4 = unsafe {
-            Tensor::<f4e2m1fnx2>::borrow_raw_parts(vd.ptr, ord, s(&vd.shape), s(&vd.stride))
-        };
-        let ks4 = unsafe {
-            Tensor::<f8e4m3fn>::borrow_raw_parts(ks.ptr, ord, s(&ks.shape), s(&ks.stride))
-        };
-        // V scales: [P, H, N, S] -> [P, H, N/4, 4 (g/SG), SG (g%SG), 4 (t%4)]
-        // (the store kernel's swizzle_scale_offset, as a strided view).
-        let vs6 = unsafe {
-            Tensor::<f8e4m3fn>::borrow_raw_parts(
-                vs.ptr,
-                ord,
-                s(&[x.pages, x.hkv, x.page_size / 4, 4, sg, 4]),
-                s(&[vs.stride[0], vs.stride[1], 4 * sd, sd, 4, 1]),
-            )
-        };
-        let bt2 =
-            unsafe { Tensor::<i32>::borrow_raw_parts(bt.ptr, ord, s(&bt.shape), s(&bt.stride)) };
-        let sl1 =
-            unsafe { Tensor::<i32>::borrow_raw_parts(sl.ptr, ord, s(&sl.shape), s(&sl.stride)) };
-        let op4 =
-            unsafe { Tensor::<bf16>::borrow_raw_parts(op.ptr, ord, s(&op.shape), s(&op.stride)) };
-        let lp3 =
-            unsafe { Tensor::<f32>::borrow_raw_parts(lp.ptr, ord, s(&lp.shape), s(&lp.stride)) };
-
-        let pg = |v: &[usize]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let pm = partial_layout(s, p, live, ptrs);
+        let mm = merge_layout(s, p, live, ptrs);
+        // SAFETY (borrow_raw_parts): every (ptr, shape, strides) below is a
+        // validated live torch tensor re-expressed over the same bytes; the
+        // 16-rounded leading dims are bounds only — the grid indexes real
+        // rows exclusively. torch keeps the memory alive past these
+        // stream-ordered launches.
+        macro_rules! t {
+            ($ty:ty, $m:expr) => {
+                unsafe {
+                    Tensor::<$ty>::borrow_raw_parts($m.ptr, ord, i32s(&$m.shape), i32s(&$m.strides))
+                }
+            };
+        }
+        let q5 = t!(bf16, pm[0]);
+        let kd4 = t!(f4e2m1fnx2, pm[1]);
+        let ks4 = t!(f8e4m3fn, pm[2]);
+        let vd4 = t!(f4e2m1fnx2, pm[3]);
+        let vs6 = t!(f8e4m3fn, pm[4]);
+        let bt1 = t!(i32, pm[5]);
+        let mt1 = t!(i32, pm[6]);
+        let sl1 = t!(i32, pm[7]);
+        let op4 = t!(bf16, pm[8]);
+        let lp3 = t!(f32, pm[9]);
+        let out5 = t!(bf16, mm[0]);
         // SAFETY (unsafe entries): the partial kernel writes o_part/lse_part
         // only at its own [r, s] slot (grid == (rows, ns)); the merge writes
         // only out rows of its own (b, qt, h, dc) tile. No two CTAs alias.
@@ -617,35 +948,25 @@ mod device {
                 &ks4,
                 &vd4,
                 &vs6,
-                &bt2,
+                &bt1,
+                &mt1,
                 &sl1,
                 &op4,
                 &lp3,
-                x.hkv as i32,
+                s.hkv as i32,
                 p.nqt as i32,
-                x.q_len as i32,
-                x.page_size as i32,
-                window_left,
+                s.q_len as i32,
+                s.page as i32,
+                s.window_left,
                 qk_scale_log2,
             )
         }
-        .generics(pg(&[
-            x.d,
-            x.d / 2,
-            sd,
-            sg,
-            p.gp,
-            p.qt,
-            p.m,
-            p.tn,
-            p.tn / 4,
-            p.ns,
-        ]))
+        .generics(partial_generics(s, p))
         .grid((p.rows as u32, p.ns as u32, 1));
         let merge =
-            unsafe { nvfp4_attn_merge(&out5, &op4, &lp3, x.hkv as i32, p.nqt as i32, v_scale) }
-                .generics(pg(&[p.gp, p.qt, p.m, p.ns, p.dt]))
-                .grid((p.rows as u32, (x.d / p.dt) as u32, 1));
+            unsafe { nvfp4_attn_merge(&out5, &op4, &lp3, s.hkv as i32, p.nqt as i32, v_scale) }
+                .generics(merge_generics(p))
+                .grid((p.rows as u32, (s.d / p.dt) as u32, 1));
         // SAFETY (async_on): outputs are torch-owned and only read by later
         // work on the same stream; the merge is ordered after the partial on
         // that stream; no host access before a torch sync.
@@ -654,15 +975,139 @@ mod device {
         Ok(())
     }
 
-    /// Point cutile's JIT at a prebuilt cubin store (bundle-shipped) so a pod
-    /// never runs `tileiras`. Returns the store root.
+    // =====================================================================
+    // Prebuilt cubins (CI: scripts/nvfp4_attn_prebuild.py; pod: own_attn.py
+    // install_cubins) — the cutile JIT store is process-global, so K-GDN1
+    // and K2-NVFP4 share crate::cubin_store.
+    // =====================================================================
+
+    fn served(
+        d: usize,
+        hq: usize,
+        hkv: usize,
+        page: usize,
+        q_len: usize,
+        window_left: i32,
+    ) -> Served {
+        Served {
+            d,
+            hq,
+            hkv,
+            page,
+            q_len,
+            window_left,
+        }
+    }
+
+    /// Split counts the plan can pick for batch 1..=max_batch (variant axis).
     #[pyfunction]
-    pub fn nvfp4_attn_enable_jit_store(dir: String) -> PyResult<String> {
-        let store = cutile::jit_cache::FileSystemJitStore::new(&dir)
-            .map_err(|e| PyRuntimeError::new_err(format!("jit store {dir}: {e}")))?;
-        let root = store.root().display().to_string();
-        cutile::jit_cache::enable(Arc::new(store));
-        Ok(root)
+    pub fn nvfp4_attn_split_set(
+        d: usize,
+        hq: usize,
+        hkv: usize,
+        page: usize,
+        q_len: usize,
+        num_sms: usize,
+        max_batch: usize,
+    ) -> PyResult<Vec<usize>> {
+        split_set(q_len, hq, hkv, d, page, num_sms, max_batch).map_err(PyValueError::new_err)
+    }
+
+    /// CI + debugging: (bytecode, bytecode_version, sha256_hex) of one kernel
+    /// of one variant (kernel = "nvfp4_attn_partial" | "nvfp4_attn_merge").
+    #[pyfunction]
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvfp4_attn_variant_bytecode<'py>(
+        py: Python<'py>,
+        d: usize,
+        hq: usize,
+        hkv: usize,
+        page: usize,
+        q_len: usize,
+        window_left: i32,
+        ns: usize,
+        kernel: &str,
+        gpu_name: &str,
+    ) -> PyResult<(Bound<'py, PyBytes>, String, String)> {
+        let s = served(d, hq, hkv, page, q_len, window_left);
+        let (bc, ver, _) =
+            variant_bytecode(&s, ns, kernel, gpu_name).map_err(PyRuntimeError::new_err)?;
+        let sha = sha256_hex(&bc);
+        Ok((PyBytes::new(py, &bc), ver, sha))
+    }
+
+    /// CI only: bytecode -> cubin with the offline `tileiras` (no GPU).
+    #[pyfunction]
+    pub fn nvfp4_attn_compile_cubin<'py>(
+        py: Python<'py>,
+        bytecode: &[u8],
+        gpu_name: &str,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let cubin = run_tileiras(bytecode, gpu_name, &TileirasOptions::default())
+            .map_err(|e| PyRuntimeError::new_err(format!("tileiras: {e}")))?;
+        Ok(PyBytes::new(py, &cubin))
+    }
+
+    /// `sm_XY` name cutile keys cubins by for this device.
+    #[pyfunction]
+    pub fn nvfp4_attn_gpu_name(ordinal: usize) -> String {
+        get_gpu_name(ordinal)
+    }
+
+    /// Pod startup: rebuild the kernel's bytecode for this variant, require
+    /// its sha256 == the manifest's, and serve `cubin` for it from the shared
+    /// in-memory JIT store under this process's own L2 key. The variant
+    /// counts as installed once BOTH kernels are. Returns the key.
+    #[pyfunction]
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvfp4_attn_install_cubin(
+        d: usize,
+        hq: usize,
+        hkv: usize,
+        page: usize,
+        q_len: usize,
+        window_left: i32,
+        ns: usize,
+        kernel: &str,
+        gpu_name: &str,
+        bc_sha256: &str,
+        cubin: &[u8],
+    ) -> PyResult<String> {
+        let s = served(d, hq, hkv, page, q_len, window_left);
+        let (bc, _, key) =
+            variant_bytecode(&s, ns, kernel, gpu_name).map_err(PyRuntimeError::new_err)?;
+        let got = sha256_hex(&bc);
+        if got != bc_sha256 {
+            return Err(PyRuntimeError::new_err(format!(
+                "K2-NVFP4 manifest mismatch for {kernel} {s:?} ns={ns}: pod bytecode \
+                 sha256 {got} != bundle {bc_sha256} (check CUTILE_BYTECODE_VERSION)"
+            )));
+        }
+        crate::cubin_store::install(&key, &bc, gpu_name, cubin).map_err(PyRuntimeError::new_err)?;
+        let mut done = DONE_KERNELS.lock().unwrap_or_else(|p| p.into_inner());
+        let k = (s, ns, kernel.to_string());
+        if !done.contains(&k) {
+            done.push(k);
+        }
+        if KERNELS
+            .iter()
+            .all(|kn| done.contains(&(s, ns, kn.to_string())))
+        {
+            let mut inst = INSTALLED.lock().unwrap_or_else(|p| p.into_inner());
+            if !inst.contains(&(s, ns)) {
+                inst.push((s, ns));
+            }
+        }
+        Ok(key)
+    }
+
+    static DONE_KERNELS: Mutex<Vec<(Served, usize, String)>> = Mutex::new(Vec::new());
+
+    /// Dev/oracle only (a box with `tileiras`): let cutile JIT uncovered
+    /// variants. Serving pods never call this (own_attn.py gates it).
+    #[pyfunction]
+    pub fn nvfp4_attn_allow_jit(allow: bool) {
+        *ALLOW_JIT.lock().unwrap_or_else(|p| p.into_inner()) = allow;
     }
 
     /// (backend_compiles, disk_hits) since process start — the startup
@@ -677,89 +1122,73 @@ mod device {
 
     #[cfg(test)]
     mod tests {
-        use super::nvfp4_attn_kernels;
-        use crate::nvfp4_attn::plan;
-        use cutile::compile_api::KernelCompiler;
-
-        fn dump(name: &str, ir: &str, bc: &[u8]) {
-            if let Some(dir) = std::env::var_os("NVFP4_ATTN_DUMP_IR") {
-                let dir = std::path::Path::new(&dir);
-                std::fs::write(dir.join(format!("{name}.mlir")), ir).expect("dump IR");
-                std::fs::write(dir.join(format!("{name}.bc")), bc).expect("dump bytecode");
-            }
-        }
+        use super::*;
 
         /// Both kernels -> Tile IR -> bytecode for sm_120 at every served
-        /// shape (gemma-4 hd512 16/2 + SWA hd256 16/8, qwen3.8-27b hd256
-        /// 24/4; decode q_len 1 and MTP verify q_len 9). No GPU/driver.
+        /// variant family (gemma-4 hd512 16/2 + SWA hd256 16/8 with window,
+        /// qwen3.8-27b hd256 24/4 page 2816; decode q_len 1 and MTP verify
+        /// q_len 9), through the SAME layout the launch uses. No GPU/driver.
         #[test]
         fn compiles_to_tile_ir_for_sm120() {
             if std::env::var_os("CUTILE_BYTECODE_VERSION").is_none() {
                 std::env::set_var("CUTILE_BYTECODE_VERSION", "13.2");
             }
-            // (hq, hkv, d, page, q_len, batch)
-            let shapes = [
-                (16, 2, 512, 16, 1, 1),
-                (16, 2, 512, 16, 9, 4),
-                (16, 8, 256, 16, 1, 8),
-                (16, 8, 256, 16, 9, 4),
-                (24, 4, 256, 2816, 1, 8),
-            ];
-            for (hq, hkv, d, page, q_len, batch) in shapes {
-                let p = plan(batch, q_len, hq, hkv, d, page, 188).unwrap();
-                let (dh, sd, sg) = (d / 2, d / 16, d / 64);
-                let tag = format!("hd{d}_{hq}_{hkv}_q{q_len}_b{batch}");
-                let pages = 64usize;
-                let page_bytes = 2 * hkv * page * (dh + sd);
-                let g = hq / hkv;
-                let gen = |v: &[usize]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-                let st = |v: &[usize]| v.iter().map(|x| *x as i32).collect::<Vec<_>>();
-                let q_row = 3 * hq * d; // qkv-slice row stride, as served
-                let _ = pages;
-                let partial = KernelCompiler::new(
-                    nvfp4_attn_kernels::__module_ast_self,
-                    "nvfp4_attn_kernels",
-                    "nvfp4_attn_partial",
-                )
-                .generics(gen(&[d, dh, sd, sg, p.gp, p.qt, p.m, p.tn, p.tn / 4, p.ns]))
-                .strides(&[
-                    ("q", &st(&[q_len * q_row, q_row, g * d, d, 1])),
-                    ("k_data", &st(&[page_bytes, page * dh, dh, 1])),
-                    ("k_sf", &st(&[page_bytes, page * sd, sd, 1])),
-                    ("v_data", &st(&[page_bytes, page * dh, dh, 1])),
-                    ("v_sf", &st(&[page_bytes, page * sd, 4 * sd, sd, 4, 1])),
-                    ("block_table", &st(&[512, 1])),
-                    ("seq_lens", &st(&[1])),
-                    ("o_part", &st(&[p.ns * p.m * d, p.m * d, d, 1])),
-                    ("lse_part", &st(&[p.ns * p.m, p.m, 1])),
-                ])
-                .target("sm_120")
-                .compile()
-                .unwrap_or_else(|e| panic!("partial {tag} must lower to Tile IR: {e:?}"));
-                let ir = partial.ir_text();
-                assert!(ir.contains("mma"), "{tag}: expected tensor-core mma in IR");
-                let bc = partial.bytecode().expect("bytecode");
-                assert_eq!(&bc[..8], &[0x7F, b'T', b'i', b'l', b'e', b'I', b'R', 0x00]);
-                dump(&format!("partial_{tag}"), &ir, &bc);
-
-                let merge = KernelCompiler::new(
-                    nvfp4_attn_kernels::__module_ast_self,
-                    "nvfp4_attn_kernels",
-                    "nvfp4_attn_merge",
-                )
-                .generics(gen(&[p.gp, p.qt, p.m, p.ns, p.dt]))
-                .strides(&[
-                    ("out", &st(&[q_len * hq * d, hq * d, g * d, d, 1])),
-                    ("o_part", &st(&[p.ns * p.m * d, p.m * d, d, 1])),
-                    ("lse_part", &st(&[p.ns * p.m, p.m, 1])),
-                ])
-                .target("sm_120")
-                .compile()
-                .unwrap_or_else(|e| panic!("merge {tag} must lower to Tile IR: {e:?}"));
-                let ir = merge.ir_text();
-                let bc = merge.bytecode().expect("bytecode");
-                dump(&format!("merge_{tag}"), &ir, &bc);
+            let dump = std::env::var_os("NVFP4_ATTN_DUMP_IR");
+            for (d, hq, hkv, page, q_len, wl) in [
+                (512, 16, 2, 16, 1, -1),
+                (512, 16, 2, 16, 9, -1),
+                (256, 16, 8, 16, 1, 1023),
+                (256, 16, 8, 16, 9, 1023),
+                (256, 24, 4, 2816, 1, -1),
+            ] {
+                let s = served(d, hq, hkv, page, q_len, wl);
+                let splits = split_set(q_len, hq, hkv, d, page, 188, 256).unwrap();
+                for ns in [splits[0], *splits.last().unwrap()] {
+                    for kernel in KERNELS {
+                        let (bc, ver, key) = variant_bytecode(&s, ns, kernel, "sm_120")
+                            .unwrap_or_else(|e| panic!("{kernel} {s:?} ns={ns}: {e}"));
+                        assert_eq!(&bc[..8], &[0x7F, b'T', b'i', b'l', b'e', b'I', b'R', 0x00]);
+                        assert_eq!(ver, "13.2");
+                        assert_eq!(key.len(), 64);
+                        if let Some(dir) = &dump {
+                            let f = format!("{kernel}_hd{d}_{hq}_{hkv}_p{page}_q{q_len}_ns{ns}.bc");
+                            std::fs::write(std::path::Path::new(dir).join(f), &bc).unwrap();
+                        }
+                    }
+                }
             }
+        }
+
+        /// The launch-side spec check accepts the live layouts vLLM hands us
+        /// (qkv-slice row stride, padded page stride, odd batch/page counts)
+        /// and refuses a misaligned pointer.
+        #[test]
+        fn live_layout_matches_variant_specialization() {
+            let s = served(512, 16, 2, 16, 9, -1);
+            let p = plan(3, 9, 16, 2, 512, 16, 188).unwrap();
+            let rep = rep_live(&s);
+            let live = Live {
+                batch16: round16(3),
+                pages16: round16(12345),
+                rows16: round16(p.rows),
+                bt_len16: round16(3) * 16384,
+                q_row: (16 + 2 * 2) * 512,
+                page_bytes: 2 * 2 * 16 * 288 + 4096,
+            };
+            let ptrs = Ptrs {
+                q: 0x7f00_0000_0000,
+                kd: 0x7f00_0010_0000,
+                ..Ptrs::default()
+            };
+            let a = specs_of(&partial_layout(&s, &p, &live, &ptrs));
+            let b = specs_of(&partial_layout(&s, &p, &rep, &Ptrs::default()));
+            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+            let bad = Ptrs {
+                q: 0x7f00_0000_0002,
+                ..ptrs
+            };
+            let c = specs_of(&partial_layout(&s, &p, &live, &bad));
+            assert_ne!(format!("{c:?}"), format!("{b:?}"));
         }
     }
 }

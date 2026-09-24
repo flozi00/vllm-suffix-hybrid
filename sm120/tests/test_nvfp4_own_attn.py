@@ -169,7 +169,12 @@ class _FIDecode:
 
 
 def _helper_ns(**extra):
-    ns = {"FIDecode": _FIDecode}
+    from types import SimpleNamespace
+
+    ns = {"FIDecode": _FIDecode, "FlashInferImpl": None,
+          "get_per_layer_parameters": lambda *a: None,
+          "infer_global_hyperparameters": lambda _p: SimpleNamespace(
+              window_left=-1, logits_soft_cap=None)}
     ns.update(extra)
     exec(compile(PATCH._OWN_ATTN_HELPER_SRC, "<own>", "exec"), ns)
     return ns
@@ -185,12 +190,13 @@ def test_gate_default_off_and_fail_closed(monkeypatch):
 
     class B:
         use_fa2_nvfp4_kv = True
+        vllm_config, layer_names = None, []
 
     if not getattr(_native, "HAS_NVFP4_ATTN_CUDA", False):
         with pytest.raises(RuntimeError, match="nvfp4-attn-kernels"):
             _helper_ns(_nvfp4_own_attn=own_attn)["_nvfp4_own_attn_gate"](B())
     B.use_fa2_nvfp4_kv = False
-    assert own_attn.builder_gate(B()) is False
+    assert own_attn.builder_gate(B(), -1, None) is False
 
 
 def test_decode_metadata_q_len_rules():
@@ -222,6 +228,41 @@ def test_wrapper_rejects_unsupported_run_args():
               kv_cache_sf=(None, None))
     with pytest.raises(ValueError, match="kv_cache_sf"):
         w.run(None, (None, None), out=object())
+
+
+def test_cubin_manifest_install_is_fail_closed(tmp_path, monkeypatch):
+    import hashlib
+    import json
+
+    calls = []
+
+    class Nat:
+        def nvfp4_attn_install_cubin(self, *a):
+            calls.append(a)
+
+    monkeypatch.delenv("CUTILE_BYTECODE_VERSION", raising=False)
+    with pytest.raises(RuntimeError, match="no K2-NVFP4 cubin manifest"):
+        own_attn.install_cubins(Nat(), (512, 16, 2, 16, -1), (1,), "sm_120",
+                                str(tmp_path))
+    blob = b"cubin"
+    (tmp_path / "a.cubin").write_bytes(blob)
+    entry = dict(file="a.cubin", d=512, hq=16, hkv=2, page=16, q_len=1,
+                 window_left=1023, ns=64, kernel="nvfp4_attn_partial",
+                 bc_sha256="x", sha256=hashlib.sha256(blob).hexdigest())
+    (tmp_path / "manifest.json").write_text(json.dumps(
+        {"bytecode_version": "13.2", "entries": [entry]}))
+    # window_left -1 and 1023 share divisibility 1 -> same variant
+    assert own_attn.install_cubins(Nat(), (512, 16, 2, 16, -1), (1,),
+                                   "sm_120", str(tmp_path)) == 1
+    assert calls and calls[0][5] == -1
+    with pytest.raises(RuntimeError, match=r"q_len=\[9\]"):
+        own_attn.install_cubins(Nat(), (512, 16, 2, 16, -1), (1, 9),
+                                "sm_120", str(tmp_path))
+    (tmp_path / "a.cubin").write_bytes(b"tampered")
+    own_attn._INSTALLED.clear()
+    with pytest.raises(RuntimeError, match="sha256 mismatch"):
+        own_attn.install_cubins(Nat(), (512, 16, 2, 16, -1), (1,), "sm_120",
+                                str(tmp_path))
 
 
 def test_max_decode_q_len_mirrors_vllm_threshold():

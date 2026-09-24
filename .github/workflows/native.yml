@@ -37,17 +37,17 @@ jobs:
           .cuda13/nvidia/cu13/bin/tileiras --version
           echo "CUDA_TOOLKIT_PATH=$PWD/.cuda13/nvidia/cu13" >> "$GITHUB_ENV"
           echo "CUTILE_TILEIRAS_PATH=$PWD/.cuda13/nvidia/cu13/bin/tileiras" >> "$GITHUB_ENV"
-      - name: Rust tests (default, qwen-gdn-kernels Tile IR lowering, K1 build)
+      - name: Rust tests (default, qwen-gdn + nvfp4-attn Tile IR lowering, K1 build)
         run: |
           sudo apt-get install -y libclang-dev
           cargo test --release
-          cargo test --release --features qwen-gdn-kernels
+          cargo test --release --features qwen-gdn-kernels,nvfp4-attn-kernels
           cargo check --release --features cutile-kernels
       - uses: PyO3/maturin-action@v1
         with:
           target: x86_64
           manylinux: '2_28'
-          args: --release --locked --features qwen-gdn-kernels --out dist
+          args: --release --locked --features qwen-gdn-kernels,nvfp4-attn-kernels --out dist
           before-script-linux: dnf install -y clang-devel || yum install -y clang-devel
           docker-options: -e CUDA_TOOLKIT_PATH=${{ github.workspace }}/.cuda13/nvidia/cu13
       - name: Exercise installed Linux wheel
@@ -59,7 +59,7 @@ jobs:
           cd "$RUNNER_TEMP"
           so=$(python -c "import suffix_hybrid._native as n; print(n.__file__)")
           if readelf -d "$so" | grep -Ei 'NEEDED.*(libcuda|libcudart|libcurand)'; then exit 1; fi
-          python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA"
+          python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA and n.HAS_NVFP4_ATTN_CUDA"
           python -m pytest "$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/sm120/tests" -q --import-mode=importlib
       - name: Prebuild K-GDN1 cubins for sm_120 (offline tileiras) + resource report
         # K-GDN1 is default-OFF and fails closed without its cubins
@@ -75,10 +75,23 @@ jobs:
           for c in qgdn_cubins/*_act0_t1_s16.cubin qgdn_cubins/*_act0_t16_s16.cubin; do
             "$obj" --dump-resource-usage "$c"
           done
+      - name: Prebuild K2-NVFP4 attention cubins for sm_120 (offline tileiras) + resource report
+        # Default-OFF lane (SUFFIX_SM120_NVP4KV_OWN_ATTN), fails closed without
+        # its cubins: never blocks the rest of the bundle.
+        continue-on-error: true
+        env:
+          CUTILE_DUMP: ir,bytecode
+        run: |
+          python scripts/nvfp4_attn_prebuild.py --out attn_cubins || { rm -rf attn_cubins; exit 1; }
+          obj=$(find .cuda13 -name cuobjdump -type f | head -1); chmod +x "$obj"
+          for c in attn_cubins/nvfp4_attn_partial_d512_hq16_hkv2_p16_q1_*.cubin attn_cubins/nvfp4_attn_partial_d512_hq16_hkv2_p16_q9_*.cubin; do
+            "$obj" --dump-resource-usage "$c"
+          done
       - name: Create directly mountable runtime bundle
         run: |
           python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA" \
-            $( [ -f qgdn_cubins/manifest.json ] && echo --qgdn-cubins qgdn_cubins )
+            $( [ -f qgdn_cubins/manifest.json ] && echo --qgdn-cubins qgdn_cubins ) \
+            $( [ -f attn_cubins/manifest.json ] && echo --attn-cubins attn_cubins )
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-linux-x86_64

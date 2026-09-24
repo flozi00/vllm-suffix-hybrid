@@ -513,7 +513,11 @@ def _nvfp4_own_attn_gate(builder) -> bool:
         raise RuntimeError(
             "SUFFIX_SM120_NVP4KV_OWN_ATTN=1 but the K2-NVFP4 adapter was not "
             "injected (sm120 nvfp4-kv patch apply() did not run).")
-    return impl.builder_gate(builder)
+    # window/soft-cap are only set on the builder after the reorder
+    # threshold; derive them the way the builder does a few lines later.
+    hp = infer_global_hyperparameters(get_per_layer_parameters(
+        builder.vllm_config, builder.layer_names, FlashInferImpl))
+    return impl.builder_gate(builder, hp.window_left, hp.logits_soft_cap)
 
 
 def _nvfp4_own_attn_decode(builder, block_table, seq_lens, qo_indptr_cpu,
