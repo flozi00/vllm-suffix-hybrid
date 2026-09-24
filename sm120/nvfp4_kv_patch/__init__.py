@@ -78,7 +78,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-24.6"
+PATCH_REVISION = "2026-09-24.7"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -360,8 +360,16 @@ def _nvfp4_kv_mm_mode(vllm_config, layer_names, window_left, use_fa2) -> bool:
         }
     layers = vllm_config.compilation_config.static_forward_context
     modes = set()
+    drafters = []
     for name in layer_names:
         layer = layers[name]
+        # Spec-decode drafter layers (gemma-4 MTP: draft_model.layers.N) are
+        # causal by their own config but share the KV group (one fa2 plan)
+        # with target layers: they inherit the target layers' mode instead of
+        # voting (drafts only; the exact target verifies every token).
+        if "draft_model." in name:
+            drafters.append(name)
+            continue
         if not getattr(layer, "use_mm_prefix", False):
             modes.add(False)
             continue
@@ -396,6 +404,12 @@ def _nvfp4_kv_mm_mode(vllm_config, layer_names, window_left, use_fa2) -> bool:
         raise ValueError(
             "suffix sm120 nvfp4-kv (fa2 route): mm-prefix and causal layers "
             f"share one KV group ({layer_names[:4]}...); refusing."
+        )
+    if drafters and True in modes:
+        logger.warning_once(
+            "suffix sm120 nvfp4-kv: %d drafter layer(s) share an mm-prefix KV "
+            "group and use its image mask (e.g. %s).", len(drafters),
+            drafters[0]
         )
     return True in modes
 

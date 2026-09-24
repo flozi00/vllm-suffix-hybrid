@@ -846,7 +846,19 @@ def test_mm_mode_per_kv_group(monkeypatch):
     cfg_d = _mode_cfg(drafter, layer_types=lt)
     assert mode(cfg_d, swa + ["draft_model.layers.0.self_attn.attn"],
                 1023, True) is True
-    # causal and mm layers in one group: refuse
+    # gemma-spec-dev 2026-09-24 20:47Z: the MTP drafter's attention is NOT
+    # mm-prefix (own model config) but shares the target sliding group: it
+    # inherits the group's mode instead of voting.
+    d_causal = dict(layers)
+    d_causal["draft_model.layers.0.self_attn.attn"] = _layer(mm=False)
+    cfg_c = _mode_cfg(d_causal, layer_types=lt)
+    assert mode(cfg_c, swa + ["draft_model.layers.0.self_attn.attn"],
+                1023, True) is True
+    assert mode(cfg_c, full + ["draft_model.layers.0.self_attn.attn"],
+                -1, True) is False
+    assert mode(cfg_c, ["draft_model.layers.0.self_attn.attn"],
+                1023, True) is False                 # drafter-only group
+    # causal and mm TARGET layers in one group: refuse
     with pytest.raises(ValueError, match="share one KV group"):
         mode(cfg, swa + full, 1023, True)
 
