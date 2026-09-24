@@ -62,14 +62,23 @@ jobs:
           python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA"
           python -m pytest "$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/sm120/tests" -q --import-mode=importlib
       - name: Prebuild K-GDN1 cubins for sm_120 (offline tileiras) + resource report
+        # K-GDN1 is default-OFF and fails closed without its cubins
+        # (SUFFIX_QWEN_GDN=1), so a tileiras failure must not block shipping
+        # the rest of the bundle. The step stays visibly red; the bundle
+        # simply omits qgdn_cubins/. CUTILE_DUMP puts the Tile IR in the log.
+        continue-on-error: true
+        env:
+          CUTILE_DUMP: ir,bytecode
         run: |
-          python scripts/qwen_gdn_prebuild.py --out qgdn_cubins
+          python scripts/qwen_gdn_prebuild.py --out qgdn_cubins || { rm -rf qgdn_cubins; exit 1; }
           obj=$(find .cuda13 -name cuobjdump -type f | head -1); chmod +x "$obj"
           for c in qgdn_cubins/*_act0_t1_s16.cubin qgdn_cubins/*_act0_t16_s16.cubin; do
             "$obj" --dump-resource-usage "$c"
           done
       - name: Create directly mountable runtime bundle
-        run: python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA" --qgdn-cubins qgdn_cubins
+        run: |
+          python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA" \
+            $( [ -f qgdn_cubins/manifest.json ] && echo --qgdn-cubins qgdn_cubins )
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-linux-x86_64
