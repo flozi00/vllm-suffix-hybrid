@@ -397,7 +397,90 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             out.zero_()
             return out
     propose._suffix_proposer = proposer
+    # Token-level verify trace hook points (SUFFIX_HYBRID_TRACE_VERIFY2):
+    # expose the per-rid published-drafts registry to the sampler wrap.
+    setattr(propose, "_suffix_trace_state", trace_state)
+    setattr(propose, "_suffix_trace_cfg", trace_cfg)
     return propose
+
+
+def _wrap_rejection_sampler(runner, propose_hook, k):
+    """Token-level verify trace (SUFFIX_HYBRID_TRACE_VERIFY2).
+
+    Publishes, per traced step and rid:
+      pub=  the drafts our propose published for that rid (from trace_state)
+      graded= the token ids the rejection kernel will compare against target
+            argmax — draft_sampled = input_ids[logits_indices] sliced by
+            cu_num_logits per request, first row (last sampled token) dropped
+      acc=  the post-verify sampled_token_ids row (accepted drafts up to the
+            first rejection, then target argmax) and num_sampled delta
+    Discriminates: handoff corruption (pub != graded -> scheduler/scatter
+    bug) vs genuine argmax mismatch (pub == graded but acc rejects).
+
+    NOTE(2026-09-24): special-method lookup ignores instance attributes, so
+    the wrap binds on the CLASS (one sampler instance per process here).
+    """
+    sampler = getattr(runner, "rejection_sampler", None)
+    if sampler is None:
+        return False
+    on_env = os.environ.get("SUFFIX_HYBRID_TRACE_VERIFY2", "").strip()
+    if not on_env:
+        return False
+    budget = [int(os.environ.get("SUFFIX_HYBRID_TRACE_VERIFY2_MAX",
+                                  "24") or 24)]
+    original = type(sampler).__call__
+
+    trace_state = getattr(propose_hook, "_suffix_trace_state", None) or {}
+
+    @functools.wraps(original)
+    def call(self, logits, input_batch, draft_logits=None, *args, **kwargs):
+        out = original(self, logits, input_batch, draft_logits,
+                       *args, **kwargs)
+        if budget[0] <= 0 or not trace_state:
+            return out
+        try:
+            if getattr(input_batch, "num_draft_tokens", 0) <= 0:
+                return out
+            cu = input_batch.cu_num_logits_np.tolist()
+            graded = input_batch.input_ids[
+                input_batch.logits_indices].detach().to(
+                "cpu", non_blocking=False).tolist()
+            sampled = out.sampled_token_ids.detach().to(
+                "cpu", non_blocking=False).tolist()
+            nsamp = out.num_sampled.detach().to(
+                "cpu", non_blocking=False).tolist()
+            rids = list(input_batch.req_ids)
+            for i, rid in enumerate(rids):
+                pub = trace_state.get(rid)
+                if pub is None:
+                    continue
+                p_total, p_drafts = pub
+                start, end = cu[i], cu[i + 1]
+                w = end - start - 1
+                if w <= 0:
+                    continue
+                g = graded[start + 1:end]
+                p = p_drafts[:w]
+                m = sum(1 for a, b in zip(p, g) if a == b)
+                a_row = sampled[i][:w] if i < len(sampled) else []
+                n_acc = max(int(nsamp[i]) - 1, 0) if i < len(nsamp) else -1
+                print(f"suffix_hybrid VTRACE2 rid={rid!r} w={w} "
+                      f"pubmatch={m}/{w} graded={g[:8]} pub={p[:8]} "
+                      f"accrow={a_row[:8]} nacc={n_acc}",
+                      file=sys.stderr, flush=True)
+            budget[0] -= 1
+            if budget[0] <= 0:
+                print("suffix_hybrid VTRACE2 budget exhausted",
+                      file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"suffix_hybrid VTRACE2 error: {type(exc).__name__}: "
+                  f"{exc}", file=sys.stderr, flush=True)
+            budget[0] = 0
+        return out
+    # Special-method lookup: obj(...) resolves __call__ on the TYPE, so the
+    # wrap must bind class-level (one sampler instance per process here).
+    type(sampler).__call__ = call
+    return True
 
 
 def _patch_get_draft_tokens(runner, widths_table):
@@ -1216,9 +1299,11 @@ def install_v2():
                 # the scheduler consumes (miss rows -> plain 1x decode).
                 patched = _patch_get_draft_tokens(
                     self, wrapped._suffix_proposer.widths_table)
+                v2 = _wrap_rejection_sampler(self, wrapped, k)
                 print(f"suffix_hybrid v2 SUFFIX-ONLY installed "
                       f"speculator={cls_name} k={k} tp={group.world_size} "
-                      f"ragged_handler={'yes' if patched else 'NO (uniform)'}",
+                      f"ragged_handler={'yes' if patched else 'NO (uniform)'} "
+                      f"vtrace2={'yes' if v2 else 'off'}",
                       file=sys.stderr, flush=True)
                 return result
             # Instance-attribute bind: the runner calls
