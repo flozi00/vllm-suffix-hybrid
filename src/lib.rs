@@ -306,6 +306,7 @@ impl SuffixCache {
 }
 mod engine;
 mod mixer;
+mod verify_fusion;
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -313,6 +314,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<engine::Engine>()?;
     m.add_class::<mixer::HybridMixer>()?;
     m.add_class::<mixer::V2SuffixProposer>()?;
+    m.add_function(wrap_pyfunction!(
+        verify_fusion::rejection_greedy_accept,
+        m
+    )?)?;
     m.add("VERSION", "0.2.0-rust-v1")?;
     Ok(())
 }
