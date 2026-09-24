@@ -364,13 +364,21 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     min_len = max(int(os.environ.get(
         "SUFFIX_HYBRID_SUFFIX_MIN", "1") or 1), 1)
     uniform_k = os.environ.get("SUFFIX_HYBRID_UNIFORM_K", "").strip() == "1"
+    # Acceptance-EWMA draft-width gate (verify-econ dossier C.#1).
+    # Default OFF ("" / "0"): the live arm stays bit-identical until the
+    # harness flips SUFFIX_HYBRID_EWMA_WIDTH=1 on a dev pool A/B.
+    width_gate = (os.environ.get("SUFFIX_HYBRID_EWMA_WIDTH", "0").strip()
+                  not in ("", "0", "false"))
     proposer = V2SuffixProposer(
         int(k), int(getattr(speculator, "max_model_len", 0) or 0) or 32768,
-        min_len, uniform_k)
+        min_len, uniform_k, width_gate)
     if uniform_k:
         print(f"suffix_hybrid v2 suffix-only UNIFORM-K pallet k={k} "
               f"(all rows width k, CUDA-graph matched)", file=sys.stderr,
               flush=True)
+    if width_gate:
+        print(f"suffix_hybrid v2 suffix-only EWMA-WIDTH gate k={k} "
+              f"(SUFFIX_HYBRID_EWMA_WIDTH=1)", file=sys.stderr, flush=True)
     draft_tokens = speculator.draft_tokens          # [max_num_reqs, K] GPU
     req_states = runner.req_states
     totals_gpu = req_states.total_len.gpu

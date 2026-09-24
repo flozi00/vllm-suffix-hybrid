@@ -707,7 +707,6 @@ impl HybridMixer {
     }
 }
 
-
 // ===================== V2 suffix-only proposer =====================
 // Drafter-free speculative decoding for the V2 runner (gemma lane, wake
 // #6-7): the wrapper never calls the native drafter forward, so a step
@@ -749,6 +748,19 @@ pub struct V2SuffixProposer {
     /// the real suffix (uniform mode misses) — the pallet overhead
     /// meter (sum over steps of row counts, not tokens).
     padded: u64,
+    /// Acceptance-EWMA draft-width gate (SUFFIX_HYBRID_EWMA_WIDTH,
+    /// default OFF): per-request EWMA of accepted draft tokens,
+    /// publishing w = ceil(EWMA).clamp(1, k) instead of the full
+    /// matched suffix width. Port of mix_core's accept_estimate/pick
+    /// (verify-econ dossier C.#1): at c1-warm acceptance ~0.024 the
+    /// ungated path pays a (k+1)-wide verify forward per step and
+    /// rejects ~97.6% of it; the gate narrows the publish toward what
+    /// the row actually wins (mirror-length delta - 1 is the per-step
+    /// accepted count), width clamp floor 1 / ceiling k.
+    width_gate: bool,
+    /// Per-request gate state; separate from `mirror` so the OFF arm's
+    /// memory profile is unchanged (empty map costs nothing).
+    gate: Map<String, GateRow>,
     elapsed_ns: u64,
 }
 
@@ -759,6 +771,17 @@ struct SuffixRowOut {
     width: usize,
     /// TRUE matched-suffix length (stats + uniform padding split point).
     real_w: usize,
+}
+
+/// Acceptance-EWMA width-gate state, per request (mirrors the hybrid
+/// path's `Previous` accept_estimate EWMA in mix_core). `ewma` tracks
+/// the number of draft tokens THIS row actually got accepted per
+/// proposal; `last_width` is the width the gate last published for
+/// this row, needed (a) to interpret the next step's mirror delta as
+/// an accept count (feedback) and (b) to censor retractions.
+struct GateRow {
+    ewma: f64,
+    last_width: usize,
 }
 
 impl V2SuffixProposer {
@@ -792,6 +815,7 @@ impl V2SuffixProposer {
         for rid in gone {
             if let Some(row) = self.mirror.remove(&rid) {
                 self.widths.remove(&rid);
+                self.gate.remove(&rid);
                 if row.len() > 8 {
                     lock_cache(&self.cache.inner).add(row);
                     self.ingested += 1;
@@ -812,6 +836,7 @@ impl V2SuffixProposer {
             let total = total as usize;
             let row = tokens.row(indices[i]);
             let tracked = self.mirror.get(rid);
+            let tracked_len = tracked.map(|t| t.len());
             // Boundary proof on the VIEW (no full copy to prove identity):
             // the tracked prefix's head and the tokens where it ends must
             // match. Same 64-token windows as mix_numpy's boundary check.
@@ -819,10 +844,14 @@ impl V2SuffixProposer {
                 Some(t) if total >= t.len() => {
                     let l = t.len();
                     let w = BOUNDARY.min(l);
-                    (t[..w].iter().zip(row.iter().take(w)).all(|(&a, &b)| a == b.into()))
-                        && (t[l - w..].iter().zip(row.iter().skip(l - w).take(w)).all(
-                            |(&a, &b)| a == b.into(),
-                        ))
+                    (t[..w]
+                        .iter()
+                        .zip(row.iter().take(w))
+                        .all(|(&a, &b)| a == b.into()))
+                        && (t[l - w..]
+                            .iter()
+                            .zip(row.iter().skip(l - w).take(w))
+                            .all(|(&a, &b)| a == b.into()))
                 }
                 _ => false,
             };
@@ -847,12 +876,89 @@ impl V2SuffixProposer {
             // last sampled token — the mirror is EXACT, no shift needed).
             let (suffix, _score, _matched) =
                 lock_cache(&self.cache.inner).speculate(&tokens_row, k);
-            let (tokens, real_w) = if !suffix.is_empty() && suffix.len() >= min_len {
+            let (mut tokens, mut real_w) = if !suffix.is_empty() && suffix.len() >= min_len {
                 let w = suffix.len().min(k);
                 (suffix[..w].to_vec(), w)
             } else {
                 (vec![], 0)
             };
+
+            // ---- Acceptance-EWMA width gate (SUFFIX_HYBRID_EWMA_WIDTH).
+            // Port of mix_core's accept_estimate/pick (verify-econ
+            // dossier C.#1). The engine verifies LAST step's published
+            // width by construction: the next authoritative total
+            // exceeds the previous mirror by exactly (accepted drafts
+            // + 1 new sampled token) on a continuing row, so
+            //     accepted = delta_since_last_view - 1
+            // with delta = total - prev_mirror_len. Mislabels are
+            // censored: feedback only trains when (a) continuity
+            // proofs held this step, (b) delta >= 1 (a real verify
+            // step elapsed), (c) last_width > 0 (drafts were actually
+            // published AND not retracted by clear_widths, which
+            // censors by zeroing last_width), and accepted is capped
+            // at last_width. Fully-accepted rows jump the EWMA back
+            // to the published width (mix_core's "don't hover one
+            // slot short" rule); partials decay by 0.7/0.3 like the
+            // hybrid path. Published width = ceil(EWMA).clamp(1, k)
+            // via shortening the matched suffix, floor 1: a row that
+            // still hits keeps at least one speculative position, so
+            // the scheduled step remains width-(>=2) and the
+            // num_speculative_tokens contract the engine sees
+            // (per-row widths from widths_table) is unchanged — this
+            // is the same truncation that already happens for
+            // ragged short suffixes.
+            if self.width_gate {
+                let mut gate_w = k; // fresh row: no evidence, keep width
+                let mut ewma = None;
+                if let Some(g) = self.gate.get_mut(rid) {
+                    if cont && g.last_width > 0 {
+                        if let Some(l_prev) = tracked_len {
+                            let delta = total - l_prev;
+                            if delta >= 1 {
+                                let a = (delta - 1).min(g.last_width);
+                                g.ewma = if a >= g.last_width {
+                                    // Fully accepted (RIGHT-censored: the
+                                    // engine took every published draft; its
+                                    // true capacity is unknown). mix_core
+                                    // jumps the EWMA to p.length == cap;
+                                    // here the publish was gate-narrowed so
+                                    // the jump target is unknown -> creep up
+                                    // one width per fully-accepted step.
+                                    // Any partial acceptance below decays
+                                    // the estimate right back.
+                                    (g.last_width + 1) as f64
+                                } else {
+                                    0.7 * g.ewma + 0.3 * a as f64
+                                };
+                            }
+                        }
+                    }
+                    gate_w = (g.ewma.ceil() as usize).clamp(1, k);
+                    ewma = Some(g.ewma);
+                }
+                if gate_w < real_w {
+                    tokens.truncate(gate_w);
+                    real_w = gate_w;
+                }
+                // Record the width THIS step publishes (uniform mode
+                // pads up to k afterwards; feedback censors at
+                // out_row.width == k, which is exactly what the
+                // engine verifies there). No entry yet -> insert with
+                // the full-width seed (no evidence against width).
+                let last_width = if self.uniform_k { k } else { real_w };
+                match self.gate.get_mut(rid) {
+                    Some(g) => g.last_width = last_width,
+                    None => {
+                        self.gate.insert(
+                            rid.clone(),
+                            GateRow {
+                                ewma: ewma.unwrap_or(k as f64),
+                                last_width,
+                            },
+                        );
+                    }
+                }
+            }
             // Uniform-k pallet (uniform_k mode): publish width=k for
             // EVERY row — hit rows carry the real suffix, miss rows are
             // padded so every step matches the compiled (k+1)-query
@@ -868,16 +974,21 @@ impl V2SuffixProposer {
             // plausibility is irrelevant.
             let out_row = if self.uniform_k {
                 let mut t = tokens;
-                let pad = tokens_row
-                    .first()
-                    .copied()
-                    .unwrap_or(0);
+                let pad = tokens_row.first().copied().unwrap_or(0);
                 while t.len() < k {
                     t.push(pad);
                 }
-                SuffixRowOut { tokens: t, width: k, real_w }
+                SuffixRowOut {
+                    tokens: t,
+                    width: k,
+                    real_w,
+                }
             } else {
-                SuffixRowOut { tokens, width: real_w, real_w }
+                SuffixRowOut {
+                    tokens,
+                    width: real_w,
+                    real_w,
+                }
             };
             if out_row.real_w > 0 {
                 self.hits += 1;
@@ -897,12 +1008,13 @@ impl V2SuffixProposer {
 #[pymethods]
 impl V2SuffixProposer {
     #[new]
-    #[pyo3(signature = (num_speculative_tokens, max_model_len, min_len=1, uniform_k=false))]
+    #[pyo3(signature = (num_speculative_tokens, max_model_len, min_len=1, uniform_k=false, width_gate=false))]
     fn new(
         num_speculative_tokens: usize,
         max_model_len: usize,
         min_len: usize,
         uniform_k: bool,
+        width_gate: bool,
     ) -> PyResult<Self> {
         if !(1..=64).contains(&num_speculative_tokens) || !(1..=16_777_216).contains(&max_model_len)
         {
@@ -924,6 +1036,8 @@ impl V2SuffixProposer {
             ingested: 0,
             resets: 0,
             padded: 0,
+            width_gate,
+            gate: map(),
             elapsed_ns: 0,
         })
     }
@@ -984,9 +1098,7 @@ impl V2SuffixProposer {
             } else if let Ok(a) = tokens.extract::<PyReadonlyArray2<'_, i64>>() {
                 self.run(&request_ids, &idx_usize, a.as_array(), &t_at)
             } else {
-                Err(PyValueError::new_err(
-                    "tokens must be int32/int64 2D NumPy",
-                ))
+                Err(PyValueError::new_err("tokens must be int32/int64 2D NumPy"))
             }
         })?;
         // Pack [n, k] drafts and [n] widths into numpy (contiguous,
@@ -1010,12 +1122,13 @@ impl V2SuffixProposer {
             .elapsed_ns
             .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         let packed_np = numpy::ndarray::Array2::<i64>::from_shape_vec((n, k), packed)
-            .map_err(|e| {
-                PyValueError::new_err(format!("suffix-only pack shape {n}x{k}: {e}"))
-            })?
+            .map_err(|e| PyValueError::new_err(format!("suffix-only pack shape {n}x{k}: {e}")))?
             .into_pyarray(py);
         let widths_arr = widths_np.into_pyarray(py);
-        Ok((packed_np.into_any().unbind(), widths_arr.into_any().unbind()))
+        Ok((
+            packed_np.into_any().unbind(),
+            widths_arr.into_any().unbind(),
+        ))
     }
 
     /// True width published per request id at the last propose call. The
@@ -1044,11 +1157,28 @@ impl V2SuffixProposer {
     /// Retract every published width (all rows -> miss). The adapter calls
     /// this on its exception path: run() may have already inserted widths
     /// for this batch while the packed upload failed, and the scheduler
-    /// would otherwise verify zeroed drafts at phantom widths.
+    /// would otherwise verify zeroed drafts at phantom widths. The width
+    /// gate censors with the same signal: a retracted width was never
+    /// verified, so its last_width goes to 0 and the next step's mirror
+    /// delta cannot be misread as an accept count for it.
     fn clear_widths(&mut self) {
-        for w in self.widths.values_mut() {
+        for (rid, w) in self.widths.iter_mut() {
             *w = 0;
+            if let Some(g) = self.gate.get_mut(rid) {
+                g.last_width = 0;
+            }
         }
+    }
+
+    /// Acceptance-EWMA width-gate diagnostics: per-rid EWMA and last
+    /// published width (gate arm only; empty when the gate is off).
+    #[getter]
+    fn gate_table<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        for (rid, g) in &self.gate {
+            d.set_item(rid, (g.ewma, g.last_width))?;
+        }
+        Ok(d)
     }
 
     fn get_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -1060,6 +1190,7 @@ impl V2SuffixProposer {
         d.set_item("resets", self.resets)?;
         d.set_item("padded", self.padded)?;
         d.set_item("uniform_k", self.uniform_k)?;
+        d.set_item("width_gate", self.width_gate)?;
         d.set_item("active", self.mirror.len())?;
         d.set_item("elapsed_ns", self.elapsed_ns)?;
         d.set_item("cache", self.cache.stats())?;
