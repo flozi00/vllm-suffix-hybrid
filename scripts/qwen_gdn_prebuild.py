@@ -26,7 +26,7 @@ SHAPES = [(16, 48, 128)]
 ACTS = (0, 1)  # silu, sigmoid
 DIVS = (1, 2, 4, 8, 16)
 ARCH = "sm_120"
-BYTECODE_VERSION = "13.2"
+BYTECODE_VERSION = "13.4"  # keep == native.yml CUTILE_BYTECODE_VERSION
 
 
 def main():

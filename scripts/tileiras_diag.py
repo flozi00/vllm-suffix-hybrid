@@ -75,8 +75,10 @@ def main():
     versions = sorted(set(re.findall(r"\b(1[3-9]\.\d+)\b", lv.stdout + lv.stderr)))
     for ver in versions:
         env = dict(os.environ, CUTILE_BYTECODE_VERSION=ver)
+        # cwd outside the checkout: its source suffix_hybrid/ (no .so) would
+        # shadow the installed wheel (d057d457 CI: every sweep row failed so).
         p = subprocess.run([sys.executable, "-c", _VER_CHILD, a.gpu], env=env,
-                           capture_output=True)
+                           capture_output=True, cwd=tempfile.gettempdir())
         if p.returncode != 0:
             print(f"--- serialize K-GDN1 at bytecode {ver} failed:\n"
                   f"{p.stderr.decode(errors='replace')[-2000:]}")

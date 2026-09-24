@@ -1131,7 +1131,7 @@ mod device {
         #[test]
         fn compiles_to_tile_ir_for_sm120() {
             if std::env::var_os("CUTILE_BYTECODE_VERSION").is_none() {
-                std::env::set_var("CUTILE_BYTECODE_VERSION", "13.2");
+                std::env::set_var("CUTILE_BYTECODE_VERSION", "13.4");
             }
             let dump = std::env::var_os("NVFP4_ATTN_DUMP_IR");
             for (d, hq, hkv, page, q_len, wl) in [
@@ -1148,7 +1148,7 @@ mod device {
                         let (bc, ver, key) = variant_bytecode(&s, ns, kernel, "sm_120")
                             .unwrap_or_else(|e| panic!("{kernel} {s:?} ns={ns}: {e}"));
                         assert_eq!(&bc[..8], &[0x7F, b'T', b'i', b'l', b'e', b'I', b'R', 0x00]);
-                        assert_eq!(ver, "13.2");
+                        assert_eq!(ver, std::env::var("CUTILE_BYTECODE_VERSION").unwrap());
                         assert_eq!(key.len(), 64);
                         if let Some(dir) = &dump {
                             let f = format!("{kernel}_hd{d}_{hq}_{hkv}_p{page}_q{q_len}_ns{ns}.bc");

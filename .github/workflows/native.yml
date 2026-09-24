@@ -14,7 +14,10 @@ env:
   # and never JIT: the cubins ship in the bundle (suffix_hybrid/qgdn_cubins/).
   CUDA_WHEEL_VERSION: '13.4.92'
   CURAND_WHEEL_VERSION: '10.4.4.72'
-  CUTILE_BYTECODE_VERSION: '13.2'
+  # Must be a bytecode version whose opcode set covers what cutile 0.3.1 emits:
+  # 13.2 rejects opcode 112 ('unsupported opcode 112 for bytecode version 13.2',
+  # d057d457 CI, both K-GDN1 and K2). tileiras 13.4.92 == bytecode 13.4.
+  CUTILE_BYTECODE_VERSION: '13.4'
 jobs:
   linux:
     runs-on: ubuntu-22.04

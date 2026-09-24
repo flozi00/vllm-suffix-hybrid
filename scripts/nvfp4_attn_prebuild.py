@@ -38,7 +38,7 @@ SERVED = [
 ]
 KERNELS = ("nvfp4_attn_partial", "nvfp4_attn_merge")
 ARCH = "sm_120"
-BYTECODE_VERSION = "13.2"
+BYTECODE_VERSION = "13.4"  # keep == native.yml CUTILE_BYTECODE_VERSION
 NUM_SMS = 188  # RTX PRO 6000 Blackwell; the pod plan uses its own count
 
 
