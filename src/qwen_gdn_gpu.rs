@@ -356,11 +356,10 @@ mod device {
                 )));
             }
         }
-        if stream_ptr == 0 {
-            return Err(PyValueError::new_err(
-                "stream_ptr must be torch's current CUDA stream",
-            ));
-        }
+        // stream_ptr == 0 is torch's legacy default stream (the NULL CUstream),
+        // valid for cuLaunchKernel and exactly what torch's default stream is;
+        // vLLM runs init + the warmup oracle there (2026-09-24 pods rejected it).
+        // Graph capture always uses a non-default stream, so capture is unaffected.
         if d.t == 0 {
             return Ok(());
         }

@@ -303,11 +303,10 @@ mod device {
         }
         let device_ordinal = if batch > 0 { d_info.device_index } else { 0 };
 
-        if stream_ptr == 0 {
-            return Err(PyValueError::new_err(
-                "stream_ptr must be a live CUDA stream (torch.cuda.current_stream().cuda_stream)",
-            ));
-        }
+        // stream_ptr == 0 is torch's legacy default stream (the NULL CUstream),
+        // valid for cuLaunchKernel and exactly what torch's default stream is;
+        // vLLM runs init + the warmup oracle there (2026-09-24 pods rejected it).
+        // Graph capture always uses a non-default stream, so capture is unaffected.
 
         // All Python interaction ends here: the launch runs GIL-free.
         py.detach(|| {
