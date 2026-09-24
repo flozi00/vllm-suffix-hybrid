@@ -174,6 +174,19 @@ def _check_speculator_capability(spec_cls):
     return propose
 
 
+def _env_flag(name, default="0"):
+    """Harmonized OFF/ON parse for the != "0" env gates (review aa5accb1
+    finding 2): 1/true/yes/on (any case, whitespace-stripped) arm the
+    feature; 0/false/no/off/empty/anything-else disarm it. Fail-closed
+    polarity: SUFFIX_HYBRID_D2H_PIPE=false must NOT arm the pipe,
+    SUFFIX_HYBRID_W0_FASTPATH=false must turn the fast path OFF, so an
+    operator trying to disable on a live pod gets OFF, never a
+    surprise-armed feature. The == "1" gate family stays untouched.
+    """
+    return os.environ.get(name, default).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _cuda_capturing():
     """Belt-check for the pipelined D2H path (I3, dossier S4).
 
@@ -420,7 +433,10 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     # ordering demands arm M measure the D2H vs Rust vs upload split
     # empirically BEFORE totals-path surgery; (3) disjunct (A) already
     # removes the Rust mix + upload on gated steps.
-    w0_fast = os.environ.get("SUFFIX_HYBRID_W0_FASTPATH", "1").strip() != "0"
+    # _env_flag (review finding 2 harmonization): default ON stays ON,
+    # and "false"/"no"/"off" now actually DISARM the fast path (the old
+    # != "0" polarity kept them ON -- breaking the OFF = stock contract).
+    w0_fast = _env_flag("SUFFIX_HYBRID_W0_FASTPATH", "1")
     fp = {"enabled": w0_fast, "seen": {}, "fast_steps": 0,
           "ghosts_fed": 0, "ghosts_dropped": 0, "ghosts_pending": 0,
           # Wake-29 drop-reason split (audit §3 caveat): one total
@@ -479,7 +495,9 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     # provenance with the stock arm (A/B = one env flip).
     # ==============================================================
     # --------------------------------------------------------------
-    pipe_en = (os.environ.get("SUFFIX_HYBRID_D2H_PIPE", "0").strip() != "0")
+    # _env_flag (review finding 2): "false"/"no"/"off" must DISARM the
+    # pipe, never silently arm it (old != "0" polarity armed on those).
+    pipe_en = _env_flag("SUFFIX_HYBRID_D2H_PIPE", "0")
     # ==============================================================
     # PIPE-EARLY (SUFFIX_HYBRID_PIPE_EARLY, default 0 = OFF =
     # bit-identical Option-A behavior): record the side-stream copy
@@ -506,8 +524,9 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     # a strict SUBSET of Option A's, so absorb_wait_us can only
     # DECREASE; its meaning (pure st_ev.synchronize wall) is unchanged.
     # ==============================================================
-    _early = os.environ.get(
-        "SUFFIX_HYBRID_PIPE_EARLY", "0").strip() != "0"
+    # _env_flag (review finding 2), same harmonized polarity as the
+    # D2H_PIPE gate above: false/no/off disarm EARLY.
+    _early = _env_flag("SUFFIX_HYBRID_PIPE_EARLY", "0")
     pipe = {"on": False, "sim": False, "armed": False, "pending": None,
             "lag": None, "steps": 0, "block_steps": 0, "fallback": False,
             "fallback_reason": "",
@@ -620,6 +639,27 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                        .clone().numpy(),
                        "n": int(pend_n)}
         pipe["pending"] = None
+        # Review aa5accb1 finding 1: cheap fail-closed absorb-side
+        # monotonicity assert. A lagged snapshot that raced a NEXT
+        # step's post_update total_len write can carry torn
+        # mixed-generation totals that still pass the `aligned`
+        # (n/ids/idx) check in _pipe_get and reach the Rust mixer.
+        # Total_len values are append-only integers keyed by a row-persistent
+        # rid: for a rid served by the PREVIOUS snapshot, the new total
+        # must never SHRINK. If it did, we observed a torn read --
+        # raise I7; the _pipe_get handler sticky-disables the pipe and
+        # serves a blocking stock read this step (fail-closed), instead
+        # of letting garbage-tail tokens reach the mirror's continuity
+        # ingest (silent corpus poisoning).
+        _prev = pipe.get("last_totals") or {}
+        _new = pipe["lag"]["totals"]
+        for _i, rid in enumerate(pend_ids):
+            if rid in _prev and int(_new[_i]) < _prev[rid]:
+                raise _PipeInvariantError(
+                    "I7", f"lagged totals shrank for rid {rid}: "
+                          f"{_prev[rid]} -> {int(_new[_i])}")
+        pipe["last_totals"] = dict(zip(pend_ids,
+                                       (int(t) for t in _new)))
         t_host = (time.perf_counter() - t_h0) * 1e6
         return t_wait, t_host
 
@@ -799,7 +839,14 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             j = int(idx_l[i])
             row = ats_np[j]
             seen[rid] = {"idx": j, "total": tot, "dirty": dirty,
-                         "head": row[:4].tolist(),
+                         # Review aa5accb1 finding 3: record the head
+                         # at the SAME [:min(4, tot)] length the ghost
+                         # re-feed checks (:995+) -- an unconditional
+                         # row[:4] pads rows with total<4 with stale
+                         # free-list tokens, so the fingerprint NEVER
+                         # matches and short-lived requests are always
+                         # dropped (and miscounted as ghosts_drop_fp).
+                         "head": row[:min(4, tot)].tolist(),
                          "tail1": int(row[tot - 1])}
 
     def _mtrace_maybe():
