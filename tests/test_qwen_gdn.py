@@ -279,9 +279,13 @@ def test_runtime_bundle_ships_qgdn_cubins(tmp_path):
         rb.bundle(wheel, tmp_path / "r2", "f" * 40, qgdn_cubins=bad)
 
 
-def test_default_cubin_dir_is_next_to_native():
-    assert qwen_gdn.cubin_dir() == str(ROOT / "suffix_hybrid" / "qgdn_cubins") or \
-        os.environ.get("SUFFIX_QWEN_GDN_CUBINS")
+def test_default_cubin_dir_is_next_to_native(monkeypatch):
+    # Next to whichever suffix_hybrid package is imported (source checkout
+    # locally, site-packages in CI, /plugins on pods).
+    import suffix_hybrid
+    monkeypatch.delenv("SUFFIX_QWEN_GDN_CUBINS", raising=False)
+    pkg = os.path.dirname(os.path.abspath(suffix_hybrid.__file__))
+    assert qwen_gdn.cubin_dir() == os.path.join(pkg, "qgdn_cubins")
 
 
 # ---------------------------------------------------------------------------
