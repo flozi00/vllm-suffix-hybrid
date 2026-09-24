@@ -612,3 +612,30 @@ def test_capacity_ratio_fp8_to_nvfp4():
     fp8 = 2 * heads * hs
     nv = 2 * heads * PATCH.nvfp4_full_dim(hs)
     assert fp8 / nv == 16 / 9  # 1.777...
+
+
+def test_nvfp4_route_forces_head_major_layout(monkeypatch):
+    # qwen-nvfp4kv-dev 2026-09-24: default LBNHC (NHD) layout + nvfp4 store
+    # kernel's head-major page packing = scrambled KV reads. The route must
+    # declare head-major layouts only, and the builder must refuse NHD.
+    import types as _t
+    new, applied = PATCH.patch_backend_source(BACKEND_FIXTURE.read_text())
+    assert "nvfp4_head_major_layouts" in applied
+    assert "head-major KV cache layout" in new
+    helper = new[new.index("def _use_fa2_for_nvfp4_kv_on_sm120"):
+                 new.index("trtllm_workspace_buffer = None")]
+    cfg = {"v": None}
+    ns = {"current_platform": _t.SimpleNamespace(
+              is_device_capability_family=lambda f: f == 120),
+          "get_current_vllm_config_or_none": lambda: cfg["v"]}
+    exec(helper, ns)
+    sel = ns["_nvfp4_kv_cache_selected"]
+    mk = lambda d: _t.SimpleNamespace(cache_config=_t.SimpleNamespace(cache_dtype=d))
+    monkeypatch.setenv("SUFFIX_SM120_NVP4KV", "1")
+    cfg["v"] = mk("nvfp4")
+    assert sel()
+    cfg["v"] = mk("fp8_e4m3")
+    assert not sel()                     # fp8 pools keep stock layouts
+    cfg["v"] = mk("nvfp4")
+    monkeypatch.delenv("SUFFIX_SM120_NVP4KV")
+    assert not sel()

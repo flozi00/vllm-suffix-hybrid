@@ -66,7 +66,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-24.3"
+PATCH_REVISION = "2026-09-24.4"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -248,6 +248,14 @@ def _use_fa2_for_nvfp4_kv_on_sm120() -> bool:
         return False
 
 
+def _nvfp4_kv_cache_selected() -> bool:
+    if not _use_fa2_for_nvfp4_kv_on_sm120():
+        return False
+    cfg = get_current_vllm_config_or_none()
+    dtype = getattr(getattr(cfg, "cache_config", None), "cache_dtype", None)
+    return str(dtype or "").startswith("nvfp4")
+
+
 # head_dim 512 (gemma-4 full-attn) is a separate opt-in: set it only after
 # the bundle's on-silicon oracle passed on this image (gemma-hd512 dossier c).
 def _nvfp4_kv_head_dim_ok(head_dim: int) -> bool:
@@ -262,6 +270,17 @@ def _nvfp4_kv_head_dim_ok(head_dim: int) -> bool:
 ''' % PATCH_REVISION
 
 _BACKEND_EDITS = [
+    # ---- H14: head-major KV layout on the fa2 nvfp4 route, as stock does
+    # for SM100 trtllm-gen: the nvfp4 store kernel writes [K|K_sf|V|V_sf]
+    # pages head-major, so NHD-family layouts (default LBNHC) corrupt reads.
+    (
+        "nvfp4_head_major_layouts",
+        """        if capability is not None and capability.major == 10:""",
+        """        if capability is not None and (
+            capability.major == 10 or _nvfp4_kv_cache_selected()
+        ):""",
+        1,
+    ),
     # ---- H1: module-level helper, right after logger/workspace globals.
     (
         "helper_after_logger",
@@ -313,6 +332,15 @@ _BACKEND_EDITS = [
                         f"head_dim<=256 only, got {self.head_dim} (512 needs "
                         "SUFFIX_SM120_NVP4KV_HD512=1 after the on-silicon "
                         "oracle `python -m nvfp4_kv_patch.oracle` passed)."
+                    )
+                # vLLM's nvfp4 store kernel packs each page head-major; an
+                # NHD-family layout makes the read views disagree with it
+                # (garbage output, qwen-nvfp4kv-dev 2026-09-24, LBNHC).
+                if get_flashinfer_layout_string(self.kv_cache_layout) != "HND":
+                    raise ValueError(
+                        "suffix sm120 nvfp4-kv (fa2 route) requires a "
+                        "head-major KV cache layout (LBHNC/BLHNC), got "
+                        f"{self.kv_cache_layout.name}."
                     )
                 logger.info_once(
                     "suffix sm120 nvfp4-kv ACTIVE: NVFP4 KV on SM120 routed "
