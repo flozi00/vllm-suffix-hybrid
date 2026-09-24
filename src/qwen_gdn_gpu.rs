@@ -510,6 +510,12 @@ mod device {
                 }
                 let bc = artifacts.bytecode().expect("bytecode");
                 assert_eq!(&bc[..8], &[0x7F, b'T', b'i', b'l', b'e', b'I', b'R', 0x00]);
+                if let Some(dir) = std::env::var_os("QWEN_GDN_DUMP_IR") {
+                    // CI feeds this to `tileiras --gpu-name sm_120` + cuobjdump
+                    // resource usage (register/spill check, risk R2).
+                    let p = std::path::Path::new(&dir).join(format!("k_gdn1_act{act}.bc"));
+                    std::fs::write(p, &bc).expect("dump bytecode");
+                }
             }
         }
     }
