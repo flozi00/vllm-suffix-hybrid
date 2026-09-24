@@ -34,13 +34,21 @@ jobs:
             --platform manylinux_2_27_x86_64 --python-version 3.11 \
             nvidia-cuda-runtime==$CUDA_WHEEL_VERSION nvidia-cuda-crt==$CUDA_WHEEL_VERSION \
             nvidia-curand==$CURAND_WHEEL_VERSION nvidia-cuda-tileiras==$CUDA_WHEEL_VERSION \
-            nvidia-cuda-cuobjdump==$CUDA_WHEEL_VERSION -d .cuda13-whl
+            nvidia-cuda-cuobjdump==$CUDA_WHEEL_VERSION \
+            nvidia-cuda-nvcc==$CUDA_WHEEL_VERSION nvidia-nvvm==$CUDA_WHEEL_VERSION \
+            nvidia-nvjitlink==$CUDA_WHEEL_VERSION -d .cuda13-whl
           for w in .cuda13-whl/*.whl; do python -m zipfile -e "$w" .cuda13; done
           test -f .cuda13/nvidia/cu13/include/cuda.h
           chmod +x .cuda13/nvidia/cu13/bin/*
           .cuda13/nvidia/cu13/bin/tileiras --version
           echo "CUDA_TOOLKIT_PATH=$PWD/.cuda13/nvidia/cu13" >> "$GITHUB_ENV"
           echo "CUTILE_TILEIRAS_PATH=$PWD/.cuda13/nvidia/cu13/bin/tileiras" >> "$GITHUB_ENV"
+          # tileiras' declared deps (Requires-Dist: nvidia-cuda-nvcc, nvidia-nvvm,
+          # nvidia-nvjitlink): without ptxas/libnvvm/libnvJitLink it prints only
+          # "failed to compile Tile IR program" (exit 5) for ANY input.
+          test -x .cuda13/nvidia/cu13/bin/ptxas && test -f .cuda13/nvidia/cu13/lib/libnvvm.so.4
+          echo "$PWD/.cuda13/nvidia/cu13/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$PWD/.cuda13/nvidia/cu13/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
       - name: Rust tests (default, qwen-gdn + nvfp4-attn Tile IR lowering, K1 build)
         run: |
           sudo apt-get install -y libclang-dev
