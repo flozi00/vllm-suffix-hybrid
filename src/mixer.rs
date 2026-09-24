@@ -948,7 +948,10 @@ impl V2SuffixProposer {
             }
         })?;
         // Pack [n, k] drafts and [n] widths into numpy (contiguous,
-        // C-order; tiny: n x k <= 32 x 64).
+        // C-order; tiny: n x k <= 32 x 64). The 2-D shape is a hard
+        // contract with the adapter's out.copy_() — a flat n*k vector
+        // broadcast-fails for any n > 1 (mixer.rs flat-packing bug,
+        // gemma lane wake #8).
         let n = rows.len();
         let k = self.k;
         let mut packed: Vec<i64> = vec![0; n * k];
@@ -964,7 +967,11 @@ impl V2SuffixProposer {
         self.elapsed_ns = self
             .elapsed_ns
             .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-        let packed_np = packed.into_pyarray(py);
+        let packed_np = numpy::ndarray::Array2::<i64>::from_shape_vec((n, k), packed)
+            .map_err(|e| {
+                PyValueError::new_err(format!("suffix-only pack shape {n}x{k}: {e}"))
+            })?
+            .into_pyarray(py);
         let widths_arr = widths_np.into_pyarray(py);
         Ok((packed_np.into_any().unbind(), widths_arr.into_any().unbind()))
     }
@@ -978,6 +985,16 @@ impl V2SuffixProposer {
             d.set_item(rid, w)?;
         }
         Ok(d)
+    }
+
+    /// Retract every published width (all rows -> miss). The adapter calls
+    /// this on its exception path: run() may have already inserted widths
+    /// for this batch while the packed upload failed, and the scheduler
+    /// would otherwise verify zeroed drafts at phantom widths.
+    fn clear_widths(&mut self) {
+        for w in self.widths.values_mut() {
+            *w = 0;
+        }
     }
 
     fn get_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {

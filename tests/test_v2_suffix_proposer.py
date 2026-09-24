@@ -24,7 +24,9 @@ def test_fresh_row_no_cache_misses_width_zero():
         ["a"], np.array([0], dtype=np.int64),
         np.array([10], dtype=np.int64), tokens)
     assert widths.tolist() == [0]
-    assert packed.shape == (4,)
+    # [rows, k] is a hard contract with the adapter's out.copy_() — a flat
+    # (n*k,) vector broadcast-fails for n > 1 (gemma lane wake #8 fix).
+    assert packed.shape == (1, 4)
     assert (packed == 0).all()
 
 
@@ -42,7 +44,7 @@ def test_echo_hit_drafts_exact_continuation():
         ["b"], np.array([1], dtype=np.int64),
         np.array([10], dtype=np.int64), tokens)
     assert widths.tolist() == [4]
-    assert packed[:4].tolist() == seq[10:14]
+    assert packed[0].tolist() == seq[10:14]
     st = p.get_stats()
     assert st["hits"] == 1 and st["hit_tokens"] == 4 and st["ingested"] == 1
 
@@ -63,7 +65,7 @@ def test_incremental_growth_sustains_hits_no_reset():
         packed, widths = p.propose_suffix_only(
             ["b"], idx1, np.array([t], dtype=np.int64), tokens)
         assert widths[0] == 4
-        assert packed[:4].tolist() == seq[t:t + 4]
+        assert packed[0].tolist() == seq[t:t + 4]
     assert p.get_stats()["resets"] == 0
 
 
@@ -119,7 +121,7 @@ def test_int64_tokens_view_accepted():
         ["b"], np.array([1], dtype=np.int64),
         np.array([10], dtype=np.int64), tokens)
     assert widths.tolist() == [4]
-    assert packed[:4].tolist() == seq[10:14]
+    assert packed[0].tolist() == seq[10:14]
 
 
 def test_batch_dimensions_mismatch_raises():
@@ -145,3 +147,47 @@ def test_min_len_floor_suppresses_short_drafts():
         np.array([9], dtype=np.int64), tokens)
     # only 1 continuation token available (seq[9]) -> below min_len -> miss
     assert widths.tolist() == [0]
+
+def test_multirow_packed_shape_is_2d():
+    """Regression (gemma wake #8): n>1 batches crashed the adapter with
+    'size of tensor a must match b' because packed was a flat (n*k,)
+    vector; the contract is [rows, k]."""
+    p = V2SuffixProposer(4, 512)
+    tokens = _buf(8, 512)
+    seq = list(range(100, 140))
+    tokens[0, :22] = np.array(seq[:22], dtype=np.int32)
+    idx = np.array([0, 1, 2], dtype=np.int64)
+    # first call: a tracked, b/c miss (cold cache for a too)
+    p.propose_suffix_only(
+        ["a"], np.array([0], dtype=np.int64),
+        np.array([22], dtype=np.int64), tokens)
+    # b shares a's prefix -> hit; c is fresh -> miss
+    tokens[1, :10] = np.array(seq[:10], dtype=np.int32)
+    tokens[2, :10] = np.array(range(500, 510), dtype=np.int32)
+    packed, widths = p.propose_suffix_only(
+        ["b", "c"], np.array([1, 2], dtype=np.int64),
+        np.array([10, 10], dtype=np.int64), tokens)
+    assert packed.shape == (2, 4)          # THE regression: not (8,)
+    assert widths.tolist() == [4, 0]       # ragged: b hits, c misses
+    assert packed[0].tolist() == seq[10:14]
+    assert (packed[1] == 0).all()
+
+
+def test_clear_widths_retracts_all_published_widths():
+    """Regression (gemma wake #8): the adapter's exception path must be
+    able to retract widths run() already published, or the scheduler
+    verifies zeroed drafts at phantom widths."""
+    p = V2SuffixProposer(4, 512)
+    tokens = _buf(8, 512)
+    seq = list(range(100, 122))
+    tokens[0, :22] = np.array(seq, dtype=np.int32)
+    idx0 = np.array([0], dtype=np.int64)
+    for t in (10, 22):
+        p.propose_suffix_only(["a"], idx0, np.array([t], dtype=np.int64), tokens)
+    tokens[1, :10] = np.array(seq[:10], dtype=np.int32)
+    p.propose_suffix_only(
+        ["b"], np.array([1], dtype=np.int64),
+        np.array([10], dtype=np.int64), tokens)
+    assert dict(p.widths_table)["b"] > 0
+    p.clear_widths()
+    assert dict(p.widths_table) == {"b": 0}  # a departed -> ingested, already gone

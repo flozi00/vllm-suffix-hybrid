@@ -330,6 +330,13 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                 print(f"suffix_hybrid suffix-only passthrough "
                       f"(#{state['skips']}): {state['reason']}",
                       file=sys.stderr, flush=True)
+            # Widths published by run() are now STALE: the packed upload
+            # failed and out is zeroed. Retract them or the scheduler
+            # verifies zeroed drafts at phantom widths.
+            try:
+                proposer.clear_widths()
+            except Exception:
+                pass
             out.zero_()
             return out
     propose._suffix_proposer = proposer
