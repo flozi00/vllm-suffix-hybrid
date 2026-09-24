@@ -496,3 +496,75 @@ def test_patch_module_is_stdlib_only_at_import():
     proc = subprocess.run([sys.executable, "-c", script],
                           capture_output=True, text=True, timeout=120)
     assert "NOTORCH NOVLLM" in proc.stdout, proc.stdout + proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Layout contract tests (pure CPU; mirror of the pinned vLLM/CUDA constants —
+# vllm/utils/torch_utils.py:547 nvfp4_kv_cache_full_dim and the swizzle in
+# csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu:34-48/285-300)
+# ---------------------------------------------------------------------------
+
+def test_nvfp4_full_dim_layout():
+    # data (fp4x2-packed: hs/2 bytes) + scales (e4m3, one per 16-element
+    # block within a head: hs/16 bytes). Block size is 16, NOT 32.
+    for hs in (64, 128, 256):
+        assert PATCH.nvfp4_full_dim(hs) == hs // 2 + hs // 16
+
+
+def test_nvfp4_scale_block_layout():
+    # Per head: one e4m3 scale byte per 16 fp4 elements. For a 256 head the
+    # packed page dim is 128 data bytes + 16 SF bytes.
+    assert PATCH.SF_VEC_SIZE == 16
+    assert PATCH.nvfp4_full_dim(256) == 144
+
+
+def test_v_scale_swizzle_roundtrip():
+    # vLLM's store kernel writes V scales in the 4-token swizzled layout
+    # (nvfp4_kv_cache_kernels.cu swizzle_scale_offset): (t,s) ->
+    # (t',s') = ((t//4)*4 + s//G, (s%G)*4 + t%4) with G = scale_dim//4.
+    # FlashInfer's FA2 prefill kernel de-swizzles by READING, for logical
+    # (entry, dcol), the byte at (entry&~3 + dcol//G, (dcol%G)*4 + entry&3)
+    # — i.e. it applies the same permutation to the read index (verified
+    # against prefill.cuh's FLASHINFER_PAGED_V_SF_DESWIZZLE branch). Check
+    # the store is a bijection AND the read position equals the store
+    # position for every logical (t, s).
+    for scale_dim in (4, 8, 16):          # head_size 64/128/256
+        for block_size in (4, 16, 64):    # pool uses 64
+            g = scale_dim // 4
+            written = {}
+            for t in range(block_size):
+                for s in range(scale_dim):
+                    off = PATCH.swizzle_scale_offset(t, s, scale_dim)
+                    assert off not in written, "not a bijection"
+                    written[off] = (t, s)
+                    # prefill.cuh read position for logical (entry=t, dcol=s):
+                    a4, e = t & ~3, t & 3
+                    read_t = a4 + s // g
+                    read_s = (s % g) * 4 + e
+                    assert (read_t, read_s) == (
+                        off // scale_dim, off % scale_dim
+                    ), (scale_dim, t, s)
+
+
+def test_v_swizzle_inverse_matches_flashinfer_prefill():
+    # prefill.cuh de-swizzle: entry-group a4=entry&~3, e=entry&3,
+    # swz_entry=a4+dcol/SF_GROUPS, swz_sd=(dcol%SF_GROUPS)*4+e — a pure
+    # permutation of the linear (entry, dcol) space.
+    for scale_dim in (4, 8, 16):
+        s_group = scale_dim // 4
+        seen = set()
+        for entry in range(64):           # enough page rows
+            for dcol in range(scale_dim):
+                swz = ((entry & ~3) + dcol // s_group, (dcol % s_group) * 4 + (entry & 3))
+                assert swz not in seen
+                seen.add(swz)
+        assert len(seen) == 64 * scale_dim
+
+
+def test_capacity_ratio_fp8_to_nvfp4():
+    # Pool gemma-spec-dev: 8 KV heads x head_dim 256. fp8 KV = 2*H*hs*1
+    # bytes/token; nvfp4 = 2*H*(hs/2+hs/16). => 56.25% of fp8 (1.78x).
+    hs, heads = 256, 8
+    fp8 = 2 * heads * hs
+    nv = 2 * heads * PATCH.nvfp4_full_dim(hs)
+    assert fp8 / nv == 16 / 9  # 1.777...
