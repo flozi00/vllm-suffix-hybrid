@@ -347,6 +347,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "qwen-gdn-kernels")]
     m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_install_cubin, m)?)?;
     #[cfg(feature = "qwen-gdn-kernels")]
+    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_probe_bytecodes, m)?)?;
+    #[cfg(feature = "qwen-gdn-kernels")]
     m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_jit_stats, m)?)?;
     m.add("HAS_QWEN_GDN_CUDA", cfg!(feature = "qwen-gdn-kernels"))?;
     m.add("VERSION", "0.2.0-rust-v1")?;

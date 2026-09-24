@@ -147,9 +147,9 @@ mod device {
                 let o: Tile<f32, { [1, K] }> = o.reshape(shape![1, K]);
                 let var: Tile<f32, { [1] }> = reduce_sum(o * o, 1i32);
                 let var: Tile<f32, { [1, 1] }> =
-                    var.reshape(shape![1, 1]) * broadcast_scalar(inv_v, shape![1, 1]);
+                    var.reshape(shape![1, 1]) * scalar_to_tile(inv_v).reshape(shape![1, 1]);
                 let rstd: Tile<f32, { [1, 1] }> = rsqrt(
-                    var + broadcast_scalar(norm_eps, shape![1, 1]),
+                    var + scalar_to_tile(norm_eps).reshape(shape![1, 1]),
                     ftz::Disabled,
                 );
                 let w_part: Partition<f32, { [K] }> = norm_w.partition(shape![K]);
@@ -806,6 +806,184 @@ mod device {
         )
     }
 
+    // =====================================================================
+    // tileiras construct probes (CI diagnostics). tileiras 13.4.92 rejects
+    // the K-GDN1 program with only "failed to compile Tile IR program"; these
+    // minimal kernels each isolate ONE construct K-GDN1 uses, so a CI run
+    // that compiles all of them pinpoints the rejected one
+    // (scripts/tileiras_diag.py prints tileiras' raw output per probe).
+    // =====================================================================
+    #[cutile::module]
+    pub mod qgdn_probes {
+        use cutile::core::*;
+
+        /// Big register tile: [R, 128] f32 load + row reduce (K-GDN1: R=128).
+        #[cutile::entry()]
+        pub fn p_tile_reduce<const R: i32>(
+            out: &mut Tensor<f32, { [R] }>,
+            x: &Tensor<f32, { [-1, -1] }>,
+        ) {
+            let part: Partition<f32, { [R, 128] }> = x.partition(shape![R, 128]);
+            let t: Tile<f32, { [R, 128] }> = part.load([0i32, 0i32]);
+            let r: Tile<f32, { [R] }> = reduce_sum(t * t, 1i32);
+            out.store(r);
+        }
+
+        /// Dynamic-slot in-place update through partition_full_mut (+ asserts).
+        #[cutile::entry()]
+        pub unsafe fn p_full_mut_dyn(
+            out: &mut Tensor<f32, { [1] }>,
+            state: &Tensor<f32, { [-1, -1, -1] }>,
+            idx: &Tensor<i32, { [-1] }>,
+        ) {
+            let ip: Partition<i32, { [1] }> = idx.partition(shape![1]);
+            let it: Tile<i32, { [1] }> = ip.load([0i32]);
+            let slot: i32 = tile_to_scalar(it.reshape(shape![]));
+            let mut v: PartitionMut<f32, { [1, 32, 32] }> =
+                unsafe { state.partition_full_mut(shape![1, 32, 32]) };
+            check_partition_access_mut(&v, [slot, 0i32, 0i32]);
+            let s: Tile<f32, { [1, 32, 32] }> = unsafe { v.load([slot, 0i32, 0i32]) };
+            let s2: Tile<f32, { [1, 32, 32] }> = s * s;
+            v.store(s2, [slot, 0i32, 0i32]);
+            let z: Tile<f32, { [1] }> = constant(0.0f32, shape![1]);
+            out.store(z);
+        }
+
+        /// Stores to the block output in BOTH branches of a data-dependent if.
+        #[cutile::entry()]
+        pub fn p_if_else_store(out: &mut Tensor<f32, { [1, 32] }>, idx: &Tensor<i32, { [-1] }>) {
+            let ip: Partition<i32, { [1] }> = idx.partition(shape![1]);
+            let it: Tile<i32, { [1] }> = ip.load([0i32]);
+            let c: i32 = tile_to_scalar(it.reshape(shape![]));
+            if c > 0i32 {
+                let a: Tile<f32, { [1, 32] }> = constant(1.0f32, shape![1, 32]);
+                out.store(a);
+            } else {
+                let b: Tile<f32, { [1, 32] }> = constant(0.0f32, shape![1, 32]);
+                out.store(b);
+            }
+        }
+
+        /// bf16 load -> f32 math -> bf16 store (ftof both ways).
+        #[cutile::entry()]
+        pub fn p_bf16_io(out: &mut Tensor<bf16, { [1, 128] }>, x: &Tensor<bf16, { [-1, -1] }>) {
+            let part: Partition<bf16, { [1, 128] }> = x.partition(shape![1, 128]);
+            let t: Tile<f32, { [1, 128] }> = convert_tile(part.load([0i32, 0i32]));
+            let y: Tile<bf16, { [1, 128] }> = convert_tile(t * t);
+            out.store(y);
+        }
+
+        /// [1,1] scalar-tile math: exp/log/select/negf/true_div/rsqrt.
+        #[cutile::entry()]
+        pub fn p_scalar_math(out: &mut Tensor<f32, { [1, 1] }>, x: &Tensor<f32, { [-1, -1] }>) {
+            let part: Partition<f32, { [1, 1] }> = x.partition(shape![1, 1]);
+            let a: Tile<f32, { [1, 1] }> = part.load([0i32, 0i32]);
+            let one: Tile<f32, { [1, 1] }> = constant(1.0f32, shape![1, 1]);
+            let th: Tile<f32, { [1, 1] }> = constant(20.0f32, shape![1, 1]);
+            let sp: Tile<f32, { [1, 1] }> = select(le_tile(a, th), log(one + exp(a)), a);
+            let sg: Tile<f32, { [1, 1] }> = true_div(one, one + exp(negf(sp)));
+            let r: Tile<f32, { [1, 1] }> = rsqrt(sg + one, ftz::Disabled);
+            out.store(r);
+        }
+
+        /// 4-D [1,1,R,R] partition load + reshape + row/col broadcasts + reduce
+        /// (the K-GDN1 state-tile data path without the in-place store).
+        #[cutile::entry()]
+        pub fn p_4d_outer<const R: i32>(
+            out: &mut Tensor<f32, { [R] }>,
+            st: &Tensor<f32, { [-1, -1, -1, -1] }>,
+            v: &Tensor<f32, { [-1, -1] }>,
+        ) {
+            let sp: Partition<f32, { [1, 1, R, R] }> = st.partition(shape![1, 1, R, R]);
+            let s0: Tile<f32, { [1, 1, R, R] }> = sp.load([0i32, 0i32, 0i32, 0i32]);
+            let s: Tile<f32, { [R, R] }> = s0.reshape(shape![R, R]);
+            let vp: Partition<f32, { [1, R] }> = v.partition(shape![1, R]);
+            let k: Tile<f32, { [1, R] }> = vp.load([0i32, 0i32]);
+            let kb: Tile<f32, { [R, R] }> = k.broadcast(shape![R, R]);
+            let col: Tile<f32, { [R] }> = reduce_sum(s * kb, 1i32);
+            let cb: Tile<f32, { [R, R] }> = col.reshape(shape![R, 1]).broadcast(shape![R, R]);
+            let o: Tile<f32, { [R] }> = reduce_sum((s + cb * kb) * kb, 1i32);
+            out.store(o);
+        }
+
+        /// Runtime scalar broadcast to [1,1] (reshape + same-shape broadcast).
+        #[cutile::entry()]
+        pub fn p_scalar_broadcast(out: &mut Tensor<f32, { [1, 1] }>, s: f32) {
+            let b: Tile<f32, { [1, 1] }> = broadcast_scalar(s, shape![1, 1]);
+            out.store(b);
+        }
+    }
+
+    const PROBE_ENTRIES: &[&str] = &[
+        "p_full_mut_dyn",
+        "p_if_else_store",
+        "p_bf16_io",
+        "p_scalar_math",
+        "p_scalar_broadcast",
+    ];
+
+    /// CI diagnostics: [(probe_name, tile_ir_bytecode)] — construct probes,
+    /// tile-size sweep, and K-GDN1 at K = 32/64/128 (the real kernel).
+    #[pyfunction]
+    pub fn qwen_gdn_probe_bytecodes<'py>(
+        py: Python<'py>,
+        gpu_name: &str,
+    ) -> PyResult<Vec<(String, Bound<'py, PyBytes>)>> {
+        let mut out = Vec::new();
+        let e =
+            |x: cutile::cutile_compiler::error::JITError| PyRuntimeError::new_err(x.to_string());
+        let mut push = |name: String, art: cutile::compile_api::CompileArtifacts| -> PyResult<()> {
+            let (bc, _) = serialize_tile_ir_bytecode(art.module()).map_err(e)?;
+            out.push((name, PyBytes::new(py, &bc)));
+            Ok(())
+        };
+        for r in [8, 32, 128] {
+            let art = KernelCompiler::new(
+                qgdn_probes::__module_ast_self,
+                "qgdn_probes",
+                "p_tile_reduce",
+            )
+            .generics(vec![r.to_string()])
+            .strides(&[("out", &[1]), ("x", &[-1, 1])])
+            .target(gpu_name)
+            .compile()
+            .map_err(e)?;
+            push(format!("p_tile_reduce_R{r}x128"), art)?;
+        }
+        for r in [32, 128] {
+            let art =
+                KernelCompiler::new(qgdn_probes::__module_ast_self, "qgdn_probes", "p_4d_outer")
+                    .generics(vec![r.to_string()])
+                    .strides(&[("out", &[1]), ("st", &[-1, -1, -1, 1]), ("v", &[-1, 1])])
+                    .target(gpu_name)
+                    .compile()
+                    .map_err(e)?;
+            push(format!("p_4d_outer_R{r}"), art)?;
+        }
+        for name in PROBE_ENTRIES {
+            let strides: Vec<(&str, &[i32])> = match *name {
+                "p_full_mut_dyn" => vec![("out", &[1]), ("state", &[-1, -1, 1]), ("idx", &[1])],
+                "p_if_else_store" => vec![("out", &[-1, 1]), ("idx", &[1])],
+                "p_bf16_io" | "p_scalar_math" => vec![("out", &[-1, 1]), ("x", &[-1, 1])],
+                _ => vec![("out", &[-1, 1])],
+            };
+            let art = KernelCompiler::new(qgdn_probes::__module_ast_self, "qgdn_probes", name)
+                .strides(&strides)
+                .target(gpu_name)
+                .compile()
+                .map_err(e)?;
+            push(name.to_string(), art)?;
+        }
+        drop(push);
+        for k in [32usize, 64, 128] {
+            let d = variant_dims(16, 48, k, 1, 16).map_err(PyValueError::new_err)?;
+            let (bc, _, _) =
+                variant_bytecode(d, ACT_SILU, gpu_name).map_err(PyRuntimeError::new_err)?;
+            out.push((format!("k_gdn1_K{k}"), PyBytes::new(py, &bc)));
+        }
+        Ok(out)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -847,6 +1025,16 @@ mod device {
                 variant_bytecode(d, 0, "sm_120").unwrap().0,
                 variant_bytecode(d, 0, "sm_120").unwrap().0
             );
+        }
+
+        #[test]
+        fn tileiras_probes_lower_to_bytecode() {
+            pin_bc();
+            pyo3::Python::initialize();
+            pyo3::Python::attach(|py| {
+                let v = qwen_gdn_probe_bytecodes(py, "sm_120").unwrap();
+                assert_eq!(v.len(), 3 + 2 + PROBE_ENTRIES.len() + 3);
+            });
         }
 
         #[test]

@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 # Served shapes: (H, HV, K) — qwen3.8-27b-fable-distill (Qwen3.5-27B GDN).
@@ -55,7 +56,17 @@ def main():
                         h, hv, k, act, t, s, ARCH)
                     if ver != BYTECODE_VERSION:
                         raise SystemExit(f"bytecode version {ver} != {BYTECODE_VERSION}")
-                    cubin = native.qwen_gdn_compile_cubin(bc, ARCH)
+                    try:
+                        cubin = native.qwen_gdn_compile_cubin(bc, ARCH)
+                    except RuntimeError as exc:
+                        # tileiras' own diagnostics + construct probes, then fail.
+                        failing = out / "failing.bc"
+                        failing.write_bytes(bc)
+                        print(f"K-GDN1 prebuild: tileiras rejected act={act} "
+                              f"t={t} s={s}: {exc}", flush=True)
+                        subprocess.run([sys.executable, str(Path(__file__).with_name(
+                            "tileiras_diag.py")), "--bc", str(failing), "--gpu", ARCH])
+                        raise SystemExit(1)
                     name = f"k_gdn1_h{h}_hv{hv}_k{k}_act{act}_t{t}_s{s}.cubin"
                     (out / name).write_bytes(cubin)
                     entries.append({
