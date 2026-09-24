@@ -92,7 +92,7 @@ def test_scan_once_repeat_dumps_content_change(cache_root, capsys):
     _scan_once(seen, repeat=True)
     line1 = _markers(capsys)[0]
     cfg = next(cache_root.glob("*/*/autotune_configs.json"))
-    cfg.write_text('{"tactic": 2}')  # mtime_ns+size change
+    cfg.write_text('{"tactic": 22}')  # size change: same-size rewrites can share mtime_ns on coarse-timestamp CI filesystems  # mtime_ns+size change
     _scan_once(seen, repeat=True)
     line2 = _markers(capsys)[0]
     assert line2 != line1  # payload changed -> new dump
@@ -103,7 +103,7 @@ def test_scan_once_default_dumps_content_change(cache_root, capsys):
     _scan_once(seen)
     _markers(capsys)
     cfg = next(cache_root.glob("*/*/autotune_configs.json"))
-    cfg.write_text('{"tactic": 2}')
+    cfg.write_text('{"tactic": 22}')  # size change: same-size rewrites can share mtime_ns on coarse-timestamp CI filesystems
     _scan_once(seen)
     assert len(_markers(capsys)) == 1
 
