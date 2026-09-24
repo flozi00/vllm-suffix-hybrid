@@ -45,6 +45,15 @@ _DUMP_PREFIX = "SUFFIX_FICACHE_DUMP"
 _SEEDS_DIR = Path("/plugins/ficache/seeds")
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    """Harmonized ON/OFF parse (review a4d3db93 lesson: bare string compare
+    traps like '!= "0"' arm on false/no/off). 1/true/yes/on (any case,
+    whitespace-stripped) arm; 0/false/no/off/empty/anything-else disarm.
+    Fail-closed: an unknown value never arms."""
+    val = os.environ.get(name, default).strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 def _log(msg: str) -> None:
     print(f"suffix ficache: {msg}", file=sys.stderr, flush=True)
 
@@ -152,7 +161,7 @@ def encode_dump(path: Path) -> str:
     return f"{_DUMP_PREFIX} {path.parent.name} {payload}"
 
 
-def _scan_once(seen: dict[Path, tuple[int, int]]) -> None:
+def _scan_once(seen: dict[Path, tuple[int, int]], repeat: bool = False) -> None:
     for root in _cache_roots():
         if not root.is_dir():
             continue
@@ -162,9 +171,14 @@ def _scan_once(seen: dict[Path, tuple[int, int]]) -> None:
                 key = (st.st_mtime_ns, st.st_size)
             except OSError:
                 continue
-            if seen.get(cfg) == key:
+            changed = seen.get(cfg) != key
+            if not changed and not repeat:
                 continue
             seen[cfg] = key
+            # repeat-dump mode emits even when `changed` is False: unchanged
+            # content re-dumps every cadence so the marker survives pod log
+            # rotation (single-shot dump at t+207s was lost 3x; log window
+            # life ~250s at ~20 lines/s).
             try:
                 line = encode_dump(cfg)
             except OSError as exc:
@@ -175,11 +189,11 @@ def _scan_once(seen: dict[Path, tuple[int, int]]) -> None:
             print(line, flush=True)
 
 
-def _harvest_loop(interval_s: float) -> None:
+def _harvest_loop(interval_s: float, repeat: bool = False) -> None:
     seen: dict[Path, tuple[int, int]] = {}
     while True:
         try:
-            _scan_once(seen)
+            _scan_once(seen, repeat=repeat)
         except Exception as exc:  # never let the thread die on a bad scan
             _log(f"harvest scan failed (retrying): {exc}")
         time.sleep(interval_s)
@@ -196,12 +210,20 @@ def install(mode: str) -> None:
             except Exception as exc:
                 _log(f"seed patch failed: {exc}")
     if mode in ("dump", "both"):
+        repeat = _env_flag("SUFFIX_FICACHE_DUMP_EVERY", "0")
         t = threading.Thread(
-            target=_harvest_loop, args=(30.0,), daemon=True, name="ficache-harvest"
+            target=_harvest_loop,
+            args=(30.0, repeat),
+            daemon=True,
+            name="ficache-harvest",
         )
         t.start()
         try:
             atexit.register(_scan_once, {})  # final sweep before exit
         except Exception:
             pass
-        _log("harvest thread running (30 s cadence, marker: " + _DUMP_PREFIX + ")")
+        _log(
+            "harvest thread running (30 s cadence, marker: "
+            + _DUMP_PREFIX
+            + (", repeat-dump every cadence" if repeat else "")  # noqa: E501
+        )
