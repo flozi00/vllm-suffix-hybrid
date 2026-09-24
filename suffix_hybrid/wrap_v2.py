@@ -290,6 +290,21 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     lut = req_states.req_id_to_index
     max_reqs = int(getattr(speculator, "max_num_reqs", 32) or 32)
 
+    # Per-step draft accounting trace (gemma wake #9): the engine rejected
+    # ~96% of published drafts at position 1 even on verbatim-repeat
+    # traffic, so either the drafted continuation is wrong (collisions) or
+    # the buffer/totals read is misaligned by one step. TRACE compares, for
+    # each traced request, the draft published LAST step against what the
+    # engine actually wrote into the token row at those positions this
+    # step — the raw diff is diagnostic either way.
+    trace_cfg = {
+        "on": os.environ.get("SUFFIX_HYBRID_TRACE", "").strip() != "",
+        "budget": int(os.environ.get(
+            "SUFFIX_HYBRID_TRACE_MAX", "200") or 200),
+        "fired": False,
+    }
+    trace_state = {}   # rid -> (total_at_publish, [draft tokens])
+
     # One pinned [max_reqs] totals buffer, reused every step.
     pin = torch.cuda.is_available()
     totals_cpu = torch.zeros(
@@ -316,10 +331,47 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
         try:
             ids = list(input_batch.req_ids)
             totals = _totals_now(n)
-            idx = np.fromiter((lut[rid] for rid in ids),
-                              dtype=np.int64, count=n)
+            idx_np = np.fromiter((lut[rid] for rid in ids),
+                                  dtype=np.int64, count=n)
+            # Draft accounting: compare last step's published drafts against
+            # the engine's actual writes at those positions this step. The
+            # engine writes the verified/sampled tokens at [p_total .. ]
+            # AFTER our propose returns, BEFORE the next propose — the UVA
+            # row read here is last step's CLEARED row audio.
+            if trace_cfg["on"]:
+                for rid in list(trace_state):
+                    if rid not in ids:
+                        del trace_state[rid]   # request left the batch
+                for i, rid in enumerate(ids):
+                    prev = trace_state.get(rid)
+                    if prev is None:
+                        continue
+                    p_total, p_drafts = prev
+                    t_now = int(totals[i])
+                    row_i = int(idx_np[i])
+                    accepted = []
+                    for j, dt in enumerate(p_drafts):
+                        pos = p_total + j
+                        real = int(ats_np[row_i, pos]) if pos < ats_np.shape[1] else -2
+                        accepted.append((dt, real))   # pairing BEFORE replace
+                    match = sum(1 for dt, re in accepted if dt == re)
+                    print(f"suffix_hybrid TRACE {rid} total {p_total}->{t_now} "
+                          f"width {len(p_drafts)} matched {match}/{len(p_drafts)} "
+                          f"pairs {accepted[:6]}", file=sys.stderr, flush=True)
+                    trace_cfg["budget"] -= 1
+                    if trace_cfg["budget"] <= 0:
+                        trace_cfg["on"] = False   # fire once, then be quiet
             packed, widths_np = proposer.propose_suffix_only(
-                ids, idx, totals, ats_np)
+                ids, idx_np, totals, ats_np)
+            # Store drafts JUST published for next step's comparison.
+            if trace_cfg["on"]:
+                packed_l = packed.tolist()
+                for i, rid in enumerate(ids):
+                    w = int(widths_np[i])
+                    if w > 0:
+                        trace_state[rid] = (int(totals[i]), packed_l[i][:w])
+                    elif rid in trace_state:
+                        del trace_state[rid]
             out.zero_()
             out.copy_(torch.from_numpy(packed).to(
                 out.device, out.dtype), non_blocking=pin)
