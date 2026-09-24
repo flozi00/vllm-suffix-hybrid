@@ -22,30 +22,41 @@ Mechanics (vLLM v0.30.0, all seams read from that source):
   `propose._suffix_proposer` (the handle wrap_v2 exposes at line
   "propose._suffix_proposer = proposer").
 
-* HTTP ROUTE: vLLM v0.30.0 has a native endpoint-plugin surface
-  (vllm.plugins.endpoint_plugins) but it requires a REGISTERED entry
-  point; this bundle is mounted as bare files at /plugins (no installed
-  distribution), so instead we use the sched_sync.py v3 loader-proxy
-  pattern: a sys.meta_path finder wraps vllm.entrypoints.launchers.app's
-  exec so `build_app` gains `POST /debug/warm-start` the moment it is
-  imported. No vLLM import happens in THIS module at import time — the
-  pytest venv has no vllm, and the worker process must never pay for the
-  API server's route.
+* HTTP ROUTE: attached through vLLM v0.30.0's NATIVE endpoint-plugin seam
+  (vllm.plugins.endpoint_plugins) by the repo-root module
+  suffix_hybrid_warmstart_ep.py (EndpointPlugin protocol: name /
+  required_tasks=None / attach_router(app) / init_state(engine_client,
+  state, args)); it is discovered via the dist-info dir
+  suffix_hybrid_warmstart_ep-1.0.dist-info/ entry point
+  [vllm.endpoint_plugins] suffix_hybrid_warmstart =
+  suffix_hybrid_warmstart_ep:register. The loader (load_endpoint_plugins in
+  vllm/plugins/__init__.py) is STRICT opt-in: it is not called at all unless
+  env VLLM_PLUGINS names the plugin, and the plugin's attach_router further
+  self-gates on SUFFIX_HYBRID_WARMSTART=1. The old sys.meta_path
+  loader-proxy build_app wrap was REMOVED: on the live pod it armed 3x but
+  never attached (an earlier importer had already put
+  vllm.entrypoints.launchers.app in sys.modules, short-circuiting find_spec).
+  No vLLM import happens in THIS module at import time — the pytest venv has
+  no vllm, and the worker process must never pay for the API server's route.
+
+* EPP GATEWAY CARRIER KEYS: the pool's gateway (EPP) body-validates every
+  POST before forwarding it to the FastAPI app against its completions
+  validator; a bare {"sequences": ...} body is REJECTED ("must have prompt
+  field"). A body carrying "model" (the pool's served model) and "prompt"
+  (a carrier string) alongside "sequences" PASSES and is forwarded with the
+  original path intact. The bench driver (bench_gemma.py --warm-start)
+  merges those carrier keys into its POST body; the handler reads ONLY
+  "sequences" and ignores the extras.
 
 Gating (default OFF must change NOTHING):
-  SUFFIX_HYBRID_WARMSTART=1 arms BOTH parts. Without the flag the hook is
-  never armed: no finder on sys.meta_path, no route object, no RPC from
-  the serving path. sitecustomize arms it in the API-server process only
-  (where build_app is imported) — see sitecustomize.py warm-start gate.
+  TWO keys must be on for the route to exist: env VLLM_PLUGINS (naming
+  suffix_hybrid_warmstart; unset => vLLM never even runs the endpoint-plugin
+  loader, so the plugin module is never imported by the server) AND
+  SUFFIX_HYBRID_WARMSTART=1 (the plugin's attach_router self-gate/belt).
+  Without them: no route object, no RPC from the serving path — and
+  sitecustomize no longer touches warm-start at all.
 """
-import os
 import sys
-
-_route_marker = "_suffix_hybrid_warmstart_route"
-
-
-def _armed() -> bool:
-    return os.environ.get("SUFFIX_HYBRID_WARMSTART", "").strip() == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -96,11 +107,22 @@ def _probe_worker(worker, sequences):
 
 
 # ---------------------------------------------------------------------------
-# API-SERVER ROUTE (imports are lazy: nothing here runs without vLLM +
-# fastapi, i.e. only inside the built app of an armed server process)
-# ---------------------------------------------------------------------------
+# API-SERVER ROUTE — attached by the suffix_hybrid_warmstart_ep
+# EndpointPlugin (vllm.endpoint_plugins seam); nothing here runs without vLLM
+# + fastapi, i.e. only inside the built app of an armed server process.
 
-async def warm_start(raw_request):
+# FastAPI injects the Request object ONLY for a parameter annotated with a
+# Request subclass — a bare name (any name) is treated as a query param and
+# yields 422. The annotation must therefore sit in the SIGNATURE; fastapi is
+# imported eagerly-if-present (the pytest venv may lack it — then the
+# annotation is None and the function is simply never routed).
+try:
+    from fastapi import Request as _FastAPIRequest
+except Exception:                # pragma: no cover - venv without fastapi
+    _FastAPIRequest = None
+
+
+async def warm_start(raw_request: _FastAPIRequest):
     """POST /debug/warm-start body {"sequences": [[ids...], ...]}.
 
     Returns {"ingested": N}. There is NO auth beyond the gateway (dev pool
@@ -135,99 +157,13 @@ async def warm_start(raw_request):
 
 
 def attach_warmstart_route(app):
-    """Register the warm-start route on the built FastAPI app.
+    """Register the warm-start route on a FastAPI app.
 
-    Called from the wrapped build_app (install_post_import_hook). Uses
-    add_api_route with a raw Request handler so the route module needs
-    NO pydantic model (keeps the surface minimal and avoids any
-    request-schema drift across vLLM versions).
+    Called by the suffix_hybrid_warmstart_ep EndpointPlugin's attach_router
+    (vllm.endpoint_plugins seam). Uses add_api_route with a raw Request
+    handler so the route module needs NO pydantic model (keeps the surface
+    minimal and avoids any request-schema drift across vLLM versions).
     """
     app.add_api_route("/debug/warm-start", warm_start,
                       methods=["POST"], name="suffix_hybrid_warm_start")
     return app
-
-
-# ---------------------------------------------------------------------------
-# POST-IMPORT HOOK (sched_sync.py v3 loader-proxy pattern)
-# ---------------------------------------------------------------------------
-
-def _wrap_launchers_app(module):
-    """Called right after vllm.entrypoints.launchers.app exec's."""
-    import functools
-
-    original = module.build_app
-    if getattr(original, _route_marker, False):
-        return
-
-    @functools.wraps(original)
-    def build_app(*args, **kwargs):
-        app = original(*args, **kwargs)
-        try:
-            attach_warmstart_route(app)
-            print("suffix_hybrid WARM-START: POST /debug/warm-start "
-                  "registered (SUFFIX_HYBRID_WARMSTART=1)",
-                  file=sys.stderr, flush=True)
-        except Exception as exc:
-            # Never block serving: the bench driver sees 404 and reports.
-            print(f"suffix_hybrid WARM-START route attach FAILED (serving "
-                  f"continues without warm-start): {exc}",
-                  file=sys.stderr, flush=True)
-        return app
-
-    setattr(build_app, _route_marker, True)
-    module.build_app = build_app
-
-
-def install_post_import_hook() -> None:
-    """Arm the loader-wrap finder. Idempotent, never raises, NO-OP when
-    SUFFIX_HYBRID_WARMSTART is unset — the flag-off process never even
-    builds the finder object graph.
-    """
-    import importlib.util
-
-    if not _armed():
-        return
-    target = "vllm.entrypoints.launchers.app"
-
-    class _LoaderProxy:
-        """Exec the real module exactly once; wrap it the instant it ends."""
-
-        def __init__(self, real_loader):
-            self._real = real_loader
-
-        def create_module(self, spec):
-            return self._real.create_module(spec)
-
-        def exec_module(self, module):
-            self._real.exec_module(module)
-            try:
-                _wrap_launchers_app(module)
-            except Exception as exc:
-                print(f"suffix_hybrid WARM-START post-import wrap failed: "
-                      f"{exc}", file=sys.stderr, flush=True)
-
-    class _Finder:
-        def find_spec(self, fullname, path=None, target=None):
-            if fullname != target:
-                return None
-            # Locate the REAL spec; drop ourselves to avoid re-entry.
-            sys.meta_path.remove(self)
-            try:
-                spec = importlib.util.find_spec(fullname)
-            finally:
-                sys.meta_path.insert(0, self)
-            if spec is None or spec.loader is None:
-                return None
-            # Re-entrant import of an already-loaded module: stand down.
-            if getattr(sys.modules.get(fullname), "__spec__", None) \
-                    is not None and fullname in sys.modules:
-                return None
-            spec.loader = _LoaderProxy(spec.loader)
-            return spec
-
-    for f in sys.meta_path:
-        if isinstance(f, _Finder):
-            return
-    sys.meta_path.insert(0, _Finder())
-    print("suffix_hybrid WARM-START: build_app post-import hook armed",
-          file=sys.stderr, flush=True)

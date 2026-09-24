@@ -377,22 +377,43 @@ def hist_file_sequences(path):
     return sequences
 
 
-def warm_start_http(base_url, api_path, sequences, timeout):
+def warm_start_http(base_url, api_path, sequences, timeout,
+                    model=None, fail_hard=False):
     """POST histories to the env-gated debug endpoint; fail loud.
 
-    Returns the server's {"ingested": N} or None when unreachable/404
-    (SUFFIX_HYBRID_WARMSTART unset server-side — the leg degrades to a
-    cold run, which is exactly what W1's f_draft comparison needs to
-    see, so this is a WARNING not an error by default).
+    The pool's EPP gateway body-validates every POST against its completions
+    validator before forwarding: a bare {"sequences": ...} body is REJECTED
+    ("must have prompt field"). A body carrying "model" (the pool's served
+    model) and a "prompt" carrier string ALONGSIDE "sequences" passes and is
+    forwarded with the original path intact — the route handler reads only
+    "sequences" and ignores the extras.
+
+    Returns the server's {"ingested": N}, or None (WARNING) when the
+    endpoint 404s and fail_hard is False (SUFFIX_HYBRID_WARMSTART unset or
+    VLLM_PLUGINS not naming the plugin server-side — the leg degrades to a
+    cold run, which is what W1's f_draft comparison needs to see). With
+    fail_hard=True a 404 FAILS the driver (non-zero exit + clear message):
+    a missing route must never be mistaken for warm success.
     """
     url = base_url.rstrip("/") + "/debug/warm-start"
-    body = json.dumps({"sequences": sequences}).encode()
+    body_dict = {"sequences": sequences,
+                 "prompt": "warmstart-carrier"}
+    if model:
+        body_dict["model"] = model
+    body = json.dumps(body_dict).encode()
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
+        if fail_hard and exc.code == 404:
+            raise SystemExit(
+                f"WARM-START FAILED: server replied 404 for {url} — the "
+                f"/debug/warm-start route is NOT registered. Check that the "
+                f"pod env has VLLM_PLUGINS naming 'suffix_hybrid_warmstart' "
+                f"AND SUFFIX_HYBRID_WARMSTART=1 (see the "
+                f"'registered (endpoint_plugins)' banner in the pod log).")
         print(f"WARM-START: server replied {exc.code} for {url} "
               f"(endpoint gated by SUFFIX_HYBRID_WARMSTART=1 on the pod?)")
         return None
@@ -656,8 +677,11 @@ def main(argv=None):
             ap.error(f"--warm-start: {args.warm_start} contains no sequences")
         print(f"WARM-START: posting {len(sequences)} histories to "
               f"{args.base_url.rstrip('/')}/debug/warm-start")
+        # fail_hard: --warm-start was REQUESTED, so a 404 (route not
+        # registered) must fail the run loudly, never read as warm success.
         resp = warm_start_http(args.base_url, args.api_path, sequences,
-                               args.timeout)
+                               args.timeout, model=args.model,
+                               fail_hard=True)
         if resp is None:
             print("WARM-START: proceeding COLD (see warning above) — the "
                   "run's ledger rows carry warm_started=false")

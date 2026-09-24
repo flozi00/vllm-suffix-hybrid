@@ -7,17 +7,15 @@ Covers (dossier hit-rate-offline-replay.md → live lever):
   speculates against (the bench/scale_bench.py path, in-process).
 - _probe_worker reaches the proposer through the worker object graph
   (worker.model_runner.speculator.propose._suffix_proposer) and ingests.
-- suffix_hybrid.warmstart.install_post_import_hook is STRICTLY env-gated:
-  no finder, no route, nothing armed with SUFFIX_HYBRID_WARMSTART unset.
-- The route attaches to a FastAPI-like app only through the wrapped
-  build_app; flag-off build_app is untouched.
+- warm_start HTTP handler shapes (503 no-engine, 400 malformed, TP-rank
+  summing) — see test_warmstart_ep.py for the vllm.endpoint_plugins seam
+  tests (route attach via the EndpointPlugin, VLLM_PLUGINS loader gating).
 - bench_gemma.py: --warm-start/--dump-histories flag parsing, hist-file
   reader (tokens / bare-array / prompt+completion rows), dump format.
 """
 import importlib.util
 import json
 import os
-import sys
 from types import SimpleNamespace as NS
 
 import numpy as np
@@ -28,6 +26,11 @@ from suffix_hybrid._native import V2SuffixProposer
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BENCH = os.path.join(REPO, "bench", "gemma-research", "bench_gemma.py")
+
+# exact seam strings (vLLM 0.30.0 pinned tarball: vllm/plugins/__init__.py)
+EP_GROUP = "vllm.endpoint_plugins"
+EP_NAME = "suffix_hybrid_warmstart"
+EP_ENV_VAR = "VLLM_PLUGINS"
 
 
 def _load_bench():
@@ -94,83 +97,7 @@ def test_probe_worker_fails_loud_without_wrap():
 
 # ---------------------------------------------------------------- env gating
 
-@pytest.fixture
-def warm_env(monkeypatch):
-    monkeypatch.setenv("SUFFIX_HYBRID_WARMSTART", "1")
-    yield
-    # _Finder removal handled by test; env restored by monkeypatch
-
-
-class _FakeFinder:
-    pass
-
-
-def test_hook_inert_when_flag_unset(monkeypatch):
-    monkeypatch.delenv("SUFFIX_HYBRID_WARMSTART", raising=False)
-    before = list(sys.meta_path)
-    warmstart.install_post_import_hook()
-    assert sys.meta_path == before            # nothing armed at all
-
-
-def test_hook_arms_finder_when_flag_set(monkeypatch):
-    monkeypatch.setenv("SUFFIX_HYBRID_WARMSTART", "1")
-    warmstart.install_post_import_hook()
-    finder = sys.meta_path[0]
-    try:
-        assert finder.__class__.__name__ == "_Finder"
-        # idempotent: second install adds nothing
-        warmstart.install_post_import_hook()
-        n_finders = sum(1 for f in sys.meta_path
-                        if f.__class__ is finder.__class__)
-        assert n_finders == 1
-    finally:
-        sys.meta_path.remove(finder)
-
-
-def test_wrap_marks_build_app_and_attaches_route(monkeypatch):
-    monkeypatch.setenv("SUFFIX_HYBRID_WARMSTART", "1")
-
-    class FakeApp:
-        def __init__(self):
-            self.routes = []
-
-        def add_api_route(self, path, endpoint, methods=None, name=None):
-            self.routes.append((path, endpoint, tuple(methods or ()), name))
-
-    calls = {"orig": 0}
-
-    def build_app(*a, **k):
-        calls["orig"] += 1
-        return FakeApp()
-
-    module = NS(build_app=build_app)
-    warmstart._wrap_launchers_app(module)
-    # wrapped but not called yet; original untouched behavior on call
-    app = module.build_app()
-    assert calls["orig"] == 1
-    assert len(app.routes) == 1
-    path, endpoint, methods, name = app.routes[0]
-    assert path == "/debug/warm-start"
-    assert "POST" in methods
-    assert endpoint is warmstart.warm_start
-
-
-def test_wrapped_build_app_survives_route_failure(monkeypatch, capsys):
-    """Route attach failure must NEVER block serving."""
-    def boom(app):
-        raise RuntimeError("fastapi exploded")
-    monkeypatch.setattr(warmstart, "attach_warmstart_route", boom)
-
-    def build_app():
-        return "APP"
-
-    module = NS(build_app=build_app)
-    warmstart._wrap_launchers_app(module)
-    assert module.build_app() == "APP"      # serving continues
-    assert "FAILED" in capsys.readouterr().err
-
-
-def test_warm_start_handler_shapes():
+def test_handler_shapes():
     """Pure-logic assertions on the route handler without fastapi installed:
     - rejects when engine_client missing (503 path via JSONResponse mock)
     - rejects malformed bodies.
@@ -284,6 +211,7 @@ def test_bench_dump_histories_format(tmp_path):
 
 
 def test_bench_warm_start_http_404_degrades(capsys):
+    # default posture: 404 -> WARNING + cold leg, exit code untouched
     bg = _load_bench()
     import urllib.error
 
@@ -294,8 +222,88 @@ def test_bench_warm_start_http_404_degrades(capsys):
     orig = urllib.request.urlopen
     urllib.request.urlopen = boom
     try:
-        out = bg.warm_start_http("http://x", "/v1", [[1]], 5)
+        out = bg.warm_start_http("http://x", "/v1", [[1]], 5, model="m")
     finally:
         urllib.request.urlopen = orig
     assert out is None
     assert "404" in capsys.readouterr().out
+
+
+def test_bench_warm_start_http_body_carries_epp_keys(capsys):
+    """EPP gateway carrier keys: the POST body must carry "model" + "prompt"
+    alongside "sequences", or the gateway rejects it before the FastAPI app
+    ever sees it. Captures the POSTed body."""
+    bg = _load_bench()
+    import urllib.request
+    seen = {}
+
+    def fake_urlopen(req, timeout):
+        seen["url"] = req.full_url
+        seen["body"] = json.loads(req.data.decode())
+        seen["method"] = req.get_method()
+
+        class R:
+            def read(self):
+                return b'{"ingested": 1}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        return R()
+
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        out = bg.warm_start_http("http://x/", "/v1", [[1, 2], [3]], 5,
+                                 model="pool-model-123")
+    finally:
+        urllib.request.urlopen = orig
+    assert out == {"ingested": 1}
+    assert seen["url"] == "http://x/debug/warm-start"
+    assert seen["method"] == "POST"
+    assert seen["body"]["sequences"] == [[1, 2], [3]]
+    assert seen["body"]["model"] == "pool-model-123"
+    assert isinstance(seen["body"]["prompt"], str)   # carrier passes the EPP
+
+
+def test_bench_warm_start_http_404_fails_hard_when_requested(capsys):
+    # --warm-start mode calls with fail_hard=True: a missing route must
+    # NEVER be mistaken for warm success.
+    bg = _load_bench()
+    import urllib.error
+
+    def boom(req, timeout):
+        raise urllib.error.HTTPError(
+            req.full_url, 404, "Not Found", None, None)
+
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = boom
+    try:
+        with pytest.raises(SystemExit, match="NOT registered"):
+            bg.warm_start_http("http://x", "/v1", [[1]], 5, model="m",
+                               fail_hard=True)
+    finally:
+        urllib.request.urlopen = orig
+
+
+def test_bench_warm_start_http_other_codes_fail_hard_message(capsys):
+    # non-404 codes still degrade (not a missing-route situation)
+    bg = _load_bench()
+    import urllib.error
+
+    def boom(req, timeout):
+        raise urllib.error.HTTPError(
+            req.full_url, 503, "Service Unavailable", None, None)
+
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = boom
+    try:
+        out = bg.warm_start_http("http://x", "/v1", [[1]], 5, model="m",
+                                 fail_hard=True)
+    finally:
+        urllib.request.urlopen = orig
+    assert out is None
+    assert "503" in capsys.readouterr().out

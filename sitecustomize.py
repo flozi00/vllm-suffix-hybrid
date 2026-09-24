@@ -139,25 +139,15 @@ if os.environ.get("SUFFIX_SM120_NVP4KV", "").strip() == "1":
         print(f"suffix sm120 nvfp4-kv: hook install failed (not SM120, "
               f"ignoring): {exc}", file=sys.stderr, flush=True)
 
-# WARM-START debug endpoint (dev pool only). SUFFIX_HYBRID_WARMSTART=1 arms
-# a post-import hook on vllm.entrypoints.launchers.app that registers
-# POST /debug/warm-start on the OpenAI server (suffix_hybrid/warmstart.py:
-# body {"sequences": [[ids...], ...]} -> collective_rpc into the SUFFIX-ONLY
-# proposer's live suffix cache via add_sequence). Arming in EVERY /plugins
-# process is safe: the hook self-gates on the same env flag and its finder
-# only acts in whichever process imports the launchers app (the API
-# server); worker processes never import it and pay nothing. With the flag
-# unset the hook is a no-op — no finder, no route, no behavior change.
-if os.environ.get("SUFFIX_HYBRID_WARMSTART", "").strip() == "1":
-    try:
-        from suffix_hybrid.warmstart import install_post_import_hook \
-            as _warmstart_hook
-        _warmstart_hook()
-    except Exception as exc:
-        # Same posture as the kernels gate: the serving path never depended
-        # on this debug endpoint; degrade with a loud refusal, never kill
-        # a healthy pool over an optional bench affordance.
-        import sys
-        print(f"suffix hybrid WARM-START hook arm FAILED (warm-start "
-              f"stays unavailable): {exc}", file=sys.stderr, flush=True)
+# NOTE: the WARM-START debug endpoint is NO LONGER armed here. The old
+# sys.meta_path build_app loader-proxy never attached on the live pod
+# (an earlier importer had already loaded vllm.entrypoints.launchers.app,
+# short-circuiting find_spec before our finder ran). The route now uses
+# vLLM 0.30.0's NATIVE vllm.endpoint_plugins seam: the repo-root module
+# suffix_hybrid_warmstart_ep.py is discovered via the dist-info dir
+# suffix_hybrid_warmstart_ep-1.0.dist-info/ (entry point group
+# vllm.endpoint_plugins), gated by env VLLM_PLUGINS naming
+# "suffix_hybrid_warmstart" (loader not called at all when unset) plus the
+# plugin's own SUFFIX_HYBRID_WARMSTART=1 belt gate. With both keys off nothing
+# here (or anywhere) runs for warm-start.
 

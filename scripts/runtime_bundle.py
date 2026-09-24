@@ -73,6 +73,38 @@ def bundle(wheel, output, revision):
     data = ficache_mod.read_bytes()
     (output / 'ficache.py').write_bytes(data)
     hashes['ficache.py'] = hashlib.sha256(data).hexdigest()
+    # warm-start endpoint plugin (vLLM 0.30.0 native vllm.endpoint_plugins
+    # seam): the module + dist-info must ship TOP-LEVEL at <bundle>/ so that
+    # with the bundle mounted at /plugins (on PYTHONPATH) importlib.metadata
+    # discovers suffix_hybrid_warmstart_ep-1.0.dist-info/ and its
+    # [vllm.endpoint_plugins] entry point suffix_hybrid_warmstart =
+    # suffix_hybrid_warmstart_ep:register. vLLM's split-allowlist loader runs
+    # ONLY when env VLLM_PLUGINS names the plugin (loader not called at all
+    # when unset), and the plugin self-gates on SUFFIX_HYBRID_WARMSTART=1 —
+    # so shipping it unconditionally is safe (bare file on disk = zero code
+    # paths executed).
+    repo = Path(__file__).resolve().parents[1]
+    warmstart_ep = repo / 'suffix_hybrid_warmstart_ep.py'
+    if not warmstart_ep.is_file():
+        raise ValueError('runtime bundle requires suffix_hybrid_warmstart_ep')
+    data = warmstart_ep.read_bytes()
+    (output / 'suffix_hybrid_warmstart_ep.py').write_bytes(data)
+    hashes['suffix_hybrid_warmstart_ep.py'] = hashlib.sha256(data).hexdigest()
+    distinfo = repo / 'suffix_hybrid_warmstart_ep-1.0.dist-info'
+    for src in sorted(distinfo.glob('*')):
+        if not src.is_file():
+            continue
+        rel = PurePosixPath('suffix_hybrid_warmstart_ep-1.0.dist-info',
+                            src.name)
+        data = src.read_bytes()
+        dest = output / PurePosixPath(*rel.parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        hashes[str(rel)] = hashlib.sha256(data).hexdigest()
+    if not (output / 'suffix_hybrid_warmstart_ep-1.0.dist-info'
+            / 'entry_points.txt').exists():
+        raise ValueError('runtime bundle requires warm-start dist-info '
+                        'entry_points.txt')
     seeds_root = ficache_root / 'seeds'
     if seeds_root.is_dir():
         for src in sorted(seeds_root.rglob('*')):
