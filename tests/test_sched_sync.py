@@ -165,3 +165,73 @@ def test_hook_arms_once(capsys):
              if getattr(f, "_suffix_hybrid_sched_sync", False)]
     assert len(armed) == 1
     capsys.readouterr()
+
+
+def test_v2_lesson_no_self_import_in_finder():
+    # v2 shipped a finder that __import__-ed its own target inside
+    # find_spec and returned None, so the machinery loaded a SECOND fresh
+    # module and everyone downstream used the unpatched corpse. Pinned:
+    # find_spec must never import the module it is asked to find.
+    import ast
+    src = open(sched_sync.__file__).read()
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "find_spec":
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call) and isinstance(
+                            sub.func, ast.Name) and sub.func.id == "__import__":
+                        raise AssertionError(
+                            "__import__ inside find_spec is the v2 "
+                            "corpse-module bug")
+
+
+def test_v3_loader_wrap_real_import(tmp_path, capsys):
+    # THE v2 regression test: import a fresh fake vllm.engine.arg_utils
+    # through the ARMED finder via the REAL import machinery and assert
+    # the module sys.modules exposes carries the patched EngineArgs. Under
+    # v2 this exact scenario left sys.modules with an unpatched class.
+    root = tmp_path / "v3imp"
+    (root / "vllm" / "engine").mkdir(parents=True)
+    (root / "vllm" / "__init__.py").write_text("")
+    (root / "vllm" / "engine" / "__init__.py").write_text("")
+    (root / "vllm" / "engine" / "arg_utils.py").write_text(
+        "class EngineArgs:\n"
+        "    async_scheduling = None\n"
+        "    def create_engine_config(self):\n"
+        "        sched = type('S', (), {'async_scheduling': self.async_scheduling})()\n"
+        "        cfg = type('V', (), {'scheduler_config': sched})()\n"
+        "        if sched.async_scheduling is None:\n"
+        "            sched.async_scheduling = True  # v0.30.0 None->True\n"
+        "        return cfg\n"
+    )
+    saved = {k: v for k, v in sys.modules.items() if k.split(".")[0] == "vllm"}
+    for k in saved:
+        del sys.modules[k]
+    sys.path.insert(0, str(root))
+    try:
+        os.environ["SUFFIX_HYBRID_WRAP"] = "1"
+        os.environ.pop("SUFFIX_HYBRID_SYNC_SCHED", None)
+        capsys.readouterr()
+        sched_sync.install_post_import_hook()
+        import vllm.engine.arg_utils as argmod  # noqa: E402
+
+        # The module the MACHINERY registered must carry the wrapped class:
+        # the v2 corpse-module bug broke exactly this identity.
+        assert argmod is sys.modules["vllm.engine.arg_utils"]
+        wrapped = getattr(argmod.EngineArgs.create_engine_config,
+                          "_suffix_hybrid_sched_sync", False)
+        assert wrapped, "sys.modules class is UNPATCHED (v2 corpse bug)"
+        cfg = argmod.EngineArgs().create_engine_config()
+        assert cfg.scheduler_config.async_scheduling is False
+        out = capsys.readouterr()
+        assert "FORCE APPLIED" in out.err
+        assert "None" in out.err  # had=None logged
+    finally:
+        sys.path.remove(str(root))
+        for k in [k for k in sys.modules if k.split(".")[0] == "vllm"]:
+            del sys.modules[k]
+        for k, v in saved.items():
+            sys.modules[k] = v
+        sys.meta_path[:] = [f for f in sys.meta_path
+                            if not getattr(f, "_suffix_hybrid_sched_sync", False)]
