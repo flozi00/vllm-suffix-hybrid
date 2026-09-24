@@ -1337,6 +1337,44 @@ def install_v2():
                     self, (lambda: proposer.widths_table)
                     if proposer is not None else None)
                 v2 = _wrap_rejection_sampler(self, wrapped, k)
+                # LOUD ENGINE-CONFIG AUDIT (wake #18): VERIFYTRACE zero-line evidence
+                # (sampler heartbeat #1000 while handler take never fires) fits
+                # async_scheduling=ON, which kills engine_core.py:625 post_step take
+                # and with it our per-step ragged-width publication. Print the live
+                # scheduler config once at install — silence must be loud.
+                try:
+                    _sc = getattr(self, "vllm_config", None)
+                    if _sc is not None:
+                        _scc = getattr(_sc, "scheduler_config", None)
+                        print(f"suffix_hybrid v2 ENGINE-CONFIG "
+                              f"async_scheduling="
+                              f"{getattr(_scc, 'async_scheduling', 'ATTR-MISSING')} "
+                              f"max_concurrent_batches="
+                              f"{getattr(_sc, 'max_concurrent_batches', 'ATTR-MISSING')} "
+                              f"num_speculative_tokens="
+                              f"{getattr(_sc, 'num_speculative_tokens', 'ATTR-MISSING')}",
+                              file=sys.stderr, flush=True)
+                except Exception as _ec_err:
+                    print(f"suffix_hybrid v2 ENGINE-CONFIG audit failed: {_ec_err}",
+                          file=sys.stderr, flush=True)
+                # Third, structurally-unbypassable probe: wrap the
+                # Scheduler class method update_draft_token_ids
+                # (upstream of the DraftTokensHandler wrap). Guarded by
+                # SUFFIX_HYBRID_SCHEDTRACE (default on when
+                # TRACE_VERIFY is set).
+                try:
+                    _sched_on = os.environ.get(
+                        "SUFFIX_HYBRID_SCHEDTRACE", "").strip().lower() in (
+                            "1", "true", "yes")
+                    if not os.environ.get("SUFFIX_HYBRID_SCHEDTRACE") \
+                            and os.environ.get("SUFFIX_HYBRID_TRACE_VERIFY"):
+                        _sched_on = True
+                    if _sched_on:
+                        from suffix_hybrid import sched_probe
+                        sched_probe.install()
+                except Exception as _sched_err:
+                    print(f"suffix_hybrid SCHEDTRACE install failed: "
+                          f"{_sched_err}", file=sys.stderr, flush=True)
                 print(f"suffix_hybrid v2 SUFFIX-ONLY installed "
                       f"speculator={cls_name} k={k} tp={group.world_size} "
                       f"ragged_handler={'yes' if patched else 'NO (uniform)'} "
