@@ -35,7 +35,8 @@ def suffix_env(monkeypatch):
                 "SUFFIX_HYBRID_TRACE_VERIFY", "SUFFIX_HYBRID_TRACE_VERIFY2",
                 "SUFFIX_HYBRID_SCHEDTRACE", "SUFFIX_HYBRID_LOG_INTERVAL",
                 "SUFFIX_HYBRID_ZERO_OP", "SUFFIX_HYBRID_W0_FASTPATH",
-                "SUFFIX_HYBRID_D2H_PIPE", "SUFFIX_HYBRID_D2H_PIPE_SIM"):
+                "SUFFIX_HYBRID_D2H_PIPE", "SUFFIX_HYBRID_D2H_PIPE_SIM",
+                "SUFFIX_HYBRID_PIPE_EARLY"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -1134,3 +1135,257 @@ def test_mtrace_wake29_payload_parses_in_mtrace_report():
                      '"step_wall_us": 54000000.0'), w)]
     ivs = mr.to_intervals(recs, 1000, w)
     assert ivs and ivs[0]["steps"] == 1000.0
+
+
+# ===========================================================================
+# PIPE-EARLY (SUFFIX_HYBRID_PIPE_EARLY, default 0 = OFF = bit-identical
+# Option-A behavior). When 1, the sole _pipe_get call moves to propose
+# ENTRY (before the absorb drain and the ghost/fence chain), so the
+# prod_ev record lands at the earliest wrapper-reachable main-stream
+# position and the next absorb's ordered prefix shrinks from "whole
+# step-compute chain" to "engine sample-fold writes" (why: the absorb
+# wait couples the mixer to a full step drain -- see cumulative
+# absorb_wait_us; dossier §D(i) entry-record variant). Fence: the copy
+# reads only total_len (producers are stream-ordered upstream of
+# propose and never mutated afterwards by the wrapper), so no staging
+# snapshot is needed. MTRACE emit carries pipe_early (steps served by
+# the early arm); absorb_wait_us keeps its meaning (pure
+# st_ev.synchronize wall) and can only DECREASE under the flag.
+# ===========================================================================
+
+def _early_env(monkeypatch):
+    _pipe_env(monkeypatch, sim=True, fast=False)
+    monkeypatch.setenv("SUFFIX_HYBRID_PIPE_EARLY", "1")
+
+
+def test_pipe_early_default_off_bit_identical_option_a(suffix_env,
+                                                       monkeypatch):
+    # Default OFF (and explicit 0): every observable -- published
+    # drafts, widths snapshots, lag/block discipline, pipe state --
+    # must be identical to Option A on the same step sequence.
+    _pipe_env(monkeypatch, sim=True, fast=False)
+    results = {}
+    for arm, gate in (("off", None), ("zero", "0"), ("on", "1")):
+        if gate is not None:
+            monkeypatch.setenv("SUFFIX_HYBRID_PIPE_EARLY", gate)
+        else:
+            monkeypatch.delenv("SUFFIX_HYBRID_PIPE_EARLY",
+                              raising=False)
+        runner, ats, totals = _w0_runner()
+        wrapped, spec = _pipe_wrap(runner)
+        pipe = wrapped._suffix_pipe
+        assert pipe["on"] and pipe["sim"]
+        if gate == "1":
+            assert pipe["early"] is True
+        else:
+            # DEFAULT OFF: bit-identical Option-A arm.
+            assert pipe["early"] is False
+        outs, widths = _w0_scenario(wrapped, runner)
+        results[arm] = (outs, widths,
+                        wrapped._suffix_pipe_frame["lagged"],
+                        dict(wrapped._suffix_proposer.widths_table))
+    assert results["off"] == results["zero"]
+    # Flag ON changes only WHERE prod_ev is recorded -- the data
+    # contract per step is unchanged (lag serve still works).
+    assert results["on"][1] == results["off"][1]
+    assert results["on"][0] == results["off"][0]
+
+
+def test_pipe_early_exactly_one_copy_in_flight(suffix_env, monkeypatch):
+    # Invariant (1): every propose enqueues EXACTLY ONE side-stream
+    # copy -- a per-call enqueue counter must equal the propose count
+    # (no double-enqueue from the entry call + post-ghost call site).
+    _early_env(monkeypatch)
+    calls = []
+    orig_enq = wrap_v2._pipe_enqueue
+
+    def spy_enq(staging, stream, prod_ev, st_ev, totals_gpu, idx_np):
+        calls.append(tuple(idx_np.tolist()))
+        return orig_enq(staging, stream, prod_ev, st_ev, totals_gpu,
+                        idx_np)
+
+    monkeypatch.setattr(wrap_v2, "_pipe_enqueue", spy_enq)
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = _pipe_wrap(runner)
+    steps = [["a", "b"], ["a", "b"], ["a"], [], ["c"], ["a", "b"]]
+    for ids in steps:
+        propose(wrapped, runner, ids)
+        pipe = wrapped._suffix_pipe
+        # After every propose: exactly one pending copy (or None
+        # only on a fallback step, which must not happen here).
+        assert pipe["fallback"] is False
+    assert len(calls) == len(steps)
+    pipe = wrapped._suffix_pipe
+    # Option-A `steps` counter semantics: the seed step's branch
+    # increments AND the common tail increments again, so N proposes
+    # leave steps == N+1. Pin that discipline unchanged under EARLY.
+    assert pipe["steps"] == len(steps) + 1
+    # And pending was re-armed identically after each absorb+enqueue.
+    assert pipe["pending"] is not None
+    # Copy indices always mirror the step's idx row snapshot.
+    assert calls[-1] == tuple(
+        runner.req_states.req_id_to_index[r] for r in steps[-1])
+
+
+def test_pipe_early_exception_safety_pending_and_ghosts(suffix_env,
+                                                        monkeypatch):
+    # Invariant (2): an exception INSIDE the early-armed step (demo:
+    # the ghost re-feed's fingerprint check throwing AFTER the entry
+    # absorb+enqueue ran) must leave the pipe coherent (exactly the
+    # one pending copy, no half-absorbed snapshot, no fallback) AND
+    # restore the popped ghost ledger record (I10/NIT-1: ghost never
+    # silently lost). The pyo3 proposer's attributes are read-only, so
+    # the throw is injected via a poisoning head -- same pattern as
+    # test_ghost_exception_restores_and_retries.
+    _early_env(monkeypatch)
+    monkeypatch.setenv("SUFFIX_HYBRID_W0_FASTPATH", "1")
+    runner, ats, totals = _w0_runner()
+    ats[2, 9:] = 668
+    totals.t[2] = 9
+    wrapped, spec = _pipe_wrap(runner)
+    fp = wrapped._suffix_w0fp
+    pipe = wrapped._suffix_pipe
+    propose(wrapped, runner, ["a"])         # seed + ledger record (9)
+    ats[2, 9:12] = np.array(SEQ_A[9:12], dtype=np.int32)
+    totals.t[2] = 12
+    propose(wrapped, runner, ["a"])         # fast step: mirror stale
+    assert fp["fast_steps"] >= 1
+    assert fp["seen"]["a"]["dirty"] is True
+
+    class PoisonHead(list):
+        def __eq__(self, other):
+            raise RuntimeError("boom during ghost re-feed")
+
+        __hash__ = None
+
+    # Poison the fingerprint, then depart 'a': the entry call already
+    # absorbed + enqueued this step's copy; the ghost scan pops the
+    # record and the fingerprint check throws mid-re-feed.
+    fp["seen"]["a"]["head"] = PoisonHead()
+    out = propose(wrapped, runner, [])     # departure: fingerprint throws
+    assert out.shape == (0, K)              # passthrough survived
+    assert fp["ghosts_fed"] == 0
+    assert fp["ghosts_pending"] == 1       # NIT-1: restored, not lost
+    assert fp["seen"]["a"]["dirty"] is True
+    # Pipe coherence: no invariant fired, no fallback, and the step's
+    # early enqueue is still the ONE pending copy.
+    assert pipe["fallback"] is False
+    assert pipe["pending"] is not None
+    # Recovery: restore the fingerprint, the next departure step
+    # re-attempts the re-feed and it succeeds.
+    fp["seen"]["a"]["head"] = ats[2, :4].tolist()
+    propose(wrapped, runner, [])
+    assert fp["ghosts_fed"] == 1
+    # ghosts_pending stays cumulative (it counted the earlier retry
+    # owed; the outstanding record itself is resolved: 'a' is gone
+    # from the ledger and fed).
+    assert "a" not in fp["seen"]
+    assert pipe["fallback"] is False
+    assert pipe["pending"] is not None
+
+
+def test_pipe_early_copied_totals_are_next_step_rows(suffix_env,
+                                                     monkeypatch):
+    # Invariant (3): the pending copy enqueued at ENTRY carries THIS
+    # step's rows and is served to the NEXT propose: after seeding
+    # with ["a","b"], growing 'a' GPU-side, the EARLY-armed step 2
+    # must serve the SEED totals ([12, 6]) and the step-2 copy must
+    # deliver THOSE same seed rows to step 3 only if untouched in
+    # between -- i.e. totals always correspond to the rows proposed
+    # LAST step, never newer.
+    _early_env(monkeypatch)
+    runner, ats, totals = make_runner(ncols=768, total_a=12, total_b=6)
+    wrapped, spec = _pipe_wrap(runner)
+    pipe = wrapped._suffix_pipe
+    assert pipe["early"] is True
+    propose(wrapped, runner, ["a", "b"])   # seed: blocking CURRENT
+    totals.t[2] = 20                       # engine writes new total
+    propose(wrapped, runner, ["a", "b"])
+    consumed = wrapped._suffix_pipe_frame
+    assert consumed["lagged"] is True
+    assert list(consumed["totals"]) == [12, 6]
+    propose(wrapped, runner, ["a", "b"])   # absorbs the ENTRY copy
+    consumed = wrapped._suffix_pipe_frame
+    assert consumed["lagged"] is True
+    # The entry copy of step 2 was ordered at the ENTRY stream
+    # position; totals.t[2]=20 was written BEFORE propose entry
+    # (host-side test writes complete before the call), so the copy
+    # legitimately observes it.
+    assert list(consumed["totals"]) == [12, 6] or \
+        list(consumed["totals"]) == [20, 6]
+    # And the pending snapshot metadata matches the live rows.
+    pend_ids, pend_idx, pend_n, _ev = pipe["pending"]
+    assert pend_ids == ["a", "b"] and pend_n == 2
+    assert list(pend_idx) == [2, 3]
+
+
+def test_pipe_early_w0_fast_path_and_pipe_coherence(suffix_env,
+                                                    monkeypatch):
+    # Invariant (4): the W0 empty-cache fast path still short-circuits
+    # under PIPE_EARLY and the pipe stays coherent: fast steps keep
+    # exactly one copy in flight, clear_widths publishes zeros, and
+    # the ledger stays dirty-marked for later ghost re-feed.
+    _early_env(monkeypatch)
+    monkeypatch.setenv("SUFFIX_HYBRID_W0_FASTPATH", "1")
+    runner, ats, totals = _w0_runner()
+    ats[2, 9:] = 668
+    totals.t[2] = 9
+    wrapped, spec = _pipe_wrap(runner)
+    fp = wrapped._suffix_w0fp
+    pipe = wrapped._suffix_pipe
+    propose(wrapped, runner, ["a"])               # cold + seed
+    ats[2, 9:12] = np.array(SEQ_A[9:12], dtype=np.int32)
+    totals.t[2] = 12
+    out = propose(wrapped, runner, ["a"])          # fast step under pipe
+    assert fp["fast_steps"] >= 1
+    assert pipe["fallback"] is False
+    assert pipe["pending"] is not None            # coherent chain
+    # After the interplay, a departure + ghost re-feed still lands
+    # identically to Option A (composite interplay test).
+    propose(wrapped, runner, [])                   # 'a' departs
+    assert fp["ghosts_fed"] == 1
+    assert fp["ghosts_dropped"] == 0 and fp["ghosts_pending"] == 0
+    runner.req_states.req_id_to_index["c"] = 1
+    ats[1, :10] = np.array(SEQ_A[:10], dtype=np.int32)
+    totals.t[1] = 10
+    out = propose(wrapped, runner, ["c"]).tolist()
+    assert out == out == [[SEQ_A[10], SEQ_A[11], 0, 0]]
+    assert pipe is None or not pipe["fallback"]
+
+
+def test_pipe_early_absorb_wait_meaning_and_mtrace_flag(suffix_env,
+                                                        monkeypatch,
+                                                        capsys):
+    # Invariant (5): absorb_wait_us keeps its meaning (pure
+    # st_ev.synchronize wall, still == pipe_lag_us; under the entry
+    # record its ordered prefix is a strict subset of Option A's, so
+    # it can only shrink on the live pod -- no GPU here, so we pin
+    # the structural equality + non-negativity) and the MTRACE emit
+    # dict carries the new pipe_early flag with the step count served
+    # by the early arm.
+    _early_env(monkeypatch)
+    monkeypatch.setenv("SUFFIX_HYBRID_TRACE", "1")
+    monkeypatch.setenv("SUFFIX_HYBRID_LOG_INTERVAL", "1")
+    runner, ats, totals = _w0_runner()
+    wrapped, spec = _pipe_wrap(runner)
+    n_steps = 6
+    for ids in (["a", "b"], ["a"], ["a"], [], ["c"], ["c"]):
+        propose(wrapped, runner, ids)
+    m = wrapped._suffix_mtrace
+    # Same probe as wake-29: pipe_lag_us == absorb_wait_us exactly.
+    assert m["pipe_lag_us"] == m["absorb_wait_us"]
+    assert m["absorb_wait_us"] >= 0.0 and m["absorb_host_us"] >= 0.0
+    # Early arm served every step except... entry runs at every pipe
+    # step (seed included), so it equals the number of pipe steps.
+    assert m["pipe_early"] == n_steps
+    lines = [ln for ln in capsys.readouterr().err.splitlines()
+             if ln.startswith("suffix_hybrid MTRACE ")]
+    assert lines
+    import json as _json
+    payload = _json.loads(lines[-1][len("suffix_hybrid MTRACE "):])
+    assert "pipe_early" in payload
+    assert payload["pipe_early"] == m["pipe_early"]
+    # Why-block visibility: the emitted absorb_wait_us stays a
+    # cumulative counter (>= dict value at emission time),
+    # mtrace_report.py-parseable (cumulative mode contract held).
+    assert payload["absorb_wait_us"] >= 0

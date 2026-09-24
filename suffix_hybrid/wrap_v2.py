@@ -457,7 +457,12 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
          # absorb-time split: host time spent in st_ev.synchronize()
          # (wait_for_gpu) vs python-side handling around it, so the
          # ordered-prefix component of the absorb can be isolated.
-         "absorb_wait_us": 0.0, "absorb_host_us": 0.0}
+         "absorb_wait_us": 0.0, "absorb_host_us": 0.0,
+         # Wake-67 PIPE_EARLY visibility: which arm produced the
+         # absorb numbers (1 = SUFFIX_HYBRID_PIPE_EARLY entry-record
+         # arm, 0 = Option-A post-compute record). Cumulative flags
+         # are additive across steps: >0 and < steps means mixed.
+         "pipe_early": 0}
 
     # --------------------------------------------------------------
     # PIPE (Option A, dossier pipelined-d2h-design.md): side-stream
@@ -475,11 +480,39 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     # ==============================================================
     # --------------------------------------------------------------
     pipe_en = (os.environ.get("SUFFIX_HYBRID_D2H_PIPE", "0").strip() != "0")
+    # ==============================================================
+    # PIPE-EARLY (SUFFIX_HYBRID_PIPE_EARLY, default 0 = OFF =
+    # bit-identical Option-A behavior): record the side-stream copy
+    # dependency (prod_ev) at the EARLIEST wrapper-reachable main-stream
+    # position -- propose entry, before the absorb drain
+    # (st_ev.synchronize) and the seed/fence chain -- and enqueue this
+    # step's copy behind that entry-record instead of a fresh
+    # post-compute record. WHY: the absorb_wait couples the mixer to a
+    # full step drain — st_ev fires only after prod_ev's ordered
+    # main-stream prefix drains, and Option A records prod_ev at the
+    # END of _pipe_get, so the prefix includes the whole step-compute
+    # chain (rust mirror handling, upload, everything enqueued by the
+    # wrapper this step; see the cumulative absorb_wait_us column in
+    # MTRACE). Recording at entry shrinks that ordered prefix to just
+    # the engine's sample-fold writes (post_update/acceptance kernels
+    # already enqueued upstream of propose), so the next absorb waits
+    # on the copy alone. Fence correctness (RC hazard list, dossier
+    # native-parity-near-zero-program.md §D(i)): the early copy reads
+    # ONLY totals_gpu (total_len), whose producers are stream-ordered
+    # BEFORE propose entry -- nothing the wrapper enqueues afterwards
+    # on the main stream mutates total_len (out.zero_/copy touch
+    # draft_tokens; the ghost scalar read is itself a fence), so moving
+    # the READ POINT needs no snapshot staging. The ordered prefix is
+    # a strict SUBSET of Option A's, so absorb_wait_us can only
+    # DECREASE; its meaning (pure st_ev.synchronize wall) is unchanged.
+    # ==============================================================
+    _early = os.environ.get(
+        "SUFFIX_HYBRID_PIPE_EARLY", "0").strip() != "0"
     pipe = {"on": False, "sim": False, "armed": False, "pending": None,
             "lag": None, "steps": 0, "block_steps": 0, "fallback": False,
             "fallback_reason": "",
             "invariant_fails": {}, "stream": None, "prod_ev": None,
-            "st_ev": None, "staging_cpu": None}
+            "st_ev": None, "staging_cpu": None, "early": False}
     if pipe_en:
         # I8 (checked first, fail-closed at install like
         # _check_speculator_capability): the pipeline's lag=1 consume
@@ -505,6 +538,13 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             pipe["staging_cpu"] = torch.zeros(
                 (max_reqs,), dtype=torch.int64, pin_memory=True)
             pipe["on"] = True
+            # PIPE-EARLY arm only exists on a live pipeline (SIM or
+            # CUDA): entry-record + single early enqueue per step.
+            pipe["early"] = _early
+            if _early:
+                print("suffix_hybrid v2 SUFFIX-PIPE EARLY armed (entry-"
+                      "record, gate=SUFFIX_HYBRID_PIPE_EARLY)",
+                      file=sys.stderr, flush=True)
             print("suffix_hybrid v2 SUFFIX-PIPE armed (lag=1, "
                   "seed=blocking, gate=SUFFIX_HYBRID_D2H_PIPE)",
                   file=sys.stderr, flush=True)
@@ -520,6 +560,11 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             pipe["staging_cpu"] = torch.zeros(
                 (max_reqs,), dtype=torch.int64, pin_memory=False)
             pipe["on"] = True
+            pipe["early"] = _early
+            if _early:
+                print("suffix_hybrid v2 SUFFIX-PIPE EARLY armed SIM "
+                      "(entry-record, gate=SUFFIX_HYBRID_PIPE_EARLY)",
+                      file=sys.stderr, flush=True)
             print("suffix_hybrid v2 SUFFIX-PIPE armed SIM (cpu-only "
                   "lag=1 simulation, gate=SUFFIX_HYBRID_D2H_PIPE_SIM)",
                   file=sys.stderr, flush=True)
@@ -613,6 +658,16 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                 # lagged without a seed.
                 t0 = time.perf_counter()
                 totals = _totals_now(idx_np)
+                # PIPE_EARLY fence discipline (idx_np-copy pattern):
+                # seed/misaligned blocking reads at the ENTRY call
+                # site return a VIEW of the shared totals_cpu staging
+                # row, which the ghost re-feed below also writes
+                # (its own blocking single-row read). Option A reads
+                # AFTER the re-feed, so the alias is dead storage by
+                # then; under EARLY the served array MUST be an
+                # immutable snapshot instead of a live view.
+                if pipe["early"]:
+                    totals = totals.copy()
                 t_blk = (time.perf_counter() - t0) * 1e6
                 pipe["armed"] = True
                 pipe["steps"] += 1
@@ -654,15 +709,24 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                     # enqueue).
                     t0 = time.perf_counter()
                     totals = _totals_now(idx_np)
+                    # Same EARLY immutable-snapshot fence as the seed
+                    # branch: entry-position blocking read must not
+                    # alias the staging row the re-feed writes.
+                    if pipe["early"]:
+                        totals = totals.copy()
                     t_blk = (time.perf_counter() - t0) * 1e6
                     used_pipe_lag = False
                     pipe["block_steps"] = pipe["block_steps"] + 1
                     if m_on:
                         m["t_fence"] += t_blk
-            # Enqueue THIS step's copy (seed step included) on the
-            # side stream, ordered behind the main-stream post_update
-            # chain via prod_ev (I2); consumed next propose (I1:
-            # exactly one in flight).
+            # Enqueue THIS step's copy (seed step included). The CALL
+            # SITE decides how early the prod_ev.record() lands: under
+            # SUFFIX_HYBRID_PIPE_EARLY the sole _pipe_get call happens
+            # at propose ENTRY (see the entry call site), so the
+            # ordered main-stream prefix behind this copy is the entry
+            # prefix (smallest the plugin can express) and the post-
+            # ghost block never calls here again (I1: exactly one
+            # copy per propose). Option A calls here later, unchanged.
             t_enq0 = time.perf_counter()
             _pipe_enqueue(pipe["staging_cpu"], pipe["stream"],
                           pipe["prod_ev"], pipe["st_ev"],
@@ -692,6 +756,10 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             _pipe_fail(getattr(exc, "invariant", "I10"), exc)
         t0 = time.perf_counter()
         totals = _totals_now(idx_np)
+        if pipe["early"]:
+            # EARLY fence: sticky-fallback read at the entry call site
+            # must not alias the re-feed's staging row either.
+            totals = totals.copy()
         t_blk = (time.perf_counter() - t0) * 1e6
         pipe["block_steps"] = pipe["block_steps"] + 1
         if m_on:
@@ -756,6 +824,7 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             "ghosts_drop_fp": fp["ghosts_drop_fp"],
             "ghosts_drop_reset": fp["ghosts_drop_reset"],
             "skip_upload": fp["skip_upload"],
+            "pipe_early": m["pipe_early"],
         }, sort_keys=True), file=sys.stderr, flush=True)
 
     # Per-step draft accounting trace (gemma wake #9): the engine rejected
@@ -836,6 +905,31 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             ids = list(input_batch.req_ids)
             idx_np = np.fromiter((lut[rid] for rid in ids),
                                  dtype=np.int64, count=n)
+            # ---- PIPE-EARLY entry call (SUFFIX_HYBRID_PIPE_EARLY). --
+            # Armed in the pipe dict at install: this step's side-stream
+            # copy is recorded+enqueued at the EARLIEST wrapper-reachable
+            # main-stream position (propose entry, before the absorb
+            # drain / ghost re-feed / seed-fence chain below), so the
+            # prod_ev-ordered prefix behind the copy is the smallest the
+            # plugin can express and the NEXT absorb waits on that shrunken
+            # prefix, not on the whole step-compute chain (see the arm
+            # comment at the `pipe` dict). Fence safety (RC hazard (i)):
+            # the copy reads ONLY total_len -- whose producers
+            # (postprocess_sampled/post_update) are stream-ordered
+            # UPSTREAM of propose and are never mutated by anything this
+            # wrapper enqueues afterwards -- plus the host-side idx_np
+            # snapshot (pipe["pending"], the in-code copy pattern), so
+            # no post_update-mutated buffer is read early and no staging
+            # snapshot is needed. I1-I10 discipline, pending bookkeeping
+            # and the absorb_wait_us probe are IDENTICAL to Option A
+            # (same _pipe_get/_pipe_absorb code, earlier call site).
+            if pipe["on"] and pipe["early"] and not pipe["fallback"]:
+                totals, pipe_lagged = _pipe_get(idx_np, n, ids)
+                consume_log["totals"] = totals.tolist()
+                consume_log["lagged"] = pipe_lagged
+                t_d2h = 0.0   # t_pipe/t_fence accounted inside _pipe_get
+                if m_on:
+                    m["pipe_early"] += 1
             # ---- Ghost re-feed (ingestion-semantics guarantee). --------
             # A REQUEST THAT HAS DEPARTED was ingesting fine while it was
             # live (its every step went through propose_suffix_only, whose
@@ -937,7 +1031,15 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
             # its OWN blocking current-total reads, so I4's ordering
             # (absence-then-absorb, re-feed, THEN totals) is satisfied
             # before any fast-path probe or pipeline work below.
-            if pipe["on"] and not pipe["fallback"]:
+            # PIPE_EARLY steps already consumed _pipe_get at entry:
+            # a second call would double-enqueue (I1); the `early_done`
+            # flag routes this block to the pure else arm (no blocking
+            # re-read needed, totals are already in hand).
+            _early_done = (pipe["on"] and pipe["early"]
+                           and not pipe["fallback"])
+            if _early_done:
+                pass                # totals already served at entry
+            elif pipe["on"] and not pipe["fallback"]:
                 totals, pipe_lagged = _pipe_get(idx_np, n, ids)
                 t_d2h = 0.0   # t_pipe/t_fence accounted inside _pipe_get
                 consume_log["totals"] = totals.tolist()
