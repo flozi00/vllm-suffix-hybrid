@@ -41,6 +41,16 @@ if os.environ.get("SUFFIX_HYBRID_DEV_ARGS", "").strip() == "1":
     apply_dev_args()
 
 if os.environ.get("SUFFIX_HYBRID_WRAP", "").strip() == "1":
+    import sys
+
+    try:
+        from suffix_hybrid.sched_sync import install_post_import_hook
+        install_post_import_hook()
+        main_gate = True
+    except Exception as exc:
+        print(f"sched_sync hook arm FAILED (async-scheduling force stays "
+              f"-- WATCH ENGINE-CONFIG): {exc}", file=sys.stderr, flush=True)
+        main_gate = False
     try:
         # V2 model runner first (the platform default on recent vLLM): the
         # speculator-path hook. Returns False only when the V2 runner module
