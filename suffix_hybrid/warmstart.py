@@ -143,8 +143,16 @@ async def warm_start(raw_request: _FastAPIRequest):
         return JSONResponse(status_code=400,
                             content={"error": "sequences must be a list "
                                               "of token-id lists"})
-    results = await engine.collective_rpc_async(
-        _probe_worker, args=(sequences,))
+    # vLLM v0.30.0: the EngineClient protocol method is `collective_rpc`
+    # (async_llm.py:1112 defines `async def collective_rpc`; protocol.py:246).
+    # The callable travels via serial_utils' enc_hook FunctionType branch
+    # (cloudpickle) re-imported in the worker by _execute_worker_rpc.
+    fn = getattr(engine, "collective_rpc_async", None) or getattr(engine, "collective_rpc", None)
+    if fn is None:
+        return JSONResponse(status_code=500,
+                            content={"error": "engine client exposes neither "
+                                              "collective_rpc_async nor collective_rpc"})
+    results = await fn(_probe_worker, args=(sequences,))
     # collective_rpc returns one result per rank; TP>1 broadcast mode mixes
     # on rank 0 only but every rank executes the RPC, so every rank has
     # submitted the same sequences to its own pod-local cache — the reply
