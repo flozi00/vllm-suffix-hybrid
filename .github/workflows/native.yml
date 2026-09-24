@@ -6,6 +6,15 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+env:
+  # K-GDN1 (cargo feature qwen-gdn-kernels): cuda-bindings needs only CUDA 13
+  # HEADERS at build time (driver API is dlopen'd at runtime) — taken from
+  # NVIDIA pip wheels, no toolkit install. `tileiras` (Tile IR -> cubin) is an
+  # offline compiler (no GPU, no driver), also from pip. Pods stay driver-only
+  # and never JIT: the cubins ship in the bundle (suffix_hybrid/qgdn_cubins/).
+  CUDA_WHEEL_VERSION: '13.4.92'
+  CURAND_WHEEL_VERSION: '10.4.4.72'
+  CUTILE_BYTECODE_VERSION: '13.2'
 jobs:
   linux:
     runs-on: ubuntu-22.04
@@ -14,19 +23,51 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: CUDA 13 headers + offline tileiras (pip wheels, no GPU)
+        run: |
+          python -m pip download --no-deps --only-binary=:all: \
+            --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 \
+            --platform manylinux_2_27_x86_64 --python-version 3.11 \
+            nvidia-cuda-runtime==$CUDA_WHEEL_VERSION nvidia-cuda-crt==$CUDA_WHEEL_VERSION \
+            nvidia-curand==$CURAND_WHEEL_VERSION nvidia-cuda-tileiras==$CUDA_WHEEL_VERSION \
+            nvidia-cuda-cuobjdump==$CUDA_WHEEL_VERSION -d .cuda13-whl
+          for w in .cuda13-whl/*.whl; do python -m zipfile -e "$w" .cuda13; done
+          test -f .cuda13/nvidia/cu13/include/cuda.h
+          chmod +x .cuda13/nvidia/cu13/bin/*
+          .cuda13/nvidia/cu13/bin/tileiras --version
+          echo "CUDA_TOOLKIT_PATH=$PWD/.cuda13/nvidia/cu13" >> "$GITHUB_ENV"
+          echo "CUTILE_TILEIRAS_PATH=$PWD/.cuda13/nvidia/cu13/bin/tileiras" >> "$GITHUB_ENV"
+      - name: Rust tests (default, qwen-gdn-kernels Tile IR lowering, K1 build)
+        run: |
+          sudo apt-get install -y libclang-dev
+          cargo test --release
+          cargo test --release --features qwen-gdn-kernels
+          cargo check --release --features cutile-kernels
       - uses: PyO3/maturin-action@v1
         with:
           target: x86_64
           manylinux: '2_28'
-          args: --release --locked --out dist
+          args: --release --locked --features qwen-gdn-kernels --out dist
+          before-script-linux: dnf install -y clang-devel || yum install -y clang-devel
+          docker-options: -e CUDA_TOOLKIT_PATH=${{ github.workspace }}/.cuda13/nvidia/cu13
       - name: Exercise installed Linux wheel
         run: |
           python -m pip install dist/*.whl numpy pytest
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          so=$(python -c "import suffix_hybrid._native as n; print(n.__file__)")
+          if readelf -d "$so" | grep -Ei 'NEEDED.*(libcuda|libcudart|libcurand)'; then exit 1; fi
+          python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA"
           cd "$RUNNER_TEMP"
           python -m pytest "$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/sm120/tests" -q --import-mode=importlib
+      - name: Prebuild K-GDN1 cubins for sm_120 (offline tileiras) + resource report
+        run: |
+          python scripts/qwen_gdn_prebuild.py --out qgdn_cubins
+          obj=$(find .cuda13 -name cuobjdump -type f | head -1); chmod +x "$obj"
+          for c in qgdn_cubins/*_act0_t1_s16.cubin qgdn_cubins/*_act0_t16_s16.cubin; do
+            "$obj" --dump-resource-usage "$c"
+          done
       - name: Create directly mountable runtime bundle
-        run: python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA"
+        run: python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA" --qgdn-cubins qgdn_cubins
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-linux-x86_64

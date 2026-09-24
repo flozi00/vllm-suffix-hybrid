@@ -118,10 +118,12 @@ def gdn_decode_fused_torch(mixed_qkv, z, ba, a_log, dt_bias, norm_w, state,
     return out
 
 
-def make_inputs(T, H, HV, K, slots, device="cpu", seed=0, idx=None):
+def make_inputs(T, H, HV, K, slots, device="cpu", seed=0, idx=None, page_pad=0):
     """Random K-GDN1 inputs at a given shape (bf16 activations, fp32 state).
     ``mixed_qkv``/``z`` are row-strided views into one packed qkvz buffer,
-    exactly like the in_proj_qkvz split the layer hands the kernel."""
+    exactly like the in_proj_qkvz split the layer hands the kernel. With
+    ``page_pad`` > 0 the state is an as_strided view with a padded per-slot
+    page stride, like vLLM's mamba cache (v1/worker/mamba_utils.py:354-357)."""
     import torch
 
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -137,6 +139,12 @@ def make_inputs(T, H, HV, K, slots, device="cpu", seed=0, idx=None):
     state_idx = torch.tensor(idx, dtype=torch.int32)
     tens = [qkvz, ba, a_log, dt_bias, norm_w, state, state_idx]
     qkvz, ba, a_log, dt_bias, norm_w, state, state_idx = [t.to(device) for t in tens]
+    if page_pad:
+        page = HV * K * K + page_pad
+        raw = torch.zeros(slots * page, dtype=state.dtype, device=state.device)
+        view = raw.as_strided((slots, HV, K, K), (page, K * K, K, 1))
+        view.copy_(state)
+        state = view
     mixed_qkv = qkvz[:, :qkv_w]
     z = qkvz[:, qkv_w:].view(T, HV, K)
     return dict(mixed_qkv=mixed_qkv, z=z, ba=ba, a_log=a_log, dt_bias=dt_bias,
@@ -156,7 +164,8 @@ def run_gpu_oracle(native, H, HV, K, act, norm_eps, row_stride=None):
     worst = {"out": 0.0, "state": 0.0}
     cases = [(1, [1]), (3, [2, 0, 5]), (16, None)]
     for T, idx in cases:
-        inp = make_inputs(T, H, HV, K, slots=24, device=dev, seed=T, idx=idx)
+        inp = make_inputs(T, H, HV, K, slots=24, device=dev, seed=T, idx=idx,
+                          page_pad=4096)
         if row_stride is not None and row_stride != inp["mixed_qkv"].stride(0):
             raise RuntimeError(
                 f"K-GDN1 oracle: layer row stride {row_stride} != oracle "
@@ -177,7 +186,7 @@ def run_gpu_oracle(native, H, HV, K, act, norm_eps, row_stride=None):
     # CUDA-graph capture/replay: the kernel must be capturable (no sync, no
     # alloc on the launch path) and replay must match an eager launch.
     T = 4
-    inp = make_inputs(T, H, HV, K, slots=24, device=dev, seed=99)
+    inp = make_inputs(T, H, HV, K, slots=24, device=dev, seed=99, page_pad=4096)
     s_eager = inp["state"].clone()
     out_eager = torch.empty(T, HV, K, dtype=torch.bfloat16, device=dev)
     out_graph = torch.empty_like(out_eager)
@@ -221,6 +230,83 @@ def _check(out, ref, state, ref_state, worst, tag):
             f"({int(bad_s.sum())} bad)")
     if not torch.isfinite(out).all():
         raise RuntimeError(f"K-GDN1 oracle FAIL ({tag}): non-finite output")
+
+
+# ---------------------------------------------------------------------------
+# bundle-prebuilt cubins (CI: scripts/qwen_gdn_prebuild.py; no JIT on pods)
+# ---------------------------------------------------------------------------
+CUBIN_DIR_ENV = "SUFFIX_QWEN_GDN_CUBINS"
+KERNEL_NAME = "gdn_decode_fused_k1"
+
+
+def cubin_dir() -> str:
+    return os.environ.get(CUBIN_DIR_ENV, "").strip() or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "qgdn_cubins")
+
+
+def load_manifest(directory=None) -> dict:
+    """Read + validate the bundle manifest (every cubin present, sha256
+    matches). Pins CUTILE_BYTECODE_VERSION to the CI value so this process
+    serializes byte-identical Tile IR. Any problem = RuntimeError."""
+    import hashlib
+    import json
+
+    directory = directory or cubin_dir()
+    path = os.path.join(directory, "manifest.json")
+    if not os.path.isfile(path):
+        raise RuntimeError(f"{GATE}=1 but no K-GDN1 cubin manifest at {path} "
+                           "(bundle not built by the CI prebuild step)")
+    with open(path) as f:
+        man = json.load(f)
+    if man.get("kernel") != KERNEL_NAME or not man.get("entries"):
+        raise RuntimeError(f"K-GDN1 manifest {path}: wrong kernel or no entries")
+    for e in man["entries"]:
+        fp = os.path.join(directory, e["file"])
+        if not os.path.isfile(fp):
+            raise RuntimeError(f"K-GDN1 manifest lists missing cubin {fp}")
+        with open(fp, "rb") as f:
+            e["_cubin"] = f.read()
+        if hashlib.sha256(e["_cubin"]).hexdigest() != e["sha256"]:
+            raise RuntimeError(f"K-GDN1 cubin sha256 mismatch: {fp}")
+    want = str(man["bytecode_version"])
+    have = os.environ.get("CUTILE_BYTECODE_VERSION")
+    if have and have != want:
+        raise RuntimeError(f"CUTILE_BYTECODE_VERSION={have} != manifest {want}")
+    os.environ["CUTILE_BYTECODE_VERSION"] = want
+    man["_dir"] = directory
+    return man
+
+
+def install_prebuilt(native, H, HV, K, act, device=None) -> int:
+    """Install every manifest cubin for (H, HV, K, act) into the in-process
+    JIT store; the Rust side rebuilds each variant's bytecode and refuses a
+    sha256 mismatch. Returns the count (0 = RuntimeError)."""
+    key = (H, HV, K, act)
+    done = _state.setdefault("installed", {})
+    if key in done:
+        return done[key]
+    import torch
+
+    man = load_manifest()
+    gpu = native.qwen_gdn_gpu_name(
+        torch.cuda.current_device() if device is None else device)
+    if gpu != man["arch"]:
+        raise RuntimeError(f"K-GDN1 cubins are for {man['arch']}, device is {gpu}")
+    n = 0
+    for e in man["entries"]:
+        if (e["h"], e["hv"], e["k"], e["act"]) != key:
+            continue
+        native.qwen_gdn_install_cubin(H, HV, K, act, e["t_div"], e["s_div"], gpu,
+                                      e["bc_sha256"], e["_cubin"])
+        n += 1
+    if n == 0:
+        raise RuntimeError(f"K-GDN1 manifest has no cubins for H={H} HV={HV} K={K} "
+                           f"act={act}")
+    done[key] = n
+    _log(f"K-GDN1 prebuilt: {n} cubins installed ({gpu}, tileiras "
+         f"{man['tileiras_version'].splitlines()[-1] if man['tileiras_version'] else '?'}, "
+         f"bytecode {man['bytecode_version']}); JIT disabled")
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +392,8 @@ def _make_layer_cls(native):
                                  f"K-GDN1 contract: {'; '.join(why)}")
             self._kgdn_act = ACT_CODES[self.norm.activation]
             self._kgdn_params = None
+            install_prebuilt(native, self.num_k_heads, self.num_v_heads,
+                             self.head_k_dim, self._kgdn_act)
             _state["active_layers"] += 1
             if _state["active_layers"] == 1:
                 _log(f"K-GDN1 ACTIVE: {LAYER_NAME} -> SuffixQwenGDN (first layer "
@@ -335,15 +423,13 @@ def _make_layer_cls(native):
                         self._kgdn_act, self.layer_norm_epsilon,
                         row_stride=mixed_qkvz.stride(0))
                     compiles, hits = native.qwen_gdn_jit_stats()
-                    if (os.environ.get("SUFFIX_QWEN_GDN_REQUIRE_PREBUILT", "").strip() == "1"
-                            and compiles):
+                    if compiles:
                         raise RuntimeError(
-                            f"K-GDN1: {compiles} tileiras JIT compile(s) on this pod "
-                            "with SUFFIX_QWEN_GDN_REQUIRE_PREBUILT=1 — the bundled "
-                            "cubin store did not cover the serving specialization")
+                            f"K-GDN1: {compiles} tileiras JIT compile(s) in this "
+                            "process — pods serve bundle-prebuilt cubins only")
                     _log(f"K-GDN1 oracle PASS max|d_out|={_state['oracle']['out']:.3e} "
                          f"max|d_state|={_state['oracle']['state']:.3e} (+graph replay) "
-                         f"jit backend_compiles={compiles} disk_hits={hits}")
+                         f"jit backend_compiles=0 disk_hits={hits}")
                 return super()._forward_core_fused_norm_packed(mixed_qkvz, ba,
                                                                core_attn_out)
             if not (md.spec_sequence_masks is None and md.num_prefills == 0
@@ -384,9 +470,7 @@ def register():
         return _state
     native = _native()
     cap = check_sm120()
-    store = os.environ.get("SUFFIX_QWEN_GDN_JIT_STORE", "").strip()
-    if store:
-        _log(f"K-GDN1 JIT store: {native.qwen_gdn_enable_jit_store(store)}")
+    load_manifest()  # fail closed now if the bundle lacks the cubins
     from vllm.model_executor.custom_op import PluggableLayer, op_registry_oot
     if LAYER_NAME not in op_registry_oot:
         PluggableLayer.register_oot(_make_layer_cls(native), name=LAYER_NAME)
@@ -413,6 +497,7 @@ def bench(Ts=(1, 4, 8, 16), layers=48, iters=50, H=16, HV=48, K=128, eps=1e-6):
 
     native = _native()
     check_sm120()
+    install_prebuilt(native, H, HV, K, 0)
     dev = torch.device("cuda", torch.cuda.current_device())
     res = {}
     for T in Ts:
@@ -474,7 +559,10 @@ def main(argv=None):
         native = _native()
         check_sm120()
         for act in (0, 1):
+            install_prebuilt(native, 16, 48, 128, act)
             w = run_gpu_oracle(native, 16, 48, 128, act, 1e-6)
+            if native.qwen_gdn_jit_stats()[0]:
+                raise RuntimeError("K-GDN1 oracle: tileiras JIT happened")
             _log(f"K-GDN1 oracle PASS act={act} max|d_out|={w['out']:.3e} "
                  f"max|d_state|={w['state']:.3e} (+graph replay)")
     else:

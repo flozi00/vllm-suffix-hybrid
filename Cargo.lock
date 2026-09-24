@@ -1127,6 +1127,7 @@ dependencies = [
  "cutile",
  "numpy",
  "pyo3",
+ "sha2",
 ]
 
 [[package]]

@@ -197,6 +197,93 @@ def test_entry_point_dist_info():
     assert callable(getattr(qwen_gdn, fn))
 
 
+def test_padded_page_state_matches_contiguous():
+    # vLLM's mamba state is an as_strided view with a padded page stride.
+    a = qwen_gdn.make_inputs(3, 2, 4, 16, 5, seed=4)
+    b = qwen_gdn.make_inputs(3, 2, 4, 16, 5, seed=4, page_pad=96)
+    assert b["state"].stride(0) == 4 * 16 * 16 + 96
+    torch.testing.assert_close(b["state"], a["state"], rtol=0, atol=0)
+    args = lambda i: (i["mixed_qkv"], i["z"], i["ba"], i["a_log"], i["dt_bias"],
+                      i["norm_w"], i["state"], i["state_idx"], 2, 0.25, 1e-6, 0)
+    torch.testing.assert_close(qwen_gdn.gdn_decode_fused_torch(*args(b)),
+                               qwen_gdn.gdn_decode_fused_torch(*args(a)))
+    torch.testing.assert_close(b["state"], a["state"])
+
+
+# ---------------------------------------------------------------------------
+# bundle-prebuilt cubins: manifest contract (fail closed, no JIT)
+# ---------------------------------------------------------------------------
+def _fake_bundle(tmp, corrupt=False, version="13.2"):
+    import hashlib
+    import json
+    cub = b"\x7fELF-fake-cubin"
+    (tmp / "a.cubin").write_bytes(cub)
+    man = {"kernel": "gdn_decode_fused_k1", "arch": "sm_120",
+           "tileiras_version": "Cuda compilation tools\nBuild 13.4",
+           "bytecode_version": version,
+           "entries": [{"file": "a.cubin", "h": 16, "hv": 48, "k": 128, "act": 0,
+                        "t_div": 1, "s_div": 16, "bc_sha256": "0" * 64,
+                        "sha256": hashlib.sha256(b"x" if corrupt else cub).hexdigest(),
+                        "bytes": len(cub)}]}
+    (tmp / "manifest.json").write_text(json.dumps(man))
+    return man
+
+
+def test_manifest_missing_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUFFIX_QWEN_GDN_CUBINS", str(tmp_path))
+    with pytest.raises(RuntimeError, match="no K-GDN1 cubin manifest"):
+        qwen_gdn.load_manifest()
+
+
+def test_manifest_sha_mismatch_fails_closed(tmp_path):
+    _fake_bundle(tmp_path, corrupt=True)
+    with pytest.raises(RuntimeError, match="sha256 mismatch"):
+        qwen_gdn.load_manifest(str(tmp_path))
+
+
+def test_manifest_pins_bytecode_version(tmp_path, monkeypatch):
+    _fake_bundle(tmp_path)
+    monkeypatch.delenv("CUTILE_BYTECODE_VERSION", raising=False)
+    man = qwen_gdn.load_manifest(str(tmp_path))
+    assert os.environ["CUTILE_BYTECODE_VERSION"] == "13.2"
+    assert man["entries"][0]["_cubin"].startswith(b"\x7fELF")
+    monkeypatch.setenv("CUTILE_BYTECODE_VERSION", "13.4")
+    with pytest.raises(RuntimeError, match="!= manifest"):
+        qwen_gdn.load_manifest(str(tmp_path))
+
+
+def test_runtime_bundle_ships_qgdn_cubins(tmp_path):
+    import importlib.util
+    import json
+    import zipfile
+    _fake_bundle(tmp_path)
+    spec = importlib.util.spec_from_file_location(
+        "rb_qgdn", ROOT / "scripts" / "runtime_bundle.py")
+    rb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rb)
+    wheel = tmp_path / "p.whl"
+    with zipfile.ZipFile(wheel, "w") as z:
+        z.writestr("suffix_hybrid/__init__.py", "")
+        z.writestr("suffix_hybrid/_native.abi3.so", b"x")
+    out = tmp_path / "runtime"
+    rb.bundle(wheel, out, "f" * 40, qgdn_cubins=tmp_path)
+    build = json.loads((out / "BUILD.json").read_text())["sha256"]
+    assert "suffix_hybrid/qgdn_cubins/manifest.json" in build
+    assert "suffix_hybrid/qgdn_cubins/a.cubin" in build
+    # the pod-side default location resolves to exactly this directory
+    assert (out / "suffix_hybrid" / "qgdn_cubins" / "a.cubin").is_file()
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    _fake_bundle(bad, corrupt=True)
+    with pytest.raises(ValueError, match="sha256 mismatch"):
+        rb.bundle(wheel, tmp_path / "r2", "f" * 40, qgdn_cubins=bad)
+
+
+def test_default_cubin_dir_is_next_to_native():
+    assert qwen_gdn.cubin_dir() == str(ROOT / "suffix_hybrid" / "qgdn_cubins") or \
+        os.environ.get("SUFFIX_QWEN_GDN_CUBINS")
+
+
 # ---------------------------------------------------------------------------
 # GPU: the real kernel (SM120 + qwen-gdn-kernels wheel only)
 # ---------------------------------------------------------------------------
@@ -206,5 +293,7 @@ def test_entry_point_dist_info():
 def test_gpu_kernel_oracle_and_graph_replay():
     qwen_gdn.check_sm120()
     for act in (0, 1):
+        qwen_gdn.install_prebuilt(_native, 16, 48, 128, act)  # bundle cubins
         worst = qwen_gdn.run_gpu_oracle(_native, 16, 48, 128, act, 1e-6)
         assert worst["out"] < 1.0
+    assert _native.qwen_gdn_jit_stats()[0] == 0  # no JIT, ever

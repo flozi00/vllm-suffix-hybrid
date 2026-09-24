@@ -34,13 +34,25 @@ pub use device::*;
 #[cfg(feature = "qwen-gdn-kernels")]
 mod device {
     use crate::qwen_gdn::{GdnDims, ACT_SIGMOID, ACT_SILU};
+    use cutile::compile_api::KernelCompiler;
     use cutile::cuda_core::{Device, Stream};
+    use cutile::cutile_compiler::cuda_tile_runtime_utils::{
+        get_gpu_name, run_tileiras, serialize_tile_ir_bytecode, tileiras_fingerprint,
+        TileirasOptions,
+    };
+    use cutile::cutile_compiler::jit_cache::{encode_entry, l2_key, EntryParams, JitStore};
+    use cutile::cutile_compiler::specialization::{
+        compute_spec, max_pow2_divisor, SpecializationBits,
+    };
     use cutile::half::bf16;
     use cutile::prelude::*;
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::types::PyAny;
-    use std::sync::{Arc, Mutex};
+    use pyo3::types::PyBytes;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     #[cutile::module]
     pub mod qwen_gdn_kernels {
@@ -315,7 +327,15 @@ mod device {
         need("dt_bias", &dt, "torch.float32", &[d.hv])?;
         need("norm_w", &nw, "torch.float32", &[d.v])?;
         need("state", &st, "torch.float32", &[d.slots, d.hv, d.v, d.k])?;
-        contiguous("state", &st)?;
+        // vLLM views the mamba state through as_strided with PADDED page
+        // strides (v1/worker/mamba_utils.py:354-357): only the per-slot block
+        // must be dense; stride[0] is the page stride.
+        if st.stride[1..] != [d.v * d.k, d.k, 1] || st.stride[0] < d.hv * d.v * d.k {
+            return Err(PyValueError::new_err(format!(
+                "state strides {:?}: per-slot [HV, V, K] block must be dense",
+                st.stride
+            )));
+        }
         need("state_idx", &si, "torch.int32", &[d.t])?;
         need("out", &oo, "torch.bfloat16", &[d.t, d.hv, d.v])?;
         contiguous("out", &oo)?;
@@ -377,6 +397,18 @@ mod device {
         act: i32,
         stream_ptr: usize,
     ) -> Result<(), String> {
+        let metas = [
+            Meta::of("out", oo),
+            Meta::of("mixed_qkv", mq),
+            Meta::of("z", zz),
+            Meta::of("ba", bb),
+            Meta::of("a_log", al),
+            Meta::of("dt_bias", dt),
+            Meta::of("norm_w", nw),
+            Meta::of("state", st),
+            Meta::of("state_idx", si),
+        ];
+        require_prebuilt(d, act, &metas)?;
         let device = device(mq.device)?;
         // SAFETY: stream_ptr is torch's live current stream on this device;
         // borrowed (never destroyed by us).
@@ -441,19 +473,331 @@ mod device {
         Ok(())
     }
 
-    /// Point cutile's JIT at a prebuilt cubin store (bundle-shipped) so a pod
-    /// never runs `tileiras`. Returns the store root.
-    #[pyfunction]
-    pub fn qwen_gdn_enable_jit_store(dir: String) -> PyResult<String> {
-        let store = cutile::jit_cache::FileSystemJitStore::new(&dir)
-            .map_err(|e| PyRuntimeError::new_err(format!("jit store {dir}: {e}")))?;
-        let root = store.root().display().to_string();
-        cutile::jit_cache::enable(Arc::new(store));
-        Ok(root)
+    // =====================================================================
+    // Prebuilt-cubin contract (no JIT on pods).
+    //
+    // cutile specializes a kernel on power-of-two divisibility (clamped to
+    // 16) of every tensor's shape, strides and base pointer
+    // (cutile-compiler specialization.rs:152) plus the stride-is-1 hints the
+    // generated launcher passes (cutile-macro kernel_launcher_generator.rs:
+    // 1782-1806). For K-GDN1 at a fixed model shape only two of those vary in
+    // serving: T (batch rows) and S (state slots). A variant is therefore
+    // (act, div(T), div(S)); CI prebuilds every variant for sm_120 with the
+    // offline `tileiras`, the pod rebuilds the (pure-Rust, GPU-free) Tile IR
+    // bytecode for each, checks its sha256 against the manifest, and serves
+    // the CI cubin from an in-memory JitStore under the pod's own L2 key.
+    // A launch whose specialization is not installed is refused BEFORE the
+    // cutile launcher could fall through to `tileiras`.
+    // =====================================================================
+    pub const DIVS: [i32; 5] = [1, 2, 4, 8, 16];
+
+    #[derive(Clone)]
+    pub struct Meta {
+        name: &'static str,
+        ptr: u64,
+        shape: Vec<i32>,
+        strides: Vec<i32>,
     }
 
-    /// (backend_compiles, disk_hits) since process start — the startup
-    /// assertion requires backend_compiles == 0 on pods (no tileiras there).
+    impl Meta {
+        fn of(name: &'static str, i: &TInfo) -> Self {
+            Meta {
+                name,
+                ptr: i.ptr,
+                shape: i32s(&i.shape),
+                strides: i32s(&i.stride),
+            }
+        }
+        fn new(name: &'static str, shape: &[usize], strides: &[usize]) -> Self {
+            // ptr 0 = maximally aligned (divisor 16), what torch allocations
+            // and the vLLM views K-GDN1 receives provide.
+            Meta {
+                name,
+                ptr: 0,
+                shape: i32s(shape),
+                strides: i32s(strides),
+            }
+        }
+    }
+
+    type Specs = (Vec<(String, Vec<i32>)>, Vec<(String, SpecializationBits)>);
+
+    /// Exactly what the generated launcher passes: stride hints (1 / -1) and
+    /// `compute_spec` of each tensor, in parameter order.
+    fn specs_of(metas: &[Meta]) -> Specs {
+        let strides = metas
+            .iter()
+            .map(|m| {
+                let h = m
+                    .strides
+                    .iter()
+                    .map(|s| if *s == 1 { 1 } else { -1 })
+                    .collect();
+                (m.name.to_string(), h)
+            })
+            .collect();
+        let specs = metas
+            .iter()
+            .map(|m| {
+                (
+                    m.name.to_string(),
+                    compute_spec(m.ptr, &m.shape, &m.strides, 0),
+                )
+            })
+            .collect();
+        (strides, specs)
+    }
+
+    /// The serving layout at representative T / S (their divisibility is all
+    /// that reaches the kernel key).
+    fn variant_metas(d: GdnDims) -> Vec<Meta> {
+        let GdnDims {
+            t, h, hv, k, slots, ..
+        } = d;
+        let row = 2 * h * k + 2 * hv * k; // in_proj_qkvz width: [q|k|v|z]
+        vec![
+            Meta::new("out", &[t, hv, k], &[hv * k, k, 1]),
+            Meta::new("mixed_qkv", &[t, 2 * h * k + hv * k], &[row, 1]),
+            Meta::new("z", &[t, hv, k], &[row, k, 1]),
+            Meta::new("ba", &[t, 2 * hv], &[2 * hv, 1]),
+            Meta::new("a_log", &[hv], &[1]),
+            Meta::new("dt_bias", &[hv], &[1]),
+            Meta::new("norm_w", &[k], &[1]),
+            Meta::new("state", &[slots, hv, k, k], &[hv * k * k, k * k, k, 1]),
+            Meta::new("state_idx", &[t], &[1]),
+        ]
+    }
+
+    fn div(x: usize) -> i32 {
+        max_pow2_divisor(x as i32)
+    }
+
+    fn variant_dims(
+        h: usize,
+        hv: usize,
+        k: usize,
+        t_div: i32,
+        s_div: i32,
+    ) -> Result<GdnDims, String> {
+        if !DIVS.contains(&t_div) || !DIVS.contains(&s_div) {
+            return Err(format!("variant divisors must be in {DIVS:?}"));
+        }
+        let d = GdnDims {
+            t: t_div as usize,
+            h,
+            hv,
+            k,
+            v: k,
+            slots: s_div as usize,
+        };
+        d.validate()?;
+        Ok(d)
+    }
+
+    /// Tile IR bytecode, its version, and this process's L2 JIT-cache key
+    /// (the one the cutile launcher will look up) for one variant. GPU-free.
+    fn variant_bytecode(
+        d: GdnDims,
+        act: i32,
+        gpu_name: &str,
+    ) -> Result<(Vec<u8>, String, String), String> {
+        let (strides, specs) = specs_of(&variant_metas(d));
+        let sref: Vec<(&str, &[i32])> = strides
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.as_slice()))
+            .collect();
+        let pref: Vec<(&str, SpecializationBits)> =
+            specs.iter().map(|(n, s)| (n.as_str(), s.clone())).collect();
+        let art = KernelCompiler::new(
+            qwen_gdn_kernels::__module_ast_self,
+            "qwen_gdn_kernels",
+            "gdn_decode_fused_k1",
+        )
+        .generics(vec![
+            d.h.to_string(),
+            d.hv.to_string(),
+            d.k.to_string(),
+            act.to_string(),
+        ])
+        .strides(&sref)
+        .spec_args(&pref)
+        .target(gpu_name)
+        .compile()
+        .map_err(|e| format!("K-GDN1 Tile IR compile: {e}"))?;
+        let (bc, ver) = serialize_tile_ir_bytecode(art.module())
+            .map_err(|e| format!("K-GDN1 bytecode: {e}"))?;
+        let key = l2_key(
+            &bc,
+            ver,
+            gpu_name,
+            &TileirasOptions::default(),
+            tileiras_fingerprint(),
+        );
+        Ok((bc, format!("{}.{}", ver.major, ver.minor), key))
+    }
+
+    fn sha256_hex(b: &[u8]) -> String {
+        Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect()
+    }
+
+    struct MemStore(Mutex<HashMap<String, Vec<u8>>>);
+
+    impl JitStore for MemStore {
+        fn get(&self, key: &str) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(key)
+                .cloned())
+        }
+        fn put(&self, key: &str, value: &[u8]) -> std::io::Result<()> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key.to_string(), value.to_vec());
+            Ok(())
+        }
+        fn delete(&self, key: &str) -> std::io::Result<()> {
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
+            Ok(())
+        }
+        fn clear(&self) -> std::io::Result<()> {
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            Ok(())
+        }
+    }
+
+    static STORE: OnceLock<Arc<MemStore>> = OnceLock::new();
+    /// Installed variants: (h, hv, k, act, t_div, s_div).
+    static INSTALLED: Mutex<Vec<(usize, usize, usize, i32, i32, i32)>> = Mutex::new(Vec::new());
+
+    fn require_prebuilt(d: GdnDims, act: i32, metas: &[Meta]) -> Result<(), String> {
+        let (td, sd) = (div(d.t), div(d.slots));
+        let want = (d.h, d.hv, d.k, act, td, sd);
+        if !INSTALLED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&want)
+        {
+            return Err(format!(
+                "no prebuilt K-GDN1 cubin for (H={}, HV={}, K={}, act={act}, div(T)={td}, \
+                 div(S)={sd}); pods never JIT — the bundle manifest must carry it",
+                d.h, d.hv, d.k
+            ));
+        }
+        let rep = variant_metas(GdnDims {
+            t: td as usize,
+            slots: sd as usize,
+            ..d
+        });
+        let (got, want) = (specs_of(metas), specs_of(&rep));
+        if format!("{got:?}") != format!("{want:?}") {
+            return Err(format!(
+                "K-GDN1 launch specialization differs from the prebuilt variant \
+                 (strides/alignment): got {got:?} want {want:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// CI + debugging: (bytecode, bytecode_version, sha256_hex) of a variant.
+    #[pyfunction]
+    pub fn qwen_gdn_variant_bytecode<'py>(
+        py: Python<'py>,
+        h: usize,
+        hv: usize,
+        k: usize,
+        act: i32,
+        t_div: i32,
+        s_div: i32,
+        gpu_name: &str,
+    ) -> PyResult<(Bound<'py, PyBytes>, String, String)> {
+        let d = variant_dims(h, hv, k, t_div, s_div).map_err(PyValueError::new_err)?;
+        let (bc, ver, _) = variant_bytecode(d, act, gpu_name).map_err(PyRuntimeError::new_err)?;
+        let sha = sha256_hex(&bc);
+        Ok((PyBytes::new(py, &bc), ver, sha))
+    }
+
+    /// CI only: bytecode -> cubin with the offline `tileiras` (no GPU).
+    #[pyfunction]
+    pub fn qwen_gdn_compile_cubin<'py>(
+        py: Python<'py>,
+        bytecode: &[u8],
+        gpu_name: &str,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let cubin = run_tileiras(bytecode, gpu_name, &TileirasOptions::default())
+            .map_err(|e| PyRuntimeError::new_err(format!("tileiras: {e}")))?;
+        Ok(PyBytes::new(py, &cubin))
+    }
+
+    /// `sm_XY` name cutile keys cubins by for this device.
+    #[pyfunction]
+    pub fn qwen_gdn_gpu_name(ordinal: usize) -> String {
+        get_gpu_name(ordinal)
+    }
+
+    /// Pod startup: rebuild the variant's bytecode, require its sha256 to
+    /// equal the manifest's, and serve `cubin` for it from the in-memory
+    /// JitStore under this process's own L2 key. Returns the key.
+    #[pyfunction]
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_gdn_install_cubin(
+        h: usize,
+        hv: usize,
+        k: usize,
+        act: i32,
+        t_div: i32,
+        s_div: i32,
+        gpu_name: &str,
+        bc_sha256: &str,
+        cubin: &[u8],
+    ) -> PyResult<String> {
+        let d = variant_dims(h, hv, k, t_div, s_div).map_err(PyValueError::new_err)?;
+        let (bc, _, key) = variant_bytecode(d, act, gpu_name).map_err(PyRuntimeError::new_err)?;
+        let digest: [u8; 32] = Sha256::digest(&bc).into();
+        let got = sha256_hex(&bc);
+        if got != bc_sha256 {
+            return Err(PyRuntimeError::new_err(format!(
+                "K-GDN1 manifest mismatch: pod bytecode sha256 {got} != bundle {bc_sha256} \
+                 (act={act}, div(T)={t_div}, div(S)={s_div}; check CUTILE_BYTECODE_VERSION)"
+            )));
+        }
+        if cubin.is_empty() {
+            return Err(PyValueError::new_err("empty cubin"));
+        }
+        let opts = TileirasOptions::default();
+        let fp = tileiras_fingerprint();
+        let params = EntryParams {
+            bc_sha256: digest,
+            gpu_name,
+            opt_level: opts.opt_level,
+            flags: opts.flags_byte(),
+            tileiras_fp: fp,
+        };
+        let entry = encode_entry(&params, cubin)
+            .ok_or_else(|| PyRuntimeError::new_err("cubin entry encode failed"))?;
+        let store = STORE.get_or_init(|| {
+            let s = Arc::new(MemStore(Mutex::new(HashMap::new())));
+            cutile::jit_cache::enable(s.clone());
+            s
+        });
+        store
+            .put(&key, &entry)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut inst = INSTALLED.lock().unwrap_or_else(|p| p.into_inner());
+        let v = (h, hv, k, act, t_div, s_div);
+        if !inst.contains(&v) {
+            inst.push(v);
+        }
+        Ok(key)
+    }
+
+    /// (backend_compiles, disk_hits) since process start. The K-GDN1 startup
+    /// assertion requires backend_compiles == 0 (no JIT on pods).
     #[pyfunction]
     pub fn qwen_gdn_jit_stats() -> (u64, u64) {
         (
@@ -464,59 +808,73 @@ mod device {
 
     #[cfg(test)]
     mod tests {
-        use super::qwen_gdn_kernels;
-        use cutile::compile_api::KernelCompiler;
+        use super::*;
 
-        /// Kernel -> Tile IR -> bytecode for sm_120 at the qwen3.8-27b shape
-        /// (H=16, HV=48, K=V=128, silu), with the pod's real strides
-        /// (in_proj_qkvz row = 2*16*128 + 2*48*128 = 16384). No GPU/driver.
-        #[test]
-        fn compiles_to_tile_ir_for_sm120() {
-            // Pin the bytecode version so serialization needs no `tileiras`
-            // probe (13.2 = the cuTile floor; the CI toolkit may override).
+        fn pin_bc() {
             if std::env::var_os("CUTILE_BYTECODE_VERSION").is_none() {
                 std::env::set_var("CUTILE_BYTECODE_VERSION", "13.2");
             }
-            for act in ["0", "1"] {
-                let artifacts = KernelCompiler::new(
-                    qwen_gdn_kernels::__module_ast_self,
-                    "qwen_gdn_kernels",
-                    "gdn_decode_fused_k1",
-                )
-                .generics(vec!["16".into(), "48".into(), "128".into(), act.into()])
-                .strides(&[
-                    ("out", &[48 * 128, 128, 1]),
-                    ("mixed_qkv", &[16384, 1]),
-                    ("z", &[16384, 128, 1]),
-                    ("ba", &[96, 1]),
-                    ("a_log", &[1]),
-                    ("dt_bias", &[1]),
-                    ("norm_w", &[1]),
-                    ("state", &[48 * 128 * 128, 128 * 128, 128, 1]),
-                    ("state_idx", &[1]),
-                ])
-                .target("sm_120")
-                .compile()
-                .expect("K-GDN1 must lower to Tile IR");
-                let ir = artifacts.ir_text();
-                assert!(ir.contains("reduce"), "expected reductions in IR");
-                assert!(
-                    ir.contains("store_view_tko"),
-                    "expected state/out stores in IR"
-                );
-                if let Some(dir) = std::env::var_os("QWEN_GDN_DUMP_IR") {
-                    let p = std::path::Path::new(&dir).join(format!("k_gdn1_act{act}.mlir"));
-                    std::fs::write(p, &ir).expect("dump IR");
-                }
-                let bc = artifacts.bytecode().expect("bytecode");
-                assert_eq!(&bc[..8], &[0x7F, b'T', b'i', b'l', b'e', b'I', b'R', 0x00]);
-                if let Some(dir) = std::env::var_os("QWEN_GDN_DUMP_IR") {
-                    // CI feeds this to `tileiras --gpu-name sm_120` + cuobjdump
-                    // resource usage (register/spill check, risk R2).
-                    let p = std::path::Path::new(&dir).join(format!("k_gdn1_act{act}.bc"));
-                    std::fs::write(p, &bc).expect("dump bytecode");
+        }
+
+        /// Every serving variant at the qwen3.8-27b shape (H=16, HV=48,
+        /// K=V=128) lowers to Tile IR bytecode for sm_120. No GPU/driver.
+        #[test]
+        fn all_variants_lower_to_tile_ir_for_sm120() {
+            pin_bc();
+            let mut shas = std::collections::HashSet::new();
+            for act in [ACT_SILU, ACT_SIGMOID] {
+                for t in DIVS {
+                    for s in [1, 16] {
+                        let d = variant_dims(16, 48, 128, t, s).unwrap();
+                        let (bc, ver, key) = variant_bytecode(d, act, "sm_120").unwrap();
+                        assert_eq!(key.len(), 64);
+                        assert_eq!(&bc[..8], &[0x7F, b'T', b'i', b'l', b'e', b'I', b'R', 0x00]);
+                        assert_eq!(ver, "13.2");
+                        shas.insert(sha256_hex(&bc));
+                        if let Some(dir) = std::env::var_os("QWEN_GDN_DUMP_IR") {
+                            let p = std::path::Path::new(&dir)
+                                .join(format!("k_gdn1_act{act}_t{t}_s{s}.bc"));
+                            std::fs::write(p, &bc).unwrap();
+                        }
+                    }
                 }
             }
+            // divisibility really reaches the key (else one variant would do)
+            assert!(shas.len() > 2, "variants collapsed: {}", shas.len());
+            // and compilation is deterministic
+            let d = variant_dims(16, 48, 128, 4, 8).unwrap();
+            assert_eq!(
+                variant_bytecode(d, 0, "sm_120").unwrap().0,
+                variant_bytecode(d, 0, "sm_120").unwrap().0
+            );
+        }
+
+        #[test]
+        fn launch_spec_check_matches_variants_and_refuses_the_rest() {
+            let d = GdnDims {
+                t: 12,
+                h: 16,
+                hv: 48,
+                k: 128,
+                v: 128,
+                slots: 40,
+            };
+            let mut metas = variant_metas(d);
+            // not installed yet -> refused
+            assert!(require_prebuilt(d, 0, &metas)
+                .unwrap_err()
+                .contains("no prebuilt"));
+            INSTALLED.lock().unwrap().push((16, 48, 128, 0, 4, 8));
+            // real sizes 12 / 40 have div 4 / 8 -> same specialization
+            require_prebuilt(d, 0, &metas).unwrap();
+            // a padded vLLM page stride (div 16) keeps the variant
+            metas[7].strides[0] = 48 * 128 * 128 + 16 * 1024;
+            require_prebuilt(d, 0, &metas).unwrap();
+            // a misaligned pointer is a different specialization -> refused
+            metas[2].ptr = 2;
+            assert!(require_prebuilt(d, 0, &metas)
+                .unwrap_err()
+                .contains("differs"));
         }
     }
 }

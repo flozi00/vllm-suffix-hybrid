@@ -9,7 +9,7 @@ name = "_native"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.29", features = ["abi3-py39", "extension-module"] }
+pyo3 = { version = "0.29", features = ["abi3-py39"] }
 numpy = "0.29"
 
 # K1 GPU twin (dossiers/kernel-k1-spike.md §5): cutile 0.3.1 exact per
@@ -18,6 +18,8 @@ numpy = "0.29"
 # cutile dependency at all.
 cutile = { version = "=0.3.1", optional = true }
 cuda-core = { version = "=0.3.1", optional = true }
+# K-GDN1 manifest check (already in the lock graph via cutile-compiler).
+sha2 = { version = "0.10", optional = true }
 
 [features]
 # K1 fused-verify GPU kernel lane. Requires a CUDA 13.x toolkit at build time
@@ -27,7 +29,7 @@ cutile-kernels = ["dep:cutile", "dep:cuda-core"]
 # K-GDN1 qwen3.8-27b fused GDN decode kernel (src/qwen_gdn_gpu.rs). Separate
 # from `cutile-kernels` so this lane builds/ships independently of K1.
 # Same toolkit rule: CUDA 13.x headers at build time (CI), driver-only pods.
-qwen-gdn-kernels = ["dep:cutile", "dep:cuda-core"]
+qwen-gdn-kernels = ["dep:cutile", "dep:cuda-core", "dep:sha2"]
 
 [profile.release]
 lto = "thin"

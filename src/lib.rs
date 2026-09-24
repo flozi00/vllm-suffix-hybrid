@@ -339,7 +339,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "qwen-gdn-kernels")]
     m.add_function(wrap_pyfunction!(qwen_gdn_gpu::gdn_decode_fused_cuda, m)?)?;
     #[cfg(feature = "qwen-gdn-kernels")]
-    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_enable_jit_store, m)?)?;
+    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_variant_bytecode, m)?)?;
+    #[cfg(feature = "qwen-gdn-kernels")]
+    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_compile_cubin, m)?)?;
+    #[cfg(feature = "qwen-gdn-kernels")]
+    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_gpu_name, m)?)?;
+    #[cfg(feature = "qwen-gdn-kernels")]
+    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_install_cubin, m)?)?;
     #[cfg(feature = "qwen-gdn-kernels")]
     m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_jit_stats, m)?)?;
     m.add("HAS_QWEN_GDN_CUDA", cfg!(feature = "qwen-gdn-kernels"))?;

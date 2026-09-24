@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 import zipfile
 
 
-def bundle(wheel, output, revision):
+def bundle(wheel, output, revision, qgdn_cubins=None):
     output = Path(output)
     hashes = {}
     with zipfile.ZipFile(wheel) as archive:
@@ -136,6 +136,27 @@ def bundle(wheel, output, revision):
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
             hashes[str(rel)] = hashlib.sha256(data).hexdigest()
+    # K-GDN1 prebuilt cubins (scripts/qwen_gdn_prebuild.py, CI-built with the
+    # offline tileiras): shipped next to the .so as suffix_hybrid/qgdn_cubins/
+    # and covered by BUILD.json. The pod never JITs; with SUFFIX_QWEN_GDN=1 a
+    # missing/mismatched manifest fails startup (suffix_hybrid.kernels.qwen_gdn).
+    if qgdn_cubins is not None:
+        src_dir = Path(qgdn_cubins)
+        man = json.loads((src_dir / 'manifest.json').read_text())
+        names = ['manifest.json'] + [e['file'] for e in man['entries']]
+        for name in names:
+            if '/' in name or '..' in name:
+                raise ValueError('unsafe qgdn cubin name')
+            data = (src_dir / name).read_bytes()
+            rel = PurePosixPath('suffix_hybrid', 'qgdn_cubins', name)
+            if name != 'manifest.json':
+                entry = next(e for e in man['entries'] if e['file'] == name)
+                if hashlib.sha256(data).hexdigest() != entry['sha256']:
+                    raise ValueError(f'qgdn cubin sha256 mismatch: {name}')
+            dest = output / PurePosixPath(*rel.parts)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            hashes[str(rel)] = hashlib.sha256(data).hexdigest()
     (output / 'BUILD.json').write_text(json.dumps({
         'source_revision': revision,
         'wheel': Path(wheel).name,
@@ -148,5 +169,7 @@ if __name__ == '__main__':
     parser.add_argument('--wheel', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--revision', required=True)
+    parser.add_argument('--qgdn-cubins', default=None,
+                        help='K-GDN1 prebuilt cubin dir (manifest.json + cubins)')
     args = parser.parse_args()
-    bundle(args.wheel, args.output, args.revision)
+    bundle(args.wheel, args.output, args.revision, args.qgdn_cubins)
