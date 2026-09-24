@@ -191,3 +191,57 @@ def test_clear_widths_retracts_all_published_widths():
     assert dict(p.widths_table)["b"] > 0
     p.clear_widths()
     assert dict(p.widths_table) == {"b": 0}  # a departed -> ingested, already gone
+
+
+def test_uniform_k_publishes_width_k_for_all_rows():
+    """Uniform-k pallet (wake #8 counter-arm): the engine compiles its
+    uniform-decode CUDA graph at k+1 queries; publishing width=k for
+    EVERY row (misses padded with -1 placeholders, exact same contract
+    as the scheduler's own pad_spec_decode) makes every step match that
+    graph instead of falling to the ragged path."""
+    p = V2SuffixProposer(4, 512, 1, True)
+    tokens = _buf(8, 512)
+    seq = list(range(100, 140))
+    tokens[0, :22] = np.array(seq[:22], dtype=np.int32)
+    packed, widths = p.propose_suffix_only(
+        ["a"], np.array([0], dtype=np.int64),
+        np.array([22], dtype=np.int64), tokens)
+    assert widths.tolist() == [4]           # uniform: even the COLD miss publishes k
+    assert (packed[0] == -1).all()          # padded with placeholders, not zeros
+    # b repeats a's prefix -> real hit of width k, REAL tokens, no padding
+    tokens[1, :10] = np.array(seq[:10], dtype=np.int32)
+    packed, widths = p.propose_suffix_only(
+        ["b"], np.array([1], dtype=np.int64),
+        np.array([10], dtype=np.int64), tokens)
+    assert widths.tolist() == [4]
+    assert packed[0].tolist() == seq[10:14]  # exact continuation, all 4 real
+    st = p.get_stats()
+    assert st["padded"] == 1               # exactly the one a-miss was padded
+    assert st["hits"] == 1 and st["hit_tokens"] == 4
+    assert st["uniform_k"] is True
+
+
+def test_uniform_k_partial_hit_pads_tail_only():
+    """Uniform-k pallet partial hit: the stored corpus ends 2 tokens
+    beyond the repeat point, so the true suffix is 2 < k=4 — the
+    published row is [real, real, -1, -1] and hit stats count only
+    the 2 REAL tokens, while `padded` counts every padded row."""
+    p = V2SuffixProposer(4, 512, 1, True)
+    tokens = _buf(8, 512)
+    seq = list(range(200, 240))
+    tokens[0, :12] = np.array(seq[:12], dtype=np.int32)
+    # call 1: a is fresh (cold cache) -> published width 4, all -1
+    p.propose_suffix_only(
+        ["a"], np.array([0], dtype=np.int64),
+        np.array([12], dtype=np.int64), tokens)
+    # call 2: a DEPARTS (ingests its 12 tokens); b repeats seq[:10]
+    # -> true continuation is seq[10:12] only (corpus ends), real_w=2
+    tokens[1, :10] = np.array(seq[:10], dtype=np.int32)
+    packed, widths = p.propose_suffix_only(
+        ["b"], np.array([1], dtype=np.int64),
+        np.array([10], dtype=np.int64), tokens)
+    assert widths.tolist() == [4]
+    assert packed[0].tolist() == seq[10:12] + [-1, -1]  # real, then pad
+    st = p.get_stats()
+    assert st["padded"] == 2      # the cold a-miss row + b's tail pad
+    assert st["hits"] == 1 and st["hit_tokens"] == 2  # true-width stats

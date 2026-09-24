@@ -271,9 +271,14 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     interval = int(os.environ.get("SUFFIX_HYBRID_LOG_INTERVAL", "0") or 0)
     min_len = max(int(os.environ.get(
         "SUFFIX_HYBRID_SUFFIX_MIN", "1") or 1), 1)
+    uniform_k = os.environ.get("SUFFIX_HYBRID_UNIFORM_K", "").strip() == "1"
     proposer = V2SuffixProposer(
         int(k), int(getattr(speculator, "max_model_len", 0) or 0) or 32768,
-        min_len)
+        min_len, uniform_k)
+    if uniform_k:
+        print(f"suffix_hybrid v2 suffix-only UNIFORM-K pallet k={k} "
+              f"(all rows width k, CUDA-graph matched)", file=sys.stderr,
+              flush=True)
     draft_tokens = speculator.draft_tokens          # [max_num_reqs, K] GPU
     req_states = runner.req_states
     totals_gpu = req_states.total_len.gpu

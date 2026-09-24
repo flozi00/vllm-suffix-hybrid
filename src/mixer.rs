@@ -736,17 +736,29 @@ pub struct V2SuffixProposer {
     k: usize,
     max_model_len: usize,
     min_len: usize,
+    /// Uniform CUDA-graph pallet mode: publish width=k for all rows
+    /// (miss rows padded with -1 placeholders), so every decode step
+    /// matches the compiled (k+1)-query uniform-decode CUDA graph.
+    uniform_k: bool,
     steps: u64,
     hits: u64,
     hit_tokens: u64,
     ingested: u64,
     resets: u64,
+    /// Rows published at width=k but padded with placeholders beyond
+    /// the real suffix (uniform mode misses) — the pallet overhead
+    /// meter (sum over steps of row counts, not tokens).
+    padded: u64,
     elapsed_ns: u64,
 }
 
 struct SuffixRowOut {
     tokens: Vec<i64>,
+    /// PUBLISHED width (what the scheduler schedules): true width in
+    /// ragged mode; k for every row in uniform mode (CUDA-graph pallet).
     width: usize,
+    /// TRUE matched-suffix length (stats + uniform padding split point).
+    real_w: usize,
 }
 
 impl V2SuffixProposer {
@@ -789,6 +801,7 @@ impl V2SuffixProposer {
         // 2) Per-row: continuity proof, incremental extend, cache lookup.
         let k = self.k;
         let min_len = self.min_len;
+        let mut padded_self: usize = 0;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let rid = &request_ids[i];
@@ -834,27 +847,40 @@ impl V2SuffixProposer {
             // last sampled token — the mirror is EXACT, no shift needed).
             let (suffix, _score, _matched) =
                 lock_cache(&self.cache.inner).speculate(&tokens_row, k);
-            let out_row = if !suffix.is_empty() && suffix.len() >= min_len {
+            let (tokens, real_w) = if !suffix.is_empty() && suffix.len() >= min_len {
                 let w = suffix.len().min(k);
-                SuffixRowOut {
-                    tokens: suffix[..w].to_vec(),
-                    width: w,
-                }
+                (suffix[..w].to_vec(), w)
             } else {
-                SuffixRowOut {
-                    tokens: vec![],
-                    width: 0,
-                }
+                (vec![], 0)
             };
-            if out_row.width > 0 {
+            // Uniform-k pallet (uniform_k mode): publish width=k for
+            // EVERY row — hit rows repeat a suffix already in `tokens`
+            // and miss rows pack -1 placeholders after the (possibly
+            // empty) real drafts. Greedy verification is self-correcting
+            // (rejected on mismatch, same contract as the scheduler's own
+            // pad_spec_decode), so correctness is identical to ragged;
+            // the win is that every step hits the compiled (k+1)-query
+            // uniform-decode CUDA graph instead of the ragged path.
+            let out_row = if self.uniform_k {
+                let mut t = tokens;
+                while t.len() < k {
+                    t.push(-1);
+                }
+                SuffixRowOut { tokens: t, width: k, real_w }
+            } else {
+                SuffixRowOut { tokens, width: real_w, real_w }
+            };
+            if out_row.real_w > 0 {
                 self.hits += 1;
-                self.hit_tokens += out_row.width as u64;
+                self.hit_tokens += out_row.real_w as u64;
             }
             self.mirror.insert(rid.clone(), tokens_row);
             self.widths.insert(rid.clone(), out_row.width);
+            padded_self += usize::from(self.uniform_k && out_row.real_w < out_row.width);
             out.push(out_row);
         }
         self.steps += 1;
+        self.padded = self.padded.saturating_add(padded_self as u64);
         Ok(out)
     }
 }
@@ -862,8 +888,13 @@ impl V2SuffixProposer {
 #[pymethods]
 impl V2SuffixProposer {
     #[new]
-    #[pyo3(signature = (num_speculative_tokens, max_model_len, min_len=1))]
-    fn new(num_speculative_tokens: usize, max_model_len: usize, min_len: usize) -> PyResult<Self> {
+    #[pyo3(signature = (num_speculative_tokens, max_model_len, min_len=1, uniform_k=false))]
+    fn new(
+        num_speculative_tokens: usize,
+        max_model_len: usize,
+        min_len: usize,
+        uniform_k: bool,
+    ) -> PyResult<Self> {
         if !(1..=64).contains(&num_speculative_tokens) || !(1..=16_777_216).contains(&max_model_len)
         {
             return Err(PyValueError::new_err(
@@ -877,11 +908,13 @@ impl V2SuffixProposer {
             k: num_speculative_tokens,
             max_model_len,
             min_len: min_len.max(1),
+            uniform_k,
             steps: 0,
             hits: 0,
             hit_tokens: 0,
             ingested: 0,
             resets: 0,
+            padded: 0,
             elapsed_ns: 0,
         })
     }
@@ -1004,6 +1037,8 @@ impl V2SuffixProposer {
         d.set_item("hit_tokens", self.hit_tokens)?;
         d.set_item("ingested", self.ingested)?;
         d.set_item("resets", self.resets)?;
+        d.set_item("padded", self.padded)?;
+        d.set_item("uniform_k", self.uniform_k)?;
         d.set_item("active", self.mirror.len())?;
         d.set_item("elapsed_ns", self.elapsed_ns)?;
         d.set_item("cache", self.cache.stats())?;
