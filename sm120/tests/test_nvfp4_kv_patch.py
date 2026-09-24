@@ -635,6 +635,8 @@ def test_nvfp4_route_forces_head_major_layout(monkeypatch):
     import types as _t
     new, applied = PATCH.patch_backend_source(BACKEND_FIXTURE.read_text())
     assert "nvfp4_head_major_layouts" in applied
+    # Must not depend on the vllm-config context (None when workers query it).
+    assert "capability.major == 10 or _use_fa2_for_nvfp4_kv_on_sm120()" in new
     assert "head-major KV cache layout" in new
     helper = new[new.index("def _use_fa2_for_nvfp4_kv_on_sm120"):
                  new.index("trtllm_workspace_buffer = None")]

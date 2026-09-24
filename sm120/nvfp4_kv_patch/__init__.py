@@ -78,7 +78,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-24.5"
+PATCH_REVISION = "2026-09-24.6"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -518,8 +518,12 @@ _BACKEND_EDITS = [
     (
         "nvfp4_head_major_layouts",
         """        if capability is not None and capability.major == 10:""",
+        # Keyed on the route gate alone: workers query layouts OUTSIDE the
+        # vllm-config context, so a cache-dtype check reads None there (gemma
+        # nvfp4 boot 20:07Z still resolved LBNHC). Head-major is valid for
+        # every FlashInfer dtype (stock forces it on SM100 for all dtypes).
         """        if capability is not None and (
-            capability.major == 10 or _nvfp4_kv_cache_selected()
+            capability.major == 10 or _use_fa2_for_nvfp4_kv_on_sm120()
         ):""",
         1,
     ),
