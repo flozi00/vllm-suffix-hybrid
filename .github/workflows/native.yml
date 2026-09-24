@@ -54,10 +54,12 @@ jobs:
         run: |
           python -m pip install dist/*.whl numpy pytest
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Leave the checkout first: its source suffix_hybrid/ (no built .so)
+          # would shadow the installed wheel.
+          cd "$RUNNER_TEMP"
           so=$(python -c "import suffix_hybrid._native as n; print(n.__file__)")
           if readelf -d "$so" | grep -Ei 'NEEDED.*(libcuda|libcudart|libcurand)'; then exit 1; fi
           python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA"
-          cd "$RUNNER_TEMP"
           python -m pytest "$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/sm120/tests" -q --import-mode=importlib
       - name: Prebuild K-GDN1 cubins for sm_120 (offline tileiras) + resource report
         run: |
