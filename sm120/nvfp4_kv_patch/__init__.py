@@ -644,8 +644,18 @@ def apply(module=None, *, force: bool = False) -> bool:
 class _PostImportFinder:
     """sys.meta_path hook: run apply() on the freshly-loaded backend module.
 
-    Appended to the END of sys.meta_path so the regular machinery owns the
-    load; we only wrap the resulting spec's loader with a post-exec step."""
+    MUST live at the FRONT of sys.meta_path. The import machinery stops at
+    the FIRST finder that returns a spec; the stock finders
+    (BuiltinImporter / FrozenImporter / PathFinder) answer any regular
+    site-packages import before a finder APPENDED at the end is ever
+    consulted. Appending was the qwen-nvfp4kv-dev crash-1 root cause
+    (2026-09-24): the hook armed loudly, PathFinder answered first, the
+    wrapping loader was never used, apply() never ran, and stock
+    validate_configuration rejected nvfp4. Front-insertion + spec-return
+    keeps the machinery executing the real loader exactly ONCE through our
+    wrapper (the sched_sync v3 loader-wrap lesson: never import the target
+    yourself and never return a spec for a different execution).
+    """
 
     def __init__(self, target: str, callback):
         self.target = target
@@ -655,9 +665,9 @@ class _PostImportFinder:
     def find_spec(self, fullname, path=None, target=None):
         if not self.armed or fullname != self.target or fullname in sys.modules:
             return None
-        # Find the spec the rest of the machinery would produce, then wrap
-        # its loader. We must NOT return None yet (that skips our hook), and
-        # must not recurse into ourselves (armed flag guards that).
+        # Step aside FIRST: importlib.util.find_spec itself walks
+        # sys.meta_path and would hit this finder again (armed flag guards
+        # the same, but stepping aside is belt and braces).
         self.armed = False
         try:
             spec = importlib.util.find_spec(fullname)
@@ -668,19 +678,25 @@ class _PostImportFinder:
             self.armed = True
             return None
         real_loader = spec.loader
+        finder = self
 
         class _WrappingLoader:
             def create_module(inner, spec_):
                 return real_loader.create_module(spec_)
 
             def exec_module(inner, module):
-                real_loader.exec_module(module)
                 try:
+                    real_loader.exec_module(module)
                     self.callback(module)
                 finally:
-                    if fullname in sys.modules:
-                        sys.modules.pop(fullname, None)
-                        sys.modules[fullname] = module
+                    # One-shot: the target loads at most once per process.
+                    # (Do NOT touch sys.modules here: the machinery already
+                    # registered the module before exec_module and removes
+                    # it itself if exec_module raises — re-inserting in a
+                    # finally would resurrect a half-loaded module.)
+                    sys.meta_path[:] = [
+                        f for f in sys.meta_path if f is not finder
+                    ]
 
             def __getattr__(inner, name):
                 return getattr(real_loader, name)
@@ -692,21 +708,37 @@ class _PostImportFinder:
 def install_post_import_hook() -> bool:
     """sitecustomize entry: arm the deferred patch. Stdlib-only, cheap.
 
-    Returns True if the hook is now installed (gate on). If the backend
-    module happens to be imported already, patch it immediately."""
+    Returns True if the hook is now installed (gate on). With the gate ON,
+    this must never arm-and-silently-idle: if the backend module was already
+    imported we patch it immediately; if the callback ever declines (gate
+    off / not SM120) the finder removes itself after firing so a later
+    re-activation cannot be missed silently."""
     if not gate_enabled():
         return False
+    if any(isinstance(finder, _PostImportFinder)
+           and getattr(finder, "target", None) == TARGET_MODULE
+           and finder.armed
+           for finder in sys.meta_path):
+        return True
     mod = sys.modules.get(TARGET_MODULE)
     if mod is not None:
-        apply(mod)
+        # Late arm (module imported before sitecustomize ran, e.g. a
+        # worker that inherited an already-warm import state): patch NOW —
+        # loudly, fail-closed via _hook_callback.
+        print(
+            f"[suffix {PATCH_NAME}] target already imported at arm time; "
+            "applying patch immediately.",
+            file=sys.stderr, flush=True,
+        )
+        _hook_callback(mod)
         return True
-    for finder in sys.meta_path:
-        if isinstance(finder, _PostImportFinder) and finder.target == TARGET_MODULE:
-            return True
-    sys.meta_path.append(_PostImportFinder(TARGET_MODULE, _hook_callback))
+    # FRONT insertion is the fix for crash-1: an appended finder is never
+    # consulted because PathFinder answers the import first.
+    sys.meta_path.insert(0, _PostImportFinder(TARGET_MODULE, _hook_callback))
     print(
-        f"[suffix {PATCH_NAME}] armed: will patch {TARGET_MODULE} on first "
-        "import (SM120 check + fail-closed happen at that point).",
+        f"[suffix {PATCH_NAME}] armed at sys.meta_path[0]: will patch "
+        f"{TARGET_MODULE} on first import (SM120 check + fail-closed "
+        "happen at that point).",
         file=sys.stderr, flush=True,
     )
     return True
@@ -714,7 +746,7 @@ def install_post_import_hook() -> bool:
 
 def _hook_callback(module) -> None:
     try:
-        apply(module)
+        applied = apply(module)
     except Exception as exc:
         # Fail closed: the operator explicitly enabled NVFP4 KV on (presumed)
         # SM120. SystemExit survives the import machinery and site.py's
@@ -722,3 +754,21 @@ def _hook_callback(module) -> None:
         raise SystemExit(
             f"[suffix {PATCH_NAME}] enabled but installation FAILED: {exc}"
         ) from exc
+    if not applied and is_sm120():
+        # apply() cleanly declined (gate off / not SM120) — but we only armed
+        # because the gate was on, and the platform probe says SM120. That
+        # combination means the gate flipped off between arm and import, or
+        # the capability probe is lying: both are armed-but-inert states and
+        # must be loud (fail-closed doctrine), never silent.
+        raise SystemExit(
+            f"[suffix {PATCH_NAME}] hook fired but apply() declined while "
+            f"the gate is on and the platform reports SM120 — refusing to "
+            "serve unpatched (armed-but-inert guard)."
+        )
+    if not applied:
+        print(
+            f"[suffix {PATCH_NAME}] hook fired; apply() inert (gate off at "
+            "import time or non-SM120 host) — NOT patched, stock FlashInfer "
+            "backend in use.",
+            file=sys.stderr, flush=True,
+        )

@@ -476,6 +476,35 @@ def test_sitecustomize_arms_hook_only_when_gated(tmp_path):
     assert "armed" in on.stderr.lower()     # and announced
 
 
+def test_hook_fires_on_real_import(tmp_path):
+    # Regression (qwen-nvfp4kv-dev crash 2026-09-24): the finder was appended
+    # to sys.meta_path, PathFinder won, apply() never ran -> armed-but-inert.
+    # Import a stand-in backend module through the real sitecustomize and
+    # prove apply() executed (it logs "present but inert" off-SM120).
+    bundle = tmp_path / "plugins"
+    (bundle / "nvfp4_kv_patch").mkdir(parents=True)
+    (bundle / "nvfp4_kv_patch" / "__init__.py").write_bytes(
+        (REPO / "sm120" / "nvfp4_kv_patch" / "__init__.py").read_bytes())
+    (bundle / "sitecustomize.py").write_bytes(
+        (REPO / "sitecustomize.py").read_bytes())
+    fake = tmp_path / "fakevllm"
+    pkg = fake / "vllm" / "v1" / "attention" / "backends"
+    pkg.mkdir(parents=True)
+    for d in (fake / "vllm", fake / "vllm" / "v1",
+              fake / "vllm" / "v1" / "attention", pkg):
+        (d / "__init__.py").write_text("")
+    (pkg / "flashinfer.py").write_text("LOADED = True\n")
+    probe = ("import vllm.v1.attention.backends.flashinfer as m;"
+             "print('LOADED', m.LOADED)")
+    env = dict(os.environ, SUFFIX_SM120_NVP4KV="1",
+               PYTHONPATH=os.pathsep.join([str(bundle), str(fake)]))
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                          text=True, env=env, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert "LOADED True" in proc.stdout
+    assert "present but inert" in proc.stderr, proc.stderr  # apply() ran
+
+
 # ---------------------------------------------------------------------------
 # Bundle builder integration lives in scripts/test_runtime_bundle.py; pin the
 # import-name contract here too (sitecustomize imports it top-level).
