@@ -69,7 +69,8 @@ def _case(rng, d, hq, hkv, page, q_len, kv_lens, nan_tail=False):
                     flat = sf[last].reshape(hkv, -1)
                     flat[:, g4 * (d // 16):] = 0x7F
             cache.v_data[last, :, n % page:] = 0xFF
-    q = rng.standard_normal((len(kv_lens) * q_len, hq, d))
+    # bf16 queries, as served (and as the on-silicon oracle feeds them)
+    q = ref.bf16(rng.standard_normal((len(kv_lens) * q_len, hq, d)))
     return cache, bt, np.array(kv_lens), q
 
 
@@ -105,8 +106,10 @@ def test_twin_matches_reference(name, d, hq, hkv, page, q_len, kv_lens, wl,
     want = ref.reference(q, cache, bt, sl, q_len, sm, 0.5, 2.0, wl)
     got = ref.kernel_twin(q, cache, bt, sl, q_len, sm, plan, 0.5, 2.0, wl)
     assert np.isfinite(got).all()
-    assert _cos(got, want) >= 0.9995, (name, _cos(got, want))
-    assert _rel(got, want) <= 2e-2, (name, _rel(got, want))
+    # FA2-class: on-silicon FA2 measured cos >= 0.99999, rel 0.0025-0.0055
+    # (mtrace/gemma-spec-dev-nvfp4-oracle-4d650e38.log); oracle gate 2e-2.
+    assert _cos(got, want) >= 0.99995, (name, _cos(got, want))
+    assert _rel(got, want) <= 8e-3, (name, _rel(got, want))
 
 
 def test_padded_rows_are_zero_and_split_invariant():
