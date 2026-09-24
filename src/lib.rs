@@ -307,6 +307,8 @@ impl SuffixCache {
 mod engine;
 mod mixer;
 mod verify_fusion;
+#[cfg(feature = "cutile-kernels")]
+mod verify_fusion_gpu;
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -316,6 +318,15 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mixer::V2SuffixProposer>()?;
     m.add_function(wrap_pyfunction!(
         verify_fusion::rejection_greedy_accept,
+        m
+    )?)?;
+    // K1 GPU twin: present only in feature-on (CI CUDA-toolkitted) builds.
+    // Its ABSENCE is part of the startup kernel-path assertion: a pod that
+    // needs the fused path and finds this import missing must fail loud,
+    // never silently use a fallback verify path.
+    #[cfg(feature = "cutile-kernels")]
+    m.add_function(wrap_pyfunction!(
+        verify_fusion_gpu::rejection_greedy_accept_cuda,
         m
     )?)?;
     m.add("VERSION", "0.2.0-rust-v1")?;

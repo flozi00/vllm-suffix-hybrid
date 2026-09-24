@@ -12,6 +12,19 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = { version = "0.29", features = ["abi3-py39", "extension-module"] }
 numpy = "0.29"
 
+# K1 GPU twin (dossiers/kernel-k1-spike.md §5): cutile 0.3.1 exact per
+# mistral.rs precedent; CUDA-toolkitted CI builds with
+# `--features cutile-kernels`. Non-default: the feature-off wheel carries no
+# cutile dependency at all.
+cutile = { version = "=0.3.1", optional = true }
+cuda-core = { version = "=0.3.1", optional = true }
+
+[features]
+# K1 fused-verify GPU kernel lane. Requires a CUDA 13.x toolkit at build time
+# (cuda-bindings runs bindgen against cuda.h) — CI-only, never built on the
+# Mac dev box.
+cutile-kernels = ["dep:cutile", "dep:cuda-core"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
