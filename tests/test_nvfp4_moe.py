@@ -42,7 +42,7 @@ def test_route_twin_is_deterministic_and_sorted():
     assert pl == [1, 2, 0, 4, 3]  # pairs ascending within each expert
 
 
-def kernel_twin(p, x, ids, tw):
+def kernel_twin(p, x, ids, tw, base=0):
     """Replays kernels-oxide/nvfp4_moe from FLAT buffers with the kernel's
     own offsets: route slots, aq/asf row-major at token = pair / topk, expert
     bases e*2I*H/2 and e*r128(2I)*r4(H/16), up row j / gate row I+j,
@@ -51,7 +51,7 @@ def kernel_twin(p, x, ids, tw):
     e_count, two_i, kh1 = p["w13"].shape
     hdim, idim = kh1 * 2, two_i // 2
     m, topk = ids.shape
-    se, so, sc, pl = nm.route_twin(ids, e_count)
+    se, so, sc, pl = nm.route_twin(ids, e_count, base)
     f8 = lambda b: torch.from_numpy(np.asarray(b, np.uint8)).view(torch.float8_e4m3fn).float()
 
     def gemm_rows(aq, asf, a_rows, k, w, w_sf, e, rows_out, n_rows_total):
@@ -81,7 +81,7 @@ def kernel_twin(p, x, ids, tw):
                              list(range(idim, two_i)), two_i)
             a = p["g1"][e]
             inter[pairs] = nm.act_ref(a * gate, p["act"]) * (a * up)
-    valid = [(0 <= int(v) < e_count) for v in ids.reshape(-1)]
+    valid = [(0 <= int(v) - base < e_count) for v in ids.reshape(-1)]
     hq, hsf = nm.quant_codes(torch.nan_to_num(inter), p["a2g"])
     y = torch.full((m * topk, hdim), float("nan"))
     for s, e in enumerate(se):
@@ -124,6 +124,55 @@ def test_invalid_expert_ids_are_skipped():
     torch.testing.assert_close(ref, only)  # id -1 contributes nothing
 
 
+def test_ep_twin_global_ids_match_local_reference_and_zero_offrank_tokens():
+    """EP rank 2 of 4 (16 global experts, 4 local, id_base 8): the kernel twin
+    fed GLOBAL ids == reference on to_local ids; rows routed only off-rank
+    (t % 3 == 1) are exactly zero; an all-off-rank batch is all zero."""
+    local, e_global, base = 4, 16, 8
+    p = nm.make_problem(local, 128, 64, "silu", seed=5)
+    ids, tw = nm.rand_routing(7, e_global, 3, "cpu", seed=2, base=base, local=local)
+    lid = nm.to_local(ids, base, local)
+    assert (lid[1::3] < 0).all() and (lid >= 0).any()
+    assert (ids[lid >= 0] - base == lid[lid >= 0]).all()
+    x = torch.randn(7, 128).bfloat16()
+    ref = nm.moe_ref(p, x, lid, tw)
+    twin = kernel_twin(p, x, ids, tw, base)
+    torch.testing.assert_close(twin, ref, rtol=1e-4, atol=1e-4)
+    dead = (lid < 0).all(1)
+    assert dead.any() and (twin[dead] == 0).all() and (ref[dead] == 0).all()
+    ids, tw = nm.rand_routing(5, e_global, 3, "cpu", seed=3, base=base, local=local, dead=True)
+    assert (nm.to_local(ids, base, local) < 0).all()
+    assert (kernel_twin(p, x[:5], ids, tw, base) == 0).all()
+    assert nm.route_twin(ids, local, base)[0] == [-1] * local
+
+
+def test_ep_base_accepts_only_flashinfers_linear_map():
+    lin = [-1] * 8 + [0, 1, 2, 3] + [-1] * 4  # rank 2 of 4, 16 experts
+    assert nm.ep_base(lin, 2, 4, 16, 4) == 8
+    assert nm.ep_base(None, 0, 1, 16, 16) == 0
+    assert nm.ep_base(lin, 1, 4, 16, 4) is None  # map / rank mismatch
+    rr = [(g // 4 if g % 4 == 2 else -1) for g in range(16)]  # round_robin
+    assert nm.ep_base(rr, 2, 4, 16, 4) is None
+    assert nm.ep_base(None, 0, 4, 16, 4) is None  # EP without a map
+    glm = [g - 160 if 160 <= g < 192 else -1 for g in range(256)]
+    assert nm.ep_base(glm, 5, 8, 256, 32) == 160
+
+
+def test_judge_enforces_offrank_zero_contract():
+    ref = torch.randn(3, 8)
+    lid = torch.tensor([[0, 1], [-1, -1], [2, -1]])
+    ref[1] = 0
+    ok, _ = nm.judge(ref.clone(), ref.clone(), ref, lid)
+    assert ok
+    bad = ref.clone()
+    bad[1, 0] = 1e-6  # off-rank token not exactly zero (ours)
+    assert not nm.judge(bad, ref.clone(), ref, lid)[0]
+    assert not nm.judge(ref.clone(), bad, ref, lid)[0]  # stock broke the contract
+    fi_nan = ref.clone()
+    fi_nan[1] = float("nan")  # FlashInfer never wrote the row
+    assert not nm.judge(ref.clone(), fi_nan, ref, lid)[0]
+
+
 def test_reference_approximates_dense_bf16_moe():
     """Quantized reference vs the unquantized expert math (catches layout
     mistakes such as swapped up/gate halves or a wrong alpha)."""
@@ -155,8 +204,11 @@ def test_oracle_gate_is_relative_to_flashinfer():
 
 GOOD = dict(quant_dtype="nvfp4", backend="FLASHINFER_CUTLASS", scale_swizzled=True,
             act="gelu_tanh", clamp_limit=None, swiglu_alpha=None,
-            router_weight_on_input=False, bias=False, tp=1, ep=1, dp=1,
-            expert_map=False, E=128, H=2816, I=704, sf_exact=True, gscale_shared=True)
+            router_weight_on_input=False, bias=False, tp=1, ep=1, dp=1, all2all=False,
+            eplb=False, mk_shared_overlap=False, expert_map=False, ep_base=0,
+            E=128, H=2816, I=704, sf_exact=True, gscale_shared=True)
+GLM_EP = dict(GOOD, act="silu", ep=8, expert_map=True, ep_base=160, E=32, H=6144, I=2048)
+GLM_TP8 = dict(GOOD, act="silu", tp=8, E=256, H=6144, I=256)
 
 
 @pytest.mark.parametrize("change,needle", [
@@ -167,8 +219,14 @@ GOOD = dict(quant_dtype="nvfp4", backend="FLASHINFER_CUTLASS", scale_swizzled=Tr
     ({"act": "swigluoai"}, "activation"),
     ({"clamp_limit": 7.0}, "clamp"),
     ({"router_weight_on_input": True}, "router_weight"),
-    ({"tp": 2}, "single GPU"),
-    ({"expert_map": True}, "expert_map"),
+    ({"tp": 2}, None),  # TP-sharded intermediate: partial sums, vLLM all-reduces
+    ({"dp": 2}, "DP/all2all"),
+    ({"all2all": True}, "DP/all2all"),
+    ({"eplb": True}, "EPLB"),
+    ({"mk_shared_overlap": True}, "shared experts"),
+    ({"tp": 2, "ep": 2, "expert_map": True, "ep_base": 0}, "not both"),
+    ({"expert_map": True, "ep_base": None}, "linear"),
+    ({"ep": 8, "ep_base": None}, "linear"),
     ({"I": 720}, "shape"),
     ({"E": 512}, "shape"),
     ({"sf_exact": False}, "swizzled layout"),
@@ -176,6 +234,20 @@ GOOD = dict(quant_dtype="nvfp4", backend="FLASHINFER_CUTLASS", scale_swizzled=Tr
 ])
 def test_eligibility(change, needle):
     why = nm.eligibility({**GOOD, **change})
+    assert (why is None) if needle is None else (needle in why)
+
+
+@pytest.mark.parametrize("change,needle", [
+    ({}, None),
+    ({"ep_base": None, "expert_map": True}, "linear"),  # round_robin placement
+    ({"eplb": True}, "EPLB"),
+    ({"I": 2048 // 3}, "shape"),
+    # GLM MTP draft layer: experts in the modelopt ignore list -> bf16
+    ({"quant_dtype": None}, "not NVFP4"),
+])
+@pytest.mark.parametrize("glm", [GLM_EP, GLM_TP8])
+def test_eligibility_glm(glm, change, needle):
+    why = nm.eligibility({**glm, **change})
     assert (why is None) if needle is None else (needle in why)
 
 
@@ -198,7 +270,7 @@ def test_workspace_sizes_and_growth():
 def test_max_m_knob(monkeypatch):
     monkeypatch.delenv(nm.MAX_M_ENV, raising=False)
     assert nm.max_m() == 32
-    monkeypatch.setenv(nm.MAX_M_ENV, "65")
+    monkeypatch.setenv(nm.MAX_M_ENV, "257")
     with pytest.raises(ValueError):
         nm.max_m()
 

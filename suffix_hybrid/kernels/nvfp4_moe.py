@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """NVFP4 routed-experts decode kernel (gemma-4-26b-a4b-nvfp4: 30 layers x 128
-experts, top-8, hidden 2816, expert intermediate 704) — reference, vLLM
-wiring, on-silicon oracle + bench.
+experts, top-8, hidden 2816, expert intermediate 704; GLM-5.3-NVFP4: 256
+experts, top-8, hidden 6144, intermediate 2048, TP=8 + expert parallel ->
+32 local experts per rank) — reference, vLLM wiring, on-silicon oracle + bench.
 
 Kernel: kernels-oxide/nvfp4_moe (cuda-oxide -> PTX .target sm_120a -> ptxas
 13.0 SASS, block-scaled mxf4nvf4 m16n8k64 mma). Host op
 ``_native.nvfp4_moe_cuda`` launches, on torch's stream, with grids that are a
 function of M only (CUDA-graph safe, no host sync):
-  route    one CTA: active experts ascending, pairs (p = token*topk + k)
-           ascending per expert -> deterministic
+  route    one CTA: local id = topk_id - id_base (EP), active local experts
+           ascending, pairs (p = token*topk + k) ascending per expert ->
+           deterministic; pairs routed to other ranks' experts are skipped
   quant x  vLLM scaled_fp4_quant math with the layer's a1 gscale
   fc1      one CTA per (expert slot, 32 intermediate cols) over only that
            expert's routed rows (16-row mma chunks):
@@ -16,7 +18,22 @@ function of M only (CUDA-graph safe, no host sync):
            (w13 rows [0, I) = up (w3), [I, 2I) = gate (w1): vLLM's FI layout)
   quant h  a2 gscale
   fc2      y[p, :] = g2[e] * (h_p @ w2[e]^T) * topk_w[p]
-  combine  out[t] = sum_k y[t*topk + k] in ascending k (fixed order)
+  combine  out[t] = sum_k y[t*topk + k] in ascending k (fixed order) over
+           local experts only; a token with no local expert gets exactly 0
+
+Parallel contract (= vLLM's stock FLASHINFER_CUTLASS path, vLLM 0.30):
+  EP (TP=N + --enable-expert-parallel, DP=1): moe tp=1, ep=N, linear
+  expert_map (global g -> g - ep_rank*E_local on this rank, else -1);
+  topk_ids reach forward_modular as GLOBAL ids and FlashInfer only computes
+  experts in [ep_rank*E_local, +E_local) (flashinfer_cutlass_moe.py passes
+  ep_size/ep_rank, not expert_map), contributing 0 for the rest. The
+  partial output is all-reduced by MoERunner._maybe_reduce_final_output
+  (no_dp_ep finalize: output_is_reduced() False), then routed_scaling_factor.
+  We take id_base = ep_rank*E_local and require expert_map to be exactly
+  that linear map (else: stock, with the reason).
+  TP-sharded (no EP): weights hold I/tp columns; per-rank partial output,
+  same all-reduce -> the kernel just runs at I = I/tp.
+  DP/all2all, EPLB, MK-overlapped shared experts: stock (fail closed).
 
 Serving (gate ``SUFFIX_NVFP4_MOE=1``, default OFF; entry point
 ``suffix_nvfp4_moe``): ``RoutedExperts`` is a vLLM PluggableLayer
@@ -25,6 +42,9 @@ Serving (gate ``SUFFIX_NVFP4_MOE=1``, default OFF; entry point
 CUTLASS layout) each eligible layer runs a LAYER ORACLE on its real weights:
 ours vs the parent ``forward_modular`` (= vLLM's FlashInfer
 cutlass_fused_moe path) vs the exact fp32 reference, fatal on mismatch.
+Shared experts: MoERunner runs them itself unless the modular kernel
+overlaps them (prepare_finalize.supports_async); the latter is ineligible,
+so ignoring the forward_modular shared_experts argument matches stock.
 Decode-sized calls (1 <= M <= SUFFIX_NVFP4_MOE_MAX_M, default 32) run ours;
 everything else calls the parent unchanged. Gated on but no layer engaged ->
 startup error naming why.
@@ -32,6 +52,7 @@ startup error naming why.
 CLI (in-pod, SM120 + oxide bundle):
   python -m suffix_hybrid.kernels.nvfp4_moe oracle   # ours vs FlashInfer vs exact ref
   python -m suffix_hybrid.kernels.nvfp4_moe bench    # us: ours vs FlashInfer (CUDA graphs)
+  (gemma + GLM-5.3 EP rank + GLM-5.3 TP=8 shard, synthetic weights, one GPU)
 """
 from __future__ import annotations
 
@@ -44,8 +65,10 @@ MAX_M_ENV = "SUFFIX_NVFP4_MOE_MAX_M"
 MARKER = "[suffix nvfp4-moe]"
 FAMILY = "nvfp4_moe"
 ACT_CODE = {"silu": 0, "gelu_tanh": 1}
-# gemma-4-26b-a4b routed experts: (E, H, I, topk, activation)
-GEMMA_MOE = (128, 2816, 704, 8, "gelu_tanh")
+# (E global, H, I per rank, topk, activation, ep_size, ep_rank)
+GEMMA_MOE = (128, 2816, 704, 8, "gelu_tanh", 1, 0)
+GLM_EP = (256, 6144, 2048, 8, "silu", 8, 5)  # TP=8+EP rank 5: experts 160..191
+GLM_TP8 = (256, 6144, 256, 8, "silu", 1, 0)  # TP=8 without EP: I/8 shard
 HBM_BPS = 1.79e12  # RTX PRO 6000 Max-Q
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _MID = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
@@ -65,8 +88,8 @@ def max_m() -> int:
     """Decode-size ceiling (tokens per call). Knob, not a constant: the
     crossover vs FlashInfer is measured by `bench`, not assumed."""
     v = int(os.environ.get(MAX_M_ENV, "32"))
-    if not 1 <= v <= 64:
-        raise ValueError(f"{MAX_M_ENV}={v} outside [1, 64]")
+    if not 1 <= v <= 256:
+        raise ValueError(f"{MAX_M_ENV}={v} outside [1, 256]")
     return v
 
 
@@ -192,10 +215,29 @@ def moe_ref(p, x, ids, tw):
     return out
 
 
-def route_twin(ids, e_count: int):
+def to_local(ids, base: int, local: int):
+    """Global expert ids -> this rank's local ids, -1 when not local (the
+    kernel's topk_id - id_base range test; = vLLM's linear expert_map)."""
+    import torch
+    loc = ids.long() - base
+    return torch.where((loc >= 0) & (loc < local), loc, -1)
+
+
+def ep_base(expert_map, ep_rank: int, ep_size: int, global_e: int, local_e: int):
+    """id_base when `expert_map` (list/None) is exactly the linear placement
+    FlashInfer assumes (local = global - ep_rank*E_local, E_local*ep ==
+    E_global), else None. No map (ep == 1) -> 0."""
+    if expert_map is None:
+        return 0 if ep_size == 1 and local_e == global_e else None
+    base = ep_rank * local_e
+    want = [g - base if base <= g < base + local_e else -1 for g in range(global_e)]
+    return base if local_e * ep_size == global_e and list(expert_map) == want else None
+
+
+def route_twin(ids, e_count: int, base: int = 0):
     """CPU twin of moe_route: (slot_expert, slot_off, slot_cnt, pair_list)
     with slots = min(E, P); active experts ascending, pairs ascending."""
-    flat = [int(v) for v in ids.reshape(-1).tolist()]
+    flat = [int(v) - base for v in ids.reshape(-1).tolist()]
     slots = min(e_count, len(flat))
     se, so, sc, pl = [-1] * slots, [0] * slots, [0] * slots, []
     s = 0
@@ -243,11 +285,19 @@ def make_problem(e_count, hdim, idim, act="gelu_tanh", device="cpu", seed=0, wst
     return p
 
 
-def rand_routing(m, e_count, topk, device, seed=0):
-    """Uniform random top-k experts per token (distinct), softmax weights."""
+def rand_routing(m, e_count, topk, device, seed=0, base=0, local=None, dead=None):
+    """Uniform random top-k experts per token (distinct), softmax weights.
+    EP (local < e_count): rows t % 3 == 1 (or all rows when dead=True) are
+    routed only to experts outside [base, base + local) — tokens this rank
+    must return as exact zeros."""
     import torch
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    ids = torch.rand(m, e_count, generator=gen).topk(topk, -1).indices.int()
+    score = torch.rand(m, e_count, generator=gen)
+    local = e_count if local is None else local
+    if local < e_count and dead is not False:
+        rows = slice(None) if dead else slice(1, None, 3)
+        score[rows, base:base + local] = -1.0
+    ids = score.topk(topk, -1).indices.int()
     tw = torch.softmax(torch.randn(m, topk, generator=gen), -1).float()
     return ids.to(device), tw.to(device)
 
@@ -265,6 +315,20 @@ def oracle_ok(rel_vs_ref: float, rel_vs_fi: float, fi_rel_vs_ref: float) -> bool
 
 def _rel(a, b) -> float:
     return float((a - b).norm() / b.norm().clamp_min(1e-30))
+
+
+def judge(ours, fi, ref, local_ids):
+    """(ok, metrics) for one oracle case: oracle_ok vs FlashInfer and the
+    exact reference, finite, and the EP zero contract — tokens with no
+    local expert are exactly 0 in ours AND in vLLM's stock output."""
+    import torch
+    r_ref, r_fi, fi_ref = _rel(ours, ref), _rel(ours, fi), _rel(fi, ref)
+    dead = (local_ids < 0).all(1)
+    zero = bool((ours[dead] == 0).all() and (fi[dead] == 0).all())
+    ok = oracle_ok(r_ref, r_fi, fi_ref) and zero and bool(torch.isfinite(ours).all())
+    return ok, (f"rel_vs_ref={r_ref:.2e} rel_vs_flashinfer={r_fi:.2e} "
+                f"flashinfer_rel_vs_ref={fi_ref:.2e} nonlocal_tokens={int(dead.sum())} "
+                f"nonlocal_zero={zero}")
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +356,7 @@ def run_ours(native, p, x, ids, tw, ws, stream, out=None):
         out = torch.empty(x.shape[0], p["w2"].shape[1], dtype=torch.bfloat16, device=x.device)
     native.nvfp4_moe_cuda(x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"],
                           p["g2"], *ws, out, float(p["a1g"]), float(p["a2g"]),
-                          int(p["act"]), stream)
+                          int(p["act"]), int(p.get("id_base", 0)), stream)
     return out
 
 
@@ -316,10 +380,16 @@ def eligibility(info: dict) -> str | None:
         return "apply_router_weight_on_input"
     if info.get("bias"):
         return "expert biases"
-    if (info.get("tp"), info.get("ep"), info.get("dp")) != (1, 1, 1):
-        return f"parallel tp/ep/dp={info.get('tp')}/{info.get('ep')}/{info.get('dp')} (single GPU only)"
-    if info.get("expert_map"):
-        return "expert_map (EP)"
+    if info.get("dp") != 1 or info.get("all2all"):
+        return f"DP/all2all dispatch (dp={info.get('dp')})"
+    if info.get("eplb"):
+        return "EPLB (physical expert ids / redundant experts)"
+    if info.get("mk_shared_overlap"):
+        return "shared experts overlapped inside the modular kernel"
+    if info.get("tp") != 1 and info.get("ep") != 1:
+        return f"parallel tp/ep={info.get('tp')}/{info.get('ep')} (TP-sharded or EP, not both)"
+    if (info.get("ep") != 1 or info.get("expert_map")) and info.get("ep_base") is None:
+        return "expert_map is not the linear ep_rank*E_local placement FlashInfer assumes"
     e, h, i = info.get("E", 0), info.get("H", 0), info.get("I", 0)
     if not (1 <= e <= 256) or h % 64 or i % 64:
         return f"shape E={e} H={h} I={i} (E<=256, H,I % 64)"
@@ -360,6 +430,7 @@ def _make_layer_cls():
             qm = self.quant_method
             qc = getattr(qm, "moe_quant_config", None)
             mc = self.moe_config
+            pc = mc.moe_parallel_config
             w13 = getattr(self, "w13_weight", None)
             info = dict(quant_dtype=getattr(qc, "quant_dtype", None),
                         backend=getattr(getattr(qm, "nvfp4_backend", None), "name", None),
@@ -370,11 +441,17 @@ def _make_layer_cls():
                         router_weight_on_input=bool(self.apply_router_weight_on_input),
                         bias=getattr(qc, "w1_bias", None) is not None,
                         tp=mc.tp_size, ep=mc.ep_size, dp=mc.dp_size,
+                        all2all=bool(pc.use_all2all_kernels), eplb=bool(pc.enable_eplb),
+                        mk_shared_overlap=bool(getattr(qm, "mk_can_overlap_shared_experts",
+                                                       False)),
                         expert_map=self.expert_map is not None)
             if info["quant_dtype"] != "nvfp4" or w13 is None or w13.dim() != 3:
                 return info, None
             e, two_i, hh = w13.shape
             h, i = hh * 2, two_i // 2
+            em = self.expert_map
+            info["ep_base"] = ep_base(None if em is None else em.tolist(), pc.ep_rank,
+                                      mc.ep_size, self.global_num_experts, e)
             s1, s2 = qc.w1_scale, qc.w2_scale
             a1, a2 = qc.a1_gscale.reshape(-1), qc.a2_gscale.reshape(-1)
             info.update(
@@ -402,7 +479,8 @@ def _make_layer_cls():
                        a1g=float(qc.a1_gscale.reshape(-1)[0]),
                        a2g=float(qc.a2_gscale.reshape(-1)[0]),
                        act=ACT_CODE[info["act"]], H=info["H"], topk=self.top_k,
-                       max_m=max_m())
+                       max_m=max_m(), id_base=info["ep_base"],
+                       E_global=self.global_num_experts)
             _state["ws"][dev] = workspace(dev, cfg["max_m"], cfg["topk"], info["H"],
                                           info["I"], info["E"], _state["ws"].get(dev))
             self._sfx_moe = cfg
@@ -417,36 +495,47 @@ def _make_layer_cls():
                             torch.cuda.current_stream(dev).cuda_stream)
 
         def _sfx_oracle(self, cfg, info):
-            """Ours vs the parent (vLLM FlashInfer cutlass_fused_moe) vs the
-            exact reference on this layer's REAL weights. Fatal."""
+            """Ours vs the parent (vLLM FlashInfer cutlass_fused_moe, with
+            this rank's real ep_size/ep_rank) vs the exact reference on this
+            layer's REAL weights, GLOBAL routing ids. EP adds a batch whose
+            tokens all route to other ranks (must be exact 0). Fatal."""
             dev = self.w13_weight.device
             worst = 0.0
-            for m in sorted({1, 8, cfg["max_m"]}):
+            base, local = cfg["id_base"], info["E"]
+            mm = cfg["max_m"]  # workspace capacity: every case M <= max_m
+            cases = [(m, None) for m in sorted({1, min(8, mm), mm})]
+            if local < cfg["E_global"]:
+                cases.append((min(8, mm), True))
+            for m, dead in cases:
                 seed = zlib.crc32(str(self.layer_name).encode()) % 10007 + m
                 gen = torch.Generator(device="cpu").manual_seed(seed)
                 amax = 2688.0 / cfg["a1g"]  # calibrated activation range
                 x = (torch.randn(m, info["H"], generator=gen) * (amax / 4.5)).to(
                     dev, torch.bfloat16)
-                ids, tw = rand_routing(m, info["E"], cfg["topk"], dev, seed)
+                ids, tw = rand_routing(m, cfg["E_global"], cfg["topk"], dev, seed,
+                                       base, local, dead)
                 fi = super().forward_modular(x, tw, ids).float()
                 ours = self._sfx_run(cfg, x, tw, ids).float()
-                ref = moe_ref(cfg, x, ids, tw).bfloat16().float()
-                r_ref, r_fi, fi_ref = _rel(ours, ref), _rel(ours, fi), _rel(fi, ref)
-                worst = max(worst, r_fi)
-                if not (oracle_ok(r_ref, r_fi, fi_ref) and torch.isfinite(ours).all()):
+                lid = to_local(ids, base, local)
+                ref = moe_ref(cfg, x, lid, tw).bfloat16().float()
+                ok, msg = judge(ours, fi, ref, lid)
+                worst = max(worst, _rel(ours, fi) if fi.norm() > 0 else 0.0)
+                if not ok:
                     raise RuntimeError(
-                        f"{MARKER} LAYER ORACLE FAIL {self.layer_name} M={m}: rel_vs_ref="
-                        f"{r_ref:.2e} rel_vs_flashinfer={r_fi:.2e} flashinfer_rel_vs_ref="
-                        f"{fi_ref:.2e} — refusing to serve with {GATE}=1")
+                        f"{MARKER} LAYER ORACLE FAIL {self.layer_name} M={m} "
+                        f"id_base={base}: {msg} — refusing to serve with {GATE}=1")
             torch.cuda.synchronize(dev)
-            _log(f"LAYER ORACLE PASS {self.layer_name} E={info['E']} H={info['H']} "
-                 f"I={info['I']} act={info['act']} max_rel_vs_flashinfer={worst:.2e}")
+            _log(f"LAYER ORACLE PASS {self.layer_name} E={local}/{cfg['E_global']} "
+                 f"id_base={base} H={info['H']} I={info['I']} act={info['act']} "
+                 f"max_rel_vs_flashinfer={worst:.2e}")
             return worst
 
         def forward_modular(self, x, topk_weights, topk_ids, shared_experts=None,
                             shared_experts_input=None):
+            # shared_experts: never run by a non-overlapping MK (eligibility
+            # rejects mk_shared_overlap) -> MoERunner already ran them.
             cfg = self._sfx_moe
-            if (cfg is None or shared_experts is not None or x.dim() != 2
+            if (cfg is None or x.dim() != 2
                     or not 1 <= x.shape[0] <= cfg["max_m"] or x.dtype != torch.bfloat16
                     or x.shape[1] != cfg["H"]):
                 return super().forward_modular(x, topk_weights, topk_ids,
@@ -545,7 +634,10 @@ def _native_ready():
 
 def _fi_call(p, x, ids, tw, out):
     """vLLM's FLASHINFER_CUTLASS NVFP4 path, verbatim argument mapping
-    (prepare_finalize/no_dp_ep.py quant + experts/flashinfer_cutlass_moe.py)."""
+    (prepare_finalize/no_dp_ep.py quant + experts/flashinfer_cutlass_moe.py),
+    incl. the EP contract: GLOBAL ids + ep_size/ep_rank (FlashInfer computes
+    only experts [ep_rank*E_local, +E_local) — no collective involved, so
+    one GPU reproduces one EP rank exactly)."""
     import torch
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -561,48 +653,72 @@ def _fi_call(p, x, ids, tw, out):
         output_dtype=torch.bfloat16,
         quant_scales=[p["a1g_t"], p["w13_sf"].view(torch.int32), p["g1"], p["a2g_t"],
                       p["w2_sf"].view(torch.int32), p["g2"]],
-        input_sf=xsf, activation_type=activation_to_flashinfer_type(MoEActivation(p["act_name"])))
+        input_sf=xsf, tp_size=1, tp_rank=0, ep_size=p["ep_size"], ep_rank=p["ep_rank"],
+        activation_type=activation_to_flashinfer_type(MoEActivation(p["act_name"])))
     return out
 
 
-def _dev_problem(dev, e_count, hdim, idim, act, seed=0):
+def _dev_problem(dev, case, seed=0):
+    """Synthetic weights for ONE rank: E_global/ep_size local experts,
+    id_base = ep_rank * E_local (vLLM linear expert_map)."""
     import torch
-    p = make_problem(e_count, hdim, idim, act, device=dev, seed=seed)
-    p["a1g_t"] = torch.full((e_count,), p["a1g"], dtype=torch.float32, device=dev)
-    p["a2g_t"] = torch.full((e_count,), p["a2g"], dtype=torch.float32, device=dev)
+    e_global, hdim, idim, topk, act, ep_size, ep_rank = case
+    local = e_global // ep_size
+    p = make_problem(local, hdim, idim, act, device=dev, seed=seed)
+    p["a1g_t"] = torch.full((local,), p["a1g"], dtype=torch.float32, device=dev)
+    p["a2g_t"] = torch.full((local,), p["a2g"], dtype=torch.float32, device=dev)
+    p.update(ep_size=ep_size, ep_rank=ep_rank, id_base=ep_rank * local, E_global=e_global)
     return p
 
 
-ORACLE_CASES = (GEMMA_MOE, (64, 2048, 768, 8, "silu"))
+def _case_name(case) -> str:
+    e_global, hdim, idim, topk, act, ep_size, ep_rank = case
+    ep = f" EP{ep_size} rank{ep_rank} ({e_global // ep_size} local)" if ep_size > 1 else ""
+    return f"E={e_global} H={hdim} I={idim} top{topk} {act}{ep}"
+
+
 CONCURRENCY = (1, 8, 16, 32)  # decode tokens per step -> routed rows = M * topk
+GLM_MS = (1, 6, 32, 64)  # MTP k=5: one seq verifies 6 tokens per step
+ORACLE_CASES = ((GEMMA_MOE, CONCURRENCY), ((64, 2048, 768, 8, "silu", 1, 0), CONCURRENCY),
+                (GLM_EP, GLM_MS), (GLM_TP8, GLM_MS))
+BENCH_CASES = ((GEMMA_MOE, CONCURRENCY), (GLM_EP, (1, 6, 12, 24, 48, 64, 96, 192)),
+               (GLM_TP8, (1, 6, 12, 24, 48, 64, 96, 192)))
 
 
-def oracle(cases=ORACLE_CASES, ms=CONCURRENCY):
+def oracle(cases=ORACLE_CASES):
+    """Per case: ours vs vLLM's FlashInfer (same EP rank) vs the exact
+    reference; EP cases add rows routed only off-rank plus one batch whose
+    tokens ALL route off-rank (exact-zero contract). Fatal on mismatch."""
     import torch
     native = _native_ready()
     dev = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.current_stream(dev).cuda_stream
     lines = []
-    for e_count, hdim, idim, topk, act in cases:
-        p = _dev_problem(dev, e_count, hdim, idim, act)
-        ws = workspace(dev, max(ms), topk, hdim, idim, e_count)
-        for m in ms:
-            ids, tw = rand_routing(m, e_count, topk, dev, seed=m)
+    for case, ms in cases:
+        e_global, hdim, idim, topk, act, ep_size, _ = case
+        p = _dev_problem(dev, case)
+        base, local = p["id_base"], e_global // ep_size
+        ws = workspace(dev, max(ms), topk, hdim, idim, local)
+        runs = [(m, None) for m in ms] + ([(8, True)] if local < e_global else [])
+        for m, dead in runs:
+            ids, tw = rand_routing(m, e_global, topk, dev, seed=m, base=base, local=local,
+                                   dead=dead)
             x = torch.randn(m, hdim, device=dev).bfloat16()
-            ref = moe_ref(p, x, ids, tw).bfloat16().float()
-            fi = _fi_call(p, x, ids, tw, torch.empty(m, hdim, dtype=torch.bfloat16,
-                                                    device=dev)).float()
+            lid = to_local(ids, base, local)
+            ref = moe_ref(p, x, lid, tw).bfloat16().float()
+            fi = _fi_call(p, x, ids, tw, torch.full((m, hdim), float("nan"),
+                                                    dtype=torch.bfloat16, device=dev)).float()
             ours = run_ours(native, p, x, ids, tw, ws, stream).float()
             again = run_ours(native, p, x, ids, tw, ws, stream).float()
-            r_ref, r_fi, fi_ref = _rel(ours, ref), _rel(ours, fi), _rel(fi, ref)
             det = bool(torch.equal(ours, again))
-            ok = oracle_ok(r_ref, r_fi, fi_ref) and det and bool(torch.isfinite(ours).all())
-            lines.append(f"E={e_count} H={hdim} I={idim} top{topk} {act} M={m} P={m * topk}: "
-                         f"rel_vs_ref={r_ref:.2e} rel_vs_flashinfer={r_fi:.2e} "
-                         f"flashinfer_rel_vs_ref={fi_ref:.2e} deterministic={det} "
-                         f"{'OK' if ok else 'FAIL'}")
+            ok, msg = judge(ours, fi, ref, lid)
+            ok = ok and det
+            lines.append(f"{_case_name(case)} M={m}{' all-nonlocal' if dead else ''} "
+                         f"P={m * topk}: {msg} deterministic={det} {'OK' if ok else 'FAIL'}")
             if not ok:
                 raise RuntimeError(f"{MARKER} NVFP4-MOE ORACLE FAIL: {lines[-1]}")
+        del p, ws
+        torch.cuda.empty_cache()
     for ln in lines:
         print(f"{MARKER} {ln}", file=sys.stderr, flush=True)
     return f"{MARKER} NVFP4-MOE ORACLE PASS ({len(lines)} cases, sm_120a mxf4nvf4 mma)"
@@ -630,31 +746,37 @@ def _graph_us(fn, dev, iters):
     return e0.elapsed_time(e1) * 1000.0 / iters
 
 
-def bench(case=GEMMA_MOE, ms=CONCURRENCY, iters=200):
-    """us per MoE layer call (x quant + experts + combine), CUDA graphs; one
-    gemma layer = 1/30 of the MoE step."""
+def bench(cases=BENCH_CASES, iters=200):
+    """us per MoE layer call on one rank (x quant + experts + combine), CUDA
+    graphs. The crossover M where FlashInfer wins sets SUFFIX_NVFP4_MOE_MAX_M
+    (above it the layer delegates to vLLM)."""
     import torch
     native = _native_ready()
     dev = torch.device("cuda", torch.cuda.current_device())
-    e_count, hdim, idim, topk, act = case
-    p = _dev_problem(dev, e_count, hdim, idim, act, seed=1)
-    ws = workspace(dev, max(ms), topk, hdim, idim, e_count)
-    per_expert = 2 * idim * hdim * (1 / 2 + 1 / 16) + hdim * idim * (1 / 2 + 1 / 16)
     res = {}
-    for m in ms:
-        ids, tw = rand_routing(m, e_count, topk, dev, seed=100 + m)
-        x = torch.randn(m, hdim, device=dev).bfloat16()
-        out = torch.empty(m, hdim, dtype=torch.bfloat16, device=dev)
-        t_fi = _graph_us(lambda s: _fi_call(p, x, ids, tw, out), dev, iters)
-        t_ours = _graph_us(lambda s: run_ours(native, p, x, ids, tw, ws, s.cuda_stream, out),
-                           dev, iters)
-        distinct = int(torch.unique(ids).numel())
-        roof = distinct * per_expert / HBM_BPS * 1e6
-        res[m] = (t_fi, t_ours, roof)
-        print(f"{MARKER} bench E={e_count} H={hdim} I={idim} top{topk} M={m} "
-              f"routed_rows={m * topk} experts={distinct}: flashinfer {t_fi:.1f} us, ours "
-              f"{t_ours:.1f} us (x{t_ours / t_fi:.2f}), weight-roofline {roof:.1f} us",
-              file=sys.stderr, flush=True)
+    for case, ms in cases:
+        e_global, hdim, idim, topk, act, ep_size, _ = case
+        p = _dev_problem(dev, case, seed=1)
+        base, local = p["id_base"], e_global // ep_size
+        ws = workspace(dev, max(ms), topk, hdim, idim, local)
+        per_expert = 2 * idim * hdim * (1 / 2 + 1 / 16) + hdim * idim * (1 / 2 + 1 / 16)
+        for m in ms:
+            ids, tw = rand_routing(m, e_global, topk, dev, seed=100 + m, dead=False)
+            x = torch.randn(m, hdim, device=dev).bfloat16()
+            out = torch.empty(m, hdim, dtype=torch.bfloat16, device=dev)
+            t_fi = _graph_us(lambda s: _fi_call(p, x, ids, tw, out), dev, iters)
+            t_ours = _graph_us(lambda s: run_ours(native, p, x, ids, tw, ws, s.cuda_stream,
+                                                  out), dev, iters)
+            lid = to_local(ids, base, local)
+            distinct = int(torch.unique(lid[lid >= 0]).numel())
+            roof = distinct * per_expert / HBM_BPS * 1e6
+            res[(case, m)] = (t_fi, t_ours, roof)
+            print(f"{MARKER} bench {_case_name(case)} M={m} routed_rows={m * topk} "
+                  f"local_experts_hit={distinct}: flashinfer {t_fi:.1f} us, ours "
+                  f"{t_ours:.1f} us (x{t_ours / t_fi:.2f}), weight-roofline {roof:.1f} us",
+                  file=sys.stderr, flush=True)
+        del p, ws
+        torch.cuda.empty_cache()
     return res
 
 

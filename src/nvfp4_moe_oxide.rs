@@ -94,8 +94,11 @@ fn need(
 ///   w2 uint8 [E, H, I/2]; w2_sf [E, r128(H), r4(I/16)]; g1, g2 f32 [E]
 ///   ws_* preallocated scratch; out bf16 [M, H]
 /// a1_gscale / a2_gscale: the layer's single activation quant multipliers.
+/// id_base: expert parallel offset (vLLM linear expert_map: ep_rank * E);
+/// topk_ids are GLOBAL ids, pairs outside [id_base, id_base + E) contribute
+/// nothing on this rank (vLLM all-reduces the partial outputs afterwards).
 #[pyfunction]
-#[pyo3(signature = (x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter, ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, stream_ptr))]
+#[pyo3(signature = (x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter, ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, id_base, stream_ptr))]
 #[allow(clippy::too_many_arguments)]
 pub fn nvfp4_moe_cuda<'py>(
     py: Python<'py>,
@@ -119,6 +122,7 @@ pub fn nvfp4_moe_cuda<'py>(
     a1_gscale: f32,
     a2_gscale: f32,
     act: u32,
+    id_base: u32,
     stream_ptr: usize,
 ) -> PyResult<()> {
     let x = info("x", x)?;
@@ -229,6 +233,7 @@ pub fn nvfp4_moe_cuda<'py>(
     let route_args = [
         Arg::Ptr(ids.ptr),
         Arg::U32(ids_i64),
+        Arg::U32(id_base),
         u(p),
         u(e),
         u(slots),
@@ -293,6 +298,7 @@ pub fn nvfp4_moe_cuda<'py>(
         Arg::Ptr(y.ptr),
         Arg::Ptr(ids.ptr),
         Arg::U32(ids_i64),
+        Arg::U32(id_base),
         u(m),
         u(k),
         u(h),

@@ -161,12 +161,16 @@ pub mod kernels {
     /// Single CTA of 256 threads (E <= 256). Dynamic smem: 2*E i32.
     /// slot_expert[s] = s-th active expert (ascending id) or -1;
     /// slot_off / slot_cnt: its rows in pair_list (ascending pair id).
-    /// Pairs with ids outside [0, E) are ignored (combine skips them).
+    /// Expert parallel: local id = topk_ids - id_base (vLLM's linear
+    /// expert_map, the ep_rank * E_local offset FlashInfer applies); pairs
+    /// whose local id falls outside [0, E) — other ranks' experts, -1 —
+    /// are ignored (combine skips them, so such a token's row is exactly 0).
     #[kernel]
     #[launch_bounds(256)]
     pub unsafe fn moe_route(
         topk_ids: *const i32,
         ids_i64: u32,
+        id_base: u32,
         pairs: u32,
         num_experts: u32,
         max_slots: u32,
@@ -178,11 +182,12 @@ pub mod kernels {
         let tid = thread::threadIdx_x();
         let sh: *mut i32 = DynamicSharedArray::<i32>::get();
         let id_of = |p: u32| -> i32 {
-            if ids_i64 != 0 {
+            let raw = if ids_i64 != 0 {
                 unsafe { *(topk_ids as *const i64).add(p as usize) as i32 }
             } else {
                 unsafe { *topk_ids.add(p as usize) }
-            }
+            };
+            raw.wrapping_sub(id_base as i32)
         };
         let mut cnt = 0i32;
         if tid < num_experts {
@@ -497,8 +502,9 @@ pub mod kernels {
         }
     }
 
-    /// out[t, h] = bf16(sum_k y[t*topk + k, h]) over valid expert ids, k in
-    /// ascending order (deterministic). One thread per (t, h).
+    /// out[t, h] = bf16(sum_k y[t*topk + k, h]) over local expert ids
+    /// (topk_ids - id_base in [0, E)), k ascending (deterministic); 0 for a
+    /// token with no local expert. One thread per (t, h).
     #[kernel]
     #[launch_bounds(256)]
     pub unsafe fn moe_combine(
@@ -506,6 +512,7 @@ pub mod kernels {
         y: *const f32,
         topk_ids: *const i32,
         ids_i64: u32,
+        id_base: u32,
         m: u32,
         topk: u32,
         hdim: u32,
@@ -526,7 +533,8 @@ pub mod kernels {
                 unsafe { *(topk_ids as *const i64).add(p as usize) as i32 }
             } else {
                 unsafe { *topk_ids.add(p as usize) }
-            };
+            }
+            .wrapping_sub(id_base as i32);
             if id >= 0 && (id as u32) < num_experts {
                 acc += unsafe { *y.add((p * hdim + h) as usize) };
             }
