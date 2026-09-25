@@ -116,6 +116,8 @@ def kgdn1_twin(out, mixed_qkv, z, ba, a_log, dt_bias, norm_w, state, state_idx,
             out[orow:orow + K] = f32_to_bf16(y)
 
 
-def interface() -> dict:
-    with open(INTERFACE) as f:
+def interface(path=None) -> dict:
+    # The file lives in the repo (kernels-oxide/), not in the installed wheel:
+    # callers outside a checkout (CI's installed-wheel run) pass the path.
+    with open(path or INTERFACE) as f:
         return json.load(f)

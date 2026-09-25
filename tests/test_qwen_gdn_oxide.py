@@ -89,7 +89,7 @@ def test_bf16_rne_matches_torch():
 
 
 def test_interface_json_matches_kernel_signature():
-    iface = ox.interface()
+    iface = ox.interface(ROOT / "kernels-oxide" / "kgdn1" / "interface.json")
     src = SRC.read_text()
     m = re.search(r"pub unsafe fn (\w+)\((.*?)\)\s*\{", src, re.S)
     assert m and m.group(1) == iface["entry"]

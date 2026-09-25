@@ -261,7 +261,8 @@ def test_oxide_manifest_kgdn1_entry(tmp_path, monkeypatch):
 
 def qwen_gdn_oxide_entry():
     from suffix_hybrid.kernels import qwen_gdn_oxide
-    return qwen_gdn_oxide.interface()["entry"]
+    return qwen_gdn_oxide.interface(
+        ROOT / "kernels-oxide" / "kgdn1" / "interface.json")["entry"]
 
 
 def test_load_prebuilt_refuses_other_shapes():
