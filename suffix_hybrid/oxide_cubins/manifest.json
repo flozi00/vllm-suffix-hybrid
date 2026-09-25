@@ -1,0 +1,39 @@
+{
+ "arch": "sm_120",
+ "ptxas_version": "13.0.88",
+ "cuda_oxide_rev": "ec4aa4797956534578a1af010f86252a0b6d8626",
+ "nightly": "nightly-2026-08-28",
+ "kernels": [
+  {
+   "name": "k2_nvfp4_attn",
+   "file": "k2_nvfp4_attn.cubin",
+   "sha256": "a862269c29624be000b870c1e6947132ad4f335116bb21ce74029bbb47e4ab5b",
+   "bytes": 117392,
+   "ptx_isa": "8.7",
+   "entries": [
+    "nvfp4_attn_merge",
+    "nvfp4_attn_partial"
+   ]
+  },
+  {
+   "name": "kgdn1",
+   "file": "kgdn1.cubin",
+   "sha256": "515845ea89eded6badfb3a36ef555112b67b1bc4adff1d336e77e1d93b6ad3da",
+   "bytes": 19840,
+   "ptx_isa": "8.7",
+   "entries": [
+    "kgdn1_decode_h16_hv48_k128"
+   ]
+  },
+  {
+   "name": "probe",
+   "file": "probe.cubin",
+   "sha256": "17f9ed23b429598398c997dce8a2b85d677ae430177a25f2a5a239ab2d7e6727",
+   "bytes": 6112,
+   "ptx_isa": "8.7",
+   "entries": [
+    "oxide_probe"
+   ]
+  }
+ ]
+}
