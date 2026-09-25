@@ -103,7 +103,14 @@ def prepare(nat, served, q_lens) -> str:
     from suffix_hybrid import oxide_kernels
 
     dev = torch.cuda.current_device()
-    oxide_kernels.ensure_loaded(FAMILY, dev)
+    # every register variant (k2_nvfp4_attn_w1/_w2/_w3); the host op picks
+    # the one the launch plan names.
+    names = [k["name"] for k in oxide_kernels.manifest()["kernels"]
+             if k["name"].startswith(FAMILY + "_w")]
+    if len(names) != 3:
+        raise RuntimeError(f"oxide manifest lacks the K2 variants (found {names})")
+    for name in names:
+        oxide_kernels.ensure_loaded(name, dev)
     if dev not in _PROBED:
         print(oxide_kernels.probe(dev), file=sys.stderr, flush=True)
         _PROBED.add(dev)

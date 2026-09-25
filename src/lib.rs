@@ -353,6 +353,8 @@ fn nvfp4_attn_plan(
         ("tn".to_string(), p.tn),
         ("ns".to_string(), p.ns),
         ("rows".to_string(), p.rows),
+        ("wv".to_string(), p.wv),
+        ("cps".to_string(), p.cps),
         ("min_tiles".to_string(), nvfp4_attn::MIN_TILES_PER_SPLIT),
     ]))
 }

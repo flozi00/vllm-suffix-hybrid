@@ -36,6 +36,10 @@ pub const HEAD_DIMS: [usize; 3] = [128, 256, 512];
 pub const SMEM_LIMIT: usize = 99 * 1024;
 /// Threads per CTA of both kernels (8 warps).
 pub const THREADS: usize = 256;
+/// SM120 shared memory per SM (2 CTAs only if both fit, minus 1 KB each).
+pub const SMEM_PER_SM: usize = 100 * 1024;
+/// S m-tile slots per warp of register variant w (kernel MTS).
+pub const S_SLOTS: [usize; 4] = [0, 2, 3, 3];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttnPlan {
@@ -46,6 +50,11 @@ pub struct AttnPlan {
     pub m: usize,
     pub tn: usize,
     pub ns: usize,
+    /// Register variant w (cubin k2_nvfp4_attn_w{w}): O m-tile slots per
+    /// warp; w1 is register-capped for 2 CTAs/SM.
+    pub wv: usize,
+    /// CTAs per SM the plan sizes the grid for (1 or 2).
+    pub cps: usize,
     /// Launch rows R = batch * hkv * nqt (partial grid = (R, NS, 1), merge
     /// grid = (R, D/64, 1)).
     pub rows: usize,
@@ -110,16 +119,34 @@ pub fn plan(
     }
     let nqt = q_len.div_ceil(qt);
     let m = round16(qt * g);
-    let tn = [64, 32, 16]
-        .into_iter()
-        .find(|&t| page_size % t == 0 && partial_smem_bytes(m, d, t) <= SMEM_LIMIT)
-        .ok_or_else(|| {
-            format!(
-                "page_size {page_size} has no KV tile in {{64, 32, 16}} fitting smem (M={m}, D={d})"
-            )
-        })?;
+    // Register variant: O m-tile slots per warp = m-tiles / warps sharing
+    // one 64-column group.
+    let o_wpj = 8 / (d / 64);
+    let wv = (m / 16).div_ceil(o_wpj);
+    if wv > 3 {
+        return Err(format!("M={m} D={d} needs {wv} O slots per warp (max 3)"));
+    }
+    let pick_tn = |cps: usize| {
+        [64, 32, 16].into_iter().find(|&t| {
+            let s_wps = 8 / (t / 8);
+            page_size % t == 0
+                && (m / 16).div_ceil(s_wps) <= S_SLOTS[wv]
+                && partial_smem_bytes(m, d, t) <= SMEM_LIMIT.min(SMEM_PER_SM / cps - 1024)
+        })
+    };
+    let (tn, cps) = match (wv == 1).then(|| pick_tn(2)).flatten() {
+        Some(t) => (t, 2),
+        None => (
+            pick_tn(1).ok_or_else(|| {
+                format!(
+                    "page_size {page_size} has no KV tile in {{64, 32, 16}} fitting smem (M={m}, D={d})"
+                )
+            })?,
+            1,
+        ),
+    };
     let rows = batch * hkv * nqt;
-    let ns = num_sms.div_ceil(rows).clamp(1, MAX_SPLITS);
+    let ns = choose_splits(rows, num_sms * cps);
     Ok(AttnPlan {
         d,
         g,
@@ -128,8 +155,22 @@ pub fn plan(
         m,
         tn,
         ns,
+        wv,
+        cps,
         rows,
     })
+}
+
+/// Split count: minimize waves/ns (time per unit of work with R*ns equal
+/// CTAs over `slots` concurrent slots); among splits within 3% of the best,
+/// the smallest (fewer partials). One-wave fill for few rows, wave-tail
+/// balancing for many (b >= 8 verify: R >= slots).
+pub fn choose_splits(rows: usize, slots: usize) -> usize {
+    let cost = |ns: usize| (rows * ns).div_ceil(slots) as f64 / ns as f64;
+    let best = (1..=MAX_SPLITS).map(cost).fold(f64::INFINITY, f64::min);
+    (1..=MAX_SPLITS)
+        .find(|&ns| cost(ns) <= best * 1.03)
+        .unwrap_or(1)
 }
 
 #[cfg(test)]
@@ -141,26 +182,39 @@ mod tests {
     #[test]
     fn gemma_full_attn_hd512() {
         // 16 q / 2 kv heads, page 64 (live), decode and MTP k=8 verify.
+        // decode: 8 rows -> M 16, w1 (2 CTAs/SM -> TN 16 to fit), one wave.
         let p = plan(1, 1, 16, 2, 512, 64, SMS).unwrap();
-        assert_eq!((p.g, p.qt, p.m, p.nqt, p.tn), (8, 1, 16, 1, 64));
-        assert_eq!((p.rows, p.ns), (2, 94));
-        // q_len 9: 72 rows -> 2 CTAs of 5 + 4 tokens (40 -> M 48), TN 32.
+        assert_eq!(
+            (p.g, p.qt, p.m, p.nqt, p.wv, p.cps, p.tn),
+            (8, 1, 16, 1, 1, 2, 16)
+        );
+        assert!(p.rows * p.ns * 100 >= SMS * p.cps * 97 && p.rows * p.ns <= SMS * p.cps);
+        // q_len 9: 72 rows -> 2 CTAs of 5 + 4 tokens (40 -> M 48), w3, TN 32.
         let v = plan(1, 9, 16, 2, 512, 64, SMS).unwrap();
         assert_eq!(
-            (v.qt, v.nqt, v.m, v.tn, v.rows, v.ns),
-            (5, 2, 48, 32, 4, 47)
+            (v.qt, v.nqt, v.m, v.tn, v.rows, v.wv, v.cps, v.ns),
+            (5, 2, 48, 32, 4, 3, 1, 46)
         );
+        // b32 verify: 128 rows on 188 slots -> tail-balanced split (not 2)
+        let b = plan(32, 9, 16, 2, 512, 64, SMS).unwrap();
+        assert_eq!((b.rows, b.ns), (128, 10));
     }
 
     #[test]
     fn gemma_swa_hd256_and_qwen() {
+        // SWA verify: 18 rows -> M 32, w1 (2 CTAs/SM) with TN 32 smem.
         let s = plan(1, 9, 16, 8, 256, 64, SMS).unwrap();
-        assert_eq!((s.g, s.qt, s.nqt, s.m, s.tn), (2, 9, 1, 32, 64));
+        assert_eq!(
+            (s.g, s.qt, s.nqt, s.m, s.wv, s.cps, s.tn),
+            (2, 9, 1, 32, 1, 2, 32)
+        );
+        let s32 = plan(32, 9, 16, 8, 256, 64, SMS).unwrap();
+        assert_eq!((s32.rows, s32.ns), (256, 10));
         let s1 = plan(32, 1, 16, 8, 256, 64, SMS).unwrap();
-        assert_eq!((s1.qt, s1.m, s1.rows, s1.ns), (1, 16, 256, 1));
+        assert_eq!((s1.qt, s1.m, s1.rows), (1, 16, 256));
         // qwen3.8-27b: 24/4 heads (G=6), page 2816 = 64*44.
         let q = plan(8, 1, 24, 4, 256, 2816, SMS).unwrap();
-        assert_eq!((q.g, q.qt, q.m, q.tn), (6, 1, 16, 64));
+        assert_eq!((q.g, q.qt, q.m, q.wv, q.tn), (6, 1, 16, 1, 32));
     }
 
     #[test]
@@ -173,10 +227,13 @@ mod tests {
                         assert!(p.m % 16 == 0 && p.m <= MAX_ROWS && p.qt * p.g <= p.m);
                         assert!(page % p.tn == 0 && p.tn % 16 == 0);
                         assert!(partial_smem_bytes(p.m, d, p.tn) <= SMEM_LIMIT, "{p:?}");
+                        assert!(p.cps * (partial_smem_bytes(p.m, d, p.tn) + 1024) <= SMEM_PER_SM);
+                        assert!((1..=3).contains(&p.wv) && (p.cps == 1 || p.wv == 1));
+                        assert!((p.m / 16).div_ceil(8 / (p.tn / 8)) <= S_SLOTS[p.wv]);
                         assert!(merge_smem_bytes(p.ns, p.m) <= SMEM_LIMIT, "{p:?}");
                         assert!(p.qt * p.nqt >= q_len && p.qt * (p.nqt - 1) < q_len);
                         assert!(p.ns >= 1 && p.ns <= MAX_SPLITS);
-                        assert!(p.rows * p.ns >= SMS.min(p.rows * MAX_SPLITS));
+                        assert!(p.rows * p.ns >= (SMS * p.cps).min(p.rows * MAX_SPLITS) * 2 / 3);
                     }
                 }
             }

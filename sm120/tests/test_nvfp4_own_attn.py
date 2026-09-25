@@ -159,9 +159,12 @@ def test_h19_h20_anchor_replay():
     assert "self.use_own_nvfp4_attn = _nvfp4_own_attn_gate(self)" in new
     assert "or self.use_own_nvfp4_attn\n" in new
     assert new.count("def _nvfp4_own_attn_gate") == 1
-    # our decode branch precedes the stock fa2 plan branch
+    # our decode branch precedes the stock fa2 plan branch and falls through
+    # to it when the helper returns None (q_len 1)
     assert new.index("_nvfp4_own_attn_decode(\n") < new.index(
         "pure_decode = num_prefills == 0")
+    assert ") is not None:\n                # uniform spec-verify rows -> K2" in new
+    compile(new, "<patched>", "exec")
     # forward() is untouched: the stock decode_wrapper.run call remains
     assert new.count("decode_wrapper.run(") == 2
 
@@ -223,9 +226,15 @@ def test_decode_metadata_q_len_rules():
     assert w.q_len == 9
     with pytest.raises(RuntimeError, match="uniform"):
         mk(B, bt, sl, torch.tensor([0, 9, 10, 19, 28]), 4)
+    # single-token decode stays on FlashInfer's fa2 decode wrapper
+    assert mk(B, bt, sl, torch.tensor([0, 1, 2, 3, 4]), 4) is None
+    assert mk(B, bt, sl, torch.tensor([0, 1, 2, 2, 2]), 4) is None  # cg pad
+    qlen = ns["_nvfp4_own_attn_q_len"]
+    assert qlen(torch.tensor([0, 9, 18, 18]), 3) == 9
+    assert qlen(torch.tensor([0, 1, 2]), 2) == 1 and qlen(torch.tensor([0]), 0) == 0
     B.logits_soft_cap = 30.0
     with pytest.raises(ValueError, match="soft-capping"):
-        mk(B, bt, sl, torch.tensor([0, 1, 2, 3, 4]), 4)
+        mk(B, bt, sl, torch.tensor([0, 2, 4, 6, 8]), 4)
 
 
 def test_wrapper_rejects_unsupported_run_args():
@@ -290,7 +299,9 @@ def test_h13_uniform_batch_only_behind_own_attn_and_h21():
         "return AttentionCGSupport.UNIFORM_BATCH") < block.index(
         "return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE")
     assert "own_attn_no_paged_indices" in applied
-    assert 'and not getattr(self, "use_own_nvfp4_attn", False)\n        )' in new
+    assert ('and not (getattr(self, "use_own_nvfp4_attn", False)\n'
+            '                     and _nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) > 1)'
+            in new)
 
 
 def _uniform_ok(has_prefill_rule):

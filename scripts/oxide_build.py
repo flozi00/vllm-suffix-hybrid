@@ -47,6 +47,43 @@ def ptx_facts(ptx: str):
     return (int(ver.group(1)), int(ver.group(2))), tgt.group(1), entries
 
 
+def build_one(crate, var, nightly, ptxas, cuobjdump, out):
+    name = crate.name + var["suffix"]
+    ptx_path = crate / f"{crate.name}.ptx"
+    if ptx_path.exists():
+        ptx_path.unlink()
+    cmd = ["cargo", f"+{nightly}", "oxide", "build", "--arch", ARCH]
+    if var["features"]:
+        cmd += ["--features", var["features"]]
+    run(cmd, cwd=crate)
+    if not ptx_path.is_file():
+        raise SystemExit(f"{name}: cargo-oxide produced no {ptx_path.name}")
+    ptx = ptx_path.read_text()
+    isa, target, entries = ptx_facts(ptx)
+    if target != ARCH or isa > MAX_PTX_ISA or not entries:
+        raise SystemExit(f"{name}: .target {target} .version {isa} entries {entries} "
+                         f"(need {ARCH}, <= {MAX_PTX_ISA}, >= 1 entry)")
+    if ".local" in ptx:
+        print(f"WARNING {name}: PTX uses local memory (register arrays spilled)")
+    cubin = out / f"{name}.cubin"
+    run([ptxas, f"-arch={ARCH}", "-O3", *var["ptxas"], "-o", str(cubin), str(ptx_path)])
+    elf = run([cuobjdump, "--list-elf", str(cubin)]).stdout
+    if ARCH not in elf:
+        raise SystemExit(f"{name}: cubin has no {ARCH} SASS:\n{elf}")
+    print(run([cuobjdump, "--dump-resource-usage", str(cubin)]).stdout, flush=True)
+    (out / f"{name}.ptx").write_text(ptx)  # audit copy (never loaded)
+    data = cubin.read_bytes()
+    return {
+        "name": name,
+        "file": cubin.name,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data),
+        "ptx_isa": f"{isa[0]}.{isa[1]}",
+        "ptxas_flags": var["ptxas"],
+        "entries": entries,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", required=True)
@@ -70,35 +107,13 @@ def main():
     for crate in sorted(Path(args.kernels).iterdir()):
         if not (crate / "Cargo.toml").is_file() or (only and crate.name not in only):
             continue
-        name = crate.name
-        ptx_path = crate / f"{name}.ptx"
-        if ptx_path.exists():
-            ptx_path.unlink()
-        run(["cargo", f"+{nightly}", "oxide", "build", "--arch", ARCH], cwd=crate)
-        if not ptx_path.is_file():
-            raise SystemExit(f"{name}: cargo-oxide produced no {ptx_path.name}")
-        ptx = ptx_path.read_text()
-        isa, target, entries = ptx_facts(ptx)
-        if target != ARCH or isa > MAX_PTX_ISA or not entries:
-            raise SystemExit(f"{name}: .target {target} .version {isa} entries {entries} "
-                             f"(need {ARCH}, <= {MAX_PTX_ISA}, >= 1 entry)")
-        cubin = out / f"{name}.cubin"
-        run([ptxas, f"-arch={ARCH}", "-O3", "-o", str(cubin), str(ptx_path)])
-        elf = run([cuobjdump, "--list-elf", str(cubin)]).stdout
-        if ARCH not in elf:
-            raise SystemExit(f"{name}: cubin has no {ARCH} SASS:\n{elf}")
-        res = run([cuobjdump, "--dump-resource-usage", str(cubin)]).stdout
-        print(res, flush=True)
-        (out / f"{name}.ptx").write_text(ptx)  # audit copy (never loaded)
-        data = cubin.read_bytes()
-        kernels.append({
-            "name": name,
-            "file": cubin.name,
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "bytes": len(data),
-            "ptx_isa": f"{isa[0]}.{isa[1]}",
-            "entries": entries,
-        })
+        # Optional register/shape variants: one cubin per entry, built with
+        # its cargo features and extra ptxas flags, named <crate><suffix>.
+        vf = crate / "oxide-variants.json"
+        variants = (json.loads(vf.read_text()) if vf.is_file()
+                    else [{"suffix": "", "features": "", "ptxas": []}])
+        for var in variants:
+            kernels.append(build_one(crate, var, nightly, ptxas, cuobjdump, out))
     if not kernels:
         raise SystemExit("no kernel crates found")
     manifest = {

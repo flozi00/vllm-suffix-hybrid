@@ -238,15 +238,17 @@ pub fn nvfp4_paged_attn_cuda<'py>(
         u(p.ns),
         Arg::F32(v_scale * SCALE_FIX),
     ];
-    let (rows, ns) = (p.rows as u32, p.ns as u32);
+    let (rows, ns, wv) = (p.rows as u32, p.ns as u32, p.wv);
     let psmem = partial_smem_bytes(p.m, d, p.tn) as u32;
     let msmem = merge_smem_bytes(p.ns, p.m) as u32;
     let block = (THREADS as u32, 1, 1);
     py.detach(move || {
         crate::guard_py("nvfp4_paged_attn_cuda", move || {
             let run = || -> Result<(), String> {
-                let fp = function(FAMILY, "nvfp4_attn_partial", ord)?;
-                let fm = function(FAMILY, "nvfp4_attn_merge", ord)?;
+                // register variant cubin k2_nvfp4_attn_w{1,2,3} (plan.wv)
+                let fam = format!("{FAMILY}_w{wv}");
+                let fp = function(&fam, "nvfp4_attn_partial", ord)?;
+                let fm = function(&fam, "nvfp4_attn_merge", ord)?;
                 launch(fp, (rows, ns, 1), block, psmem, stream_ptr, &partial_args)?;
                 launch(
                     fm,

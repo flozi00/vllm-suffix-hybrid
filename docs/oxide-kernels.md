@@ -65,6 +65,20 @@ grep -E '^\.(version|target)' <name>.ptx      # .version <= 9.0, .target sm_120
 
 (`cargo add cuda-oxide` is an unrelated crates.io crate — never use it.)
 
+### Variants (one crate, several cubins)
+
+`kernels-oxide/<name>/oxide-variants.json` (optional) builds the crate once
+per entry with its cargo features and extra ptxas flags; each result is its
+own cubin/family `<name><suffix>`:
+
+```json
+[{"suffix": "_w1", "features": "w1", "ptxas": ["-maxrregcount=128"]},
+ {"suffix": "_w3", "features": "w3", "ptxas": []}]
+```
+
+Use it for compile-time sizes (register-array lengths, launch bounds) the
+host selects per launch — see k2_nvfp4_attn (MTW/MTS consts per feature).
+
 ## 2. Host side (plugin crate, feature `oxide-kernels`)
 
 ```rust

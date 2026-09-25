@@ -31,7 +31,7 @@
 //!
 //! e4m3 -> f16 is a bit shift that yields value * 2^-8 exactly (subnormals
 //! included); the host folds 2^8 into qk_scale_log2 and v_scale.
-use cuda_device::{DynamicSharedArray, cuda_module, kernel, ptx_asm, thread};
+use cuda_device::{DynamicSharedArray, cuda_module, kernel, launch_bounds, ptx_asm, thread};
 
 #[cuda_module]
 mod kernels {
@@ -45,8 +45,23 @@ mod kernels {
     use cuda_device::wmma::{ldmatrix_x4, mma_m16n8k16_f32_f16};
 
     const WARPS: u32 = 8;
+    // Build variant (cargo feature, one cubin each — oxide-variants.json):
+    // MTW = O m-tile slots per warp (accumulator registers: 32 * MTW),
+    // MTS = S m-tile slots per warp. The host picks the smallest variant
+    // that covers the plan; w1 is built with -maxrregcount=128 (2 CTAs/SM).
+    #[cfg(feature = "w1")]
+    const MTW: usize = 1;
+    #[cfg(feature = "w1")]
+    const MTS: usize = 2;
+    #[cfg(feature = "w2")]
+    const MTW: usize = 2;
+    #[cfg(feature = "w2")]
+    const MTS: usize = 3;
+    #[cfg(not(any(feature = "w1", feature = "w2")))]
+    const MTW: usize = 3;
+    #[cfg(not(any(feature = "w1", feature = "w2")))]
+    const MTS: usize = 3;
     const THREADS: u32 = 256;
-    const MT: usize = 3; // max m-tiles per CTA (48 rows)
     const FULL: u32 = 0xFFFF_FFFF;
     const NEG_INF: f32 = f32::NEG_INFINITY;
     const MIN_TILES_PER_SPLIT: u32 = 2;
@@ -193,6 +208,7 @@ mod kernels {
     }
 
     #[kernel]
+    #[launch_bounds(256)]
     pub fn nvfp4_attn_partial(
         q: *const u16,
         k_data: *const u8,
@@ -336,7 +352,7 @@ mod kernels {
         let acol = 8 * (lane / 16);
         let gblk = 4 * cj + gq / 2; // V scale block of this lane's dims
 
-        let mut acc_o = [[[0.0f32; 4]; 8]; MT];
+        let mut acc_o = [[[0.0f32; 4]; 8]; MTW];
 
         let mut j = t0;
         while j < t1 {
@@ -360,7 +376,8 @@ mod kernels {
             let vsf = unsafe { kd.add((tn * (2 * kp + sd)) as usize) };
 
             // ---- S = Q K^T for (this warp's m-tiles) x (n-tile nt) ----------
-            let mut sacc = [[0.0f32; 4]; MT];
+            let mut sacc = [[0.0f32; 4]; MTS];
+            let mut sacc2 = [[0.0f32; 4]; MTS]; // 2nd chain: halves mma dependency depth
             let krow = nt * 8 + gq;
             let mut p = 0u32;
             while p < d / 32 {
@@ -370,31 +387,45 @@ mod kernels {
                 let f = nib8(wk);
                 let ba = [hmul2(f[0], sc2), hmul2(f[1], sc2)];
                 let bb = [hmul2(f[2], sc2), hmul2(f[3], sc2)];
-                let mut mt = 0usize;
+                let mut slot = 0usize;
                 #[unroll]
-                while mt < MT {
-                    if (mt as u32) < mtiles && (mt as u32) % s_wps == s_grp {
-                        let rowp = (mt as u32 * 16 + arow) * qrow + 32 * p + acol;
+                while slot < MTS {
+                    let mt = s_grp + slot as u32 * s_wps;
+                    if mt < mtiles {
+                        let rowp = (mt * 16 + arow) * qrow + 32 * p + acol;
                         let aa = unsafe { ldmatrix_x4(qs.add(rowp as usize) as *const u32) };
                         let ab = unsafe { ldmatrix_x4(qs.add((rowp + 16) as usize) as *const u32) };
-                        let c = unsafe { mma_m16n8k16_f32_f16(sacc[mt], aa, ba) };
-                        sacc[mt] = unsafe { mma_m16n8k16_f32_f16(c, ab, bb) };
+                        sacc[slot] = unsafe { mma_m16n8k16_f32_f16(sacc[slot], aa, ba) };
+                        sacc2[slot] = unsafe { mma_m16n8k16_f32_f16(sacc2[slot], ab, bb) };
                     }
-                    mt += 1;
+                    slot += 1;
                 }
                 p += 1;
             }
 
+            let mut slot = 0usize;
+            #[unroll]
+            while slot < MTS {
+                let mut e = 0usize;
+                #[unroll]
+                while e < 4 {
+                    sacc[slot][e] += sacc2[slot][e];
+                    e += 1;
+                }
+                slot += 1;
+            }
+
             // ---- scale + mask + per-warp row max ------------------------------
             let kp0 = (tok0 + nt * 8 + 2 * t4) as i32;
-            let mut mt = 0usize;
+            let mut slot = 0usize;
             #[unroll]
-            while mt < MT {
-                if (mt as u32) < mtiles && (mt as u32) % s_wps == s_grp {
+            while slot < MTS {
+                let mt = s_grp + slot as u32 * s_wps;
+                if mt < mtiles {
                     let mut half = 0usize;
                     #[unroll]
                     while half < 2 {
-                        let row = mt as u32 * 16 + gq + 8 * half as u32;
+                        let row = mt * 16 + gq + 8 * half as u32;
                         let i = row / g_heads;
                         let valid = row < real_rows && qt * qt_n + i < q_len;
                         let qpos = q0 + i as i32;
@@ -406,12 +437,12 @@ mod kernels {
                             if window_left >= 0 && kp + window_left < qpos {
                                 ok = false;
                             }
-                            let v = sacc[mt][2 * half + e];
-                            sacc[mt][2 * half + e] = if ok { v * qk_scale_log2 } else { NEG_INF };
+                            let v = sacc[slot][2 * half + e];
+                            sacc[slot][2 * half + e] = if ok { v * qk_scale_log2 } else { NEG_INF };
                             e += 1;
                         }
-                        let a = sacc[mt][2 * half];
-                        let c = sacc[mt][2 * half + 1];
+                        let a = sacc[slot][2 * half];
+                        let c = sacc[slot][2 * half + 1];
                         let mut mx = if a > c { a } else { c };
                         let o1 = shuffle_xor_f32_sync(FULL, mx, 1);
                         if o1 > mx {
@@ -427,19 +458,20 @@ mod kernels {
                         half += 1;
                     }
                 }
-                mt += 1;
+                slot += 1;
             }
             thread::sync_threads();
 
             // ---- P = exp2(S - m_new) -> smem (f16), per-warp row sums ----------
-            let mut mt = 0usize;
+            let mut slot = 0usize;
             #[unroll]
-            while mt < MT {
-                if (mt as u32) < mtiles && (mt as u32) % s_wps == s_grp {
+            while slot < MTS {
+                let mt = s_grp + slot as u32 * s_wps;
+                if mt < mtiles {
                     let mut half = 0usize;
                     #[unroll]
                     while half < 2 {
-                        let row = mt as u32 * 16 + gq + 8 * half as u32;
+                        let row = mt * 16 + gq + 8 * half as u32;
                         let mut m_new = unsafe { *m_run.add(row as usize) };
                         let mut n = 0u32;
                         while n < ntc {
@@ -450,8 +482,8 @@ mod kernels {
                             n += 1;
                         }
                         let m_safe = if m_new == NEG_INF { 0.0 } else { m_new };
-                        let p0 = ex2(sacc[mt][2 * half] - m_safe);
-                        let p1 = ex2(sacc[mt][2 * half + 1] - m_safe);
+                        let p0 = ex2(sacc[slot][2 * half] - m_safe);
+                        let p1 = ex2(sacc[slot][2 * half + 1] - m_safe);
                         unsafe {
                             *(ps.add((row * prow + nt * 8 + 2 * t4) as usize) as *mut u32) =
                                 cvt_f16x2_f32(p0, p1);
@@ -465,7 +497,7 @@ mod kernels {
                         half += 1;
                     }
                 }
-                mt += 1;
+                slot += 1;
             }
             thread::sync_threads();
 
@@ -496,23 +528,24 @@ mod kernels {
             thread::sync_threads();
 
             // ---- O[:, 64-col group cj] = O * alpha + P V ----------------------
-            let mut mt = 0usize;
+            let mut slot = 0usize;
             #[unroll]
-            while mt < MT {
-                if (mt as u32) < mtiles && (mt as u32) % o_wpj == o_grp {
-                    let a0 = unsafe { *alpha_s.add((mt as u32 * 16 + gq) as usize) };
-                    let a8 = unsafe { *alpha_s.add((mt as u32 * 16 + gq + 8) as usize) };
+            while slot < MTW {
+                let mt = o_grp + slot as u32 * o_wpj;
+                if mt < mtiles {
+                    let a0 = unsafe { *alpha_s.add((mt * 16 + gq) as usize) };
+                    let a8 = unsafe { *alpha_s.add((mt * 16 + gq + 8) as usize) };
                     let mut jn = 0usize;
                     #[unroll]
                     while jn < 8 {
-                        acc_o[mt][jn][0] *= a0;
-                        acc_o[mt][jn][1] *= a0;
-                        acc_o[mt][jn][2] *= a8;
-                        acc_o[mt][jn][3] *= a8;
+                        acc_o[slot][jn][0] *= a0;
+                        acc_o[slot][jn][1] *= a0;
+                        acc_o[slot][jn][2] *= a8;
+                        acc_o[slot][jn][3] *= a8;
                         jn += 1;
                     }
                 }
-                mt += 1;
+                slot += 1;
             }
             let mut ks = 0u32;
             while ks < tn / 16 {
@@ -572,24 +605,25 @@ mod kernels {
                     pr += 1;
                 }
                 let pcol = ks * 16 + acol;
-                let mut mt = 0usize;
+                let mut slot = 0usize;
                 #[unroll]
-                while mt < MT {
-                    if (mt as u32) < mtiles && (mt as u32) % o_wpj == o_grp {
+                while slot < MTW {
+                    let mt = o_grp + slot as u32 * o_wpj;
+                    if mt < mtiles {
                         let a = unsafe {
                             ldmatrix_x4(
-                                ps.add(((mt as u32 * 16 + arow) * prow + pcol) as usize) as *const u32,
+                                ps.add(((mt * 16 + arow) * prow + pcol) as usize) as *const u32,
                             )
                         };
                         let mut jn = 0usize;
                         #[unroll]
                         while jn < 8 {
-                            acc_o[mt][jn] =
-                                unsafe { mma_m16n8k16_f32_f16(acc_o[mt][jn], a, [b0[jn], b1[jn]]) };
+                            acc_o[slot][jn] =
+                                unsafe { mma_m16n8k16_f32_f16(acc_o[slot][jn], a, [b0[jn], b1[jn]]) };
                             jn += 1;
                         }
                     }
-                    mt += 1;
+                    slot += 1;
                 }
                 ks += 1;
             }
@@ -597,14 +631,15 @@ mod kernels {
         }
 
         // ---- normalized partial O (bf16, 2 x 16 B per row) + lse --------------
-        let mut mt = 0usize;
+        let mut slot = 0usize;
         #[unroll]
-        while mt < MT {
-            if (mt as u32) < mtiles && (mt as u32) % o_wpj == o_grp {
+        while slot < MTW {
+            let mt = o_grp + slot as u32 * o_wpj;
+            if mt < mtiles {
                 let mut half = 0usize;
                 #[unroll]
                 while half < 2 {
-                    let row = mt as u32 * 16 + gq + 8 * half as u32;
+                    let row = mt * 16 + gq + 8 * half as u32;
                     let l = unsafe { *l_run.add(row as usize) };
                     let inv = if l == 0.0 { 0.0 } else { 1.0 / l };
                     let dst = unsafe {
@@ -615,10 +650,10 @@ mod kernels {
                     while k < 4 {
                         // n-tile jn covers dims 64cj + 8c + jn; this lane's C
                         // cols 2t, 2t+1 -> dims 64cj + 16t + jn and + 8.
-                        let e0 = acc_o[mt][2 * k][2 * half] * inv;
-                        let e1 = acc_o[mt][2 * k + 1][2 * half] * inv;
-                        let o0 = acc_o[mt][2 * k][2 * half + 1] * inv;
-                        let o1 = acc_o[mt][2 * k + 1][2 * half + 1] * inv;
+                        let e0 = acc_o[slot][2 * k][2 * half] * inv;
+                        let e1 = acc_o[slot][2 * k + 1][2 * half] * inv;
+                        let o0 = acc_o[slot][2 * k][2 * half + 1] * inv;
+                        let o1 = acc_o[slot][2 * k + 1][2 * half + 1] * inv;
                         unsafe {
                             *dst.add(k) = bf16_bits(e0) | (bf16_bits(e1) << 16);
                             *dst.add(4 + k) = bf16_bits(o0) | (bf16_bits(o1) << 16);
@@ -628,7 +663,7 @@ mod kernels {
                     half += 1;
                 }
             }
-            mt += 1;
+            slot += 1;
         }
         if tid < m_rows {
             let m = unsafe { *m_run.add(tid as usize) };

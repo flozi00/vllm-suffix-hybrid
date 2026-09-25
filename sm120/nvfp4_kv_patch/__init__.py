@@ -78,7 +78,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-24.9"
+PATCH_REVISION = "2026-09-25.10"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -543,10 +543,22 @@ def _nvfp4_own_attn_gate(builder) -> bool:
     return impl.builder_gate(builder, hp.window_left, hp.logits_soft_cap)
 
 
+def _nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) -> int:
+    if num_decodes <= 0:
+        return 0
+    q_lens = qo_indptr_cpu[1:num_decodes + 1] - qo_indptr_cpu[:num_decodes]
+    return int(q_lens.max().item())
+
+
 def _nvfp4_own_attn_decode(builder, block_table, seq_lens, qo_indptr_cpu,
                            num_decodes):
+    """K2 metadata for uniform spec-verify rows (q_len > 1); None for
+    single-token decode, which stays on FlashInfer's fa2 decode wrapper
+    (faster there, and graph-captured by the stock single-token path)."""
     q_lens = qo_indptr_cpu[1:num_decodes + 1] - qo_indptr_cpu[:num_decodes]
     q_len = int(q_lens.max().item())
+    if q_len <= 1:
+        return None
     real = int((q_lens > 0).sum().item())
     # Uniform rows first, CUDA-graph padding (q_len 0) only at the tail.
     if q_len < 1 or not bool((q_lens[:real] == q_len).all().item()):
@@ -889,7 +901,8 @@ _BACKEND_EDITS = [
         )""",
         """        needs_native_paged_decode = (
             num_decodes > 0 and not decode_with_flashinfer_trtllm_api
-            and not getattr(self, "use_own_nvfp4_attn", False)
+            and not (getattr(self, "use_own_nvfp4_attn", False)
+                     and _nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) > 1)
         )""",
         1,
     ),
@@ -972,10 +985,13 @@ _BACKEND_EDITS = [
         """            else:
                 assert seq_lens_cpu is not None
                 pure_decode = num_prefills == 0""",
-        """            elif getattr(self, "use_own_nvfp4_attn", False):
-                attn_metadata.decode = _nvfp4_own_attn_decode(
+        """            elif getattr(self, "use_own_nvfp4_attn", False) and (
+                _own_decode := _nvfp4_own_attn_decode(
                     self, block_table_tensor, seq_lens, qo_indptr_cpu,
                     num_decodes)
+            ) is not None:
+                # uniform spec-verify rows -> K2; q_len 1 -> stock fa2 below
+                attn_metadata.decode = _own_decode
             else:
                 assert seq_lens_cpu is not None
                 pure_decode = num_prefills == 0""",
