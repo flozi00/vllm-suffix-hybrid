@@ -163,7 +163,7 @@ def test_h19_h20_anchor_replay():
     # to it when the helper returns None (q_len 1)
     assert new.index("_nvfp4_own_attn_decode(\n") < new.index(
         "pure_decode = num_prefills == 0")
-    assert ") is not None:\n                # uniform spec-verify rows -> K2" in new
+    assert ") is not None:\n                # decode rows (ragged ok) -> K2" in new
     compile(new, "<patched>", "exec")
     # forward() is untouched: the stock decode_wrapper.run call remains
     assert new.count("decode_wrapper.run(") == 2
@@ -209,7 +209,7 @@ def test_gate_default_off_and_fail_closed(monkeypatch):
     assert own_attn.builder_gate(B(), -1, None) is False
 
 
-def test_decode_metadata_q_len_rules():
+def test_decode_metadata_routing_rules():
     torch = pytest.importorskip("torch")
     ns = _helper_ns(_nvfp4_own_attn=own_attn)
 
@@ -217,28 +217,113 @@ def test_decode_metadata_q_len_rules():
         num_qo_heads, num_kv_heads, head_dim, page_size = 16, 2, 512, 16
         window_left, sm_scale, logits_soft_cap = -1, 1.0, None
 
-    bt = torch.zeros(4, 8, dtype=torch.int32)
-    sl = torch.ones(4, dtype=torch.int32)
+    n = 12
+    bt = torch.zeros(n, 8, dtype=torch.int32)
+    sl = torch.ones(n, dtype=torch.int32)
     mk = ns["_nvfp4_own_attn_decode"]
-    w = mk(B, bt, sl, torch.tensor([0, 9, 18, 27, 36]), 4).wrapper
-    assert w.q_len == 9 and w.block_table.shape[0] == 4
-    w = mk(B, bt, sl, torch.tensor([0, 9, 18, 18, 18]), 4).wrapper  # cg pad
-    assert w.q_len == 9
-    with pytest.raises(RuntimeError, match="uniform"):
-        mk(B, bt, sl, torch.tensor([0, 9, 10, 19, 28]), 4)
-    # single-token decode stays on FlashInfer's fa2 decode wrapper
-    assert mk(B, bt, sl, torch.tensor([0, 1, 2, 3, 4]), 4) is None
-    assert mk(B, bt, sl, torch.tensor([0, 1, 2, 2, 2]), 4) is None  # cg pad
-    qlen = ns["_nvfp4_own_attn_q_len"]
-    assert qlen(torch.tensor([0, 9, 18, 18]), 3) == 9
-    assert qlen(torch.tensor([0, 1, 2]), 2) == 1 and qlen(torch.tensor([0]), 0) == 0
+
+    def qo(*lens):
+        return torch.tensor([0] + list(np.cumsum(lens)), dtype=torch.int32)
+
+    q = qo(9, 9, 9, 9)
+    w = mk(B, bt, sl, q, q, 4).wrapper
+    assert w.q_max == 9 and w.block_table.shape[0] == 4
+    assert w.qo_indptr.shape[0] == 5
+    w = mk(B, bt, sl, qo(9, 9, 0, 0), qo(9, 9, 0, 0), 4).wrapper  # cg pad
+    assert w.q_max == 9
+    # ragged widths (suffix drafts, misses as q_len 1) -> K2, q_max bound
+    w = mk(B, bt, sl, qo(1, 9, 3, 1), qo(1, 9, 3, 1), 4).wrapper
+    assert w.q_max == 9 and w.seq_lens.shape[0] == 4 and w.max_rows == 48
+    w = mk(B, bt, sl, qo(1, 1, 3, 1), qo(1, 1, 3, 1), 4).wrapper
+    assert w.q_max == 3 and w.max_rows == 16  # miss-dominated: light tiles
+    assert own_attn.row_budget([9, 9, 0]) == 48 and own_attn.row_budget([]) == 48
+    # plain q_len-1 batches: K2 up to K2_Q1_MAX_BATCH, fa2 beyond
+    k = own_attn.K2_Q1_MAX_BATCH
+    ones = qo(*([1] * k))
+    assert mk(B, bt, sl, ones, ones, k).wrapper.q_max == 1
+    wide = qo(*([1] * (k + 1)))
+    assert mk(B, bt, sl, wide, wide, k + 1) is None
+    takes = ns["_nvfp4_own_attn_takes"]
+    assert takes(wide, k + 1) is False and takes(qo(1, 2), 2) is True
+    assert takes(torch.tensor([0]), 0) is False
     B.logits_soft_cap = 30.0
     with pytest.raises(ValueError, match="soft-capping"):
-        mk(B, bt, sl, torch.tensor([0, 2, 4, 6, 8]), 4)
+        mk(B, bt, sl, qo(2, 2), qo(2, 2), 2)
+
+
+@pytest.mark.parametrize("sms", [1, 188])
+def test_twin_ragged_matches_reference(sms):
+    """Ragged q lengths (suffix drafts: misses q_len 1, partial and full
+    verifies) through the qo_indptr indexing, plus a padding request."""
+    rng = np.random.default_rng(21 + sms)
+    for d, hq, hkv, page, wl in ((512, 16, 2, 16, -1), (256, 16, 8, 64, 63)):
+        lens = [1, 9, 3, 1, 0]
+        kv = (70, 130, 9, 1, 0)
+        cache, bt, sl, _ = _case(rng, d, hq, hkv, page, 1, kv)
+        q = ref.bf16(rng.standard_normal((sum(lens), hq, d)))
+        sm = 1.0 / math.sqrt(d)
+        want = ref.reference(q, cache, bt, sl, lens, sm, 0.5, 2.0, wl)
+        for cap in (16, 48):
+            plan = _native.nvfp4_attn_plan(len(lens), max(lens), hq, hkv, d,
+                                           page, sms, cap)
+            assert plan["m"] <= cap
+            got = ref.kernel_twin(q, cache, bt, sl, lens, sm, plan, 0.5, 2.0,
+                                  wl)
+            assert _cos(got, want) >= 0.99995 and _rel(got, want) <= 8e-3
+        # each request equals its own uniform run (rows are independent)
+        off = 0
+        for b, ql in enumerate(lens[:-1]):
+            one = ref.reference(q[off:off + ql], cache, bt[b:b + 1],
+                                sl[b:b + 1], ql, sm, 0.5, 2.0, wl)
+            assert np.allclose(want[off:off + ql], one)
+            off += ql
+
+
+def test_exact_seq_lens_helper(monkeypatch):
+    torch = pytest.importorskip("torch")
+    import contextlib
+    from types import SimpleNamespace as NS
+
+    ns = _helper_ns(_nvfp4_own_attn=own_attn, torch=torch,
+                    gpu_sync_allowed=contextlib.nullcontext)
+    ns["logger"].info = lambda *a: None
+    exact = ns["_nvfp4_exact_seq_lens_cpu"]
+    ub = torch.tensor([5, 9, 0], dtype=torch.int32)
+    cm = NS(seq_lens=ub.clone(), seq_lens_cpu_upper_bound=ub)
+    b = NS(use_dcp=False, vllm_config=NS(
+        scheduler_config=NS(async_scheduling=False)))
+    assert exact(b, cm) is ub
+    b.vllm_config.scheduler_config.async_scheduling = True
+    assert exact(b, cm) is None  # async: upper bound is only a bound
+    b.vllm_config.scheduler_config.async_scheduling = False
+    assert exact(b, NS(seq_lens=ub, seq_lens_cpu_upper_bound=None)) is None
+    b.use_dcp = True
+    assert exact(b, cm) is None
+    b.use_dcp = False
+    bad = NS(seq_lens=ub + 1, seq_lens_cpu_upper_bound=ub)
+    with pytest.raises(RuntimeError, match="refusing"):
+        exact(b, bad)  # sampled check fails closed
+    ns["_NVFP4_SEQ_LENS_CHECKS"][0] = 100
+    assert exact(b, bad) is ub  # unsampled build: trusts the contract
+
+
+def test_h23_h24_anchors():
+    new, applied = PATCH.patch_backend_source(FIXTURE.read_text())
+    assert {"exact_seq_lens_no_sync", "own_attn_ragged_split"} <= set(applied)
+    i = new.index("seq_lens_cpu = common_attn_metadata.seq_lens.cpu()")
+    block = new[i - 400:i]
+    assert "_nvfp4_exact_seq_lens_cpu(self, common_attn_metadata)" in block
+    assert 'getattr(self, "use_fa2_nvfp4_kv", False)' in block
+    assert "if seq_lens_cpu is None:" in block
+    assert ('require_uniform=not (\n                        self.use_xqa\n'
+            '                        or getattr(self, "use_own_nvfp4_attn", False)),'
+            in new)
+    compile(new, "<patched>", "exec")
 
 
 def test_wrapper_rejects_unsupported_run_args():
-    w = own_attn.DecodeWrapper(None, None, 1, 16, 2, 512, 16, -1, 1.0, None)
+    w = own_attn.DecodeWrapper(None, None, None, 1, 16, 2, 512, 16, -1, 1.0,
+                               None, 16)
     with pytest.raises(ValueError, match="sinks"):
         w.run(None, (None, None), sinks=object(), out=object(),
               kv_cache_sf=(None, None))
@@ -280,8 +365,9 @@ def test_gpu_kernel_matches_reference():
                  c2.k_sf.view(torch.float8_e4m3fn), c2.v_data,
                  c2.v_sf.view(torch.float8_e4m3fn),
                  torch.from_numpy(bt).to(dev, torch.int32),
-                 torch.from_numpy(sl).to(dev, torch.int32), out, q_len, -1,
-                 1 / math.sqrt(d), 1.0)
+                 torch.from_numpy(sl).to(dev, torch.int32),
+                 torch.arange(4, dtype=torch.int32, device=dev) * q_len, out,
+                 q_len, -1, 1 / math.sqrt(d), 1.0)
     want = ref.reference(ref.bf16(q), cache, bt, sl, q_len, 1 / math.sqrt(d))
     got = out.float().cpu().numpy()
     assert _cos(got, want) >= 0.9995 and _rel(got, want) <= 2e-2
@@ -300,7 +386,7 @@ def test_h13_uniform_batch_only_behind_own_attn_and_h21():
         "return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE")
     assert "own_attn_no_paged_indices" in applied
     assert ('and not (getattr(self, "use_own_nvfp4_attn", False)\n'
-            '                     and _nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) > 1)'
+            '                     and _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes))'
             in new)
 
 
@@ -355,7 +441,7 @@ def test_h22_skips_seq_lens_sync_only_for_k2_only_batches():
     block = new[i:i + 500]
     for cond in ("num_prefills == 0", "not self.use_dcp", "not use_cascade",
                  'getattr(self, "use_own_nvfp4_attn", False)',
-                 "_nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) > 1"):
+                 "_nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes)"):
         assert cond in block, cond
     # decided before the seq_lens.cpu() read it guards
     assert i < new.index("seq_lens_cpu = common_attn_metadata.seq_lens.cpu()")

@@ -2,14 +2,13 @@
 //! K2-NVFP4 host op on the cuda-oxide track (feature `oxide-kernels`):
 //! validates the torch views, then launches the two kernels of
 //! kernels-oxide/k2_nvfp4_attn (sm_120 SASS from ptxas 13.0, loaded by
-//! suffix_hybrid.oxide_kernels) on torch's current stream. Python API is the
-//! same as the retired cutile op, so sm120/nvfp4_kv_patch/own_attn.py (and
-//! the H19/H20/H21/H13 patch logic, oracle and CPU twin) are unchanged.
+//! suffix_hybrid.oxide_kernels) on torch's current stream.
 //!
-//! Grid depends only on (batch, q_len, heads) — never on seq_lens — so a
-//! captured CUDA graph replays correctly for any KV lengths.
+//! Grid depends only on (batch, q_max, heads) — never on seq_lens or the
+//! per-request q lengths (qo_indptr is read on the device) — so a captured
+//! CUDA graph replays correctly for any KV lengths.
 
-use crate::nvfp4_attn::{merge_smem_bytes, partial_smem_bytes, plan, round16, AttnPlan, THREADS};
+use crate::nvfp4_attn::{merge_smem_bytes, partial_smem_bytes, plan_rows, round16, AttnPlan, THREADS};
 use crate::oxide::{function, launch, Arg};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -68,19 +67,21 @@ fn need(name: &str, i: &TInfo, dtype: &str, shape: &[usize]) -> PyResult<()> {
 
 /// Our NVFP4 paged decode / spec-verify attention (K2-NVFP4).
 ///
-/// q        [B*q_len, HQ, D] bf16 (row stride free, heads/dims dense)
+/// q        [T, HQ, D] bf16 (row stride free, heads/dims dense)
 /// k_data   [P, HKV, PAGE, D/2] uint8     } nvfp4_split_data_scale views
 /// k_sf     [P, HKV, PAGE, D/16] e4m3     } of the HND cache (one shared
 /// v_data   [P, HKV, PAGE, D/2] uint8     } page stride; (head, token,
 /// v_sf     [P, HKV, PAGE, D/16] e4m3     } byte) dense within a side)
 /// block_table [>=B, W] int32 (row-contiguous), seq_lens [>=B] int32
-/// meta     [16] int32 (kept for API stability; unused on this track)
-/// out      [B*q_len, HQ, D] bf16, contiguous — fully written
+/// qo_indptr [B+1] int32: request b's q rows are qo_indptr[b]..[b+1]
+///          (ragged, each <= q_max; B = len - 1; padding rows = empty)
+/// out      [T, HQ, D] bf16, contiguous — request rows written, rows past
+///          qo_indptr[B] (graph padding) zeroed
 /// o_part   [round16(R), NS, M, D] bf16, lse_part [round16(R), NS, M] f32
 /// window_left: -1 = full attention, else FlashInfer semantics.
 /// qk_scale_log2 = sm_scale * k_scale * log2(e); v_scale = global V scale.
 #[pyfunction]
-#[pyo3(signature = (q, k_data, k_sf, v_data, v_sf, block_table, meta, seq_lens, out, o_part, lse_part, q_len, window_left, qk_scale_log2, v_scale, num_sms, stream_ptr))]
+#[pyo3(signature = (q, k_data, k_sf, v_data, v_sf, block_table, qo_indptr, seq_lens, out, o_part, lse_part, q_max, window_left, qk_scale_log2, v_scale, num_sms, stream_ptr, max_rows=crate::nvfp4_attn::MAX_ROWS))]
 #[allow(clippy::too_many_arguments)]
 pub fn nvfp4_paged_attn_cuda<'py>(
     py: Python<'py>,
@@ -90,20 +91,21 @@ pub fn nvfp4_paged_attn_cuda<'py>(
     v_data: &Bound<'py, PyAny>,
     v_sf: &Bound<'py, PyAny>,
     block_table: &Bound<'py, PyAny>,
-    meta: &Bound<'py, PyAny>,
+    qo_indptr: &Bound<'py, PyAny>,
     seq_lens: &Bound<'py, PyAny>,
     out: &Bound<'py, PyAny>,
     o_part: &Bound<'py, PyAny>,
     lse_part: &Bound<'py, PyAny>,
-    q_len: usize,
+    q_max: usize,
     window_left: i32,
     qk_scale_log2: f32,
     v_scale: f32,
     num_sms: usize,
     stream_ptr: usize,
+    max_rows: usize,
 ) -> PyResult<()> {
-    let _ = meta;
     let qi = tinfo("q", q)?;
+    let qo = tinfo("qo_indptr", qo_indptr)?;
     let kd = tinfo("k_data", k_data)?;
     let ks = tinfo("k_sf", k_sf)?;
     let vd = tinfo("v_data", v_data)?;
@@ -113,24 +115,27 @@ pub fn nvfp4_paged_attn_cuda<'py>(
     let oo = tinfo("out", out)?;
     let op = tinfo("o_part", o_part)?;
     let lp = tinfo("lse_part", lse_part)?;
-    if qi.shape.len() != 3 || kd.shape.len() != 4 || bt.shape.len() != 2 || sl.shape.len() != 1 {
+    if qi.shape.len() != 3
+        || kd.shape.len() != 4
+        || bt.shape.len() != 2
+        || sl.shape.len() != 1
+        || qo.shape.len() != 1
+    {
         return Err(PyValueError::new_err(
-            "q must be 3-D, k/v views 4-D, block_table 2-D, seq_lens 1-D",
+            "q must be 3-D, k/v views 4-D, block_table 2-D, seq_lens and qo_indptr 1-D",
         ));
     }
     let (tokens, hq, d) = (qi.shape[0], qi.shape[1], qi.shape[2]);
     let (pages, hkv, page) = (kd.shape[0], kd.shape[1], kd.shape[2]);
-    if q_len == 0 || tokens % q_len != 0 {
-        return Err(PyValueError::new_err(format!(
-            "q rows {tokens} not a multiple of q_len {q_len} (uniform batches only)"
-        )));
-    }
-    let batch = tokens / q_len;
-    if batch == 0 {
+    need("qo_indptr", &qo, "torch.int32", &qo.shape.clone())?;
+    let batch = qo.shape[0].saturating_sub(1);
+    if batch == 0 || tokens == 0 {
         return Ok(());
     }
-    let p: AttnPlan =
-        plan(batch, q_len, hq, hkv, d, page, num_sms).map_err(PyValueError::new_err)?;
+    // q_max bounds every request's q rows (the caller derives it from the
+    // same qo_indptr on the host); the grid covers q_max rows per request.
+    let p: AttnPlan = plan_rows(batch, q_max, hq, hkv, d, page, num_sms, max_rows)
+        .map_err(PyValueError::new_err)?;
     let (dh, sd) = (d / 2, d / 16);
     need("q", &qi, "torch.bfloat16", &[tokens, hq, d])?;
     if qi.stride[1] != d {
@@ -185,6 +190,7 @@ pub fn nvfp4_paged_attn_cuda<'py>(
         ("v_sf", &vs),
         ("block_table", &bt),
         ("seq_lens", &sl),
+        ("qo_indptr", &qo),
         ("out", &oo),
         ("o_part", &op),
         ("lse_part", &lp),
@@ -206,6 +212,7 @@ pub fn nvfp4_paged_attn_cuda<'py>(
         Arg::Ptr(vs.ptr),
         Arg::Ptr(bt.ptr),
         Arg::Ptr(sl.ptr),
+        Arg::Ptr(qo.ptr),
         Arg::Ptr(op.ptr),
         Arg::Ptr(lp.ptr),
         u(qi.stride[0]),
@@ -217,7 +224,6 @@ pub fn nvfp4_paged_attn_cuda<'py>(
         u(p.m),
         u(d),
         u(p.nqt),
-        u(q_len),
         u(page),
         u(p.ns),
         u(p.tn),
@@ -228,13 +234,14 @@ pub fn nvfp4_paged_attn_cuda<'py>(
         Arg::Ptr(oo.ptr),
         Arg::Ptr(op.ptr),
         Arg::Ptr(lp.ptr),
+        Arg::Ptr(qo.ptr),
+        u(tokens),
         u(hkv),
         u(p.g),
         u(p.qt),
         u(p.m),
         u(d),
         u(p.nqt),
-        u(q_len),
         u(p.ns),
         Arg::F32(v_scale * SCALE_FIX),
     ];

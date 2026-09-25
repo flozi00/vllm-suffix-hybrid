@@ -78,7 +78,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-25.11"
+PATCH_REVISION = "2026-09-25.12"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -546,33 +546,63 @@ def _nvfp4_own_attn_gate(builder) -> bool:
     return impl.builder_gate(builder, hp.window_left, hp.logits_soft_cap)
 
 
-def _nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) -> int:
+def _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes) -> bool:
+    """K2 serves this step's decode rows (ragged q lengths included, no
+    FlashInfer plan, paged indices or host seq_lens); False only for a
+    batch of plain q_len-1 decodes wider than K2_Q1_MAX_BATCH, which stays
+    on FlashInfer's fa2 decode wrapper (faster kernel at that width)."""
     if num_decodes <= 0:
-        return 0
+        return False
     q_lens = qo_indptr_cpu[1:num_decodes + 1] - qo_indptr_cpu[:num_decodes]
-    return int(q_lens.max().item())
+    if int(q_lens.max().item()) > 1:
+        return True
+    return num_decodes <= _nvfp4_own_attn.K2_Q1_MAX_BATCH
 
 
-def _nvfp4_own_attn_decode(builder, block_table, seq_lens, qo_indptr_cpu,
-                           num_decodes):
-    """K2 metadata for uniform spec-verify rows (q_len > 1); None for
-    single-token decode, which stays on FlashInfer's fa2 decode wrapper
-    (faster there, and graph-captured by the stock single-token path)."""
-    q_lens = qo_indptr_cpu[1:num_decodes + 1] - qo_indptr_cpu[:num_decodes]
-    q_len = int(q_lens.max().item())
-    if q_len <= 1:
+def _nvfp4_own_attn_decode(builder, block_table, seq_lens, qo_indptr,
+                           qo_indptr_cpu, num_decodes):
+    """K2 metadata for the decode rows (per-request q lengths read from
+    qo_indptr on the device); None when fa2 keeps them (see _takes)."""
+    if not _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes):
         return None
-    real = int((q_lens > 0).sum().item())
-    # Uniform rows first, CUDA-graph padding (q_len 0) only at the tail.
-    if q_len < 1 or not bool((q_lens[:real] == q_len).all().item()):
-        raise RuntimeError(
-            "K2-NVFP4 decode needs uniform decode rows, got q_lens="
-            f"{q_lens.tolist()}")
+    q_lens = qo_indptr_cpu[1:num_decodes + 1] - qo_indptr_cpu[:num_decodes]
+    q_max = max(int(q_lens.max().item()), 1)
     return FIDecode(wrapper=_nvfp4_own_attn.DecodeWrapper(
-        block_table[:num_decodes], seq_lens[:num_decodes], q_len,
-        builder.num_qo_heads, builder.num_kv_heads, builder.head_dim,
-        builder.page_size, builder.window_left, builder.sm_scale,
-        builder.logits_soft_cap))
+        block_table[:num_decodes], seq_lens[:num_decodes],
+        qo_indptr[:num_decodes + 1], q_max, builder.num_qo_heads,
+        builder.num_kv_heads, builder.head_dim, builder.page_size,
+        builder.window_left, builder.sm_scale, builder.logits_soft_cap,
+        _nvfp4_own_attn.row_budget(q_lens.tolist())))
+
+
+def _nvfp4_exact_seq_lens_cpu(builder, cm):
+    """Host seq_lens WITHOUT a device sync: the V2 runner's CPU upper bound
+    is exact outside async scheduling (vllm/v1/attention/backend.py
+    seq_lens_cpu_upper_bound: optimistic only for async-spec decode rows).
+    Sampled equality check against the device (first 64 builds, then every
+    4096th) fails closed. None -> caller syncs as stock."""
+    ub = getattr(cm, "seq_lens_cpu_upper_bound", None)
+    cfg = builder.vllm_config
+    if (ub is None or builder.use_dcp
+            or getattr(cfg.scheduler_config, "async_scheduling", True)
+            or tuple(ub.shape) != tuple(cm.seq_lens.shape)):
+        return None
+    n = _NVFP4_SEQ_LENS_CHECKS[0] = _NVFP4_SEQ_LENS_CHECKS[0] + 1
+    if n <= 64 or n % 4096 == 0:
+        with gpu_sync_allowed():
+            dev = cm.seq_lens.cpu()
+        if not torch.equal(dev, ub.to(dev.dtype)):
+            raise RuntimeError(
+                "suffix sm120 nvfp4-kv: seq_lens_cpu_upper_bound != device "
+                f"seq_lens under sync scheduling (host {ub.tolist()} vs "
+                f"device {dev.tolist()}); refusing to plan attention on it.")
+        if n == 64:
+            logger.info("suffix sm120 nvfp4-kv: exact host seq_lens verified "
+                        "on 64 builds (no per-group device sync from here).")
+    return ub
+
+
+_NVFP4_SEQ_LENS_CHECKS = [0]
 
 '''
 
@@ -905,7 +935,7 @@ _BACKEND_EDITS = [
         """        needs_native_paged_decode = (
             num_decodes > 0 and not decode_with_flashinfer_trtllm_api
             and not (getattr(self, "use_own_nvfp4_attn", False)
-                     and _nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) > 1)
+                     and _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes))
         )""",
         1,
     ),
@@ -921,8 +951,38 @@ _BACKEND_EDITS = [
         if (needs_seq_lens_cpu and num_prefills == 0 and not self.use_dcp
                 and not use_cascade
                 and getattr(self, "use_own_nvfp4_attn", False)
-                and _nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) > 1):
+                and _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes)):
             needs_seq_lens_cpu = False
+""",
+        1,
+    ),
+    # ---- H23: exact host seq_lens from the V2 runner's CPU copy under sync
+    # scheduling instead of one blocking seq_lens.cpu() per KV group.
+    (
+        "exact_seq_lens_no_sync",
+        """        if needs_seq_lens_cpu:
+            with gpu_sync_allowed():
+                seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+""",
+        """        if needs_seq_lens_cpu:
+            seq_lens_cpu = (
+                _nvfp4_exact_seq_lens_cpu(self, common_attn_metadata)
+                if getattr(self, "use_fa2_nvfp4_kv", False) else None)
+            if seq_lens_cpu is None:
+                with gpu_sync_allowed():
+                    seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+""",
+        1,
+    ),
+    # ---- H24: K2 takes ragged decode rows (per-request q lengths via
+    # qo_indptr), so the decode/prefill split need not be uniform.
+    (
+        "own_attn_ragged_split",
+        """                    require_uniform=not self.use_xqa,
+""",
+        """                    require_uniform=not (
+                        self.use_xqa
+                        or getattr(self, "use_own_nvfp4_attn", False)),
 """,
         1,
     ),
@@ -1007,10 +1067,10 @@ _BACKEND_EDITS = [
                 pure_decode = num_prefills == 0""",
         """            elif getattr(self, "use_own_nvfp4_attn", False) and (
                 _own_decode := _nvfp4_own_attn_decode(
-                    self, block_table_tensor, seq_lens, qo_indptr_cpu,
-                    num_decodes)
+                    self, block_table_tensor, seq_lens, qo_indptr,
+                    qo_indptr_cpu, num_decodes)
             ) is not None:
-                # uniform spec-verify rows -> K2; q_len 1 -> stock fa2 below
+                # decode rows (ragged ok) -> K2; wide q_len-1 -> fa2 below
                 attn_metadata.decode = _own_decode
             else:
                 assert seq_lens_cpu is not None

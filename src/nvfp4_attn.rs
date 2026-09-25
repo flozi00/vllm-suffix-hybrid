@@ -91,6 +91,27 @@ pub fn plan(
     page_size: usize,
     num_sms: usize,
 ) -> Result<AttnPlan, String> {
+    plan_rows(batch, q_len, hq, hkv, d, page_size, num_sms, MAX_ROWS)
+}
+
+/// `plan` with the CTA row budget capped at `max_rows` (16..=MAX_ROWS,
+/// multiple of 16). A small cap suits ragged batches dominated by q_len-1
+/// rows: each row needs one light CTA (w1, 2 CTAs/SM) instead of a
+/// q_max-sized tile; wider rows take ceil(q_len / QT) CTAs.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_rows(
+    batch: usize,
+    q_len: usize,
+    hq: usize,
+    hkv: usize,
+    d: usize,
+    page_size: usize,
+    num_sms: usize,
+    max_rows: usize,
+) -> Result<AttnPlan, String> {
+    if !(16..=MAX_ROWS).contains(&max_rows) || max_rows % 16 != 0 {
+        return Err(format!("max_rows {max_rows} not in 16..={MAX_ROWS} step 16"));
+    }
     if !HEAD_DIMS.contains(&d) {
         return Err(format!(
             "head_dim {d} unsupported (need one of {HEAD_DIMS:?})"
@@ -108,12 +129,12 @@ pub fn plan(
         return Err("batch and num_sms must be positive".into());
     }
     let g = hq / hkv;
-    if g > MAX_ROWS {
-        return Err(format!("GQA group {g} exceeds {MAX_ROWS} rows per CTA"));
+    if round16(g) > max_rows {
+        return Err(format!("GQA group {g} exceeds {max_rows} rows per CTA"));
     }
-    let mut nqt = (q_len * g).div_ceil(MAX_ROWS);
+    let mut nqt = (q_len * g).div_ceil(max_rows);
     let mut qt = q_len.div_ceil(nqt);
-    while round16(qt * g) > MAX_ROWS {
+    while round16(qt * g) > max_rows {
         nqt += 1;
         qt = q_len.div_ceil(nqt);
     }
@@ -178,6 +199,20 @@ mod tests {
     use super::*;
 
     const SMS: usize = 188;
+
+    #[test]
+    fn capped_rows_for_q1_dominated_ragged() {
+        // hd512 g8, q_max 9 under a 16-row cap: QT 2 -> 5 q tiles of M 16,
+        // light w1 variant at 2 CTAs/SM (q_len-1 rows use one tile).
+        let p = plan_rows(8, 9, 16, 2, 512, 64, SMS, 16).unwrap();
+        assert_eq!((p.qt, p.nqt, p.m, p.wv, p.cps), (2, 5, 16, 1, 2));
+        // hd256 g2: 2 balanced tiles (QT 5, M 16).
+        let s = plan_rows(8, 9, 16, 8, 256, 64, SMS, 16).unwrap();
+        assert_eq!((s.qt, s.nqt, s.m, s.wv), (5, 2, 16, 1));
+        assert_eq!(plan_rows(8, 9, 16, 2, 512, 64, SMS, 48), plan(8, 9, 16, 2, 512, 64, SMS));
+        assert!(plan_rows(1, 1, 48, 1, 512, 64, SMS, 32).is_err()); // g 48 > cap
+        assert!(plan_rows(1, 1, 16, 2, 512, 64, SMS, 24).is_err());
+    }
 
     #[test]
     fn gemma_full_attn_hd512() {

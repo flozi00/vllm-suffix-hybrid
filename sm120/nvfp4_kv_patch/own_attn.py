@@ -10,16 +10,21 @@ out-of-contract shape (head_dim, GQA group, spec width > 16, page size) or
 logits soft-capping raises at backend init — the pool never silently keeps
 the FA2 decode kernel while the operator believes ours is serving.
 
-What changes (patch anchors H19/H20):
+What changes (patch anchors H19/H20/H24):
   * H19 builder: ``supports_spec_as_decode`` also when our kernel is armed, so
-    uniform MTP/suffix verify rows (q_len = 1+k) become DECODE rows instead of
-    riding the FA2 paged prefill kernel. Non-uniform rows, real prefills and
-    image-bearing short extends (H17 resplit) stay on FA2 (incl. the
-    mm-prefix custom mask) — multimodality untouched.
+    MTP/suffix verify rows (q_len <= 1+k) become DECODE rows instead of
+    riding the FA2 paged prefill kernel; H24 drops the uniform-split
+    requirement (K2 reads per-request q lengths from qo_indptr), so ragged
+    suffix widths are one K2 launch. Real prefills and image-bearing short
+    extends (H17 resplit) stay on FA2 (incl. the mm-prefix custom mask) —
+    multimodality untouched. Plain q_len-1 batches wider than
+    K2_Q1_MAX_BATCH stay on FA2's decode wrapper.
   * H20 builder decode branch: ``FIDecode(wrapper=DecodeWrapper(...))`` in
     place of FlashInfer's planned BatchDecodeWithPagedKVCacheWrapper, so
     forward()'s existing ``decode_wrapper.run(...)`` call lands on our op with
-    zero forward-path edits.
+    zero forward-path edits. K2 steps build no FlashInfer plan, paged
+    indices or host seq_lens (H21/H22); H23 takes host seq_lens for the
+    remaining FA2 plans from the runner's exact CPU copy (no device sync).
 CUDA graphs (V2 runner): H13 UNIFORM_BATCH. Uniform verify batches (q_len
 2..1+k) replay FULL graphs through K2 (grid is seq_lens-independent, H22
 drops the host seq_lens sync); uniform q_len-1 batches replay FULL graphs
@@ -40,10 +45,13 @@ import sys
 ENV = "SUFFIX_SM120_NVP4KV_OWN_ATTN"
 LOG2E = 1.4426950408889634
 MAX_Q_LEN = 16
+# Plain q_len-1 decode batches up to this width run on K2 (no FlashInfer
+# plan/indices/host work per KV group); wider ones stay on FA2's decode
+# kernel, which is faster per call there (oracle --bench q1 rows).
+K2_Q1_MAX_BATCH = 8
 
 _PLANS: dict = {}
 _SMS: dict = {}
-_META: dict = {}
 
 
 def enabled() -> bool:
@@ -62,14 +70,25 @@ def native():
     return _native
 
 
-def plan(batch, q_len, hq, hkv, d, page_size, num_sms):
-    key = (batch, q_len, hq, hkv, d, page_size, num_sms)
+def plan(batch, q_len, hq, hkv, d, page_size, num_sms, max_rows=48):
+    key = (batch, q_len, hq, hkv, d, page_size, num_sms, max_rows)
     p = _PLANS.get(key)
     if p is None:
         from suffix_hybrid import _native
 
         p = _PLANS[key] = _native.nvfp4_attn_plan(*key)
     return p
+
+
+def row_budget(q_lens) -> int:
+    """CTA row cap for one K2 launch: ragged batches of mostly q_len-1 rows
+    (suffix misses) take 16-row tiles (one light CTA per plain row, wide
+    rows split across q tiles); uniform or verify-heavy batches keep the
+    48-row tiles that share each KV read across a whole verify."""
+    lens = [int(x) for x in q_lens if int(x) > 0]
+    if not lens or min(lens) == max(lens):
+        return 48
+    return 16 if sum(lens) <= 2 * len(lens) else 48
 
 
 def num_sms(device) -> int:
@@ -150,8 +169,9 @@ def install_uniform_graph_lens() -> bool:
     batch of plain decodes (q_len 1: suffix misses, W0 fast path) or of
     shorter verifies runs PIECEWISE with eager attention in every layer.
     UNIFORM_BATCH (our H13 tier) already promises any uniform width is
-    capturable: q_len 1 lands on FlashInfer's stock fa2 cudagraph decode
-    wrappers, 2..1+k on K2 with q_len baked per graph. Same multimodal
+    capturable: q_len 2..1+k (and q_len 1 up to K2_Q1_MAX_BATCH wide) on K2
+    with q_max baked per graph, wider q_len 1 on FlashInfer's stock fa2
+    cudagraph decode wrappers. Same multimodal
     guard as 1+k: a batch with any prefilling request is never uniform.
     Only called when K2 graphs are enabled; V1 runner -> no-op.
     SUFFIX_SM120_NVP4KV_GRAPH_ALL_WIDTHS=0 keeps vLLM's 1+k-only set (A/B,
@@ -247,8 +267,9 @@ def builder_gate(builder, window_left, logits_soft_cap) -> bool:
     wl = -1 if window_left is None else int(window_left)
     how = prepare(nat, (d, hq, hkv, page, wl), tuple(range(1, q_max + 1)))
     print(
-        f"[suffix sm120-nvfp4-kv] OWN-ATTN ACTIVE: decode + uniform "
-        f"spec-verify (q_len<={q_max}) -> K2-NVFP4 cutile kernel "
+        f"[suffix sm120-nvfp4-kv] OWN-ATTN ACTIVE: decode rows (ragged "
+        f"q_len<={q_max}; plain q_len-1 batches <= {K2_Q1_MAX_BATCH} wide) "
+        f"-> K2-NVFP4 kernel "
         f"(head_dim={d}, heads={hq}/{hkv}, page={page}, window_left={wl}; "
         f"{how}); prefill + mm-prefix stay on FlashInfer fa2.",
         file=sys.stderr, flush=True)
@@ -261,9 +282,9 @@ class DecodeWrapper:
     Carries the attributes forward() asserts on and implements the one
     ``run`` signature forward() uses on the fa2 nvfp4 route."""
 
-    def __init__(self, block_table, seq_lens, q_len, num_qo_heads,
+    def __init__(self, block_table, seq_lens, qo_indptr, q_max, num_qo_heads,
                  num_kv_heads, head_dim, page_size, window_left, sm_scale,
-                 logits_soft_cap):
+                 logits_soft_cap, max_rows=48):
         if logits_soft_cap:
             raise ValueError(
                 f"{ENV}=1: logits soft-capping ({logits_soft_cap}) is not in "
@@ -273,7 +294,9 @@ class DecodeWrapper:
         self._sm_scale = sm_scale
         self.block_table = block_table
         self.seq_lens = seq_lens
-        self.q_len = q_len
+        self.qo_indptr = qo_indptr
+        self.q_max = q_max
+        self.max_rows = max_rows
         self.shape = (num_qo_heads, num_kv_heads, head_dim, page_size)
 
     def run(self, q, kv_cache, *, q_scale=None, k_scale=None, v_scale=None,
@@ -289,45 +312,32 @@ class DecodeWrapper:
         scale = self._sm_scale * (1.0 if q_scale is None else q_scale) * (
             1.0 if k_scale is None else k_scale)
         return run(q, k_data, k_sf, v_data, v_sf, self.block_table,
-                   self.seq_lens, out.view(q.shape[0], hq, d), self.q_len,
-                   self._window_left, scale,
-                   1.0 if v_scale is None else v_scale)
+                   self.seq_lens, self.qo_indptr, out.view(q.shape[0], hq, d),
+                   self.q_max, self._window_left, scale,
+                   1.0 if v_scale is None else v_scale, self.max_rows)
 
 
-def _meta(device, bt_row_stride):
-    """Persistent device word carrying the block-table row stride (keeps it
-    out of the kernel key; stable address for CUDA-graph capture)."""
-    key = (str(device), int(bt_row_stride))
-    t = _META.get(key)
-    if t is None:
-        import torch
-
-        t = torch.zeros(16, dtype=torch.int32, device=device)
-        t[0] = int(bt_row_stride)
-        _META[key] = t
-    return t
-
-
-def run(q, k_data, k_sf, v_data, v_sf, block_table, seq_lens, out, q_len,
-        window_left, sm_scale, v_scale):
-    """out[b*q_len + i] = attention of q row (b, i) over request b's paged
-    NVFP4 KV (causal, q at the tail, optional window). Uniform q_len."""
+def run(q, k_data, k_sf, v_data, v_sf, block_table, seq_lens, qo_indptr,
+        out, q_max, window_left, sm_scale, v_scale, max_rows=48):
+    """out[qo_indptr[b] + i] = attention of request b's q row i over its
+    paged NVFP4 KV (causal, q at the tail, optional window). Ragged q
+    lengths (each <= q_max; padding requests have length 0)."""
     import torch
 
     tokens, hq, d = q.shape
     _, hkv, page, _ = k_data.shape
-    if tokens == 0:
+    batch = qo_indptr.shape[0] - 1
+    if tokens == 0 or batch <= 0:
         return out
     sms = num_sms(q.device)
-    p = plan(tokens // q_len, q_len, hq, hkv, d, page, sms)
+    p = plan(batch, q_max, hq, hkv, d, page, sms, max_rows)
     rows16 = -(-p["rows"] // 16) * 16
     o_part = torch.empty((rows16, p["ns"], p["m"], d), dtype=torch.bfloat16,
                          device=q.device)
     lse_part = torch.empty((rows16, p["ns"], p["m"]), dtype=torch.float32,
                            device=q.device)
     native().nvfp4_paged_attn_cuda(
-        q, k_data, k_sf, v_data, v_sf, block_table,
-        _meta(q.device, block_table.stride(0)), seq_lens, out, o_part,
-        lse_part, q_len, window_left, sm_scale * LOG2E, v_scale, sms,
-        torch.cuda.current_stream(q.device).cuda_stream)
+        q, k_data, k_sf, v_data, v_sf, block_table, qo_indptr, seq_lens, out,
+        o_part, lse_part, q_max, window_left, sm_scale * LOG2E, v_scale, sms,
+        torch.cuda.current_stream(q.device).cuda_stream, max_rows)
     return out

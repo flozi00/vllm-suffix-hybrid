@@ -327,7 +327,8 @@ mod verify_fusion_gpu;
 /// K2-NVFP4 launch plan (src/nvfp4_attn.rs) as a dict; ValueError when the
 /// shape is outside the kernel contract (the adapter must refuse, loudly).
 #[pyfunction]
-#[pyo3(signature = (batch, q_len, num_q_heads, num_kv_heads, head_dim, page_size, num_sms))]
+#[pyo3(signature = (batch, q_len, num_q_heads, num_kv_heads, head_dim, page_size, num_sms, max_rows=nvfp4_attn::MAX_ROWS))]
+#[allow(clippy::too_many_arguments)]
 fn nvfp4_attn_plan(
     batch: usize,
     q_len: usize,
@@ -336,8 +337,9 @@ fn nvfp4_attn_plan(
     head_dim: usize,
     page_size: usize,
     num_sms: usize,
+    max_rows: usize,
 ) -> PyResult<HashMap<String, usize>> {
-    let p = nvfp4_attn::plan(
+    let p = nvfp4_attn::plan_rows(
         batch,
         q_len,
         num_q_heads,
@@ -345,6 +347,7 @@ fn nvfp4_attn_plan(
         head_dim,
         page_size,
         num_sms,
+        max_rows,
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
     Ok(HashMap::from([

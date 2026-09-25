@@ -193,8 +193,14 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
     v_deq = dequant_side(v_data, v_sf, True, v_scale)
 
     sm_scale = 1.0 / math.sqrt(d)
-    qs = [torch.randn(q_len, hq, d, generator=gen, device="cuda")
-          .to(torch.bfloat16) for _ in kv_lens]
+    # q_len: int (uniform) or per-request lengths (ragged: suffix drafts)
+    q_lens = ([q_len] * len(kv_lens) if isinstance(q_len, int)
+              else list(q_len))
+    offs = [0]
+    for ql in q_lens:
+        offs.append(offs[-1] + ql)
+    qs = [torch.randn(ql, hq, d, generator=gen, device="cuda")
+          .to(torch.bfloat16) for ql in q_lens]
     q = torch.cat(qs)
     ws = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
     i32 = dict(dtype=torch.int32, device="cuda")
@@ -216,7 +222,7 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
     else:
         w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             ws, "HND", backend="fa2")
-        qo_indptr = torch.arange(len(kv_lens) + 1, **i32) * q_len
+        qo_indptr = torch.tensor(offs, **i32)
         w.plan(qo_indptr, kv_indptr, kv_indices, kv_last, hq, hkv, d, page,
                causal=True, sm_scale=sm_scale, window_left=window - 1
                if window > 0 else -1, **dtypes)
@@ -233,8 +239,8 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
     fa2_out = None
     if own:
         fa2_out, out = out, _run_own(q, (k_data, k_sf, v_data, v_sf), indices,
-                                     kv_lens, q_len, window, sm_scale, scales,
-                                     graph)
+                                     kv_lens, q_lens, window, sm_scale,
+                                     scales, graph)
 
     worst = {"cos_kernel": 1.0, "rel_kernel": 0.0, "cos_e2e": 1.0,
              "cos_decode": 1.0}
@@ -244,19 +250,20 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
         # Gather through the page table (proves paging math, not just data).
         kd = k_deq[ids].permute(0, 2, 1, 3).reshape(-1, hkv, d)[:n]
         vd = v_deq[ids].permute(0, 2, 1, 3).reshape(-1, hkv, d)[:n]
-        o = out[i * q_len:(i + 1) * q_len]
-        allowed = _allowed(q_len, n, window, mm[i] if mm else (), q.device)
+        ql = q_lens[i]
+        o = out[offs[i]:offs[i + 1]]
+        allowed = _allowed(ql, n, window, mm[i] if mm else (), q.device)
         ref = _ref_attn(qs[i], kd, vd, sm_scale, allowed)
         e2e = _ref_attn(qs[i], keys[i].float(), vals[i].float(),
                         sm_scale, allowed)
         if mm is not None:
             causal = _ref_attn(qs[i], kd, vd, sm_scale,
-                               _allowed(q_len, n, window, (), q.device))
+                               _allowed(ql, n, window, (), q.device))
             worst["rel_mm_vs_causal"] = max(worst["rel_mm_vs_causal"],
                                             _rel(ref, causal))
         if fa2_out is not None:
             worst["cos_vs_fa2"] = min(worst.get("cos_vs_fa2", 1.0), _cos(
-                o, fa2_out[i * q_len:(i + 1) * q_len]))
+                o, fa2_out[offs[i]:offs[i + 1]]))
         worst["cos_kernel"] = min(worst["cos_kernel"], _cos(o, ref))
         worst["rel_kernel"] = max(worst["rel_kernel"], _rel(o, ref))
         worst["cos_e2e"] = min(worst["cos_e2e"], _cos(o, e2e))
@@ -286,30 +293,33 @@ def _block_table(indices, device):
     return bt
 
 
-def _run_own(q, views, indices, kv_lens, q_len, window, sm_scale, scales,
+def _run_own(q, views, indices, kv_lens, q_lens, window, sm_scale, scales,
              graph):
     """OUR kernel on the production views (own_attn.run = what the patched
-    backend's DecodeWrapper.run calls)."""
+    backend's DecodeWrapper.run calls); q_lens per request (ragged ok)."""
     import torch
 
     from . import own_attn
 
     k_data, k_sf, v_data, v_sf = views
     d, hq, hkv = q.shape[2], q.shape[1], k_data.shape[1]
+    q_max = max(q_lens)
     own_attn.prepare(own_attn.native(), (d, hq, hkv, k_data.shape[2],
                                          window - 1 if window > 0 else -1),
-                     (q_len,))
+                     (q_max,))
     bt = _block_table(indices, q.device)
     sl = torch.tensor(kv_lens, dtype=torch.int32, device=q.device)
+    qo = torch.tensor([0] + [sum(q_lens[:i + 1]) for i in range(len(q_lens))],
+                      dtype=torch.int32, device=q.device)
     out = torch.empty_like(q)
-    args = (q, k_data, k_sf, v_data, v_sf, bt, sl, out, q_len,
+    args = (q, k_data, k_sf, v_data, v_sf, bt, sl, qo, out, q_max,
             window - 1 if window > 0 else -1, sm_scale * scales[0], scales[1])
     if not graph:
         own_attn.run(*args)
     else:
         # Capture with DIFFERENT lengths, then replay with the real ones: the
         # grid and workspace must not depend on seq_lens.
-        sl.copy_((sl - q_len).clamp(min=q_len))
+        sl.copy_((sl - q_max).clamp(min=q_max))
         own_attn.run(*args)  # eager warmup (module load outside capture)
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
@@ -359,6 +369,14 @@ OWN_CASES = (
     ("own_graph_decode", (65, 777, 4100), 1, "decode",
      dict(own=True, graph=True)),
     ("own_graph_verify_k8", (130, 3001), 9, "prefill",
+     dict(own=True, graph=True)),
+    # Ragged decode rows as the suffix-only arm schedules them (misses q_len
+    # 1 next to partial/full verifies) — one K2 launch via qo_indptr.
+    ("own_ragged_verify", (1, 130, 700, 64, 3001), (1, 9, 3, 1, 5), "prefill",
+     dict(own=True)),
+    ("own_ragged_swa", (9, 700, 3001, 300), (9, 1, 4, 2), "prefill",
+     dict(own=True, window=128)),
+    ("own_graph_ragged", (130, 777, 3001), (2, 9, 1), "prefill",
      dict(own=True, graph=True)),
     # FA2 decode wrapper at q_len 9 (q_len_per_req) vs the torch reference:
     # evidence for a graph-capturable FA2 verify path (no K2 involved).
@@ -454,7 +472,8 @@ def bench(shapes, batches, kvs, q_lens, max_gb, iters, page, as_json):
                         q, (k_data, v_data), k_scale=1.0, v_scale=1.0,
                         kv_cache_sf=(k_sf, v_sf)), iters)
                     out = torch.empty_like(q)
-                    args = (q, k_data, k_sf, v_data, v_sf, bt, sl, out,
+                    qo = torch.arange(batch + 1, **i32) * q_len
+                    args = (q, k_data, k_sf, v_data, v_sf, bt, sl, qo, out,
                             q_len, -1, sm, 1.0)
                     own_attn.prepare(own_attn.native(),
                                      (d, hq, hkv, page, -1), (q_len,))

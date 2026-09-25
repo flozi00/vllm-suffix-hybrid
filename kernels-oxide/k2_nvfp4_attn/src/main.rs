@@ -9,7 +9,9 @@
 //! rows are ALL q tokens x GQA heads of the tile packed token-major
 //! (row = i*G + g): decode q_len 1 (G rows) and MTP verify q_len 9 (9G rows)
 //! stream every KV byte ONCE per CTA and feed it to all rows, so verify costs
-//! ~ decode instead of ~9x.
+//! ~ decode instead of ~9x. Ragged batches: request b's q rows are
+//! qo_indptr[b]..qo_indptr[b+1] (<= the planned q_max); q tiles past a
+//! request's length exit at once, rows past it are masked and not stored.
 //!
 //! Per TN-token KV tile:
 //!   * cp.async 16 B copies of the raw packed K/V data + block scales into a
@@ -217,6 +219,7 @@ mod kernels {
         v_sf: *const u8,
         block_table: *const i32,
         seq_lens: *const i32,
+        qo_indptr: *const i32,
         o_part: *mut u16,
         lse_part: *mut f32,
         q_tok_stride: u32,
@@ -228,7 +231,6 @@ mod kernels {
         m_rows: u32,
         d: u32,
         nqt: u32,
-        q_len: u32,
         page_size: u32,
         ns: u32,
         tn: u32,
@@ -253,6 +255,18 @@ mod kernels {
         let mtiles = m_rows / 16;
         let real_rows = qt_n * g_heads;
         let slot_base = (r * ns + s) * m_rows;
+
+        // ---- this request's q rows; tiles past them have no work -----------
+        let qs0 = unsafe { *qo_indptr.add(b as usize) };
+        let qe = unsafe { *qo_indptr.add(b as usize + 1) };
+        let q_len = if qe > qs0 { (qe - qs0) as u32 } else { 0 };
+        let qs0 = qs0 as u32;
+        if qt * qt_n >= q_len {
+            if tid < m_rows {
+                unsafe { *lse_part.add((slot_base + tid) as usize) = NEG_INF };
+            }
+            return;
+        }
 
         // ---- this CTA's KV range [t0, t1) in TN-token tiles -----------------
         let kv_len = unsafe { *seq_lens.add(b as usize) };
@@ -322,7 +336,7 @@ mod kernels {
             let v = if row < real_rows && tok < q_len {
                 let raw = unsafe {
                     *q.add(
-                        ((b * q_len + tok) * q_tok_stride + (h * g_heads + gg) * d + perm_k(kl))
+                        ((qs0 + tok) * q_tok_stride + (h * g_heads + gg) * d + perm_k(kl))
                             as usize,
                     )
                 };
@@ -710,7 +724,8 @@ mod kernels {
     }
 
     /// LSE merge of the NS partials for launch row r and head-dim chunk
-    /// blockIdx.y (64 dims); v_scale; bf16 store into out [B*q_len, HQ, D].
+    /// blockIdx.y (64 dims); v_scale; bf16 store into out [T, HQ, D] at the
+    /// request's qo_indptr rows (rows past its q length are not stored).
     /// Work item = (row, 8 dims); with M*8 <= 128 items two threads split the
     /// splits of one item and combine through smem.
     #[kernel]
@@ -718,13 +733,14 @@ mod kernels {
         out: *mut u16,
         o_part: *const u16,
         lse_part: *const f32,
+        qo_indptr: *const i32,
+        t_rows: u32,
         hkv: u32,
         g_heads: u32,
         qt_n: u32,
         m_rows: u32,
         d: u32,
         nqt: u32,
-        q_len: u32,
         ns: u32,
         v_scale: f32,
     ) {
@@ -735,6 +751,33 @@ mod kernels {
         let h = (r / nqt) % hkv;
         let qt = r % nqt;
         let hq = hkv * g_heads;
+        if r + 1 == thread::gridDim_x() {
+            // Padding tokens past the last request (CUDA-graph batches) are
+            // owned by no request: zero them (this 64-dim chunk, all heads)
+            // so downstream layers never read stale memory.
+            let nb = thread::gridDim_x() / (hkv * nqt);
+            let tail = unsafe { *qo_indptr.add(nb as usize) } as u32;
+            let mut item = tid;
+            while tail + item / (hq * 8) < t_rows {
+                let tok = tail + item / (hq * 8);
+                let hh = (item / 8) % hq;
+                let col = 64 * dc + 8 * (item % 8);
+                let dst = unsafe { out.add(((tok * hq + hh) * d + col) as usize) as *mut u32 };
+                let mut k = 0usize;
+                while k < 4 {
+                    unsafe { *dst.add(k) = 0 };
+                    k += 1;
+                }
+                item += THREADS;
+            }
+        }
+        let qs0 = unsafe { *qo_indptr.add(b as usize) };
+        let qe = unsafe { *qo_indptr.add(b as usize + 1) };
+        let q_len = if qe > qs0 { (qe - qs0) as u32 } else { 0 };
+        let qs0 = qs0 as u32;
+        if qt * qt_n >= q_len {
+            return; // no rows of this request in this q tile
+        }
         let wts: *mut f32 = DynamicSharedArray::<f32>::get(); // [ns][M]
         let inv: *mut f32 = unsafe { wts.add((ns * m_rows) as usize) }; // [M]
         let part: *mut f32 = unsafe { inv.add(m_rows as usize) }; // [M*8][8]
@@ -772,7 +815,7 @@ mod kernels {
             if row < qt_n * g_heads && tok < q_len {
                 let sc = unsafe { *inv.add(row as usize) };
                 let dst = unsafe {
-                    out.add((((b * q_len + tok) * hq + h * g_heads + gg) * d + col) as usize) as *mut u32
+                    out.add((((qs0 + tok) * hq + h * g_heads + gg) * d + col) as usize) as *mut u32
                 };
                 let mut k = 0usize;
                 #[unroll]

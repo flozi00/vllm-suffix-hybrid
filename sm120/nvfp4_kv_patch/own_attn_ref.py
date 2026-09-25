@@ -96,33 +96,45 @@ def _dequant(data, sf, swizzled):
     return vals * np.repeat(sc, 16, axis=-1)
 
 
+def q_rows(q_len, tokens):
+    """q_len: int (uniform, B = tokens // q_len) or per-request lengths
+    (ragged). -> (lengths, offsets[B+1])."""
+    if isinstance(q_len, (int, np.integer)):
+        lens = [int(q_len)] * (tokens // int(q_len))
+    else:
+        lens = [int(x) for x in q_len]
+    return lens, [0] + list(np.cumsum(lens, dtype=np.int64))
+
+
 def reference(q, cache, block_table, seq_lens, q_len, sm_scale, k_scale=1.0,
               v_scale=1.0, window_left=-1):
-    """q (B*q_len, HQ, D) float -> (B*q_len, HQ, D) float64."""
+    """q (T, HQ, D) float -> (T, HQ, D) float64; q_len int or per-request
+    lengths (request b's rows start at the running sum)."""
     k = _dequant(cache.k_data, cache.k_sf, False) * k_scale
     v = _dequant(cache.v_data, cache.v_sf, True) * v_scale
     tokens, hq, d = q.shape
     hkv, page = cache.hkv, cache.page
     g = hq // hkv
     out = np.zeros((tokens, hq, d))
-    for b in range(tokens // q_len):
+    lens, offs = q_rows(q_len, tokens)
+    for b, ql in enumerate(lens):
         n = int(seq_lens[b])
         if n == 0:
             continue
         pages = block_table[b, :math.ceil(n / page)]
         kb = k[pages].transpose(0, 2, 1, 3).reshape(-1, hkv, d)[:n]
         vb = v[pages].transpose(0, 2, 1, 3).reshape(-1, hkv, d)[:n]
-        for i in range(q_len):
-            pos = n - q_len + i
+        for i in range(ql):
+            pos = n - ql + i
             kk = np.arange(n)
             ok = kk <= pos
             if window_left >= 0:
                 ok &= pos - kk <= window_left
             for hh in range(hq):
-                logits = kb[:, hh // g] @ q[b * q_len + i, hh] * sm_scale
+                logits = kb[:, hh // g] @ q[offs[b] + i, hh] * sm_scale
                 logits = np.where(ok, logits, -np.inf)
                 w = np.exp(logits - logits.max())
-                out[b * q_len + i, hh] = (w / w.sum()) @ vb[:, hh // g]
+                out[offs[b] + i, hh] = (w / w.sum()) @ vb[:, hh // g]
     return out
 
 
@@ -142,9 +154,10 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
     tn, ns, nqt = plan["tn"], plan["ns"], plan["nqt"]
     min_tiles = plan.get("min_tiles", 1)
     sd, sg, tq = d // 16, d // 64, tn // 4
-    batch = tokens // q_len
+    lens, offs = q_rows(q_len, tokens)
+    batch = len(lens)
     qk_scale_log2 = sm_scale * k_scale * math.log2(math.e)
-    q5 = f16(bf16(q)).reshape(batch, q_len, hkv, g, d)
+    q4 = f16(bf16(q)).reshape(tokens, hkv, g, d)
     rows = batch * hkv * nqt
     o_part = np.zeros((rows, ns, m_rows, d))
     lse_part = np.full((rows, ns, m_rows), -np.inf)
@@ -152,8 +165,11 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
     real = qt_n * g
     for r in range(rows):
         b, h, qt = r // (hkv * nqt), (r // nqt) % hkv, r % nqt
+        ql = lens[b]
+        if qt * qt_n >= ql:
+            continue  # q tile past this request's rows: lse -inf, no store
         kv_len = int(seq_lens[b])
-        q0 = kv_len - q_len + qt * qt_n
+        q0 = kv_len - ql + qt * qt_n
         hi = max(min(q0 + qt_n, kv_len), 0)
         lo = max(q0 - window_left, 0) if window_left >= 0 else 0
         lo_t, hi_t = lo // tn, -(-hi // tn)
@@ -164,8 +180,8 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
         row_ok = np.zeros(m_rows, dtype=bool)
         for row in range(real):
             i = row // g
-            if qt * qt_n + i < q_len:
-                qm[row] = q5[b, qt * qt_n + i, h, row % g]
+            if qt * qt_n + i < ql:
+                qm[row] = q4[offs[b] + qt * qt_n + i, h, row % g]
                 row_ok[row] = True
         qpos = (q0 + np.arange(m_rows) // g)[:, None]
         for s in range(ns):
@@ -211,9 +227,11 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
             with np.errstate(divide="ignore"):
                 lse_part[r, s] = (m_i + np.log2(l_i))[:, 0]
     out = np.zeros((tokens, hq, d))
-    out5 = out.reshape(batch, q_len, hkv, g, d)
+    out4 = out.reshape(tokens, hkv, g, d)
     for r in range(rows):
         b, h, qt = r // (hkv * nqt), (r // nqt) % hkv, r % nqt
+        if qt * qt_n >= lens[b]:
+            continue  # merge CTA returns before any store
         lse = lse_part[r]
         mx = lse.max(0, keepdims=True)
         mx = np.where(mx == -np.inf, 0.0, mx)
@@ -223,6 +241,6 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
         o = bf16((o_part[r] * w[:, :, None]).sum(0) * inv)
         for row in range(real):
             i = row // g
-            if qt * qt_n + i < q_len:
-                out5[b, qt * qt_n + i, h, row % g] = o[row]
+            if qt * qt_n + i < lens[b]:
+                out4[offs[b] + qt * qt_n + i, h, row % g] = o[row]
     return out
