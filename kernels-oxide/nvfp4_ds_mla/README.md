@@ -8,7 +8,10 @@ DeepSeek-V3.2 sparse MLA) on SM120. Contract dossier:
 Build: cargo-oxide -> PTX `.target sm_120a` (ISA 8.7) -> ptxas 13.0 ->
 sm_120a cubin (`oxide-variants.json`; the writer's
 `cvt.rn.satfinite.e2m1x2.f32` is arch-specific). Products are f16
-`mma.sync.m16n8k16` with in-register e2m1/e4m3 dequant (k2 recipe).
+`mma.sync.m16n8k16` with in-register e2m1/e4m3 dequant (k2 recipe). The
+bf16 query is staged as f16 after an exact per-(token, head) power-of-two
+prescale (inverse folded into the logit scale): no f16 overflow for any
+|q| < ~2e33 (STATUS.md).
 
 ## Row layout — 352 B/token
 
@@ -29,7 +32,7 @@ strides, e.g. HiSparse hot views, are fine).
 1. `nvfp4_ds_mla_quant_store` — grid `(T)`, block 64 (warp 0: 32 latent SF
    blocks, warp 1 lanes 0..3: RoPE). Negative slots skipped.
 2. `nvfp4_ds_mla_attn_partial` — grid `(T * ceil(HQ/8), NS)`, 256 threads,
-   69,312 B smem (1 CTA/SM). One CTA = (token, 8-head tile, capacity split of
+   69,376 B smem (1 CTA/SM). One CTA = (token, 8-head tile, capacity split of
    `c_per_split` rows, 64-row cp.async double-buffered tiles). Q is staged
    through the k-permutation that cancels the B-fragment dim order
    (tests/test_nvfp4_ds_mla_fragments.py proves S and PV on CPU). `-1` rows

@@ -43,7 +43,10 @@
 //! Numerics: every e2m1 x e4m3 product is exact in f16 (2 x 3 mantissa
 //! bits); S and P*V accumulate in f32. e4m3 -> f16 is a bit shift yielding
 //! value * 2^-8 exactly (subnormals included); the host folds 2^8 into
-//! qk_scale_log2 AND v_scale (both operands carry the same 2^-8).
+//! qk_scale_log2 AND v_scale (both operands carry the same 2^-8). The bf16
+//! query is staged as f16 after a per-(token, head) power-of-two prescale
+//! (amax -> [2^14, 2^15)) whose inverse is folded into the logit scale:
+//! exact, and no |q| (up to ~1e33) can overflow the f16 staging.
 use cuda_device::{DynamicSharedArray, cuda_module, kernel, launch_bounds, ptx_asm, thread};
 
 #[cuda_module]
@@ -54,7 +57,7 @@ mod kernels {
     };
     use cuda_device::convert::cvt_f16x2_f32;
     use cuda_device::prmt::prmt;
-    use cuda_device::warp::shuffle_xor_f32_sync;
+    use cuda_device::warp::{shuffle_xor_f32_sync, shuffle_xor_sync};
     use cuda_device::wmma::{ldmatrix_x4, mma_m16n8k16_f32_f16};
 
     const THREADS: u32 = 256;
@@ -418,7 +421,8 @@ mod kernels {
 
         // ---- shared memory carve-up (all offsets 16-byte aligned) --------
         // Q f16 [16][576+8... use 16 rows x 576] | 2 x KV stage TN x 368 B
-        // | P f16 [16][TN+8] | red_max + red_sum [TN/8][16] | m, l, m' [16]
+        // | P f16 [16][TN+8] | red_max + red_sum [TN/8][16] | m, l, m',
+        // qfold [16] f32
         let qs: *mut u16 = DynamicSharedArray::<u16>::get();
         let qrow = DIM + PE_DIM + 8; // 584 f16 per staged Q row
         let stage_bytes = TN * ROW_PITCH;
@@ -438,38 +442,85 @@ mod kernels {
         unsafe {
             issue_tile(kv0, rows, topk_indices, (t * topk_stride) as u64, topk_len, c0, TN.min(c1 - c0), tid, block_size, block_stride);
         }
-        // Q staging: 16 rows x 576 f16 as bf16->f16 (mirror rows 8..15
-        // zero; heads past hq zero). One u32 word (2 f16) per work item,
-        // 9216 B total. LOGICAL-K PERMUTATION (k2 precedent): the B
-        // fragments dequant dims 32p+8t4+{0..7} (byte 16p+4t4 of the
-        // pinned 352 B row) and hand them to the mma at hardware k
-        // positions {2t4,2t4+1,2t4+8,2t4+9}(+16) — with a straight
-        // dim-major staging the dot product scrambles the head dim.
-        // Physical dim d = 32*blk + 8a + 4b + 2e + f therefore goes to
-        // smem COLUMN 32*blk + 16b + 8e + 2a + f; (f=0,1) pairs stay
-        // adjacent so each u32 word stays one store.
-        let words = TH * (DIM + PE_DIM) / 2; // 4608
-        let mut wi = tid;
-        while wi < words {
-            let row = wi / ((DIM + PE_DIM) / 2); // head-mirror row 0..15
-            let off = wi % ((DIM + PE_DIM) / 2); // f16 pair offset in row
-            let valid = row < 8 && h0 + row < hq;
-            let d0 = off * 2; // first physical dim of this pair (even)
+        // Q staging: 16 rows x 576 f16 (mirror rows 8..15 zero; heads past
+        // hq zero). Warp w stages head row w and zeroes mirror row w + 8.
+        // OVERFLOW-SAFE PRESCALE: bf16 q can exceed f16 (65504) and its tiny
+        // values fall below f16 normals, so each (token, head) row is
+        // multiplied by 2^k with k = 141 - e(amax) (e = amax's biased bf16
+        // exponent), i.e. amax * 2^k in [2^14, 2^15): every staged value is
+        // < 2^15 (no inf), and every value >= amax * 2^-28 is an f16 NORMAL,
+        // so bf16 (8 significant bits) -> f16 (11) is exact; smaller values
+        // contribute < 2^-39 of the largest product (below the f32
+        // accumulator's resolution). The f32 S accumulator is then exactly
+        // 2^k x the unscaled one (power-of-two scaling commutes with every
+        // product/sum), and qfold[row] = 2^-k folded into qk_scale_log2 is
+        // exact too: S * (qk_scale_log2 * 2^-k) rounds identically to the
+        // unscaled path wherever that path was representable. k is clamped
+        // to [-114, 126] so 2^k and 2^-k are f32 normals (all-zero rows: any
+        // k; amax inf/NaN propagates as it would in bf16).
+        // LOGICAL-K PERMUTATION (k2 precedent): the B fragments dequant
+        // dims 32p+8t4+{0..7} (byte 16p+4t4 of the pinned 352 B row) and
+        // hand them to the mma at hardware k positions {2t4,2t4+1,2t4+8,
+        // 2t4+9}(+16) — with a straight dim-major staging the dot product
+        // scrambles the head dim. Physical dim d = 32*blk + 8a + 4b + 2e + f
+        // therefore goes to smem COLUMN 32*blk + 16b + 8e + 2a + f; (f=0,1)
+        // pairs stay adjacent so each u32 word stays one store.
+        let qfold: *mut f32 = unsafe { m_run1.add(m_rows as usize) };
+        let pairs = (DIM + PE_DIM) / 2; // 288 u32 words per row
+        let valid = h0 + w < hq;
+        let qrow_g = unsafe {
+            q.add((t * q_stride + (h0 + w) * (DIM + PE_DIM)) as usize) as *const u32
+        };
+        let mut amax_bits = 0u32; // |bf16| bits are monotone in magnitude
+        if valid {
+            let mut wi = lane;
+            while wi < pairs {
+                let v = unsafe { *qrow_g.add(wi as usize) };
+                let lo = v & 0x7FFF;
+                let hi = (v >> 16) & 0x7FFF;
+                let m = if lo > hi { lo } else { hi };
+                if m > amax_bits {
+                    amax_bits = m;
+                }
+                wi += 32;
+            }
+        }
+        // warp max (u32 shuffles; this cuda-oxide rev classifies every
+        // redux.sync as sm_100a-only)
+        let mut sh = 1u32;
+        while sh < 32 {
+            let o = shuffle_xor_sync(FULL, amax_bits, sh);
+            if o > amax_bits {
+                amax_bits = o;
+            }
+            sh *= 2;
+        }
+        let mut k = 141i32 - (amax_bits >> 7) as i32; // 14 - (e - 127)
+        if k > 126 {
+            k = 126;
+        }
+        let up = f32::from_bits(((k + 127) as u32) << 23); // 2^k
+        let mut wi = lane;
+        while wi < pairs {
+            let d0 = wi * 2; // first physical dim of this pair (even)
             let o = d0 % 32;
             let (ka, kb, ke) = (o / 8, (o % 8) / 4, (o % 4) / 2);
             let col = 32 * (d0 / 32) + 16 * kb + 8 * ke + 2 * ka;
             let v: u32 = if valid {
-                let p = unsafe {
-                    q.add((t * q_stride + (h0 + row) * (DIM + PE_DIM) + d0) as usize)
-                };
-                let a = bf16_to_f32(unsafe { *p.add(0) } as u32);
-                let b = bf16_to_f32(unsafe { *p.add(1) } as u32);
-                cvt_f16x2_f32(a, b)
+                let x = unsafe { *qrow_g.add(wi as usize) };
+                cvt_f16x2_f32(bf16_to_f32(x & 0xFFFF) * up, bf16_to_f32(x >> 16) * up)
             } else {
                 0
             };
-            unsafe { *(qs.add((row * qrow + col) as usize) as *mut u32) = v };
-            wi += THREADS;
+            unsafe {
+                *(qs.add((w * qrow + col) as usize) as *mut u32) = v;
+                *(qs.add(((w + 8) * qrow + col) as usize) as *mut u32) = 0;
+            }
+            wi += 32;
+        }
+        if lane == 0 {
+            // 2^-k: undoes the prescale in the S -> logit multiply below.
+            unsafe { *qfold.add(w as usize) = f32::from_bits(((127 - k) as u32) << 23) };
         }
         if tid < m_rows {
             unsafe {
@@ -558,11 +609,13 @@ mod kernels {
             while half < 2 {
                 let row = gq + 8 * half;
                 let valid = krow_live && row < 8 && h0 + row < hq;
+                // exact: qk_scale_log2 * 2^-k is a power-of-two rescale
+                let sc = if valid { qk_scale_log2 * unsafe { *qfold.add(row as usize) } } else { 0.0 };
                 let mut e = 0usize;
                 while e < 2 {
                     let v = sacc[2 * half as usize + e];
                     sacc[2 * half as usize + e] = if valid {
-                        v * qk_scale_log2
+                        v * sc
                     } else {
                         NEG_INF
                     };

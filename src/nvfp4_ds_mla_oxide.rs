@@ -19,7 +19,8 @@
 //! Grid = f(T, HQ, C, NS) only: CUDA-graph replay safe.
 
 use crate::nvfp4_ds_mla::{
-    DIM, PE_DIM, ROW_BYTES, SCALE_FIX, THREADS, merge_smem_bytes, partial_smem_bytes, split_rows,
+    DIM, PE_DIM, ROW_BYTES, SCALE_FIX, THREADS, check_launch, merge_smem_bytes, partial_smem_bytes,
+    split_rows,
 };
 use crate::oxide::{Arg, function, launch};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -150,6 +151,7 @@ pub fn nvfp4_ds_mla_decode_cuda<'py>(
         [t, h, n, d] if t == tokens && h == hq && d == DIM && n >= 1 => n,
         _ => return err(format!("o_part must be [T, HQ, NS, 512], got {:?}", op.shape)),
     };
+    check_launch(tokens, hq, cap, ns).or_else(err)?;
     let c_per_split = split_rows(cap, ns);
     if cap.div_ceil(c_per_split) != ns {
         return err(format!("NS={ns} is not a plan split count for capacity {cap}"));

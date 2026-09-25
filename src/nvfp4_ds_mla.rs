@@ -75,13 +75,13 @@ pub fn sf_perm(s: usize) -> usize {
 
 /// Dynamic shared memory of nvfp4_ds_mla_attn_partial (kernel mirror):
 /// Q f16 [16][584] | 2 x stage of TN x ROW_PITCH bytes | P f16 [16][TN+8]
-/// | red_max + red_sum [TN/8][16] f32 | m, l, m' [16] f32 x3.
+/// | red_max + red_sum [TN/8][16] f32 | m, l, m', qfold [16] f32 x4.
 pub fn partial_smem_bytes() -> usize {
     16 * (DIM + PE_DIM + 8) * 2
         + 2 * TN * ROW_PITCH
         + 16 * (TN + 8) * 2
         + 2 * (TN / 8) * 16 * 4
-        + 3 * 16 * 4
+        + 4 * 16 * 4
 }
 
 /// Dynamic shared memory of nvfp4_ds_mla_attn_merge: weights [ns] + scale
@@ -94,6 +94,30 @@ pub fn merge_smem_bytes(ns: usize) -> usize {
 /// op derives it from o_part's shape, so plan and launch cannot disagree).
 pub fn split_rows(capacity: usize, ns: usize) -> usize {
     TN * capacity.div_ceil(TN).div_ceil(ns.max(1))
+}
+
+/// Launch-shape contract of the kernels: grid.x <= 2^31 - 1 (partial
+/// T * HQT, merge T * HQ), grid.y = NS <= 65535, and every u32 element
+/// index the kernels form stays in range: o_part T*HQ*NS*512, q T*HQ*576,
+/// topk T*C. GLM prefill (T 8192, HQ 8, C 2048, NS 1) uses <= 2^25 of 2^32.
+pub fn check_launch(tokens: usize, hq: usize, capacity: usize, ns: usize) -> Result<(), String> {
+    let lim = u32::MAX as u128;
+    let (t, h, c, n) = (tokens as u128, hq as u128, capacity as u128, ns as u128);
+    let bad = [
+        (t * h, i32::MAX as u128, "grid.x T*HQ"),
+        (n, 65535, "grid.y NS"),
+        (t * h * n * DIM as u128, lim, "o_part index T*HQ*NS*512"),
+        (t * h * (DIM + PE_DIM) as u128, lim, "q index T*HQ*576"),
+        (t * c, lim, "topk index T*C"),
+    ]
+    .into_iter()
+    .find(|(v, max, _)| v > max);
+    match bad {
+        Some((v, max, what)) => Err(format!(
+            "{what} = {v} exceeds {max} (T={tokens}, HQ={hq}, C={capacity}, NS={ns})"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Plan from (T, HQ, C, num_sms) ONLY (CUDA-graph stable).
@@ -123,6 +147,7 @@ pub fn plan(
     let want = num_sms.div_ceil(rows).clamp(1, tiles.min(MAX_SPLITS));
     let c_per_split = split_rows(capacity, want);
     let ns = capacity.div_ceil(c_per_split);
+    check_launch(tokens, hq, capacity, ns)?;
     Ok(DsMlaPlan {
         hqt,
         c_per_split,
@@ -343,6 +368,24 @@ mod tests {
         assert_eq!((p.ns, p.c_per_split), (1, 2048));
         let p = plan(1, 64, 2048, SMS).unwrap(); // TP=1
         assert_eq!((p.hqt, p.ns, p.c_per_split), (8, 16, 128));
+    }
+
+    #[test]
+    fn prefill_t8192_stays_inside_grid_and_index_limits() {
+        // vLLM on SM120 routes prefill through this decode path: T up to
+        // max-num-batched-tokens 8192 at 8 (TP=8) and 64 (TP=1) heads.
+        for hq in [8, 64] {
+            let p = plan(8192, hq, 2048, SMS).unwrap();
+            assert_eq!(p.ns, 1);
+            assert!(p.rows <= i32::MAX as usize && p.merge_rows <= i32::MAX as usize);
+            // o_part workspace = T * HQ * NS * 1 KiB (bf16): 64 / 512 MiB,
+            // the same bytes as the output itself at NS 1.
+            assert_eq!(8192 * hq * p.ns * DIM * 2, 8192 * hq * 1024);
+        }
+        // the u32 index guard trips before the kernels could wrap
+        assert!(check_launch(1 << 20, 16, 2048, 1).is_err()); // o_part 2^33
+        assert!(check_launch(1, 8, 2048, 65536).is_err()); // grid.y
+        assert!(check_launch(8192, 8, 2048, 1).is_ok());
     }
 
     #[test]

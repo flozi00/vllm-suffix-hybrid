@@ -50,17 +50,33 @@ def word(row, byte):
     return sum(int(row[byte + k]) << (8 * k) for k in range(4))
 
 
-def stage_q(Q):
-    """Kernel Q staging: pair (d0, d0+1) -> smem column col (+1)."""
+def bf16(x):
+    """f64 -> nearest bf16 value (RNE via the f32 bit pattern)."""
+    u = np.asarray(x, np.float32).view(np.uint32).astype(np.uint64)
+    u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
+    return u.astype(np.uint32).view(np.float32).astype(np.float64)
+
+
+def stage_q(Q, prescale=True):
+    """Kernel Q staging: per-row power-of-two prescale (k = 141 - biased
+    bf16 exponent of the row amax, clamped <= 126) then pair (d0, d0+1) ->
+    smem column col (+1) as f16. Returns (smem, per-row fold 2^-k).
+    prescale=False is the pre-hardening kernel (plain bf16 -> f16)."""
     qs = np.zeros((16, 584), dtype=np.uint16)
-    for row in range(Q.shape[0]):
-        for d0 in range(0, 576, 2):
-            o = d0 % 32
-            ka, kb, ke = o // 8, (o % 8) // 4, (o % 4) // 2
-            col = 32 * (d0 // 32) + 16 * kb + 8 * ke + 2 * ka
-            qs[row, col] = K2.f2h(Q[row, d0])
-            qs[row, col + 1] = K2.f2h(Q[row, d0 + 1])
-    return qs
+    fold = np.ones(16)
+    with np.errstate(over="ignore"):
+        for row in range(Q.shape[0]):
+            bits = np.asarray(Q[row], np.float32).view(np.uint32) >> 16
+            e = int((bits & 0x7FFF).max()) >> 7
+            k = min(141 - e, 126) if prescale else 0
+            fold[row] = 2.0 ** -k
+            for d0 in range(0, 576, 2):
+                o = d0 % 32
+                ka, kb, ke = o // 8, (o % 8) // 4, (o % 4) // 2
+                col = 32 * (d0 // 32) + 16 * kb + 8 * ke + 2 * ka
+                qs[row, col] = K2.f2h(Q[row, d0] * 2.0 ** k)
+                qs[row, col + 1] = K2.f2h(Q[row, d0 + 1] * 2.0 ** k)
+    return qs, fold
 
 
 def test_q_staging_is_a_column_bijection():
@@ -72,12 +88,9 @@ def test_q_staging_is_a_column_bijection():
     assert cols == set(range(576))
 
 
-def test_s_phase_computes_q_dot_k_over_latent_and_rope():
-    rows, lat, rope = rand_rows(8)  # one n-tile: 8 gathered rows
-    K = np.concatenate([lat, rope], -1)
-    Q = rng.standard_normal((16, 576)).astype(np.float16).astype(np.float64)
-    Q[8:] = 0  # mirror rows
-    qs = stage_q(Q)
+def s_phase(qs, rows):
+    """Kernel S phase for one n-tile of 8 gathered rows (f64 matmuls of the
+    emulated fragments): returns the raw accumulator [16, 8]."""
     arow = lambda l: (l % 8) + 8 * ((l // 8) % 2)  # noqa: E731
     acol = lambda l: 8 * (l // 16)                 # noqa: E731
     S = np.zeros((16, 8))
@@ -105,7 +118,87 @@ def test_s_phase_computes_q_dot_k_over_latent_and_rope():
             ba.append([e2(w0 & 0xFFFF), e2(w0 >> 16)])
             bb.append([e2(w1 & 0xFFFF), e2(w1 >> 16)])
         S += K2.a_matrix(aa) @ K2.b_matrix(ba) + K2.a_matrix(ab) @ K2.b_matrix(bb)
+    return S
+
+
+def test_s_phase_computes_q_dot_k_over_latent_and_rope():
+    rows, lat, rope = rand_rows(8)  # one n-tile: 8 gathered rows
+    K = np.concatenate([lat, rope], -1)
+    Q = bf16(rng.standard_normal((16, 576)))
+    Q[8:] = 0  # mirror rows
+    qs, fold = stage_q(Q)
+    S = s_phase(qs, rows) * fold[:, None]  # kernel: S * qk_scale * 2^-k
     np.testing.assert_allclose(S * 256.0, Q @ K.T, rtol=1e-6, atol=1e-6)
+
+
+def adversarial_q():
+    """bf16 query rows the pre-hardening f16 staging cannot represent."""
+    Q = np.zeros((16, 576))
+    Q[0] = rng.standard_normal(576) * 2.0 ** 15        # |q| ~ 1e5 everywhere
+    Q[1] = rng.standard_normal(576)                    # benign
+    Q[1, 7], Q[1, 520] = 1e5, -1e5                     # mixed: 2 huge dims (latent + RoPE)
+    Q[2] = rng.standard_normal(576) * 1e-6             # f16-subnormal range
+    Q[3] = rng.standard_normal(576) * 1e30             # far past f16
+    Q[4, 3] = 1e33                                     # one dim, near the f32-logit bound
+    # Q[5..7] = 0: all-zero rows (k clamps; S must be exactly 0)
+    return bf16(Q)
+
+
+def max_sf_rows(n):
+    """Rows at the format's magnitude ceiling: every nibble +-6, every SF
+    0x7E (448), RoPE bytes +-448 -> |latent| = 2688 (6 x 448)."""
+    rows = np.zeros((n, ROW), np.int64)
+    rows[:, :256] = rng.choice([0x77, 0xFF, 0x7F, 0xF7], (n, 256))
+    rows[:, PE_BASE:SF_BASE] = rng.choice([0x7E, 0xFE], (n, 64))
+    rows[:, SF_BASE:] = 0x7E
+    return rows
+
+
+def test_s_phase_prescale_is_exact_where_plain_f16_staging_breaks():
+    """Fails on the OLD kernel (bf16 -> f16 overflow to inf / subnormal
+    loss), passes on the prescaled staging, for benign AND max-SF rows."""
+    Q = adversarial_q()
+    for rows in (rand_rows(8)[0], max_sf_rows(8)):
+        lat = np.stack([np.concatenate(_deq(r)) for r in rows])
+        with np.errstate(over="ignore", invalid="ignore"):
+            ref = Q[:8] @ lat.T
+            qs, fold = stage_q(Q)
+            new = (s_phase(qs, rows) * fold[:, None] * 256.0)[:8]
+            qs0, fold0 = stage_q(Q, prescale=False)
+            old = (s_phase(qs0, rows) * fold0[:, None] * 256.0)[:8]
+        # staged values are exact: f16(q * 2^k) * 2^-k == q for rows 0..4
+        # (row 2's 1e-6 values stay f16 normals after the prescale)
+        for r in (0, 1, 2, 3):
+            got = np.array([K2.h2f(int(b)) for b in qs[r, :576]]) * fold[r]
+            assert sorted(got) == sorted(Q[r]), f"row {r} staging inexact"
+        assert np.isfinite(new[:5]).all()
+        np.testing.assert_allclose(new[:5], ref[:5], rtol=1e-6)
+        assert (new[5:] == 0).all()
+        # the old staging: inf/NaN scores (rows 0, 1, 3, 4) and a
+        # subnormal-truncated row 2
+        assert (~np.isfinite(old[[0, 1, 3, 4]])).all(axis=1).all()
+        assert np.abs(old[2] - ref[2]).max() > 1e-3 * np.abs(ref[2]).max()
+
+
+def _deq(row):
+    nib = np.stack((row[:256] & 0xF, row[:256] >> 4), -1).reshape(512)
+    sf = np.array([K2.e4m3_ref(int(row[SF_BASE + sf_perm(b)])) for b in range(32)])
+    return K2.E2M1[nib] * np.repeat(sf, 16), e4m3_vals(row[PE_BASE:SF_BASE])
+
+
+def test_max_magnitude_rows_stay_inside_f16_and_f32():
+    """V/PV and lse headroom at the format ceiling (SF 448 x e2m1 6)."""
+    # in-kernel f16 operands carry 2^-8: |K|, |V| <= 6 * 448 / 256 = 10.5
+    rows = max_sf_rows(8)
+    f = [K2.h2f(K2.hmul2(K2.nib8(word(r, 0))[0], K2.e4m3_f16(0x7E) * 0x10001)) for r in rows]
+    assert max(abs(x) for x in f) == 10.5
+    # S accumulator: 576 products of |q| < 2^15 (prescaled) and <= 10.5
+    assert 576 * 2.0 ** 15 * 10.5 < np.finfo(np.float32).max
+    # P in [0, 1] (f16), O partial <= l * 10.5 with l <= 2048 rows
+    assert 2048 * 10.5 * 256 < 3.39e38  # merge output (x v_scale 2^8), bf16 range
+    # true logits stay finite in f32 up to |q| ~ 2e33 (bf16 max is 3.4e38):
+    # 576 * 2e33 * 2688 * (256^-0.5 * log2 e) < f32 max
+    assert 576 * 2e33 * 2688 * (1 / 16) * 1.4427 < np.finfo(np.float32).max
 
 
 def test_pv_phase_and_output_store_mapping():
