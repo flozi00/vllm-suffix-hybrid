@@ -78,7 +78,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-25.10"
+PATCH_REVISION = "2026-09-25.11"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -523,6 +523,9 @@ def _nvfp4_own_attn_graphs_ok() -> bool:
             "K2-NVFP4 (V2 runner has_prefill invariant not verified); spec "
             "verify stays piecewise.")
         return False
+    # FULL graphs for every uniform width 1..1+k (q_len 1 -> stock fa2
+    # cudagraph decode wrappers), not only 1+k. Same invariant as above.
+    impl.install_uniform_graph_lens()
     return True
 
 
@@ -904,6 +907,23 @@ _BACKEND_EDITS = [
             and not (getattr(self, "use_own_nvfp4_attn", False)
                      and _nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) > 1)
         )""",
+        1,
+    ),
+    # ---- H22: a K2-only batch (uniform verify, no prefill rows) never
+    # reads seq_lens on the host (K2 takes seq_lens + block_table on the
+    # GPU; H21 already skipped the paged indices), so skip the blocking
+    # seq_lens.cpu() D2H — one GPU sync per KV group per verify step.
+    (
+        "own_attn_no_seq_lens_sync",
+        """        needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
+""",
+        """        needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
+        if (needs_seq_lens_cpu and num_prefills == 0 and not self.use_dcp
+                and not use_cascade
+                and getattr(self, "use_own_nvfp4_attn", False)
+                and _nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) > 1):
+            needs_seq_lens_cpu = False
+""",
         1,
     ),
     # ---- H16: per-KV-group mm mask decision at builder init (window_left

@@ -20,10 +20,12 @@ What changes (patch anchors H19/H20):
     place of FlashInfer's planned BatchDecodeWithPagedKVCacheWrapper, so
     forward()'s existing ``decode_wrapper.run(...)`` call lands on our op with
     zero forward-path edits.
-CUDA graphs: unchanged tier (H13 UNIFORM_SINGLE_TOKEN_DECODE). q_len=1 decode
-batches replay FULL graphs through our op (grid is seq_lens-independent);
-spec-verify batches run piecewise as today — UNIFORM_BATCH needs the image
-ranges in-kernel first (dossier sm120-nvfp4-attn-kernel.md §5).
+CUDA graphs (V2 runner): H13 UNIFORM_BATCH. Uniform verify batches (q_len
+2..1+k) replay FULL graphs through K2 (grid is seq_lens-independent, H22
+drops the host seq_lens sync); uniform q_len-1 batches replay FULL graphs
+through FlashInfer's stock fa2 cudagraph decode wrappers
+(install_uniform_graph_lens adds the widths vLLM does not capture itself).
+Batches holding a prefilling request are never uniform -> piecewise, FA2.
 
 Cubins: pods never JIT. CI (scripts/oxide_build.py) compiles the kernel
 crate with cargo-oxide to PTX (ISA <= 9.0) and ptxas 13.0 to sm_120 SASS;
@@ -139,6 +141,84 @@ def uniform_decode_excludes_prefill(func=None) -> bool:
     except Exception:
         return False
     return "if not has_prefill and" in src
+
+
+def install_uniform_graph_lens() -> bool:
+    """Target FULL graphs for EVERY uniform decode width 1..1+k, not just
+    1+k. vLLM's V2 runner captures uniform-decode graphs only at
+    decode_query_len = 1+k (cudagraph_utils._init_candidates), so a uniform
+    batch of plain decodes (q_len 1: suffix misses, W0 fast path) or of
+    shorter verifies runs PIECEWISE with eager attention in every layer.
+    UNIFORM_BATCH (our H13 tier) already promises any uniform width is
+    capturable: q_len 1 lands on FlashInfer's stock fa2 cudagraph decode
+    wrappers, 2..1+k on K2 with q_len baked per graph. Same multimodal
+    guard as 1+k: a batch with any prefilling request is never uniform.
+    Only called when K2 graphs are enabled; V1 runner -> no-op."""
+    try:
+        from vllm.v1.worker.gpu import cudagraph_utils as cgu
+    except ImportError:
+        return False
+    return wrap_init_candidates(cgu.ModelCudaGraphManager, cgu.CUDAGraphMode)
+
+
+def wrap_init_candidates(cls, modes) -> bool:
+    cur = cls.__dict__.get("_init_candidates")
+    if getattr(cur, "_suffix_k2_lens", False):
+        return True
+    base = cls._init_candidates
+
+    def _init_candidates(self):
+        base(self)
+        added = add_uniform_lens(self, base, modes)
+        if added:
+            print(f"[suffix sm120-nvfp4-kv] K2 graphs: FULL uniform-decode "
+                  f"graphs also for q_len {added} (vLLM default: "
+                  f"{self.decode_query_len} only)", file=sys.stderr,
+                  flush=True)
+
+    _init_candidates._suffix_k2_lens = True
+    cls._init_candidates = _init_candidates
+    return True
+
+
+def add_uniform_lens(mgr, base, modes) -> list:
+    """Run the stock candidate builder once per extra width and merge its
+    FULL uniform descriptors (captures + dispatch candidates, FULL entries
+    ahead of PIECEWISE ones as stock orders them)."""
+    full = modes.FULL
+    mode = mgr.cudagraph_mode
+    spec = getattr(mgr.vllm_config, "speculative_config", None)
+    dq = mgr.decode_query_len
+    dynamic = spec is not None and getattr(
+        spec, "uses_dynamic_speculative_decoding", lambda: False)()
+    if (dq <= 1 or not mode or not mode.separate_routine()
+            or mode.decode_mode() != full or mgr.varlen_decode or dynamic):
+        return []
+    descs, cands = mgr._capture_descs, mgr._candidates
+    added = []
+    try:
+        for u in range(1, dq):
+            mgr._capture_descs, mgr._candidates = {}, {}
+            mgr.decode_query_len = u
+            base(mgr)
+            new = [d for d in mgr._capture_descs.get(full, [])
+                   if d.uniform_token_count == u]
+            dst = descs.setdefault(full, [])
+            dst.extend(d for d in new if d not in dst)
+            for key, lst in mgr._candidates.items():
+                fu = [d for d in lst
+                      if d.cg_mode == full and d.uniform_token_count == u]
+                tgt = cands.setdefault(key, [])
+                at = next((i for i, d in enumerate(tgt)
+                           if d.cg_mode != full), len(tgt))
+                tgt[at:at] = [d for d in fu if d not in tgt]
+            if new:
+                added.append(u)
+    finally:
+        mgr.decode_query_len = dq
+        mgr._capture_descs, mgr._candidates = descs, cands
+    descs.get(full, []).sort(key=lambda d: d.num_tokens, reverse=True)
+    return added
 
 
 def builder_gate(builder, window_left, logits_soft_cap) -> bool:

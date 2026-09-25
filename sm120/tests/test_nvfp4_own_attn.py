@@ -346,3 +346,133 @@ def test_graphs_ok_helper_gates(monkeypatch):
     monkeypatch.setattr(own_attn, "uniform_decode_excludes_prefill",
                         lambda: True)
     assert ns["_nvfp4_own_attn_graphs_ok"]() is True
+
+
+def test_h22_skips_seq_lens_sync_only_for_k2_only_batches():
+    new, applied = PATCH.patch_backend_source(FIXTURE.read_text())
+    assert "own_attn_no_seq_lens_sync" in applied
+    i = new.index("needs_seq_lens_cpu = self.use_dcp or use_cascade")
+    block = new[i:i + 500]
+    for cond in ("num_prefills == 0", "not self.use_dcp", "not use_cascade",
+                 'getattr(self, "use_own_nvfp4_attn", False)',
+                 "_nvfp4_own_attn_q_len(qo_indptr_cpu, num_decodes) > 1"):
+        assert cond in block, cond
+    # decided before the seq_lens.cpu() read it guards
+    assert i < new.index("seq_lens_cpu = common_attn_metadata.seq_lens.cpu()")
+
+
+class _Mode:
+    """Stand-in for vLLM CUDAGraphMode: FULL_AND_PIECEWISE = (FULL, PW)."""
+    FULL, PIECEWISE = "FULL", "PIECEWISE"
+
+    def __init__(self, decode):
+        self.decode = decode
+
+    def __bool__(self):
+        return True
+
+    def separate_routine(self):
+        return True
+
+    def decode_mode(self):
+        return self.decode
+
+
+class _Desc:
+    def __init__(self, cg_mode, num_tokens, num_reqs=None, u=None):
+        self.cg_mode, self.num_tokens = cg_mode, num_tokens
+        self.num_reqs, self.uniform_token_count = num_reqs, u
+
+    def _k(self):
+        return (self.cg_mode, self.num_tokens, self.num_reqs,
+                self.uniform_token_count)
+
+    def __eq__(self, o):
+        return self._k() == o._k()
+
+    def __hash__(self):
+        return hash(self._k())
+
+
+class _Mgr:
+    """Mirrors vllm 0.30.0 CudaGraphManager._init_candidates (separate
+    decode routine, non-varlen, non-dynamic spec)."""
+    sizes = [1, 2, 4, 8, 9, 16, 18, 24, 32]
+    max_num_reqs = 4
+
+    def __init__(self, dq, decode=_Mode.FULL):
+        from types import SimpleNamespace
+        self.vllm_config = SimpleNamespace(speculative_config=None)
+        self.cudagraph_mode = _Mode(decode)
+        self.decode_query_len, self.varlen_decode = dq, False
+        self._capture_descs, self._candidates = {}, {}
+        self._init_candidates()
+
+    def _init_candidates(self):
+        from collections import defaultdict
+        from itertools import groupby
+        by = defaultdict(list)
+        u = self.decode_query_len
+        for n in self.sizes:
+            r = -(-n // u) * u
+            if r <= self.max_num_reqs * u:
+                d = _Desc("FULL", r, r // u, u)
+                if d not in by["FULL"]:
+                    by["FULL"].append(d)
+            by["PIECEWISE"].append(_Desc("PIECEWISE", n))
+        for m, ds in by.items():
+            ds.sort(key=lambda d: d.num_tokens, reverse=True)
+            self._capture_descs[m] = ds
+        for m in ("FULL", "PIECEWISE"):
+            start = 0
+            for n, grp in groupby(tuple(reversed(by.get(m, []))),
+                                  lambda d: d.num_tokens):
+                grp = list(grp)
+                for i in range(start, n + 1):
+                    self._candidates.setdefault(i, []).extend(grp)
+                start = n + 1
+
+    def dispatch(self, n, u):
+        for d in self._candidates.get(n, []):
+            if d.uniform_token_count in (None, u) and d.num_tokens >= n:
+                return d
+        return None
+
+
+def test_uniform_graph_lens_adds_every_width(monkeypatch):
+    class M(_Mgr):
+        pass
+
+    assert own_attn.wrap_init_candidates(M, _Mode)
+    assert own_attn.wrap_init_candidates(M, _Mode)  # idempotent
+    stock, mgr = _Mgr(3), M(3)
+    assert mgr.decode_query_len == 3
+    full = mgr._capture_descs["FULL"]
+    assert {d.uniform_token_count for d in full} == {1, 2, 3}
+    assert len(full) == len(set(full))
+    assert [d.num_tokens for d in full] == sorted(
+        (d.num_tokens for d in full), reverse=True)
+    assert set(stock._capture_descs["FULL"]) <= set(full)
+    assert mgr._capture_descs["PIECEWISE"] == stock._capture_descs["PIECEWISE"]
+    # stock only had FULL for u=3; now q_len 1 and 2 batches replay FULL too
+    assert stock.dispatch(2, 1).cg_mode == "PIECEWISE"
+    for n, u in ((1, 1), (3, 1), (4, 1), (2, 2), (6, 2), (3, 3), (9, 3)):
+        d = mgr.dispatch(n, u)
+        assert d.cg_mode == "FULL" and d.uniform_token_count == u, (n, u)
+        assert d.num_tokens >= n and d.num_tokens % u == 0
+    # mixed (non-uniform) batches keep the stock piecewise pick
+    assert mgr.dispatch(5, None).cg_mode == "PIECEWISE"
+    for key, lst in mgr._candidates.items():
+        modes = [d.cg_mode for d in lst]
+        assert modes == sorted(modes), key  # FULL entries before PIECEWISE
+
+
+def test_uniform_graph_lens_inert_cases():
+    class M(_Mgr):
+        pass
+
+    own_attn.wrap_init_candidates(M, _Mode)
+    assert {d.uniform_token_count for d in M(1)._capture_descs["FULL"]} == {1}
+    pw = M(3, decode="PIECEWISE")
+    base = _Mgr(3, decode="PIECEWISE")
+    assert pw._capture_descs["FULL"] == base._capture_descs["FULL"]
