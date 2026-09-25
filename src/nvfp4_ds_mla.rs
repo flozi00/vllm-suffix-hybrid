@@ -30,9 +30,11 @@
 //!   TN = 64 gathered rows per 2-stage cp.async smem ring (row pitch
 //!   368 B, 22 x 16 B chunks per 352 B row);
 //!   NS splits cover C: the partial CTA holds 69 KB of smem, so ONE CTA
-//!   runs per SM; ns = the fewest splits that fill one wave of `num_sms`
-//!   CTAs (ceil(num_sms / (T * HQT)), capped at ceil(C / TN)), and
-//!   c_per_split = TN * ceil(ceil(C / TN) / ns). Chosen from (T, HQ, C,
+//!   runs per SM; the grid must fit ONE wave: at most floor(num_sms /
+//!   (T * HQT)) splits (>= 1, capped at ceil(C / TN)), c_per_split = TN *
+//!   ceil(ceil(C / TN) / that), ns = ceil(C / c_per_split) — the fewest
+//!   splits at the shortest one-wave critical path (ceil would overshoot:
+//!   T=6 HQ=8 on 188 SMs launched 192 CTAs = 2 waves). Chosen from (T, HQ, C,
 //!   num_sms) ONLY (CUDA-graph stable). Large T (prefill chunks) collapse to
 //!   ns = 1, which bounds the o_part workspace at T * HQ * 1 KiB.
 
@@ -141,10 +143,11 @@ pub fn plan(
     }
     let hqt = hq.div_ceil(8);
     let rows = tokens * hqt;
-    // One partial CTA per SM (smem-bound): fill one wave with the fewest
-    // splits; every split adds o_part traffic and merge work.
+    // One partial CTA per SM (smem-bound): the grid must fit one wave
+    // (rows * ns <= num_sms, a second wave doubles the critical path), and
+    // among those the fewest splits (each adds o_part traffic + merge work).
     let tiles = capacity.div_ceil(TN);
-    let want = num_sms.div_ceil(rows).clamp(1, tiles.min(MAX_SPLITS));
+    let want = (num_sms / rows).clamp(1, tiles.min(MAX_SPLITS));
     let c_per_split = split_rows(capacity, want);
     let ns = capacity.div_ceil(c_per_split);
     check_launch(tokens, hq, capacity, ns)?;
@@ -350,6 +353,8 @@ mod tests {
                 c
             );
             assert_eq!(p.merge_rows, t * hq);
+            // one wave (1 CTA/SM) unless ns is already 1
+            assert!(p.ns == 1 || p.rows * p.ns <= SMS, "t={t} hq={hq} ns={}", p.ns);
             // deterministic: same inputs, same plan (CUDA-graph replay).
             assert_eq!(plan(t, hq, c, SMS).unwrap(), p);
         }
@@ -361,9 +366,11 @@ mod tests {
         let p = plan(1, 8, 2048, SMS).unwrap();
         assert_eq!((p.hqt, p.ns, p.c_per_split), (1, 32, 64));
         let p = plan(6, 8, 2048, SMS).unwrap(); // MTP k=5 verify
-        assert_eq!((p.ns, p.c_per_split), (32, 64));
+        assert_eq!((p.ns, p.c_per_split), (16, 128)); // 96 CTAs, not 192
         let p = plan(32, 8, 2048, SMS).unwrap();
-        assert_eq!((p.ns, p.c_per_split), (6, 384)); // multi-tile splits
+        assert_eq!((p.ns, p.c_per_split), (5, 448)); // multi-tile splits
+        let p = plan(64, 8, 2048, SMS).unwrap();
+        assert_eq!((p.ns, p.c_per_split), (2, 1024));
         let p = plan(8192, 8, 2048, SMS).unwrap(); // prefill chunk
         assert_eq!((p.ns, p.c_per_split), (1, 2048));
         let p = plan(1, 64, 2048, SMS).unwrap(); // TP=1

@@ -36,6 +36,23 @@ Hardened 2026-09-26 (branch dsmla-harden):
   1e30 rows, max-SF rows, all -1 tokens, T 1/6/32/8192, HQ 64) and a
   T=8192 bench row. CPU: the old f16 staging fails them, the fix passes.
 
+Silicon 2026-09-25 (bundle dc3c688c, RTX PRO 6000): T=1 PASS, every T>1
+reader gate FAIL (row rel-L2 1.1-1.8). Fixed:
+- S mask tested each lane's B-fragment row (nt*8 + gq) instead of its C
+  columns (nt*8 + 2t4 + e; k2 does it right). Exact only without -1 slots,
+  and the oracle's T=1 token was the one full top-k row. CPU repro:
+  tests/test_nvfp4_ds_mla_fragments.py (index-level partial + merge with
+  the host op's launch args; the old mask fails every token with -1s).
+  Oracle T=1 now uses a partial token; T {1,6,32,256} x HQ {8,64}.
+- plan: ns = ceil(SMs / rows) overshot one wave (T=6: 192 CTAs on 188
+  SMs, the 0.79x bench row; T=64: 3 splits x 64 = 2 waves, 0.68x). Now
+  floor(SMs / rows): T=6 -> ns 16 (96 CTAs), T=32 -> 5, T=64 -> 2.
+- writer_vs_vllm_triton (2.54 % bytes): not a convention fork. Triton
+  quantizes its f32 normed/roped values, the gate fed our writer the bf16
+  copies; that rounding alone gives 2.46 % / 3.70e-2 on CPU. The gate now
+  takes f32 kv_c_out / k_pe_out and requires Triton == the row reference
+  byte for byte (same SF/e2m1/e4m3/perm convention).
+
 Residual (needs silicon): oracle + bench NOT RUN; the PTX is built locally
 (sm_120a, ISA 8.7, no .local), ptxas/SASS is CI-only. lse = m + lg2(l) in
 f32 loses lg2(l) resolution when |m| is huge (merge weight error <=

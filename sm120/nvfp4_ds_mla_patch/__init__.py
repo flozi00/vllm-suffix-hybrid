@@ -44,7 +44,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-ds-mla"
-PATCH_REVISION = "2026-09-26.2"
+PATCH_REVISION = "2026-09-26.3"
 PINNED_VLLM = "0.30.0"
 GATE_ENV = "SUFFIX_SM120_NVP4DSMLA"
 MARKER_ATTR = "__suffix_nvfp4_ds_mla_revision__"

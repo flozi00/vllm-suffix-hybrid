@@ -11,8 +11,9 @@ Every gate is fatal (exit 1); exit 2 = could not run (no SM120 / imports).
 (a) writer  our quant_store (through the patch helper) vs a torch reference
     of the 352 B row contract: bytes equal (e2m1 +-0 canonicalized),
     SF permutation, sf floor/saturation rows, -1 slots skipped, no stray
-    writes, padded block-stride view; plus agreement with vLLM's fused
-    Triton writer (fused_norm_rope, the non-HiSparse production writer).
+    writes, padded block-stride view; plus vLLM's fused Triton writer
+    (fused_norm_rope, the non-HiSparse production writer) == that same
+    reference byte for byte on Triton's own f32 inputs (same convention).
 (b) reader  decode vs (1) a torch dequant reference of the SAME cache:
     per-(token, head) rel-L2 <= 2e-2 — the kernel adds only f16 P / bf16
     partial+output rounding (~4e-3); (2) the stock fp8_ds_mla FlashInfer
@@ -22,15 +23,15 @@ Every gate is fatal (exit 1); exit 2 = could not run (no SM120 / imports).
     that the reference semantics (scale, RoPE order, -1 masking) are vLLM's;
     and rel-L2(ours, stock) <= nvfp4ref~fp8ref (format noise, measured live)
     + stock~fp8ref + 0.02 (our kernel budget).
-    T in {1, 6 (MTP k=5 verify), 32, 256 (prefill: ns=1)},
-    HQ 8 (TP=8) and 64, -1 padding / holes / an all -1 token (exact 0),
-    split-capacity merge (ns 32 / 6 / 1), padded block stride (bitwise),
+    T in {1, 6 (MTP k=5 verify), 32, 256 (prefill: ns=1)} x HQ 8 (TP=8)
+    and 64, -1 padding / holes / an all -1 token (exact 0),
+    split-capacity merge (ns 32 / 16 / 5 / 1), padded block stride (bitwise),
     CUDA-graph replay with new indices (bitwise).
 (c) adversarial magnitudes vs an f64 reference of the same cache: |q| ~ 1e5
     on every dim (bf16 -> f16 staging overflowed before the per-row
     power-of-two prescale: NaN rows), 1e5 on single latent/RoPE dims,
     1e-6 and 1e30 rows, max-SF cache rows (every nibble +-6 x SF 448, RoPE
-    +-448), all -1 top-k tokens (exact 0), T 1/6/32 (ns 32/32/6) and HQ 64,
+    +-448), all -1 top-k tokens (exact 0), T 1/6/32 (ns 32/16/5) and HQ 64,
     and a T=8192 prefill batch (ns 1; sampled rows checked).
 (d) --bench  graph-replayed us/call, ours vs stock, T in 1..64, HQ 8, plus
     T=8192 (prefill through the decode kernel; stock skipped: its decode
@@ -298,16 +299,29 @@ def gate_writer(ours, dev, gen, report):
     report("writer_padded_block_stride", same and pads == 0,
            f"rows equal {same}, {pads} pad bytes touched")
 
-    # vLLM's fused Triton writer (non-HiSparse production path)
+    # vLLM's fused Triton writer (non-HiSparse production path). It
+    # quantizes its f32 normed kv_c / roped k_pe in registers; our writer
+    # (and vLLM's C++ concat_and_cache) gets the bf16 copies, and that input
+    # rounding alone moves ~2.5 % of bytes (dequant rel-L2 ~3.7e-2) — the
+    # 2026-09-25 silicon FAIL, reproduced on CPU with identical conventions.
+    # So compare CONVENTIONS on identical inputs: f32 kv_c_out / k_pe_out
+    # hand back exactly the values Triton quantized, and its rows must equal
+    # the reference our writer is bit-gated on above (SF = e4m3 RNE of
+    # max(amax * f32(1/6), 2^-9), e2m1 RNE ties-to-even satfinite, RoPE e4m3
+    # RNE satfinite, low nibble = even dim, SF byte 8*(s&3)+(s>>2)). Slack:
+    # Triton's 1/sf is div.full (<= 2 ulp) vs our rcp.rn — only an exact
+    # e2m1 tie can differ, ~never on f32 inputs.
     from vllm.models.deepseek_v32.common.kernels import fused_norm_rope
 
     n = 128
     kv_in = randn(gen, dev, n, DIM).bfloat16()
     kpe_in = randn(gen, dev, n, PE).bfloat16()
+    kv_in[1] = 0  # normed to 0: the 2^-9 SF floor row
     ang = randn(gen, dev, n, 32) * 3.0
     cos_sin = torch.cat([ang.cos(), ang.sin()], -1).float()
     tri = torch.zeros((nb, bs, ROW), dtype=torch.uint8, device=dev)
-    kv_out, kpe_out = torch.empty_like(kv_in), torch.empty_like(kpe_in)
+    kv_out = torch.empty(n, DIM, dtype=torch.float32, device=dev)
+    kpe_out = torch.empty(n, PE, dtype=torch.float32, device=dev)
     sl = torch.arange(n, device=dev)
     fused_norm_rope(
         torch.arange(n, device=dev), torch.randn(n, 256, device=dev).bfloat16(),
@@ -317,18 +331,13 @@ def gate_writer(ours, dev, gen, report):
         torch.zeros(n, TOPK, dtype=torch.int32, device=dev),
         slot_mapping=sl, mla_kv_cache=tri, mla_kv_cache_dtype="nvfp4_ds_mla",
         has_indexer=False, kv_c_out=kv_out, k_pe_out=kpe_out)
-    mine = torch.zeros_like(tri)
-    ours.write(kv_out, kpe_out, mine, sl)
     torch.cuda.synchronize()
-    a, b = tri.view(-1, ROW)[:n], mine.view(-1, ROW)[:n]
-    frac = float((canon(a) != canon(b)).float().mean())
-    la, ra = dequant_rows_ref(a)
-    lb, rb = dequant_rows_ref(b)
-    err = max(rel_l2(lb, la), rel_l2(rb, ra))
-    # Triton quantizes the f32 normed kv_c, we get its bf16 copy: rare
-    # rounding-boundary flips only.
-    report("writer_vs_vllm_triton", frac <= 0.02 and err <= 0.02,
-           f"{frac:.4%} bytes differ, dequant rel-L2 {err:.2e}")
+    a, ref = canon(tri.view(-1, ROW)[:n]), canon(quant_rows_ref(kv_out, kpe_out))
+    diff = int((a != ref).sum())
+    report("writer_vs_vllm_triton", diff <= 2,
+           f"{diff}/{a.numel()} bytes differ from the row reference on "
+           f"Triton's own f32 inputs (SF {int((a[:, 320:] != ref[:, 320:]).sum())}, "
+           f"RoPE {int((a[:, 256:320] != ref[:, 256:320]).sum())})")
 
 
 def gate_reader(ours, stock, dev, gen, report):
@@ -347,9 +356,12 @@ def gate_reader(ours, stock, dev, gen, report):
     torch.cuda.synchronize()
     lat, rope = dequant_rows_ref(cache.view(-1, ROW))
     flat, frope = dequant_fp8_rows(fp8.view(-1, FP8_ROW))
-    for t, h in [(1, 8), (6, 8), (32, 8), (1, 64), (6, 64), (256, 8)]:
+    for t, h in [(1, 8), (6, 8), (32, 8), (256, 8), (1, 64), (6, 64), (32, 64),
+                 (256, 64)]:
         q = randn(gen, dev, t, h, DIM + PE).bfloat16()
-        topk = make_topk(t, nslots, dev, gen)
+        # T=1: a partial token (-1 tail), not the full one — the pre-fix S
+        # mask was only exact without -1 slots, which hid it at T=1.
+        topk = make_topk(t, nslots, dev, gen, full_first=t > 1)
         out = ours.decode(q, cache, topk)
         torch.cuda.synchronize()
         ref = attention_ref(q.float(), lat, rope, topk, SCALE)

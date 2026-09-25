@@ -40,10 +40,11 @@ strides, e.g. HiSparse hot views, are fine).
 3. `nvfp4_ds_mla_attn_merge` — grid `(T * HQ)`, exp2-domain LSE merge,
    all -inf => zero row.
 
-Plan (`src/nvfp4_ds_mla.rs`, `_native.nvfp4_ds_mla_plan`): NS = fewest splits
-that fill one wave of SMs, capped at ceil(C/64); a function of (T, HQ, C,
-SMs) only (CUDA-graph stable). GLM TP=8 (HQ 8/rank), C 2048, 188 SMs:
-T=1..31 -> NS 32..7, T>=188 -> NS 1 (prefill: o_part = T*HQ*1 KiB).
+Plan (`src/nvfp4_ds_mla.rs`, `_native.nvfp4_ds_mla_plan`): the grid fits ONE
+wave (T*HQT*NS <= SMs, 1 CTA/SM), fewest splits at the shortest critical
+path, capped at ceil(C/64); a function of (T, HQ, C, SMs) only (CUDA-graph
+stable). GLM TP=8 (HQ 8/rank), C 2048, 188 SMs: T=1 -> NS 32, T=6 -> 16,
+T=32 -> 5, T=64 -> 2, T>=95 -> NS 1 (prefill: o_part = T*HQ*1 KiB).
 
 Host ops: `src/nvfp4_ds_mla_oxide.rs`. vLLM patch + oracle:
 `sm120/nvfp4_ds_mla_patch/`. Status: `STATUS.md`.

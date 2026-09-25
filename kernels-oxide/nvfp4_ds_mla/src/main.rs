@@ -553,11 +553,18 @@ mod kernels {
 
             // ---- S = S0 (latent, 16 k-steps) + S1 (RoPE, 2 k-steps) -------
             // Warp w owns gathered rows nt*8..nt*8+7 of the tile (n-tile);
-            // each lane gq owns row krow, dims k = 32p + 8*t4 (+16) step.
+            // each lane gq owns row krow, dims k = 32p + 8*t4 (+16) step
+            // (B fragment). The C fragment is laid out differently: lane
+            // (gq, t4) holds S COLUMNS 2t4, 2t4+1, i.e. gathered rows
+            // nt*8 + 2t4 + {0,1} — the mask must test THOSE rows, not krow
+            // (masking by krow dropped live rows and let zero-staged -1
+            // rows in with S = 0 whenever a tile held -1 slots).
             let krow = nt * 8 + gq;
-            let cc_krow = j + krow; // this lane's logical capacity index
-            let krow_live = cc_krow < c1
-                && unsafe { *topk_indices.add((t * topk_stride + cc_krow) as usize) } >= 0;
+            let live = |cc: u32| -> bool {
+                cc < c1 && unsafe { *topk_indices.add((t * topk_stride + cc) as usize) } >= 0
+            };
+            let col0 = j + nt * 8 + 2 * t4; // this lane's first C column
+            let col_live = [live(col0), live(col0 + 1)];
             let mut sacc = [0.0f32; 4];
             let mut p = 0u32;
             while p < DIM / 32 {
@@ -608,13 +615,13 @@ mod kernels {
             let mut half = 0u32;
             while half < 2 {
                 let row = gq + 8 * half;
-                let valid = krow_live && row < 8 && h0 + row < hq;
+                let valid = row < 8 && h0 + row < hq;
                 // exact: qk_scale_log2 * 2^-k is a power-of-two rescale
                 let sc = if valid { qk_scale_log2 * unsafe { *qfold.add(row as usize) } } else { 0.0 };
                 let mut e = 0usize;
                 while e < 2 {
                     let v = sacc[2 * half as usize + e];
-                    sacc[2 * half as usize + e] = if valid {
+                    sacc[2 * half as usize + e] = if valid && col_live[e] {
                         v * sc
                     } else {
                         NEG_INF

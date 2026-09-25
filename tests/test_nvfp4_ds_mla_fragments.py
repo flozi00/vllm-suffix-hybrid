@@ -241,3 +241,125 @@ def test_pv_phase_and_output_store_mapping():
                 out[g, base], out[g, base + 8] = c[0], c[1]
                 out[g + 8, base], out[g + 8, base + 8] = c[2], c[3]
     np.testing.assert_allclose(out * 256.0, P @ lat, rtol=1e-6, atol=1e-6)
+
+
+# ---- multi-token decode: grid / offsets / S mask / merge ------------------
+# Silicon (2026-09-25): T=1 PASS, every T>1 FAIL (row rel-L2 ~1). T=1 in the
+# oracle is one FULL top-k token (no -1); T>1 adds -1 holes / tails. The S
+# mask tested the B-fragment row krow = nt*8 + gq of each lane, but a lane's
+# C fragment holds COLUMNS 2t4, 2t4+1 (k2 masks kp0 = nt*8 + 2t4 + e): live
+# rows were dropped and zero-staged -1 rows entered with S = 0.
+def _s_mask_src(fixed):
+    """[16, 8] map: S element (row, col) of an n-tile -> the n-tile row
+    whose liveness the kernel's lane applies to it (from K2.c_of_lane)."""
+    pos = np.arange(128).reshape(16, 8)
+    src = np.full((16, 8), -1)
+    for lane in range(32):
+        g, t = lane // 4, lane % 4
+        for i, p in enumerate(K2.c_of_lane(pos, lane)):
+            e = i % 2
+            src[p // 8, p % 8] = (2 * t + e) if fixed else g
+    assert (src >= 0).all()
+    return src
+
+
+def emulate_decode(q, lat, rope, topk, ns, fixed=True):
+    """Index-level transcription of nvfp4_ds_mla_attn_partial + _merge with
+    the host op's launch args (grid (T*HQT, NS), c_per_split = split_rows,
+    topk_stride = topk_len = C, q_stride = HQ*576) over flat buffers."""
+    T, HQ, _ = q.shape
+    C = topk.shape[1]
+    hqt = -(-HQ // 8)
+    cps = 64 * -(-(-(-C // 64)) // ns)  # split_rows
+    assert -(-C // cps) == ns
+    qf, tk = q.reshape(-1), topk.reshape(-1)
+    o_part = np.full(T * HQ * ns * 512, np.nan)
+    lse = np.full(T * HQ * ns, np.nan)
+    src = _s_mask_src(fixed)
+    K = np.concatenate([lat, rope], -1)
+    for r in range(T * hqt):
+        for s in range(ns):
+            ht, t = r % hqt, r // hqt
+            h0 = ht * 8
+            c0, c1 = s * cps, min(s * cps + cps, C)
+            heads = [h for h in range(8) if h0 + h < HQ]
+            Q = np.zeros((16, 576))
+            for h in heads:
+                base = t * HQ * 576 + (h0 + h) * 576
+                Q[h] = qf[base:base + 576]
+            S_all, V_all = [], []
+            for j in range(c0, c1, 64):
+                for nt in range(8):
+                    cc = j + nt * 8 + np.arange(8)
+                    slot = np.where(cc < c1, tk[t * C + np.minimum(cc, C - 1)], -1)
+                    live = slot >= 0
+                    Kt = np.where(live[:, None], K[np.maximum(slot, 0)], 0.0)  # zero-staged
+                    S = Q @ Kt.T
+                    ok = (np.arange(16)[:, None] < 8) & live[src]
+                    S_all.append(np.where(ok, S, -np.inf))
+                    V_all.append(Kt[:, :512])
+            S, V = np.concatenate(S_all, 1), np.concatenate(V_all, 0)
+            m = S.max(1, keepdims=True)
+            P = np.exp(S - np.where(np.isinf(m), 0, m))
+            lsum = P.sum(1)
+            Ot = (P @ V) / np.where(lsum == 0, 1, lsum)[:, None]
+            for h in heads:
+                row = (t * HQ + h0 + h) * ns + s
+                o_part[row * 512:(row + 1) * 512] = Ot[h]
+                lse[row] = -np.inf if lsum[h] == 0 else m[h, 0] + np.log(lsum[h])
+    out = np.zeros(T * HQ * 512)
+    for r in range(T * HQ):
+        ls = lse[r * ns:(r + 1) * ns]
+        assert not np.isnan(ls).any(), "lse slot never written"
+        mx = ls.max()
+        w = np.exp(ls - (0 if np.isinf(mx) else mx))
+        acc = sum(w[s] * o_part[(r * ns + s) * 512:(r * ns + s + 1) * 512]
+                  for s in range(ns) if w[s] != 0)
+        out[r * 512:(r + 1) * 512] = 0 if w.sum() == 0 else acc / w.sum()
+    return out.reshape(T, HQ, 512)
+
+
+def decode_ref(q, lat, rope, topk):
+    K = np.concatenate([lat, rope], -1)
+    out = np.zeros(q.shape[:2] + (512,))
+    for t in range(q.shape[0]):
+        idx = topk[t][topk[t] >= 0]
+        if idx.size:
+            S = q[t] @ K[idx].T
+            P = np.exp(S - S.max(1, keepdims=True))
+            out[t] = (P / P.sum(1, keepdims=True)) @ lat[idx]
+    return out
+
+
+def oracle_topk(T, C, nslots):
+    """oracle.make_topk's shape: token 0 full, token 1 all -1, others a
+    random count, odd tokens with the -1s scattered as holes."""
+    tk = np.full((T, C), -1)
+    for i in range(T):
+        n = C if i == 0 else (0 if i == 1 else int(rng.integers(1, C + 1)))
+        tk[i, :n] = rng.permutation(nslots)[:n]
+        if i % 2:
+            tk[i] = tk[i, rng.permutation(C)]
+    return tk
+
+
+def test_multi_token_decode_grid_offsets_mask_and_merge():
+    nslots, C = 1024, 512
+    lat, rope = rng.standard_normal((nslots, 512)), rng.standard_normal((nslots, 64))
+    for T, HQ, ns in [(6, 8, 8), (6, 8, 3), (3, 12, 4), (6, 64, 2), (2, 8, 1)]:
+        q = rng.standard_normal((T, HQ, 576)) * 0.05
+        tk = oracle_topk(T, C, nslots)
+        ref = decode_ref(q, lat, rope, tk)
+        np.testing.assert_allclose(emulate_decode(q, lat, rope, tk, ns), ref,
+                                   rtol=1e-9, atol=1e-12)
+        assert (emulate_decode(q, lat, rope, tk, ns)[1] == 0).all()
+        # the pre-fix mask: wrong on every token with -1 slots
+        old = emulate_decode(q, lat, rope, tk, ns, fixed=False)
+        err = np.linalg.norm(old - ref, axis=-1) / np.maximum(
+            np.linalg.norm(ref, axis=-1), 1e-30)
+        assert T <= 2 or err[2:].max() > 0.3, (T, HQ, ns, err.max())
+    # ... and exact when no slot is -1: why T=1 (one full token) passed
+    q = rng.standard_normal((1, 8, 576)) * 0.05
+    tk = rng.permutation(nslots)[None, :C]
+    np.testing.assert_allclose(emulate_decode(q, lat, rope, tk, 8, fixed=False),
+                               decode_ref(q, lat, rope, tk), rtol=1e-9, atol=1e-12)

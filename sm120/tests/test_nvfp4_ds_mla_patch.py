@@ -399,12 +399,57 @@ def test_plan_via_native_when_built():
     if not hasattr(_native, "nvfp4_ds_mla_plan"):
         pytest.skip("wheel predates nvfp4_ds_mla")
     p = _native.nvfp4_ds_mla_plan
-    assert (p(1, 8, 2048, 188)["ns"], p(6, 8, 2048, 188)["ns"]) == (32, 32)
-    assert (p(32, 8, 2048, 188)["ns"], p(32, 8, 2048, 188)["c_per_split"]) == (6, 384)
+    assert (p(1, 8, 2048, 188)["ns"], p(6, 8, 2048, 188)["ns"]) == (32, 16)
+    assert (p(32, 8, 2048, 188)["ns"], p(32, 8, 2048, 188)["c_per_split"]) == (5, 448)
     assert p(8192, 8, 2048, 188)["ns"] == 1  # prefill: bounded workspace
     assert p(1, 8, 2048, 188)["partial_smem_bytes"] == 69376
     with pytest.raises(ValueError):
         p(0, 8, 2048, 188)
+
+
+def _emu_fused_norm_rope(*a, slot_mapping, mla_kv_cache, kv_c_out, k_pe_out, **kw):
+    """vLLM's _fused_norm_rope_kernel pid 1 (nvfp4_ds_mla): f32 RMS norm +
+    interleaved RoPE, quantized from the f32 registers; kv_c_out / k_pe_out
+    receive those values cast to THEIR dtype."""
+    import torch
+
+    pos, kv, w, eps, kpe, cs = a[0], a[4].float(), a[5].float(), a[6], a[7].float(), a[8]
+    kv = kv * torch.rsqrt((kv * kv).mean(-1, keepdim=True) + eps) * w
+    half = cs.shape[-1] // 2
+    cos, sin = cs[pos, :half].float(), cs[pos, half:].float()
+    x1, x2 = kpe[:, 0::2], kpe[:, 1::2]
+    pe = torch.stack([x1 * cos - x2 * sin, x2 * cos + x1 * sin], -1).flatten(1)
+    kv_c_out.copy_(kv)
+    k_pe_out.copy_(pe)
+    _EmuOurs().write(kv, pe, mla_kv_cache, slot_mapping)
+
+
+def test_triton_writer_gap_is_bf16_input_rounding(monkeypatch):
+    """Silicon 2026-09-25: writer_vs_vllm_triton FAILED at 2.54 % bytes /
+    dequant rel-L2 3.71e-2 while writer_bytes_vs_ref PASSED. Same
+    conventions reproduce it on CPU: Triton quantizes f32, the old gate fed
+    our writer the bf16 copies. The fixed gate (f32 outputs) is exact."""
+    import torch
+
+    g = torch.Generator().manual_seed(0)
+    n = 128
+    kv, kpe = torch.randn(n, 512, generator=g).bfloat16(), torch.randn(n, 64, generator=g).bfloat16()
+    ang = torch.randn(n, 32, generator=g) * 3.0
+    cs = torch.cat([ang.cos(), ang.sin()], -1)
+    tri = torch.zeros(2, 64, O.ROW, dtype=torch.uint8)
+    outs = {}
+    for dt in (torch.float32, torch.bfloat16):
+        ko, po = torch.empty(n, 512, dtype=dt), torch.empty(n, 64, dtype=dt)
+        _emu_fused_norm_rope(torch.arange(n), None, None, 1e-6, kv, torch.ones(512), 1e-6,
+                             kpe, cs, slot_mapping=torch.arange(n), mla_kv_cache=tri,
+                             kv_c_out=ko, k_pe_out=po)
+        outs[dt] = O.canon(O.quant_rows_ref(ko, po))
+    a = O.canon(tri.view(-1, O.ROW)[:n])
+    assert torch.equal(a, outs[torch.float32])
+    frac = float((a != outs[torch.bfloat16]).float().mean())
+    la, _ = O.dequant_rows_ref(a)
+    lb, _ = O.dequant_rows_ref(outs[torch.bfloat16])
+    assert 0.015 < frac < 0.04 and 0.02 < O.rel_l2(lb, la) < 0.06, (frac, O.rel_l2(lb, la))
 
 
 # ---- oracle harness dry run: GPU kernels emulated by the references -------
@@ -470,13 +515,8 @@ def test_oracle_gates_dry_run_on_cpu(monkeypatch):
 
     import torch
 
-    def fused_norm_rope(*a, slot_mapping, mla_kv_cache, kv_c_out, k_pe_out, **kw):
-        kv_c_out.copy_(a[4])
-        k_pe_out.copy_(a[7])
-        _EmuOurs().write(kv_c_out, k_pe_out, mla_kv_cache, slot_mapping)
-
     monkeypatch.setitem(sys.modules, "vllm.models.deepseek_v32.common.kernels",
-                        types.SimpleNamespace(fused_norm_rope=fused_norm_rope))
+                        types.SimpleNamespace(fused_norm_rope=_emu_fused_norm_rope))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a: None)
     stream = types.SimpleNamespace(wait_stream=lambda s: None)
     monkeypatch.setattr(torch.cuda, "Stream", lambda *a: stream)
@@ -501,7 +541,7 @@ def test_oracle_gates_dry_run_on_cpu(monkeypatch):
     O.gate_reader(_EmuOurs(), _EmuStock(), "cpu", gen, report)
     O.gate_adversarial(_EmuOurs(), "cpu", gen, report)
     names = [r[0] for r in results]
-    assert len(results) == 23 and "reader_cuda_graph_replay" in names
+    assert len(results) == 26 and "reader_cuda_graph_replay" in names
     assert "adversarial_prefill_T96" in names
     print(*results, sep="\n")
     assert all(ok for _n, ok, _d in results), [r for r in results if not r[1]]
