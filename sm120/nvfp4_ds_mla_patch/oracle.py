@@ -21,7 +21,8 @@ Every gate is fatal (exit 1); exit 2 = could not run (no SM120 / imports).
     e4m3 MMAs, so Q/P carry fp8 rounding) — this is the independent check
     that the reference semantics (scale, RoPE order, -1 masking) are vLLM's;
     and rel-L2(ours, stock) <= nvfp4ref~fp8ref (format noise, measured live)
-    + stock~fp8ref + 0.02 (our kernel budget). T in {1, 6 (MTP k=5 verify), 32, 128 (prefill, ns=1)},
+    + stock~fp8ref + 0.02 (our kernel budget).
+    T in {1, 6 (MTP k=5 verify), 32, 256 (prefill: ns=1)},
     HQ 8 (TP=8) and 64, -1 padding / holes / an all -1 token (exact 0),
     split-capacity merge (ns 32 / 6 / 1), padded block stride (bitwise),
     CUDA-graph replay with new indices (bitwise).
@@ -168,12 +169,14 @@ def randperm(gen, dev, n):
     return torch.randperm(n, generator=gen, device=gen.device).to(dev)
 
 
-def make_kv(n, dev, gen):
+def make_kv(n, dev, gen, special=True):
     import torch
 
     chan = torch.exp(randn(gen, dev, DIM) * 0.75)
     kv_c = (randn(gen, dev, n, DIM) * chan).bfloat16()
     k_pe = (randn(gen, dev, n, PE) * 2.0).bfloat16()
+    if not special:
+        return kv_c, k_pe
     kv_c[0] = 0                     # sf floor 2^-9 row
     kv_c[1, :16] = 5000.0           # saturating block (sf 448)
     kv_c[2] = (kv_c[2].float() * 1e-4).bfloat16()  # tiny row
@@ -325,7 +328,9 @@ def gate_reader(ours, stock, dev, gen, report):
 
     bs, nb = 64, 256
     nslots = bs * nb
-    kv_c, k_pe = make_kv(nslots, dev, gen)
+    # no saturating rows here: 5000 clips to 6 * 448 in nvfp4 (writer gate
+    # covers it) and would dominate the format-noise comparison with stock
+    kv_c, k_pe = make_kv(nslots, dev, gen, special=False)
     all_slots = torch.arange(nslots, device=dev)
     cache = torch.zeros((nb, bs, ROW), dtype=torch.uint8, device=dev)
     ours.write(kv_c, k_pe, cache, all_slots)
@@ -334,7 +339,7 @@ def gate_reader(ours, stock, dev, gen, report):
     torch.cuda.synchronize()
     lat, rope = dequant_rows_ref(cache.view(-1, ROW))
     flat, frope = dequant_fp8_rows(fp8.view(-1, FP8_ROW))
-    for t, h in [(1, 8), (6, 8), (32, 8), (1, 64), (6, 64), (128, 8)]:
+    for t, h in [(1, 8), (6, 8), (32, 8), (1, 64), (6, 64), (256, 8)]:
         q = randn(gen, dev, t, h, DIM + PE).bfloat16()
         topk = make_topk(t, nslots, dev, gen)
         out = ours.decode(q, cache, topk)

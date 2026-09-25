@@ -405,3 +405,100 @@ def test_plan_via_native_when_built():
     assert p(1, 8, 2048, 188)["partial_smem_bytes"] == 69312
     with pytest.raises(ValueError):
         p(0, 8, 2048, 188)
+
+
+# ---- oracle harness dry run: GPU kernels emulated by the references -------
+class _FakeGraph:
+    def __init__(self):
+        self.fn = None
+
+    def replay(self):
+        self.fn()
+
+
+class _EmuOurs:
+    capturing = None
+
+    def write(self, kv_c, k_pe, cache, slots):
+        rows = O.quant_rows_ref(kv_c, k_pe)
+        bs = cache.shape[1]
+        for i, s in enumerate(slots.tolist()[:rows.shape[0]]):
+            if s >= 0:
+                cache[s // bs, s % bs] = rows[i]
+
+    def decode(self, q, cache, topk, out=None):
+        import torch
+
+        if out is None:
+            out = q.new_empty(q.shape[0], q.shape[1], O.DIM)
+
+        def run():
+            lat, rope = O.dequant_rows_ref(cache.reshape(-1, O.ROW))
+            out.copy_(O.attention_ref(q.float(), lat, rope, topk, O.SCALE))
+        if _EmuOurs.capturing is not None:
+            _EmuOurs.capturing.fn = run
+        else:
+            run()
+        return out if isinstance(out, torch.Tensor) else None
+
+
+class _EmuStock(_EmuOurs):
+    def write(self, kv_c, k_pe, cache, slots):
+        import torch
+
+        x = kv_c.float().view(-1, 4, 128)
+        scale = torch.clamp(x.abs().amax(-1) / 448.0, min=1e-30)
+        rows = torch.zeros(kv_c.shape[0], O.FP8_ROW, dtype=torch.uint8)
+        rows[:, :512] = O.e4m3_bytes((x / scale[..., None]).view(-1, 512))
+        rows[:, 512:528] = scale.contiguous().view(torch.uint8)
+        rows[:, 528:] = k_pe.contiguous().view(torch.uint8)
+        bs = cache.shape[1]
+        for i, s in enumerate(slots.tolist()):
+            if s >= 0:
+                cache[s // bs, s % bs] = rows[i]
+
+    def decode(self, q, cache, topk, out=None):
+        lat, rope = O.dequant_fp8_rows(cache.reshape(-1, O.FP8_ROW))
+        return O.attention_ref(q.float(), lat, rope, topk, O.SCALE).bfloat16()
+
+
+def test_oracle_gates_dry_run_on_cpu(monkeypatch):
+    """The oracle harness itself (data, indexing, masks, metrics, verdicts)
+    runs end to end with exact emulations in place of the CUDA kernels —
+    so a silicon run can only fail on kernel numerics, not harness bugs."""
+    import contextlib
+
+    import torch
+
+    def fused_norm_rope(*a, slot_mapping, mla_kv_cache, kv_c_out, k_pe_out, **kw):
+        kv_c_out.copy_(a[4])
+        k_pe_out.copy_(a[7])
+        _EmuOurs().write(kv_c_out, k_pe_out, mla_kv_cache, slot_mapping)
+
+    monkeypatch.setitem(sys.modules, "vllm.models.deepseek_v32.common.kernels",
+                        types.SimpleNamespace(fused_norm_rope=fused_norm_rope))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a: None)
+    stream = types.SimpleNamespace(wait_stream=lambda s: None)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda *a: stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: stream)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", _FakeGraph)
+
+    @contextlib.contextmanager
+    def graph(g):
+        _EmuOurs.capturing = g
+        yield
+        _EmuOurs.capturing = None
+    monkeypatch.setattr(torch.cuda, "graph", graph)
+    results = []
+
+    def report(name, ok, detail):
+        results.append((name, ok, detail))
+
+    gen = torch.Generator().manual_seed(0)
+    O.gate_writer(_EmuOurs(), "cpu", gen, report)
+    O.gate_reader(_EmuOurs(), _EmuStock(), "cpu", gen, report)
+    names = [r[0] for r in results]
+    assert len(results) == 16 and "reader_cuda_graph_replay" in names
+    print(*results, sep="\n")
+    assert all(ok for _n, ok, _d in results), [r for r in results if not r[1]]
