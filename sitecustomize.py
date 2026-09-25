@@ -238,6 +238,36 @@ if _nvfp4_gemm in ("oracle", "bench", "both") and not os.environ.get(
     subprocess.run([sys.executable, "-m", "suffix_hybrid.kernels.nvfp4_gemm",
                     _nvfp4_gemm])
 
+# Boot gates: the kernel-lab gates that need no model, run once per pod in a
+# CHILD process before vLLM sizes memory — how silicon evidence is gathered
+# when no lab can start (the lab image comes from a registry; this path only
+# needs the stock vLLM image + the bundle). SUFFIX_BOOT_GATES is a comma list
+# of ALLOWLISTED names (no free-form modules). Evidence only: never blocks
+# serving. Children get the pod env minus other SUFFIX_* feature gates, so the
+# pool's own patches never leak into the gate's vLLM instances.
+_BOOT_GATES = {
+    "nvfp4_dsmla_oracle": (["-m", "nvfp4_ds_mla_patch.oracle"], {}),
+    "nvfp4_dsmla_bench": (["-m", "nvfp4_ds_mla_patch.oracle", "--bench", "--json"], {}),
+    "hisparse_mtp_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "3",
+                             "--prompt-len", "4096"], {"SUFFIX_SM120": "1"}),
+}
+_boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
+if _boot_gates and not os.environ.get("SUFFIX_BOOT_GATES_DONE"):
+    import subprocess
+    import sys
+    os.environ["SUFFIX_BOOT_GATES_DONE"] = "1"
+    for _g in _boot_gates:
+        if _g not in _BOOT_GATES:
+            print(f"[suffix boot-gate] {_g}: unknown gate, skipped", file=sys.stderr, flush=True)
+            continue
+        _argv, _extra = _BOOT_GATES[_g]
+        _env = {k: v for k, v in os.environ.items()
+                if not k.startswith("SUFFIX_") or k.endswith("_DONE")}
+        _env.update(_extra)
+        print(f"[suffix boot-gate] {_g}: start", file=sys.stderr, flush=True)
+        _rc = subprocess.run([sys.executable] + _argv, env=_env).returncode
+        print(f"[suffix boot-gate] {_g}: exit {_rc}", file=sys.stderr, flush=True)
+
 # NVFP4-KV pod warmup oracle (gemma-hd512 dossier c.4). The console pins the
 # pod command to `vllm serve`, so the on-silicon numerics gate runs here: once
 # per pod (the _DONE marker is inherited by every child), in a CHILD process so
