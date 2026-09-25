@@ -218,19 +218,73 @@ def _make_kernel_cls():
     return SuffixNvFp4LinearKernel
 
 
-def selection_verdict(instances: int, quantization, disabled: list[str]) -> str | None:
-    """None when SuffixNvFp4LinearKernel was selected for >= 1 NVFP4 linear,
-    else the loud startup error text."""
+def target_quantization(cfg) -> tuple:
+    """(target quantization, draft quantization) from a VllmConfig. With spec
+    decode the CURRENT config at first forward can be the drafter's, so the
+    target comes from speculative_config.target_model_config when present."""
+    if cfg is None:
+        return None, None
+    sc = getattr(cfg, "speculative_config", None)
+    tgt = getattr(sc, "target_model_config", None) or getattr(cfg, "model_config", None)
+    dft = getattr(sc, "draft_model_config", None)
+    return (getattr(tgt, "quantization", None),
+            getattr(dft, "quantization", None) if dft is not None else None)
+
+
+def layer_census(objects=None) -> dict:
+    """Count built linear / MoE layers by quant method class (gc scan, once,
+    at startup): e.g. {'linear:UnquantizedLinearMethod': 210,
+    'moe:ModelOptNvFp4FusedMoE': 30}. Tells precisely what a checkpoint
+    quantized (dense NVFP4 linears vs NVFP4 MoE experts only)."""
+    import gc
+
+    import torch
+    out: dict = {}
+    for o in (gc.get_objects() if objects is None else objects):
+        # nn.Modules only, plain __dict__ lookup: never trigger lazy
+        # attribute machinery on arbitrary gc objects (ctypes, pytest.mark).
+        if not isinstance(o, torch.nn.Module):
+            continue
+        qm = o.__dict__.get("quant_method")
+        if qm is None:
+            continue
+        cls = type(o).__name__
+        if "MoE" in cls or "Experts" in cls:
+            kind = "moe"
+        elif "Linear" in cls or "LMHead" in cls:
+            kind = "linear"
+        else:
+            continue
+        key = f"{kind}:{type(qm).__name__}"
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+def selection_verdict(instances: int, target_quant, disabled: list[str],
+                      census: dict | None = None, draft_quant=None) -> str | None:
+    """None when SuffixNvFp4LinearKernel was selected for >= 1 NVFP4 dense
+    linear, else the loud startup error naming the precise reason."""
     if instances > 0:
         return None
-    if quantization in (None, "None", ""):
-        why = ("the served checkpoint is NOT NVFP4-quantized (quantization=None, "
+    census = census or {}
+    cen = ", ".join(f"{k} x{v}" for k, v in sorted(census.items())) or "-"
+    nvfp4_moe = sum(v for k, v in census.items()
+                    if k.startswith("moe:") and "Unquantized" not in k)
+    if target_quant in (None, "None", ""):
+        why = ("the TARGET checkpoint is NOT NVFP4-quantized (quantization=None, "
                "bf16 weights) — there is no NVFP4 linear to replace")
+    elif nvfp4_moe:
+        why = (f"TARGET quantization={target_quant} quantizes only MoE experts "
+               f"({nvfp4_moe} quantized FusedMoE layers -> NVFP4 MoE backend, a "
+               "different kernel family); its dense linears are excluded (bf16) — "
+               "no NVFP4 dense linear to replace")
     else:
-        why = (f"quantization={quantization} built no NVFP4 linear through "
-               "init_nvfp4_linear_kernel with SuffixNvFp4LinearKernel "
+        why = (f"TARGET quantization={target_quant} built no NVFP4 dense linear "
+               "through init_nvfp4_linear_kernel with SuffixNvFp4LinearKernel "
                f"(VLLM_DISABLED_KERNELS={','.join(disabled) or '-'})")
-    return f"{MARKER} NVFP4-GEMM NOT SELECTED with {GATE}=1: {why}"
+    extra = f"; drafter quantization={draft_quant}" if draft_quant is not None else ""
+    return (f"{MARKER} NVFP4-GEMM NOT SELECTED with {GATE}=1: {why}{extra}; "
+            f"layer census: {cen}")
 
 
 def _first_forward_check(module, args):
@@ -244,22 +298,23 @@ def _first_forward_check(module, args):
     if _state["checked"]:
         return
     _state["checked"] = True
-    quant = None
+    tq = dq = None
     try:
         from vllm.config import get_current_vllm_config_or_none
-        cfg = get_current_vllm_config_or_none()
-        quant = getattr(getattr(cfg, "model_config", None), "quantization", None)
+        tq, dq = target_quantization(get_current_vllm_config_or_none())
     except Exception:  # verdict below still fires on instances == 0
         pass
+    census = layer_census()
     disabled = [x for x in os.environ.get("VLLM_DISABLED_KERNELS", "").split(",") if x]
-    err = selection_verdict(_state["instances"], quant, disabled)
+    err = selection_verdict(_state["instances"], tq, disabled, census, dq)
     if err is not None:
         _log(err)
         raise RuntimeError(err)
     shapes = ", ".join(f"{k} x{v}" for k, v in sorted(_state["shapes"].items()))
-    _log(f"NVFP4-GEMM SELECTION: NVFP4 linear kernel = SuffixNvFp4LinearKernel "
-         f"({_state['instances']} instances; quantization={quant}); per shape "
-         f"(NxK:route x layers): {shapes}")
+    cen = ", ".join(f"{k} x{v}" for k, v in sorted(census.items()))
+    _log(f"NVFP4-GEMM SELECTION: NVFP4 dense linear kernel = SuffixNvFp4LinearKernel "
+         f"({_state['instances']} instances; target quantization={tq}); per shape "
+         f"(NxK:route x layers): {shapes}; layer census: {cen}")
     _log(summary())
 
 

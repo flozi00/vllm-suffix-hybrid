@@ -55,10 +55,58 @@ def test_entry_point():
 
 def test_selection_verdict_fails_loud_on_bf16_checkpoint():
     msg = nl.selection_verdict(0, None, [])
-    assert "NOT NVFP4-quantized" in msg and "NOT SELECTED" in msg
+    assert "TARGET checkpoint is NOT NVFP4-quantized" in msg and "NOT SELECTED" in msg
     msg = nl.selection_verdict(0, "modelopt_fp4", ["A"])
     assert "modelopt_fp4" in msg and "VLLM_DISABLED_KERNELS=A" in msg
     assert nl.selection_verdict(3, "modelopt_fp4", []) is None
+
+
+def test_verdict_gemma_moe_only_checkpoint():
+    # silicon 02d97b8a gemma-spec-dev: target modelopt_fp4, MTP drafter bf16,
+    # NVFP4 only in the 30 MoE layers, dense linears bf16
+    census = {"linear:UnquantizedLinearMethod": 180, "moe:ModelOptNvFp4FusedMoE": 30}
+    msg = nl.selection_verdict(0, "modelopt_fp4", [], census, draft_quant=None)
+    assert "quantizes only MoE experts" in msg and "30 quantized FusedMoE" in msg
+    assert "linear:UnquantizedLinearMethod x180" in msg
+
+
+class _Cfg:
+    def __init__(self, q):
+        self.quantization = q
+
+
+class _Spec:
+    target_model_config = _Cfg("modelopt_fp4")
+    draft_model_config = _Cfg(None)
+
+
+class _Vcfg:
+    model_config = _Cfg(None)  # the drafter's config is current at first forward
+    speculative_config = _Spec()
+
+
+def test_target_quantization_prefers_spec_target():
+    assert nl.target_quantization(_Vcfg()) == ("modelopt_fp4", None)
+    assert nl.target_quantization(None) == (None, None)
+
+
+def test_layer_census_classifies_linear_and_moe():
+    class UnquantizedLinearMethod: pass
+    class ModelOptNvFp4FusedMoE: pass
+    import torch
+
+    class RowParallelLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.quant_method = UnquantizedLinearMethod()
+
+    class FusedMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.quant_method = ModelOptNvFp4FusedMoE()
+    objs = [RowParallelLinear(), RowParallelLinear(), FusedMoE(), object()]
+    assert nl.layer_census(objs) == {"linear:UnquantizedLinearMethod": 2,
+                                     "moe:ModelOptNvFp4FusedMoE": 1}
 
 
 def test_first_forward_hook_raises_when_not_selected(monkeypatch):
