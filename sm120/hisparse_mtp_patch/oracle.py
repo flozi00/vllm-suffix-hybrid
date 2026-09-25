@@ -28,6 +28,7 @@ not bitwise here, not a patch fault).
 import argparse
 import json
 import os
+from pathlib import Path
 import random
 import subprocess
 import sys
@@ -178,7 +179,9 @@ def verdict(ref: dict, stock: dict, patched: dict) -> tuple[int, list]:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--child", choices=("ref", "stock", "patched"))
-    ap.add_argument("--model", default="deepseek-ai/DeepSeek-V3.2")
+    # Vendored DeepSeek-V3.2 config.json (public, MIT): load_format=dummy +
+    # skip_tokenizer_init need nothing else, so the pod needs no HF access.
+    ap.add_argument("--model", default=str(Path(__file__).with_name("deepseek_v32")))
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--prompt-len", type=int, default=4096)
