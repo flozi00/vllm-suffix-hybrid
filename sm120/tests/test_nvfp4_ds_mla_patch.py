@@ -502,3 +502,61 @@ def test_oracle_gates_dry_run_on_cpu(monkeypatch):
     assert len(results) == 16 and "reader_cuda_graph_replay" in names
     print(*results, sep="\n")
     assert all(ok for _n, ok, _d in results), [r for r in results if not r[1]]
+
+
+# ---- sitecustomize integration (subprocess, fake /plugins bundle) ---------
+def _bundle(tmp_path):
+    import shutil
+
+    b = tmp_path / "plugins"
+    for pkg in ("nvfp4_kv_patch", "hisparse_mtp_patch", "nvfp4_ds_mla_patch"):
+        shutil.copytree(REPO / "sm120" / pkg, b / pkg)
+    shutil.copy(REPO / "sitecustomize.py", b / "sitecustomize.py")
+    fake = tmp_path / "fakevllm"
+    pkg = fake / "vllm/v1/attention/backends/mla"
+    pkg.mkdir(parents=True)
+    for d in (fake / "vllm", fake / "vllm/v1", fake / "vllm/v1/attention",
+              fake / "vllm/v1/attention/backends", pkg):
+        (d / "__init__.py").write_text("")
+    (pkg / "index_group.py").write_text("LOADED = True\n")
+    return b, fake
+
+
+def _run_site(env_extra, probe, tmp_path):
+    import os
+    import subprocess
+
+    b, fake = _bundle(tmp_path)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("SUFFIX_")}
+    env.update(env_extra, PYTHONPATH=os.pathsep.join([str(b), str(fake)]))
+    return subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                          text=True, env=env, timeout=120)
+
+
+_PROBE = ("import sys; f=[x for x in sys.meta_path if type(x).__name__=="
+          "'_PostImportFinder']; print('ARMED', sorted(x.target for x in f));"
+          "print('MOD', 'nvfp4_ds_mla_patch' in sys.modules, 'torch' in sys.modules)")
+
+
+def test_sitecustomize_gate_off_is_inert(tmp_path):
+    p = _run_site({}, _PROBE, tmp_path)
+    assert p.returncode == 0, p.stderr
+    assert "ARMED []" in p.stdout and "MOD False False" in p.stdout
+
+
+def test_sitecustomize_arms_three_hooks_and_composes(tmp_path):
+    p = _run_site({P.GATE_ENV: "1", HS.GATE_ENV: "1"}, _PROBE, tmp_path)
+    assert p.returncode == 0, p.stderr
+    want = sorted(list(P.TARGETS) + [HS.TARGET_MODULE])
+    assert f"ARMED {want}" in p.stdout, p.stdout
+    assert "MOD True False" in p.stdout  # stdlib-only at arm time
+
+
+def test_hook_fires_on_real_import(tmp_path):
+    probe = ("import vllm.v1.attention.backends.mla.index_group as m;"
+             "print('LOADED', m.LOADED)")
+    p = _run_site({P.GATE_ENV: "1"}, probe, tmp_path)
+    assert p.returncode == 0, p.stderr
+    assert "LOADED True" in p.stdout
+    assert "present but inert" in p.stderr, p.stderr  # apply() ran (no GPU)
