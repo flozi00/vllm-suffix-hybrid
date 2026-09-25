@@ -153,7 +153,11 @@ def install_uniform_graph_lens() -> bool:
     capturable: q_len 1 lands on FlashInfer's stock fa2 cudagraph decode
     wrappers, 2..1+k on K2 with q_len baked per graph. Same multimodal
     guard as 1+k: a batch with any prefilling request is never uniform.
-    Only called when K2 graphs are enabled; V1 runner -> no-op."""
+    Only called when K2 graphs are enabled; V1 runner -> no-op.
+    SUFFIX_SM120_NVP4KV_GRAPH_ALL_WIDTHS=0 keeps vLLM's 1+k-only set (A/B,
+    or to hand the extra graph memory back to KV)."""
+    if os.environ.get("SUFFIX_SM120_NVP4KV_GRAPH_ALL_WIDTHS", "1").strip() == "0":
+        return False
     try:
         from vllm.v1.worker.gpu import cudagraph_utils as cgu
     except ImportError:

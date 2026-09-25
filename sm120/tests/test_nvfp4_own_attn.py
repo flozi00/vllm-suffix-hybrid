@@ -476,3 +476,8 @@ def test_uniform_graph_lens_inert_cases():
     pw = M(3, decode="PIECEWISE")
     base = _Mgr(3, decode="PIECEWISE")
     assert pw._capture_descs["FULL"] == base._capture_descs["FULL"]
+
+
+def test_uniform_graph_lens_kill_switch(monkeypatch):
+    monkeypatch.setenv("SUFFIX_SM120_NVP4KV_GRAPH_ALL_WIDTHS", "0")
+    assert own_attn.install_uniform_graph_lens() is False
