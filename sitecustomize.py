@@ -248,8 +248,10 @@ if _nvfp4_gemm in ("oracle", "bench", "both") and not os.environ.get(
 _BOOT_GATES = {
     "nvfp4_dsmla_oracle": (["-m", "nvfp4_ds_mla_patch.oracle"], {}),
     "nvfp4_dsmla_bench": (["-m", "nvfp4_ds_mla_patch.oracle", "--bench", "--json"], {}),
+    # 200 GPU blocks (12.8k tokens) < 5 x 4k prompts: forces host spills.
     "hisparse_mtp_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "3",
-                             "--prompt-len", "4096"], {"SUFFIX_SM120": "1"}),
+                             "--prompt-len", "4096", "--gpu-blocks", "200"],
+                            {"SUFFIX_SM120": "1"}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 if _boot_gates and not os.environ.get("SUFFIX_BOOT_GATES_DONE"):
