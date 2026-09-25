@@ -1,20 +1,14 @@
 # NVFP4 DS-MLA reader cache kernels (cuda-oxide SIMT track, f16 mma.sync):
-# writer (kv_c/k_pe -> 352 B nvfp4_ds_mla rows) + gather attention BMM1
+# writer (kv_c/k_pe -> 352 B nvfp4_ds_mla rows) + gather attention
 # (split-capacity partial/merge) for DeepSeek-style sparse-MLA decode.
-# Standalone crate (own workspace); built only by scripts/oxide_build.py,
-# once per register variant listed in oxide-variants.json.
+# Standalone crate (own workspace); built only by scripts/oxide_build.py
+# (arch from oxide-variants.json).
 [package]
 name = "nvfp4_ds_mla"
 version = "0.1.0"
 edition = "2024"
 
 [workspace]
-
-[features]
-# capability variants (see src/main.rs ROWS macro + oxide-variants.json)
-w1 = []
-w2 = []
-w3 = []
 
 [dependencies]
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }

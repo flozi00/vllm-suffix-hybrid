@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! NVFP4 DS-MLA reader-cache kernels on the cuda-oxide track: sparse-MLA
 //! decode (top-k gathered rows) over vLLM's `nvfp4_ds_mla` reader cache with
-//! warp `mma.sync.m16n8k16` f32/f16 (sm_80+ ISA; PTX .target sm_120, ptxas
-//! 13.0 SASS — the k2_nvfp4_attn toolchain contract, no tcgen05/UMMA).
+//! warp `mma.sync.m16n8k16` f32/f16. PTX .target sm_120a (the writer's
+//! cvt.rn.satfinite.e2m1x2.f32 is arch-specific), ptxas 13.0 SASS; no
+//! tcgen05/UMMA.
 //!
 //! Plan: src/nvfp4_ds_mla.rs (pure Rust, CPU-testable). Host op:
-//! src/nvfp4_ds_mla_oxide.rs. vLLM patch sketch: sm120-drafts/.
+//! src/nvfp4_ds_mla_oxide.rs. vLLM patch + oracle: sm120/nvfp4_ds_mla_patch/.
 //!
 //! Row layout (pinned domain contract — vLLM `nvfp4_ds_mla` reader cache,
 //! rows [num_blocks, block_size, 352] uint8, per token):
@@ -17,8 +18,8 @@
 //! applied OUTSIDE as floats): sf = e4m3(max(amax16/6, 2^-9)),
 //! dequant x = e2m1_val * sf; RoPE dequant x = e4m3 byte (no SF).
 //!
-//! Kernels (k2-family shape; the split domain is the CAPACITY axis —
-//! splits = ceil(topk / 64), the flashinfer SM120 sparse-decode contract):
+//! Kernels (k2-family shape; the split domain is the CAPACITY axis — the
+//! host plan picks ns from (T, HQ, C, SMs) only, c_per_split a multiple of 64):
 //!   * nvfp4_ds_mla_quant_store (writer): one CTA per token, 64 threads —
 //!     warp 0 owns the 32 16-dim latent blocks (one lane each: amax -> SF
 //!     byte, permuted store, 8 e2m1-packed data bytes), warp 1 lanes 0..3
@@ -76,6 +77,15 @@ mod kernels {
     #[inline(always)]
     fn sf_perm(s: u32) -> u32 {
         8 * (s & 3) + (s >> 2)
+    }
+
+    /// Byte offset of cache row `slot` in a [blocks, block_size, 352] view
+    /// whose block stride may exceed block_size * 352 (flashinfer semantics:
+    /// page = slot / block_size, entry = slot % block_size).
+    #[inline(always)]
+    fn row_offset(slot: u64, block_size: u32, block_stride: u32) -> usize {
+        let bs = block_size as u64;
+        ((slot / bs) * block_stride as u64 + (slot % bs) * ROW_BYTES as u64) as usize
     }
 
     /// e4m3fn byte -> f16 bits of value * 2^-8 (exact incl. subnormals).
@@ -222,6 +232,9 @@ mod kernels {
         num_tokens: u32,
         kv_stride: u32,
         pe_stride: u32,
+        block_size: u32,   // cache rows per block (tensor shape[1])
+        block_stride: u32, // bytes between blocks (tensor stride(0); may be
+                           // padded, e.g. HiSparse hot views)
     ) {
         let tok = thread::blockIdx_x();
         if tok >= num_tokens {
@@ -232,7 +245,7 @@ mod kernels {
             return; // padding token: no cache row
         }
         let tid = thread::threadIdx_x();
-        let dst = unsafe { rows.add((slot as u64 * ROW_BYTES as u64) as usize) };
+        let dst = unsafe { rows.add(row_offset(slot as u64, block_size, block_stride)) };
         let blk = tid & 31; // latent SF block (warp 0) / RoPE group (warp 1)
         if tid < 32 {
             // ---- latent: one lane owns SF block `blk` and its 16 dims ----
@@ -289,27 +302,6 @@ mod kernels {
     // =====================================================================
     const TH: u32 = 16; // staged q rows per CTA (8 real + 8 zero mirror)
     const TN: u32 = 64; // gathered rows per smem stage (LN == TN)
-    const MIN_TILES_PER_SPLIT: u32 = 2;
-
-    /// Build variant (cargo feature, one cubin each — oxide-variants.json):
-    /// ACC_SLOTS = O m-tile slots per warp. TH=16 rows = ONE m-tile, so all
-    /// variants use 1 O slot; w1 is built with -maxrregcount=96 (2 CTAs/SM),
-    /// w2/w3 keep ptxas defaults for headroom tuning on silicon.
-    #[cfg(feature = "w1")]
-    const ACC_SLOTS: usize = 1;
-    #[cfg(not(feature = "w1"))]
-    const ACC_SLOTS: usize = 1;
-
-    /// Concurrent CTA slots (the register-capped w1 cubin runs 2 per SM).
-    #[inline(always)]
-    fn sm_slots() -> u32 {
-        let nsm: u32;
-        unsafe {
-            ptx_asm!("mov.u32 %0, %%nsmid;", out("=r") nsm, options(register_only));
-        }
-        let cps = if cfg!(feature = "w1") { 2 } else { 1 };
-        nsm * cps
-    }
 
     /// cp.async one TN-row window of gathered rows into a stage. Copies
     /// `ln` rows (the CTA's tile split may end mid-stage); rows past `ln`
@@ -326,6 +318,8 @@ mod kernels {
         c0: u32, // first logical capacity row of the tile
         ln: u32, // live rows in the tile (<= TN)
         tid: u32,
+        block_size: u32,
+        block_stride: u32,
     ) {
         unsafe {
             let mut c = tid;
@@ -335,14 +329,14 @@ mod kernels {
                 let live = row < ln;
                 let cc = c0 + row;
                 let slot = if live && cc < cap_len {
-                    unsafe { *capacity.add((cap_base + cc as u64) as usize) }
+                    *capacity.add((cap_base + cc as u64) as usize)
                 } else {
                     -1
                 };
                 let d = dst.add((row * ROW_PITCH + chunk * 16) as usize) as *mut u32;
                 if slot >= 0 {
                     let src = rows
-                        .add((slot as u64 * ROW_BYTES as u64 + (chunk * 16) as u64) as usize);
+                        .add(row_offset(slot as u64, block_size, block_stride) + (chunk * 16) as usize);
                     cp_async_cg_16(d, src as *const u32);
                 } else {
                     *d = 0;
@@ -368,15 +362,16 @@ mod kernels {
         topk_stride: u32,         // topk_indices token stride (i32 elements)
         topk_len: u32,            // active capacity width (cols past it are
                                   // expected -1; -1 columns masked regardless)
-        c_per_split: u32,         // TN(=64): rows per split — flashinfer contract
-                                  // splits = ceil(topk / 64); param kept for
-                                  // tiling flexibility (pad columns tolerated)
+        c_per_split: u32,         // capacity rows per split (multiple of TN;
+                                  // host plan, src/nvfp4_ds_mla.rs)
         ns: u32,                  // launched splits = ceil(C / c_per_split)
         q_stride: u32,            // q token stride (HQ * 576 elements)
         num_tokens: u32,          // padded token count T (grid rows past the
                                   // live count exit with -inf lse; graph-safe)
         hq: u32,                  // query heads (GLM 5.3: 64; runtime u32)
         hqt: u32,                 // q-head tiles = ceil(HQ / 8)
+        block_size: u32,          // cache rows per block (kv shape[1])
+        block_stride: u32,        // bytes between cache blocks (kv stride(0))
         qk_scale_log2: f32,       // sm_scale * log2(e) * 2^8 (SF shift undo;
                                   // bmm1_scale = self.scale, bmm2_scale = 1.0)
     ) {
@@ -397,7 +392,7 @@ mod kernels {
             // (t >= num_tokens, launched to keep graph grids rectangular)
             // are exactly the rows that must exit with -inf lse.
             if h0 + head < hq {
-                let idx = (((t * hq + h0 + head) * ns + s) as usize);
+                let idx = ((t * hq + h0 + head) * ns + s) as usize;
                 unsafe { *lse_part.add(idx) = NEG_INF };
             }
         };
@@ -441,7 +436,7 @@ mod kernels {
 
         // ---- first tile in flight; meanwhile Q -> smem (f16) -------------
         unsafe {
-            issue_tile(kv0, rows, topk_indices, (t * topk_stride) as u64, topk_len, c0, TN.min(c1 - c0), tid);
+            issue_tile(kv0, rows, topk_indices, (t * topk_stride) as u64, topk_len, c0, TN.min(c1 - c0), tid, block_size, block_stride);
         }
         // Q staging: 16 rows x 576 f16 as bf16->f16 (mirror rows 8..15
         // zero; heads past hq zero). One u32 word (2 f16) per work item,
@@ -488,11 +483,11 @@ mod kernels {
         let arow = (lane % 8) + 8 * ((lane / 8) % 2); // ldmatrix row of this lane
         let acol = 8 * (lane / 16);
 
-        let mut acc_o = [[[0.0f32; 4]; 8]; ACC_SLOTS];
+        let mut acc_o = [[[0.0f32; 4]; 8]; 1];
 
         let mut j = c0;
         while j < c1 {
-            let st = (j - c0) % 2;
+            let st = ((j - c0) / TN) % 2; // ring stage of this tile
             let m_run = if st == 0 { m_run0 } else { m_run1 };
             let m_next = if st == 0 { m_run1 } else { m_run0 };
             unsafe { cp_async_wait_all() };
@@ -500,7 +495,7 @@ mod kernels {
             if j + TN < c1 {
                 let dst = unsafe { kv0.add(((st ^ 1) * stage_bytes) as usize) };
                 unsafe {
-                    issue_tile(dst, rows, topk_indices, (t * topk_stride) as u64, topk_len, j + TN, TN, tid);
+                    issue_tile(dst, rows, topk_indices, (t * topk_stride) as u64, topk_len, j + TN, TN.min(c1 - j - TN), tid, block_size, block_stride);
                 }
             }
             let kd = unsafe { kv0.add((st * stage_bytes) as usize) };
@@ -721,9 +716,7 @@ mod kernels {
                     pr2 += 1;
                 }
                 let pcol = ks * 16 + acol;
-                let a = unsafe {
-                    ldmatrix_x4(ps.add(((arow * prow + pcol) as usize) as *const u32))
-                };
+                let a = unsafe { ldmatrix_x4(ps.add((arow * prow + pcol) as usize) as *const u32) };
                 let mut jn = 0usize;
                 while jn < 8 {
                     acc_o[0][jn] =
@@ -777,7 +770,7 @@ mod kernels {
                     let l = unsafe { *l_run.add(gq as usize) };
                     let lse = if l == 0.0 { NEG_INF } else { m + lg2(l) };
                     unsafe {
-                        *lse_part.add((((t * hq + h0 + gq) * ns + s) as usize)) = lse
+                        *lse_part.add(((t * hq + h0 + gq) * ns + s) as usize) = lse
                     };
                 }
             }
@@ -857,8 +850,6 @@ mod kernels {
 }
 
 fn main() {
-    // Build-only crate: scripts/oxide_build.py -> PTX (.target sm_120) ->
-    // ptxas 13.0 -> sm_120 cubin; the plugin launches it
-    // (src/nvfp4_ds_mla_oxide.rs). TODO(CI): PTX generation + ABI param
-    // check cannot run on this macOS host (no CUDA_TOOLKIT_PATH).
+    // Build-only crate: scripts/oxide_build.py -> PTX (.target sm_120a) ->
+    // ptxas 13.0 -> sm_120a cubin; launched by src/nvfp4_ds_mla_oxide.rs.
 }

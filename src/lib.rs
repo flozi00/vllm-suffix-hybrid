@@ -398,7 +398,6 @@ fn nvfp4_ds_mla_plan(
             "merge_smem_bytes".to_string(),
             nvfp4_ds_mla::merge_smem_bytes(p.ns),
         ),
-        ("min_split_rows".to_string(), nvfp4_ds_mla::MIN_SPLIT_ROWS),
     ]))
 }
 

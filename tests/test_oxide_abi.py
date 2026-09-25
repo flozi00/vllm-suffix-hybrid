@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def kernel_params(src: str, name: str):
+    src = re.sub(r"//[^\n]*", "", src)
     m = re.search(rf"pub fn {name}\((.*?)\)\s*\{{", src, re.S)
     assert m, name
     kinds = []
@@ -25,6 +26,7 @@ def kernel_params(src: str, name: str):
 
 
 def host_args(src: str, var: str):
+    src = re.sub(r"//[^\n]*", "", src)
     body = re.search(rf"let {var} = vec!\[(.*?)\];", src, re.S).group(1)
     out = []
     for tok in re.findall(r"Arg::(\w+)\(|\bu\(", body):
@@ -37,6 +39,14 @@ def test_k2_launch_args_match_kernel_params():
     host = (ROOT / "src/nvfp4_attn_oxide.rs").read_text()
     assert host_args(host, "partial_args") == kernel_params(dev, "nvfp4_attn_partial")
     assert host_args(host, "merge_args") == kernel_params(dev, "nvfp4_attn_merge")
+
+
+def test_nvfp4_ds_mla_launch_args_match_kernel_params():
+    dev = (ROOT / "kernels-oxide/nvfp4_ds_mla/src/main.rs").read_text()
+    host = (ROOT / "src/nvfp4_ds_mla_oxide.rs").read_text()
+    assert host_args(host, "partial_args") == kernel_params(dev, "nvfp4_ds_mla_attn_partial")
+    assert host_args(host, "merge_args") == kernel_params(dev, "nvfp4_ds_mla_attn_merge")
+    assert host_args(host, "args") == kernel_params(dev, "nvfp4_ds_mla_quant_store")
 
 
 def test_probe_launch_args_match_kernel_params():

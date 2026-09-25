@@ -29,11 +29,12 @@
 //!   shape integral; mirror rows are masked to -inf and never stored);
 //!   TN = 64 gathered rows per 2-stage cp.async smem ring (row pitch
 //!   368 B, 22 x 16 B chunks per 352 B row);
-//!   NS splits cover C: c_per_split = TN * ceil(C / TN / NS_pre) where
-//!   NS_pre = min(MAX_SPLITS, num_sms) — the smallest wave-filling grid
-//!   the workspace tolerates, chosen from (T, HQ, C) ONLY (CUDA-graph
-//!   stable), with splits past a token's live capacity exiting at once
-//!   (-inf lse; the merge weights them 0).
+//!   NS splits cover C: the partial CTA holds 69 KB of smem, so ONE CTA
+//!   runs per SM; ns = the fewest splits that fill one wave of `num_sms`
+//!   CTAs (ceil(num_sms / (T * HQT)), capped at ceil(C / TN)), and
+//!   c_per_split = TN * ceil(ceil(C / TN) / ns). Chosen from (T, HQ, C,
+//!   num_sms) ONLY (CUDA-graph stable). Large T (prefill chunks) collapse to
+//!   ns = 1, which bounds the o_part workspace at T * HQ * 1 KiB.
 
 pub const DIM: usize = 512; // kv_lora_rank / latent (and value) dims
 pub const PE_DIM: usize = 64; // RoPE dims (raw e4m3)
@@ -51,16 +52,12 @@ pub const THREADS: usize = 256;
 /// Gathered rows per smem stage (kernel TN; kernel mirror).
 pub const TN: usize = 64;
 pub const MAX_SPLITS: usize = 256;
-/// Split-capacity granularity: tiles of the capacity axis.
-pub const CAP_TILE: usize = 64;
-/// Minimum C we plan splits for beneath: one split for tiny capacities.
-pub const MIN_SPLIT_ROWS: usize = TN * 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DsMlaPlan {
     /// q-head tiles (CTAs per token): ceil(HQ / 8).
     pub hqt: usize,
-    /// capacity rows per split (multiple of TN; >= MIN_SPLIT_ROWS).
+    /// capacity rows per split (multiple of TN).
     pub c_per_split: usize,
     /// launched splits: ceil(C / c_per_split) clamped to the wave target.
     pub ns: usize,
@@ -93,12 +90,10 @@ pub fn merge_smem_bytes(ns: usize) -> usize {
     (ns + 1) * 4
 }
 
-/// Wave-targeting split count: enough CTAs to fill `slots` concurrent CTA
-/// slots in ONE wave when the work allows, otherwise as few splits as
-/// possible (each split adds partial O traffic + a merge pass). Derived
-/// from (T, HQ, C) ONLY — never from the live capacity fill state.
-fn wave_splits(rows: usize, slots: usize, c: usize) -> usize {
-    (slots.div_ceil(rows.max(1))).min(c.div_ceil(TN)).clamp(1, MAX_SPLITS)
+/// Capacity rows per split implied by a workspace of `ns` splits (the host
+/// op derives it from o_part's shape, so plan and launch cannot disagree).
+pub fn split_rows(capacity: usize, ns: usize) -> usize {
+    TN * capacity.div_ceil(TN).div_ceil(ns.max(1))
 }
 
 /// Plan from (T, HQ, C, num_sms) ONLY (CUDA-graph stable).
@@ -122,11 +117,12 @@ pub fn plan(
     }
     let hqt = hq.div_ceil(8);
     let rows = tokens * hqt;
-    // FlashInfer SM120 sparse-decode contract: num_splits = ceil(topk / 64)
-    // (_sparse_mla_decode_workspace: mid_out [T, H, splits, 512] bf16,
-    // mid_lse [T, H, splits]) — one split per 64-row capacity tile.
-    let c_per_split = TN;
-    let ns = capacity.div_ceil(TN);
+    // One partial CTA per SM (smem-bound): fill one wave with the fewest
+    // splits; every split adds o_part traffic and merge work.
+    let tiles = capacity.div_ceil(TN);
+    let want = num_sms.div_ceil(rows).clamp(1, tiles.min(MAX_SPLITS));
+    let c_per_split = split_rows(capacity, want);
+    let ns = capacity.div_ceil(c_per_split);
     Ok(DsMlaPlan {
         hqt,
         c_per_split,
@@ -145,8 +141,8 @@ pub fn plan(
 /// e4m3fn byte -> f32 (bit-exact decode; mirror of the kernel's cvt chain).
 pub fn e4m3_to_f32(b: u8) -> f32 {
     // e4m3fn: exp bias 7, denorm at exp==0, no inf; 0x7F/0xFF = NaN.
-    if b & 0x7F > 0x7F {
-        return f32::NAN; // unreachable for u8; completeness
+    if b & 0x7F == 0x7F {
+        return f32::NAN;
     }
     let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
     let exp = ((b >> 3) & 0xF) as i32;
@@ -175,15 +171,13 @@ pub fn f32_to_e2m1(x: f32) -> u8 {
     } else {
         0
     };
-    // satfinite clamps |x| > 6 to 6; RNE among the 8 magnitudes.
-    if a >= 5.0 {
-        return sign | 7;
-    }
+    // satfinite clamps |x| > 6 to 6 (nearest grid point); RNE ties go to
+    // the even code (e.g. 0.25 -> 0, 5.0 -> 4.0).
     let mut best = 0u8;
     let mut best_err = f32::INFINITY;
     for (i, &m) in MAGS.iter().enumerate() {
         let e = (a - m).abs();
-        if e < best_err || (e == best_err && i % 2 == 1) {
+        if e < best_err || (e == best_err && i % 2 == 0) {
             best_err = e;
             best = i as u8;
         }
@@ -206,15 +200,14 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
     if a == 0.0 {
         return sign;
     }
-    if a >= 448.0 * (1.0 - 2.0f32.powi(-4)) {
-        return sign | 0x7E; // max finite
+    if a >= 448.0 {
+        return sign | 0x7E; // satfinite: max finite
     }
     // find exp: largest e with 2^(e-7) <= a
-    let mut man = 0u8;
     if a < 2.0f32.powi(-6) {
         // denormal: a = man/8 * 2^-6
-        man = (a / 2.0f32.powi(-9)).round() as u8;
-        return sign | man; // exp == 0
+        let man = (a / 2.0f32.powi(-9)).round_ties_even() as u8;
+        return sign | man; // exp == 0 (man == 8 is exactly the min normal)
     }
     // normal
     let mut e = -6i32;
@@ -224,7 +217,7 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
     // e in -6..=8
     let mut exp = (e + 7) as u8;
     let frac = a / 2.0f32.powi(e) - 1.0;
-    man = (frac * 8.0).round() as u8;
+    let mut man = (frac * 8.0).round_ties_even() as u8;
     if man == 8 {
         exp += 1;
         man = 0;
@@ -318,8 +311,10 @@ mod tests {
             assert_eq!(p.rows, t * p.hqt);
             // every launched split covers its share; splits past C exit.
             assert!(p.ns >= 1 && p.ns <= MAX_SPLITS);
-            assert_eq!(p.c_per_split, TN, "flashinfer splits = ceil(topk/64)");
             assert_eq!(p.c_per_split % TN, 0, "c_per_split must tile by TN");
+            assert_eq!(split_rows(c, p.ns), p.c_per_split, "host re-derivation");
+            // no empty split: the last one starts inside C
+            assert!((p.ns - 1) * p.c_per_split < c);
             // NS alone covers C unless clamped by the wave target — then
             // c_per_split grows so ns * c_per_split >= C ALWAYS holds.
             assert!(
@@ -333,6 +328,21 @@ mod tests {
             // deterministic: same inputs, same plan (CUDA-graph replay).
             assert_eq!(plan(t, hq, c, SMS).unwrap(), p);
         }
+    }
+
+    #[test]
+    fn plan_glm53_shapes() {
+        // GLM 5.3 per-rank HQ at TP=8 is 64/8 = 8; topk 2048; 188 SMs.
+        let p = plan(1, 8, 2048, SMS).unwrap();
+        assert_eq!((p.hqt, p.ns, p.c_per_split), (1, 32, 64));
+        let p = plan(6, 8, 2048, SMS).unwrap(); // MTP k=5 verify
+        assert_eq!((p.ns, p.c_per_split), (32, 64));
+        let p = plan(32, 8, 2048, SMS).unwrap();
+        assert_eq!((p.ns, p.c_per_split), (6, 384)); // multi-tile splits
+        let p = plan(8192, 8, 2048, SMS).unwrap(); // prefill chunk
+        assert_eq!((p.ns, p.c_per_split), (1, 2048));
+        let p = plan(1, 64, 2048, SMS).unwrap(); // TP=1
+        assert_eq!((p.hqt, p.ns, p.c_per_split), (8, 16, 128));
     }
 
     #[test]
@@ -360,8 +370,14 @@ mod tests {
         // 0 and saturation clamps.
         assert_eq!(f32_to_e2m1(100.0), 7);
         assert_eq!(f32_to_e2m1(-100.0), 0xF);
-        assert_eq!(f32_to_e2m1(0.24), 0); // RNE .24 -> 0 (tie .25 favors even=0)
+        assert_eq!(f32_to_e2m1(0.25), 0); // ties -> even code
+        assert_eq!(f32_to_e2m1(0.75), 2);
+        assert_eq!(f32_to_e2m1(2.5), 4);
+        assert_eq!(f32_to_e2m1(5.0), 6);
+        assert_eq!(f32_to_e2m1(5.01), 7);
         assert_eq!(f32_to_e4m3(1e30), 0x7E);
+        assert_eq!(f32_to_e4m3(420.0), 0x7D); // 416, not saturated
+        assert_eq!(f32_to_e4m3(440.0), 0x7E);
     }
 
     #[test]
