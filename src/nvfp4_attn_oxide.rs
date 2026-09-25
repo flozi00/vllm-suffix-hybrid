@@ -143,6 +143,12 @@ pub fn nvfp4_paged_attn_cuda<'py>(
             "q: heads must be dense (stride[1] == D)",
         ));
     }
+    // the kernel reads Q with 16-byte vector loads
+    if qi.ptr % 16 != 0 || (qi.stride[0] * 2) % 16 != 0 {
+        return Err(PyValueError::new_err(
+            "q: base and row stride must be 16-byte aligned (vector Q loads)",
+        ));
+    }
     let page_bytes = kd.stride[0];
     for (n, i, w, dt) in [
         ("k_data", &kd, dh, "torch.uint8"),
