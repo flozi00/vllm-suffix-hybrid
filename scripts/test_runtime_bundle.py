@@ -39,6 +39,8 @@ class BundleTest(unittest.TestCase):
             manifest = json.loads((root / 'runtime/BUILD.json').read_text())
             self.assertIn('deep_gemm/__init__.py', manifest['sha256'])
             self.assertIn('deep_gemm/sm120_fallback.py', manifest['sha256'])
+            self.assertIn('hisparse_mtp_patch/__init__.py', manifest['sha256'])
+            self.assertIn('hisparse_mtp_patch/oracle.py', manifest['sha256'])
             shipped = (root / 'runtime/deep_gemm/__init__.py').read_text()
             self.assertIn('__suffix_shim__', shipped)
 

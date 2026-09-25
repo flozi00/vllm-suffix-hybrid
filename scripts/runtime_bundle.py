@@ -44,10 +44,13 @@ def bundle(wheel, output, revision, qgdn_cubins=None, attn_cubins=None,
     # shadowing / /plugins import is the whole point).
     #   deep_gemm_shim  -> <output>/deep_gemm/       (SUFFIX_SM120 gate)
     #   nvfp4_kv_patch  -> <output>/nvfp4_kv_patch/  (SUFFIX_SM120_NVP4KV gate)
+    #   hisparse_mtp_patch -> <output>/hisparse_mtp_patch/
+    #                                  (SUFFIX_SM120_HISPARSE_MTP gate)
     # Both self-gate at import time, so shipping them unconditionally is safe.
     sm120_root = Path(__file__).resolve().parents[1] / 'sm120'
     for shim_name, member in (('deep_gemm_shim', 'deep_gemm'),
-                              ('nvfp4_kv_patch', 'nvfp4_kv_patch')):
+                              ('nvfp4_kv_patch', 'nvfp4_kv_patch'),
+                              ('hisparse_mtp_patch', 'hisparse_mtp_patch')):
         shim_root = sm120_root / shim_name
         for src in sorted(shim_root.rglob('*')):
             if src.is_dir() or '__pycache__' in src.parts:
@@ -64,6 +67,8 @@ def bundle(wheel, output, revision, qgdn_cubins=None, attn_cubins=None,
         raise ValueError('runtime bundle requires the sm120 deep_gemm shim')
     if not (output / 'nvfp4_kv_patch' / '__init__.py').exists():
         raise ValueError('runtime bundle requires the sm120 nvfp4_kv patch')
+    if not (output / 'hisparse_mtp_patch' / '__init__.py').exists():
+        raise ValueError('runtime bundle requires the sm120 hisparse_mtp patch')
     # sm120 ficache: FlashInfer autotune cache seed/harvest, shipped FLAT as
     # <output>/ficache.py (sitecustomize loads it by file location), plus the
     # optional seed payloads sm120/ficache/seeds/* -> <output>/ficache/seeds/*.
