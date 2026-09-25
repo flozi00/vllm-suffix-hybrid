@@ -1,0 +1,16 @@
+[package]
+name = "kgdn1"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "K-GDN1: fused Gated-DeltaNet decode step (qwen3.8-27b) as a cuda-oxide SIMT kernel"
+
+# Standalone workspace: built only by `cargo oxide build` in CI (Linux, pinned
+# nightly, LLVM 21+ NVPTX), never by the plugin's maturin/cargo build.
+[workspace]
+
+[dependencies]
+# NVlabs cuda-oxide (NOT the unrelated crates.io `cuda-oxide`), pinned by rev.
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-core = "=0.3.1"

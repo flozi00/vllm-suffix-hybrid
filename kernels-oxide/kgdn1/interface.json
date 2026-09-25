@@ -1,0 +1,27 @@
+{
+  "kernel": "kgdn1",
+  "entry": "kgdn1_decode_h16_hv48_k128",
+  "arch": "sm_120",
+  "shape": {"H": 16, "HV": 48, "K": 128, "V": 128},
+  "grid": ["HV", "T", 1],
+  "block": [256, 1, 1],
+  "dynamic_smem_bytes": 0,
+  "params": [
+    {"name": "out", "type": "ptr", "dtype": "bf16", "mut": true},
+    {"name": "mixed_qkv", "type": "ptr", "dtype": "bf16"},
+    {"name": "z", "type": "ptr", "dtype": "bf16"},
+    {"name": "ba", "type": "ptr", "dtype": "bf16"},
+    {"name": "a_log", "type": "ptr", "dtype": "f32"},
+    {"name": "dt_bias", "type": "ptr", "dtype": "f32"},
+    {"name": "norm_w", "type": "ptr", "dtype": "f32"},
+    {"name": "state", "type": "ptr", "dtype": "f32", "mut": true},
+    {"name": "state_idx", "type": "ptr", "dtype": "i32"},
+    {"name": "slots", "type": "u32"},
+    {"name": "qkv_stride", "type": "u32"},
+    {"name": "z_stride", "type": "u32"},
+    {"name": "state_stride", "type": "u32"},
+    {"name": "act", "type": "u32"},
+    {"name": "scale", "type": "f32"},
+    {"name": "norm_eps", "type": "f32"}
+  ]
+}
