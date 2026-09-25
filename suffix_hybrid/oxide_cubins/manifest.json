@@ -1,0 +1,87 @@
+{
+ "arch": "sm_120",
+ "ptxas_version": "13.0.88",
+ "cuda_oxide_rev": "ec4aa4797956534578a1af010f86252a0b6d8626",
+ "nightly": "nightly-2026-08-28",
+ "kernels": [
+  {
+   "name": "k2_nvfp4_attn_w1",
+   "file": "k2_nvfp4_attn_w1.cubin",
+   "sha256": "db2a6b8b23eec786cf6a49d4224447891497c7e28ea40e9fc22711b8d5a4ea5c",
+   "bytes": 91072,
+   "ptx_isa": "8.7",
+   "ptxas_flags": [
+    "-maxrregcount=128"
+   ],
+   "arch": "sm_120",
+   "entries": [
+    "nvfp4_attn_partial",
+    "nvfp4_attn_merge"
+   ]
+  },
+  {
+   "name": "k2_nvfp4_attn_w2",
+   "file": "k2_nvfp4_attn_w2.cubin",
+   "sha256": "ebb1cd95e417777476e9c39db85220caac343ac8b63636c429b06ab88becaf51",
+   "bytes": 110832,
+   "ptx_isa": "8.7",
+   "ptxas_flags": [],
+   "arch": "sm_120",
+   "entries": [
+    "nvfp4_attn_merge",
+    "nvfp4_attn_partial"
+   ]
+  },
+  {
+   "name": "k2_nvfp4_attn_w3",
+   "file": "k2_nvfp4_attn_w3.cubin",
+   "sha256": "3be950259df18ceb67289805347ff110cc9a09027756b230da7ddb9dd219749e",
+   "bytes": 117216,
+   "ptx_isa": "8.7",
+   "ptxas_flags": [],
+   "arch": "sm_120",
+   "entries": [
+    "nvfp4_attn_merge",
+    "nvfp4_attn_partial"
+   ]
+  },
+  {
+   "name": "kgdn1",
+   "file": "kgdn1.cubin",
+   "sha256": "515845ea89eded6badfb3a36ef555112b67b1bc4adff1d336e77e1d93b6ad3da",
+   "bytes": 19840,
+   "ptx_isa": "8.7",
+   "ptxas_flags": [],
+   "arch": "sm_120",
+   "entries": [
+    "kgdn1_decode_h16_hv48_k128"
+   ]
+  },
+  {
+   "name": "nvfp4_gemm",
+   "file": "nvfp4_gemm.cubin",
+   "sha256": "31a27e5743287043fc9f2461a3365725d61d8c3f1d30e5fda5c4b2a903a0a05e",
+   "bytes": 31912,
+   "ptx_isa": "8.7",
+   "ptxas_flags": [],
+   "arch": "sm_120a",
+   "entries": [
+    "nvfp4_splitk_reduce",
+    "nvfp4_gemm_m16",
+    "nvfp4_quant_act"
+   ]
+  },
+  {
+   "name": "probe",
+   "file": "probe.cubin",
+   "sha256": "17f9ed23b429598398c997dce8a2b85d677ae430177a25f2a5a239ab2d7e6727",
+   "bytes": 6112,
+   "ptx_isa": "8.7",
+   "ptxas_flags": [],
+   "arch": "sm_120",
+   "entries": [
+    "oxide_probe"
+   ]
+  }
+ ]
+}
