@@ -249,7 +249,7 @@ _BOOT_GATES = {
     "nvfp4_dsmla_oracle": (["-m", "nvfp4_ds_mla_patch.oracle"], {}),
     "nvfp4_dsmla_bench": (["-m", "nvfp4_ds_mla_patch.oracle", "--bench", "--json"], {}),
     # 200 GPU blocks (12.8k tokens) < 5 x 4k prompts: forces host spills.
-    "hisparse_mtp_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "3",
+    "hisparse_mtp_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "3", "5",
                              "--prompt-len", "4096", "--gpu-blocks", "200"],
                             {"SUFFIX_SM120": "1"}),
 }

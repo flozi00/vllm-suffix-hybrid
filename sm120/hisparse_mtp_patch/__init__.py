@@ -34,6 +34,24 @@ two patches share no file and compose in any order):
      uses it; SM90's builder is a subclass and is excluded);
   3. ``build()``: count + log (once) real multi-token decode batches —
      marker ``[suffix sm120-hisparse-mtp] HISPARSE-MTP-DECODE``.
+
+Swap-row capacity off-by-one (rev .2; upstream, not SM120-specific)
+------------------------------------------------------------------
+Silicon (stock child, HiSparse on, k=3, max_num_seqs=1): ``ValueError: HiSparse
+swap rows exceed the configured speculative decode capacity: stop=5,
+capacity=4``. The index group's physical-top-k workspace has
+``max_rows + 1`` rows (index_group.py:465-476, +1 = ragged-decode sink row) and
+``convert_logical_to_physical_topk`` sends every batch with ``num_tokens <=
+workspace.shape[0]`` (index_group.py:236) to ``swap_in``; the runtime's shared
+swap state has only ``_get_max_swap_rows == max_rows`` rows (runtime.py:61-67,
+643). A pure-prefill, all-resident batch of exactly ``max_num_seqs*(1+k)+1``
+tokens therefore overflows ``_step_rows`` (runtime.py:869-879). Rewrite 4
+(target ``vllm.v1.hisparse.runtime``, touched by no other patch; only the
+function, not the module, is re-executed so already-imported classes keep
+their identity): ``_get_max_swap_rows`` returns ``max_rows + 1``. Safe: that
+branch only runs with every context page resident, and resident rows bypass
+the hot LRU region (hisparse_kernels.cu resolve_residency, resident_row >= 0),
+so only the shared swap arrays grow (4 x topk int32 rows per index group).
 """
 
 import importlib
@@ -42,11 +60,12 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-09-25.1"
+PATCH_REVISION = "2026-09-25.2"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
 DEPENDENT_MODULE = "vllm.v1.attention.backends.mla.flashinfer_mla_sparse"
+RUNTIME_MODULE = "vllm.v1.hisparse.runtime"
 PINNED_VLLM = "0.30.0"
 GATE_ENV = "SUFFIX_SM120_HISPARSE_MTP"
 MARKER_ATTR = "__suffix_hisparse_mtp_revision__"
@@ -150,6 +169,42 @@ EDITS = [
 ]
 
 
+# runtime.py: the function is replaced (anchor = its whole stock text); the
+# call-site anchor proves every consumer looks it up at call time.
+RUNTIME_OLD = (
+    "def _get_max_swap_rows(vllm_config: VllmConfig) -> int:\n"
+    "    max_query_len = _get_max_decode_query_len(vllm_config)\n"
+    "    scheduler_config = vllm_config.scheduler_config\n"
+    "    return min(\n"
+    "        scheduler_config.max_num_batched_tokens,\n"
+    "        scheduler_config.max_num_seqs * max_query_len,\n"
+    "    )\n"
+)
+RUNTIME_CALL_SITE = "    max_swap_rows = _get_max_swap_rows(vllm_config)\n"
+RUNTIME_NEW = (
+    f"# --- {HELPER_TAG} (rev {PATCH_REVISION}): swap rows == index-group\n"
+    "# workspace rows (max_rows + 1, index_group.py:465), so the all-resident\n"
+    "# prefill branch (index_group.py:236) never overflows _step_rows.\n"
+    + RUNTIME_OLD.replace("    )\n", "    ) + 1\n")
+)
+
+
+def patch_runtime_source(src: str) -> str:
+    """Pure check of runtime.py; returns the replacement function source."""
+    bad = [f"{n}: expected 1, found {src.count(t)}"
+           for n, t in (("swap_rows_def", RUNTIME_OLD),
+                        ("swap_rows_call", RUNTIME_CALL_SITE))
+           if src.count(t) != 1]
+    if HELPER_TAG in src:
+        bad.append("already carries the rewrite on disk")
+    if bad:
+        raise PatchDriftError(
+            "hisparse/runtime.py does not match the pinned anchor text "
+            f"(expected vLLM {PINNED_VLLM}): " + "; ".join(bad))
+    compile(RUNTIME_NEW, f"<{PATCH_NAME}:runtime>", "exec")
+    return RUNTIME_NEW
+
+
 def patch_source(src: str) -> tuple[str, list[str]]:
     """Pure transform of sparse_mla_attention.py. Every anchor is
     count-verified BEFORE any replacement (all failures reported at once)."""
@@ -202,11 +257,17 @@ def apply(module=None) -> bool:
     if HELPER_TAG in src:
         raise PatchDriftError(f"{src_path} already carries the rewrite on disk")
     new_src, applied = patch_source(src)
+    runtime = importlib.import_module(RUNTIME_MODULE)
+    rt_path = Path(runtime.__file__)
+    rt_new = patch_runtime_source(rt_path.read_text())
+    # Both files verified before either changes (fail closed, all or nothing).
+    exec_patched_source(runtime, rt_new, rt_path)
     exec_patched_source(module, new_src, src_path)
     setattr(module, MARKER_ATTR, PATCH_REVISION)
     print(f"[suffix {PATCH_NAME}] ACTIVE on SM120: HiSparse spec-verify tokens "
-          f"-> multi-token hot-buffer decode (rev {PATCH_REVISION}; "
-          f"{len(applied)} anchors; vllm {ver}).", file=sys.stderr, flush=True)
+          f"-> multi-token hot-buffer decode + swap rows = max_rows+1 "
+          f"(rev {PATCH_REVISION}; {len(applied) + 1} anchors; vllm {ver}).",
+          file=sys.stderr, flush=True)
     return True
 
 
