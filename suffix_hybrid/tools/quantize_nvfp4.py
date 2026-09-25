@@ -405,7 +405,7 @@ def write_checkpoint(src: Path, out: Path, w_amax, key_group, a_amax, device: st
 
 def copy_side_files(src: Path, out: Path):
     for f in src.iterdir():
-        if f.is_file() and f.suffix in COPY_FILES and f.name not in (
+        if f.is_file() and not f.name.startswith(".") and f.suffix in COPY_FILES and f.name not in (
                 "model.safetensors.index.json", "config.json"):
             shutil.copy2(f, out / f.name)
     cfg = json.loads((src / "config.json").read_text())
