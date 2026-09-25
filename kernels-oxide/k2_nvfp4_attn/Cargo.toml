@@ -1,0 +1,13 @@
+# K2-NVFP4 attention kernels (cuda-oxide SIMT track, bf16 mma.sync).
+# Standalone crate (own [workspace]); built only by scripts/oxide_build.py.
+[package]
+name = "k2_nvfp4_attn"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-core = "0.3.1"

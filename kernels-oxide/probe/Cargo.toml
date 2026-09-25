@@ -1,0 +1,14 @@
+# Probe kernel: proves the cuda-oxide -> PTX (ISA <= 9.0) -> ptxas 13.0 ->
+# sm_120 cubin -> boot driver-load chain before any heavy kernel matters.
+# Standalone crate (own [workspace]); built only by scripts/oxide_build.py.
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-core = "0.3.1"

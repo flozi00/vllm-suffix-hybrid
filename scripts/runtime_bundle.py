@@ -20,7 +20,8 @@ from pathlib import Path, PurePosixPath
 import zipfile
 
 
-def bundle(wheel, output, revision, qgdn_cubins=None, attn_cubins=None):
+def bundle(wheel, output, revision, qgdn_cubins=None, attn_cubins=None,
+           oxide_cubins=None):
     output = Path(output)
     hashes = {}
     with zipfile.ZipFile(wheel) as archive:
@@ -142,20 +143,24 @@ def bundle(wheel, output, revision, qgdn_cubins=None, attn_cubins=None):
     # missing/mismatched manifest fails startup (suffix_hybrid.kernels.qwen_gdn).
     # K2-NVFP4 attention cubins (scripts/nvfp4_attn_prebuild.py): same
     # contract, suffix_hybrid/nvfp4_attn_cubins/, SUFFIX_SM120_NVP4KV_OWN_ATTN.
+    # cuda-oxide kernels (scripts/oxide_build.py): suffix_hybrid/oxide_cubins/
+    # (manifest lists 'kernels' instead of 'entries').
     for src, sub in ((qgdn_cubins, 'qgdn_cubins'),
-                     (attn_cubins, 'nvfp4_attn_cubins')):
+                     (attn_cubins, 'nvfp4_attn_cubins'),
+                     (oxide_cubins, 'oxide_cubins')):
         if src is None:
             continue
         src_dir = Path(src)
         man = json.loads((src_dir / 'manifest.json').read_text())
-        names = ['manifest.json'] + [e['file'] for e in man['entries']]
+        items = man.get('entries') or man.get('kernels') or []
+        names = ['manifest.json'] + [e['file'] for e in items]
         for name in names:
             if '/' in name or '..' in name:
                 raise ValueError(f'unsafe {sub} cubin name')
             data = (src_dir / name).read_bytes()
             rel = PurePosixPath('suffix_hybrid', sub, name)
             if name != 'manifest.json':
-                entry = next(e for e in man['entries'] if e['file'] == name)
+                entry = next(e for e in items if e['file'] == name)
                 if hashlib.sha256(data).hexdigest() != entry['sha256']:
                     raise ValueError(f'{sub} cubin sha256 mismatch: {name}')
             dest = output / PurePosixPath(*rel.parts)
@@ -176,8 +181,10 @@ if __name__ == '__main__':
     parser.add_argument('--revision', required=True)
     parser.add_argument('--qgdn-cubins', default=None,
                         help='K-GDN1 prebuilt cubin dir (manifest.json + cubins)')
+    parser.add_argument('--oxide-cubins', default=None,
+                        help='cuda-oxide cubin dir (scripts/oxide_build.py)')
     parser.add_argument('--attn-cubins', default=None,
                         help='K2-NVFP4 prebuilt cubin dir (manifest.json + cubins)')
     args = parser.parse_args()
     bundle(args.wheel, args.output, args.revision, args.qgdn_cubins,
-           args.attn_cubins)
+           args.attn_cubins, args.oxide_cubins)

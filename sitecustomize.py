@@ -141,6 +141,18 @@ if os.environ.get("SUFFIX_SM120_NVP4KV", "").strip() == "1":
         print(f"suffix sm120 nvfp4-kv: hook install failed (not SM120, "
               f"ignoring): {exc}", file=sys.stderr, flush=True)
 
+# cuda-oxide toolchain probe (docs/oxide-kernels.md): SUFFIX_OXIDE_PROBE=1
+# driver-loads every bundle cubin (suffix_hybrid/oxide_cubins) and runs the
+# probe kernel once per pod, in a CHILD process before vLLM sizes memory.
+# Marker in the pod log: "[suffix oxide] OXIDE-PROBE PASS|FAIL". Evidence
+# only: kernel lanes fail closed on their own gates.
+if (os.environ.get("SUFFIX_OXIDE_PROBE", "").strip() == "1"
+        and not os.environ.get("SUFFIX_OXIDE_PROBE_DONE")):
+    import subprocess
+    import sys
+    os.environ["SUFFIX_OXIDE_PROBE_DONE"] = "1"
+    subprocess.run([sys.executable, "-m", "suffix_hybrid.oxide_kernels"])
+
 # NVFP4-KV pod warmup oracle (gemma-hd512 dossier c.4). The console pins the
 # pod command to `vllm serve`, so the on-silicon numerics gate runs here: once
 # per pod (the _DONE marker is inherited by every child), in a CHILD process so

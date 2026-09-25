@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K2-NVFP4: our SM120 NVFP4-KV decode / spec-verify attention (cutile-rs
-kernel, src/nvfp4_attn_gpu.rs) inside the patched FlashInfer backend.
+"""K2-NVFP4: our SM120 NVFP4-KV decode / spec-verify attention (cuda-oxide
+kernels kernels-oxide/k2_nvfp4_attn, host op src/nvfp4_attn_oxide.rs)
+inside the patched FlashInfer backend.
 
 Gate: ``SUFFIX_SM120_NVP4KV_OWN_ATTN=1`` on top of the fa2 NVFP4 route
 (``SUFFIX_SM120_NVP4KV=1``). Default OFF. When set it is FAIL-CLOSED: a
@@ -24,10 +25,10 @@ batches replay FULL graphs through our op (grid is seq_lens-independent);
 spec-verify batches run piecewise as today — UNIFORM_BATCH needs the image
 ranges in-kernel first (dossier sm120-nvfp4-attn-kernel.md §5).
 
-Cubins: pods never JIT. CI (scripts/nvfp4_attn_prebuild.py) compiles every
-variant with the offline tileiras into suffix_hybrid/nvfp4_attn_cubins/;
-``builder_gate`` verifies + installs them. ``..._ALLOW_JIT=1`` (dev boxes
-with tileiras only) skips that requirement.
+Cubins: pods never JIT. CI (scripts/oxide_build.py) compiles the kernel
+crate with cargo-oxide to PTX (ISA <= 9.0) and ptxas 13.0 to sm_120 SASS;
+``prepare`` driver-loads the sha256-verified cubin and runs the toolchain
+probe (suffix_hybrid.oxide_kernels) before serving.
 """
 
 import json
@@ -35,16 +36,12 @@ import os
 import sys
 
 ENV = "SUFFIX_SM120_NVP4KV_OWN_ATTN"
-ALLOW_JIT_ENV = "SUFFIX_SM120_NVP4KV_OWN_ATTN_ALLOW_JIT"
-CUBIN_DIR_ENV = "SUFFIX_SM120_NVP4KV_OWN_ATTN_CUBINS"
-KERNELS = ("nvfp4_attn_partial", "nvfp4_attn_merge")
 LOG2E = 1.4426950408889634
 MAX_Q_LEN = 16
 
 _PLANS: dict = {}
 _SMS: dict = {}
 _META: dict = {}
-_INSTALLED: set = set()
 
 
 def enabled() -> bool:
@@ -93,105 +90,27 @@ def max_decode_q_len(vllm_config) -> int:
     return 1 + (2 if getattr(spec, "parallel_drafting", False) else 1) * k
 
 
-def cubin_dir() -> str:
-    d = os.environ.get(CUBIN_DIR_ENV, "").strip()
-    if d:
-        return d
-    import suffix_hybrid
-
-    return os.path.join(os.path.dirname(suffix_hybrid.__file__),
-                        "nvfp4_attn_cubins")
-
-
-def install_cubins(nat, served, q_lens, gpu, directory=None) -> int:
-    """Verify + install every manifest cubin for ``served`` = (d, hq, hkv,
-    page, window_left) and q_len in ``q_lens``; each q_len must be covered.
-    Returns the number of cubins installed."""
-    import hashlib
-
-    directory = directory or cubin_dir()
-    path = os.path.join(directory, "manifest.json")
-    if not os.path.isfile(path):
-        raise RuntimeError(f"{ENV}=1 but no K2-NVFP4 cubin manifest at {path} "
-                           f"(CI prebuild missing; dev boxes: {ALLOW_JIT_ENV}=1)")
-    with open(path) as f:
-        man = json.load(f)
-    want = str(man["bytecode_version"])
-    have = os.environ.get("CUTILE_BYTECODE_VERSION")
-    if have and have != want:
-        raise RuntimeError(f"CUTILE_BYTECODE_VERSION={have} != manifest {want}")
-    os.environ["CUTILE_BYTECODE_VERSION"] = want
-    d, hq, hkv, page, wl = served
-    n, covered = 0, set()
-    for e in man["entries"]:
-        if (e["d"], e["hq"], e["hkv"], e["page"]) != (d, hq, hkv, page) or (
-                e["q_len"] not in q_lens) or not _same_div(e["window_left"], wl):
-            continue
-        with open(os.path.join(directory, e["file"]), "rb") as f:
-            cubin = f.read()
-        if hashlib.sha256(cubin).hexdigest() != e["sha256"]:
-            raise RuntimeError(f"K2-NVFP4 cubin sha256 mismatch: {e['file']}")
-        key = (d, hq, hkv, page, e["q_len"], wl, e["ns"], e["kernel"])
-        if key not in _INSTALLED:
-            nat.nvfp4_attn_install_cubin(d, hq, hkv, page, e["q_len"], wl,
-                                         e["ns"], e["kernel"], gpu,
-                                         e["bc_sha256"], cubin)
-            _INSTALLED.add(key)
-        covered.add(e["q_len"])
-        n += 1
-    missing = sorted(set(q_lens) - covered)
-    if missing:
-        raise RuntimeError(
-            f"K2-NVFP4 manifest has no cubins for d={d} hq={hq} hkv={hkv} "
-            f"page={page} window_left={wl} q_len={missing}; add this served "
-            "shape to scripts/nvfp4_attn_prebuild.py --served and rebuild")
-    return n
+FAMILY = "k2_nvfp4_attn"
 
 
 def prepare(nat, served, q_lens) -> str:
-    """Make every variant of ``served`` x ``q_lens`` launchable: install the
-    CI cubins (serving), or allow JIT under ALLOW_JIT (dev boxes only)."""
-    if os.environ.get(ALLOW_JIT_ENV, "").strip() == "1":
-        nat.nvfp4_attn_allow_jit(True)
-        return "JIT allowed (dev only)"
+    """Make the K2 kernels launchable on this device: load the CI-built
+    cuda-oxide cubin (sm_120 SASS from ptxas 13.0; sha256-verified, driver
+    load = the self-check) and run the toolchain probe once. There is no JIT
+    path at all on this track."""
     import torch
+
+    from suffix_hybrid import oxide_kernels
 
     dev = torch.cuda.current_device()
-    gpu = nat.nvfp4_attn_gpu_name(dev)
-    n = install_cubins(nat, served, q_lens, gpu)
-    selfcheck(nat, served, max(q_lens), dev)
-    return f"{n} prebuilt {gpu} cubins installed + self-checked, JIT off"
+    oxide_kernels.ensure_loaded(FAMILY, dev)
+    if dev not in _PROBED:
+        print(oxide_kernels.probe(dev), file=sys.stderr, flush=True)
+        _PROBED.add(dev)
+    return "cuda-oxide sm_120 cubin driver-loaded + probe PASS, no JIT"
 
 
-_CHECKED: set = set()
-
-
-def selfcheck(nat, served, q_len, device) -> None:
-    """One REAL lookup per kernel before serving: resolve the launch keys
-    through cutile's own launcher (specialize_on, metadata only) and require
-    them in the store, then load every installed cubin through the driver.
-    Raises with the specific cause (key drift vs driver rejection)."""
-    import torch
-
-    d, hq, hkv, page, wl = served
-    ns = nat.nvfp4_attn_split_set(d, hq, hkv, page, q_len, num_sms(device), 1)[0]
-    key = (served, q_len, ns)
-    if key in _CHECKED:
-        return
-    scratch = torch.empty(4096, dtype=torch.uint8, device=device)
-    nat.nvfp4_attn_selfcheck(d, hq, hkv, page, q_len, wl, ns, device,
-                             scratch.data_ptr(),
-                             torch.cuda.current_stream(device).cuda_stream)
-    torch.cuda.synchronize(device)
-    _CHECKED.add(key)
-
-
-def _same_div(a: int, b: int) -> bool:
-    """window_left only reaches the kernel key via its pow2 divisibility."""
-    def div(x):
-        x = int(x)
-        return 16 if x == 0 else min(x & -x, 16)
-    return div(a) == div(b)
+_PROBED: set = set()
 
 
 def uniform_decode_excludes_prefill(func=None) -> bool:

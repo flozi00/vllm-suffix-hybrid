@@ -34,6 +34,12 @@ qwen-gdn-kernels = ["dep:cutile", "dep:cuda-core", "dep:sha2"]
 # (src/nvfp4_attn_gpu.rs). Separate lane feature; same toolkit rule: CUDA
 # 13.x headers at build time (CI), driver-only pods.
 nvfp4-attn-kernels = ["dep:cutile", "dep:cuda-core", "dep:sha2"]
+# cuda-oxide kernel track (kernels-oxide/*, docs/oxide-kernels.md): host-side
+# cubin loading + launches (src/oxide.rs) and the K2-NVFP4 host op
+# (src/nvfp4_attn_oxide.rs). THE shipping feature for our kernels since
+# 2026-09-25 (cutile cubins cannot load on driver 580 / no PTX JIT). Only
+# cuda-core (CUDA 13 headers at build time, libcuda dlopen'd at runtime).
+oxide-kernels = ["dep:cuda-core"]
 
 [profile.release]
 lto = "thin"

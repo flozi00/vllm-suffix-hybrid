@@ -9,4 +9,7 @@ target/
 *.so
 *.dylib
 bench/*
-results/*
+results/*# cargo-oxide build products inside kernel crates (CI copies what ships)
+kernels-oxide/*/*.ll
+kernels-oxide/*/*.ptx
+kernels-oxide/*/*.cubin

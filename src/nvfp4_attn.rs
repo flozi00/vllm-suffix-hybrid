@@ -21,13 +21,14 @@
 //!   QT q tokens per CTA, M = QT*GP rows, M*D <= ACC_ELEMS (f32 accumulator
 //!      budget per CTA) and M >= 16 where the budget allows (mma row tile)
 //!   NQT = ceil(q_len/QT) CTAs per (request, kv head)
-//!   TN KV tokens per tile: TN*D <= KV_TILE_ELEMS, TN | page_size, 4 | TN
+//!   TN = 16 KV tokens per tile (cuda-oxide kernel), 16 | page_size
 //!   NS split-KV partitions: a function of the launch rows ONLY (never of
 //!      seq_lens) so the grid is CUDA-graph replay-stable; each CTA derives
 //!      its chunk from seq_lens on the device.
 //!   DT merge D-chunk: NS*M*DT <= MERGE_ELEMS.
 
 pub const ACC_ELEMS: usize = 8192;
+#[allow(dead_code)] // cutile-track budget (retired kernels + tests)
 pub const KV_TILE_ELEMS: usize = 8192;
 pub const MERGE_ELEMS: usize = 8192;
 pub const MAX_SPLITS: usize = 64;
@@ -99,13 +100,12 @@ pub fn plan(
     let qt = q_len.next_power_of_two().max(16 / gp.min(16)).min(qt_max);
     let nqt = q_len.div_ceil(qt);
     let m = qt * gp;
-    let mut tn = floor_pow2(KV_TILE_ELEMS / d);
-    while page_size % tn != 0 {
-        tn /= 2;
-    }
-    if tn < 4 {
+    // The cuda-oxide kernel tiles KV in fixed 16-token tiles (one mma
+    // n16 pair); a tile never straddles a page.
+    let tn = 16;
+    if page_size % tn != 0 {
         return Err(format!(
-            "page_size {page_size} has no power-of-two tile divisor >= 4"
+            "page_size {page_size} must be a multiple of 16 (K2 KV tile)"
         ));
     }
     let rows = batch * hkv * nqt;
@@ -143,6 +143,7 @@ pub fn round16(x: usize) -> usize {
 
 /// Every split count `plan` can pick for batch 1..=max_batch at this shape —
 /// the prebuilt-cubin variant axis (everything else is shape-determined).
+#[allow(dead_code)] // cutile prebuild variant axis
 pub fn split_set(
     q_len: usize,
     hq: usize,
@@ -184,12 +185,12 @@ mod tests {
     #[test]
     fn gemma_swa_hd256_and_qwen() {
         let s = plan(1, 9, 16, 8, 256, 64, SMS).unwrap();
-        assert_eq!((s.g, s.gp, s.qt, s.nqt, s.m, s.tn), (2, 2, 16, 1, 32, 32));
+        assert_eq!((s.g, s.gp, s.qt, s.nqt, s.m, s.tn), (2, 2, 16, 1, 32, 16));
         let s1 = plan(32, 1, 16, 8, 256, 64, SMS).unwrap();
         assert_eq!((s1.qt, s1.m, s1.rows, s1.ns), (8, 16, 256, 2));
         // qwen3.8-27b: 24/4 heads (G=6 -> GP=8), page 2816 = 16*176.
         let q = plan(8, 1, 24, 4, 256, 2816, SMS).unwrap();
-        assert_eq!((q.g, q.gp, q.qt, q.m, q.tn), (6, 8, 2, 16, 32));
+        assert_eq!((q.g, q.gp, q.qt, q.m, q.tn), (6, 8, 2, 16, 16));
         assert_eq!(2816 % q.tn, 0);
     }
 

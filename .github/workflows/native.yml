@@ -19,6 +19,12 @@ env:
   # d057d457 CI, both K-GDN1 and K2). cutile 0.3.1 clamps to 13.3 at most
   # (asked for 13.4 it serialized 13.3, dff7803a CI), so pin its maximum.
   CUTILE_BYTECODE_VERSION: '13.3'
+  # cuda-oxide kernel track (docs/oxide-kernels.md) — THE shipping path for
+  # our kernels since 2026-09-25: pods run driver 580 (CUDA 13.0) with no
+  # PTX JIT library, so every shipped kernel is sm_120 SASS from ptxas 13.0.
+  OXIDE_NIGHTLY: nightly-2026-08-28
+  CUDA_OXIDE_REV: ec4aa4797956534578a1af010f86252a0b6d8626
+  PTXAS_WHEEL_VERSION: '13.0.88'
 jobs:
   linux:
     runs-on: ubuntu-22.04
@@ -49,17 +55,36 @@ jobs:
           test -x .cuda13/nvidia/cu13/bin/ptxas && test -f .cuda13/nvidia/cu13/lib/libnvvm.so.4
           echo "$PWD/.cuda13/nvidia/cu13/bin" >> "$GITHUB_PATH"
           echo "LD_LIBRARY_PATH=$PWD/.cuda13/nvidia/cu13/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-      - name: Rust tests (default, qwen-gdn + nvfp4-attn Tile IR lowering, K1 build)
+      - name: Rust tests (default, oxide host, qwen-gdn Tile IR lowering, retired cutile builds)
         run: |
           sudo apt-get install -y libclang-dev
           cargo test --release
-          cargo test --release --features qwen-gdn-kernels,nvfp4-attn-kernels
+          cargo test --release --features oxide-kernels,qwen-gdn-kernels
           cargo check --release --features cutile-kernels
+          cargo check --release --features nvfp4-attn-kernels
+      - name: cuda-oxide toolchain (pinned nightly + its llc/NVPTX) + ptxas 13.0
+        run: |
+          rustup toolchain install "$OXIDE_NIGHTLY" --profile minimal -c rust-src,rustc-dev,llvm-tools
+          # The real tool (NOT the unrelated crates.io `cuda-oxide` crate).
+          cargo +"$OXIDE_NIGHTLY" install --locked --git https://github.com/NVlabs/cuda-oxide.git \
+            --rev "$CUDA_OXIDE_REV" cargo-oxide
+          llc="$(rustc +"$OXIDE_NIGHTLY" --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llc"
+          "$llc" --version | grep -q nvptx64
+          echo "CUDA_OXIDE_LLC=$llc" >> "$GITHUB_ENV"
+          python -m pip download --no-deps --only-binary=:all: \
+            --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 \
+            --platform manylinux_2_27_x86_64 --python-version 3.11 \
+            nvidia-cuda-nvcc==$PTXAS_WHEEL_VERSION -d .cuda130-whl
+          for w in .cuda130-whl/*.whl; do python -m zipfile -e "$w" .cuda130; done
+          ptxas=$(find .cuda130 -name ptxas -type f | head -1); chmod +x "$ptxas"
+          "$ptxas" --version | tee /dev/stderr | grep -q "release 13.0"
+          echo "OXIDE_PTXAS=$PWD/$ptxas" >> "$GITHUB_ENV"
+          echo "OXIDE_CUOBJDUMP=$(find $PWD/.cuda13 -name cuobjdump -type f | head -1)" >> "$GITHUB_ENV"
       - uses: PyO3/maturin-action@v1
         with:
           target: x86_64
           manylinux: '2_28'
-          args: --release --locked --features qwen-gdn-kernels,nvfp4-attn-kernels --out dist
+          args: --release --locked --features oxide-kernels,qwen-gdn-kernels --out dist
           before-script-linux: dnf install -y clang-devel || yum install -y clang-devel
           docker-options: -e CUDA_TOOLKIT_PATH=${{ github.workspace }}/.cuda13/nvidia/cu13
       - name: Exercise installed Linux wheel
@@ -71,7 +96,7 @@ jobs:
           cd "$RUNNER_TEMP"
           so=$(python -c "import suffix_hybrid._native as n; print(n.__file__)")
           if readelf -d "$so" | grep -Ei 'NEEDED.*(libcuda|libcudart|libcurand)'; then exit 1; fi
-          python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA and n.HAS_NVFP4_ATTN_CUDA"
+          python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA and n.HAS_NVFP4_ATTN_CUDA and n.HAS_OXIDE_KERNELS"
           python -m pytest "$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/sm120/tests" -q --import-mode=importlib
       - name: Prebuild K-GDN1 cubins for sm_120 (offline tileiras) + resource report
         # K-GDN1 is default-OFF and fails closed without its cubins
@@ -87,23 +112,20 @@ jobs:
           for c in qgdn_cubins/*_act0_t1_s16.cubin qgdn_cubins/*_act0_t16_s16.cubin; do
             "$obj" --dump-resource-usage "$c"
           done
-      - name: Prebuild K2-NVFP4 attention cubins for sm_120 (offline tileiras) + resource report
-        # Default-OFF lane (SUFFIX_SM120_NVP4KV_OWN_ATTN), fails closed without
-        # its cubins: never blocks the rest of the bundle.
+      - name: Build cuda-oxide kernels -> sm_120 cubins (ptxas 13.0) + SASS/ISA assertions
+        # kernels-oxide/<name>/ -> PTX (ISA <= 9.0) -> ptxas 13.0 -> cubin;
+        # asserts sm_120 SASS (cuobjdump --list-elf) and ptxas release 13.0.
+        # Default-OFF lanes fail closed without their cubins, and the boot
+        # probe (SUFFIX_OXIDE_PROBE=1) reports OXIDE-PROBE FAIL: never block
+        # the rest of the bundle, stay visibly red.
         continue-on-error: true
-        env:
-          CUTILE_DUMP: ir,bytecode
         run: |
-          python scripts/nvfp4_attn_prebuild.py --out attn_cubins || { rm -rf attn_cubins; exit 1; }
-          obj=$(find .cuda13 -name cuobjdump -type f | head -1); chmod +x "$obj"
-          for c in attn_cubins/nvfp4_attn_partial_d512_hq16_hkv2_p16_q1_*.cubin attn_cubins/nvfp4_attn_partial_d512_hq16_hkv2_p16_q9_*.cubin; do
-            "$obj" --dump-resource-usage "$c"
-          done
+          python scripts/oxide_build.py --out oxide_cubins || { rm -rf oxide_cubins; exit 1; }
       - name: Create directly mountable runtime bundle
         run: |
           python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA" \
             $( [ -f qgdn_cubins/manifest.json ] && echo --qgdn-cubins qgdn_cubins ) \
-            $( [ -f attn_cubins/manifest.json ] && echo --attn-cubins attn_cubins )
+            $( [ -f oxide_cubins/manifest.json ] && echo --oxide-cubins oxide_cubins )
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-linux-x86_64

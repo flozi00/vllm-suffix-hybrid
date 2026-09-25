@@ -309,8 +309,12 @@ mod cubin_store;
 mod engine;
 mod mixer;
 mod nvfp4_attn;
-#[cfg(feature = "nvfp4-attn-kernels")]
+#[cfg(all(feature = "nvfp4-attn-kernels", not(feature = "oxide-kernels")))]
 mod nvfp4_attn_gpu;
+#[cfg(feature = "oxide-kernels")]
+mod nvfp4_attn_oxide;
+#[cfg(feature = "oxide-kernels")]
+mod oxide;
 mod qwen_gdn;
 #[cfg(feature = "qwen-gdn-kernels")]
 mod qwen_gdn_gpu;
@@ -412,8 +416,26 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // is the startup kernel-path assertion's probe — an armed pod without it
     // refuses to start, it never silently keeps the FA2 decode route.
     m.add_function(wrap_pyfunction!(nvfp4_attn_plan, m)?)?;
-    m.add("HAS_NVFP4_ATTN_CUDA", cfg!(feature = "nvfp4-attn-kernels"))?;
-    #[cfg(feature = "nvfp4-attn-kernels")]
+    m.add(
+        "HAS_NVFP4_ATTN_CUDA",
+        cfg!(any(
+            feature = "nvfp4-attn-kernels",
+            feature = "oxide-kernels"
+        )),
+    )?;
+    // cuda-oxide track (ships): shared cubin loader + probe + K2 host op.
+    m.add("HAS_OXIDE_KERNELS", cfg!(feature = "oxide-kernels"))?;
+    #[cfg(feature = "oxide-kernels")]
+    {
+        m.add_function(wrap_pyfunction!(oxide::oxide_load_cubin, m)?)?;
+        m.add_function(wrap_pyfunction!(oxide::oxide_probe_launch, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            nvfp4_attn_oxide::nvfp4_paged_attn_cuda,
+            m
+        )?)?;
+    }
+    // Retired cutile K2 (kept buildable, never shipped with oxide-kernels).
+    #[cfg(all(feature = "nvfp4-attn-kernels", not(feature = "oxide-kernels")))]
     {
         m.add_function(wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_paged_attn_cuda, m)?)?;
         for f in [

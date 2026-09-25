@@ -237,41 +237,6 @@ def test_wrapper_rejects_unsupported_run_args():
         w.run(None, (None, None), out=object())
 
 
-def test_cubin_manifest_install_is_fail_closed(tmp_path, monkeypatch):
-    import hashlib
-    import json
-
-    calls = []
-
-    class Nat:
-        def nvfp4_attn_install_cubin(self, *a):
-            calls.append(a)
-
-    monkeypatch.delenv("CUTILE_BYTECODE_VERSION", raising=False)
-    with pytest.raises(RuntimeError, match="no K2-NVFP4 cubin manifest"):
-        own_attn.install_cubins(Nat(), (512, 16, 2, 16, -1), (1,), "sm_120",
-                                str(tmp_path))
-    blob = b"cubin"
-    (tmp_path / "a.cubin").write_bytes(blob)
-    entry = dict(file="a.cubin", d=512, hq=16, hkv=2, page=16, q_len=1,
-                 window_left=1023, ns=64, kernel="nvfp4_attn_partial",
-                 bc_sha256="x", sha256=hashlib.sha256(blob).hexdigest())
-    (tmp_path / "manifest.json").write_text(json.dumps(
-        {"bytecode_version": "13.2", "entries": [entry]}))
-    # window_left -1 and 1023 share divisibility 1 -> same variant
-    assert own_attn.install_cubins(Nat(), (512, 16, 2, 16, -1), (1,),
-                                   "sm_120", str(tmp_path)) == 1
-    assert calls and calls[0][5] == -1
-    with pytest.raises(RuntimeError, match=r"q_len=\[9\]"):
-        own_attn.install_cubins(Nat(), (512, 16, 2, 16, -1), (1, 9),
-                                "sm_120", str(tmp_path))
-    (tmp_path / "a.cubin").write_bytes(b"tampered")
-    own_attn._INSTALLED.clear()
-    with pytest.raises(RuntimeError, match="sha256 mismatch"):
-        own_attn.install_cubins(Nat(), (512, 16, 2, 16, -1), (1,), "sm_120",
-                                str(tmp_path))
-
-
 def test_max_decode_q_len_mirrors_vllm_threshold():
     class S:
         num_speculative_tokens, parallel_drafting = 8, False
