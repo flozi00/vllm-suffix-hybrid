@@ -39,7 +39,7 @@ use cuda_device::{DynamicSharedArray, cuda_module, kernel, launch_bounds, ptx_as
 mod kernels {
     use super::*;
     use cuda_device::async_copy::{
-        cp_async_cg_16, cp_async_commit_group, cp_async_wait_all, cp_async_wait_group,
+        cp_async_cg_16, cp_async_commit_group, cp_async_wait_all,
     };
     use cuda_device::convert::cvt_f16x2_f32;
     use cuda_device::prmt::prmt;
@@ -67,6 +67,10 @@ mod kernels {
     const FULL: u32 = 0xFFFF_FFFF;
     const NEG_INF: f32 = f32::NEG_INFINITY;
     const MIN_TILES_PER_SPLIT: u32 = 2;
+    /// KV tokens a split should cover (fixed per-split cost: Q load, pipeline
+    /// fill, partial-O write + merge read) — relaxed when fewer tokens per
+    /// split are needed to keep one wave of CTAs busy.
+    const MIN_SPLIT_TOKENS: u32 = 512;
 
     #[inline(always)]
     fn ex2(x: f32) -> f32 {
@@ -140,6 +144,59 @@ mod kernels {
     fn swizzle_scale_offset(t: u32, g: u32, s: u32) -> u32 {
         let grp = s / 4;
         ((t / 4) * 4 + g / grp) * s + (g % grp) * 4 + t % 4
+    }
+
+    /// O rescale factor of one row for this tile: exp2(m_old - m_new), m_new
+    /// = max(m_old, every n-tile's row max) — the same value the stats thread
+    /// commits for the next tile.
+    #[inline(always)]
+    fn row_alpha(m_run: *const f32, red_max: *const f32, row: u32, ntc: u32, m_rows: u32) -> f32 {
+        let m_old = unsafe { *m_run.add(row as usize) };
+        let mut m_new = m_old;
+        let mut n = 0u32;
+        while n < ntc {
+            let v = unsafe { *red_max.add((n * m_rows + row) as usize) };
+            if v > m_new {
+                m_new = v;
+            }
+            n += 1;
+        }
+        let m_safe = if m_new == NEG_INF { 0.0 } else { m_new };
+        ex2(m_old - m_safe)
+    }
+
+    /// Concurrent CTA slots: SMs (%nsmid) x CTAs per SM of this variant
+    /// (the register-capped w1 cubin runs 2 per SM).
+    #[inline(always)]
+    fn sm_slots() -> u32 {
+        let nsm: u32;
+        unsafe {
+            ptx_asm!("mov.u32 %0, %%nsmid;", out("=r") nsm, options(register_only));
+        }
+        nsm * if MTW == 1 { 2 } else { 1 }
+    }
+
+    /// 16-byte read-only global load (4 x u32).
+    #[inline(always)]
+    unsafe fn ld_nc_v4(p: *const u16) -> [u32; 4] {
+        let (a, b, c, d): (u32, u32, u32, u32);
+        unsafe {
+            ptx_asm!(
+                "ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];",
+                out("=r") a,
+                out("=r") b,
+                out("=r") c,
+                out("=r") d,
+                in("l") p as u64,
+            );
+        }
+        [a, b, c, d]
+    }
+
+    /// Two bf16 (low half first) -> f16x2 (RN).
+    #[inline(always)]
+    fn bf16x2_to_f16x2(w: u32) -> u32 {
+        cvt_f16x2_f32(bf16_to_f32(w & 0xFFFF), bf16_to_f32(w >> 16))
     }
 
     /// Physical head-dim index of logical k position `kl` (16-wide k-steps;
@@ -288,9 +345,19 @@ mod kernels {
         let lo_t = (lo as u32) / tn;
         let hi_t = (hi as u32).div_ceil(tn);
         let n_t = if hi_t > lo_t { hi_t - lo_t } else { 0 };
+        // Tiles per split: the plan's ns, but never finer than
+        // MIN_SPLIT_TOKENS unless that many splits are needed to fill one
+        // wave (rows x splits >= SM slots); launched splits past the
+        // request's need exit at once (-inf lse, skipped by the merge).
         let mut per = n_t.div_ceil(ns);
         if per < MIN_TILES_PER_SPLIT {
             per = MIN_TILES_PER_SPLIT;
+        }
+        let wave = (n_t * thread::gridDim_x()).div_ceil(sm_slots());
+        let tok_floor = MIN_SPLIT_TOKENS.div_ceil(tn);
+        let floor = if wave < tok_floor { wave } else { tok_floor };
+        if per < floor {
+            per = floor;
         }
         let t0 = lo_t + s * per;
         let mut t1 = t0 + per;
@@ -313,9 +380,12 @@ mod kernels {
         let ps: *mut u16 = unsafe { kv0.add((2 * stage_bytes) as usize) as *mut u16 };
         let red_max: *mut f32 = unsafe { ps.add((m_rows * prow) as usize) as *mut f32 };
         let red_sum: *mut f32 = unsafe { red_max.add((ntc * m_rows) as usize) };
-        let m_run: *mut f32 = unsafe { red_sum.add((ntc * m_rows) as usize) };
-        let l_run: *mut f32 = unsafe { m_run.add(m_rows as usize) };
-        let alpha_s: *mut f32 = unsafe { l_run.add(m_rows as usize) };
+        // running max double-buffered by tile parity (tile j reads m_runs[j%2]
+        // and its stats thread writes m_runs[(j+1)%2]), so no barrier sits
+        // between the stats update and the O phase.
+        let m_run0: *mut f32 = unsafe { red_sum.add((ntc * m_rows) as usize) };
+        let l_run: *mut f32 = unsafe { m_run0.add(m_rows as usize) };
+        let m_run1: *mut f32 = unsafe { l_run.add(m_rows as usize) };
 
         let tile_src = |j: u32| -> (u64, u64) {
             let tok0 = j * tn;
@@ -326,30 +396,59 @@ mod kernels {
         // ---- first tile in flight, then Q -> smem (f16, permuted k) ----------
         let (po, ht) = tile_src(t0);
         unsafe { issue_tile(kv0, k_data, k_sf, v_data, v_sf, po, ht, tn, dh, sd, tid) };
-        let mut idx = tid;
-        while idx < m_rows * d {
-            let row = idx / d;
-            let kl = idx % d;
-            let i = row / g_heads;
-            let gg = row % g_heads;
-            let tok = qt * qt_n + i;
-            let v = if row < real_rows && tok < q_len {
-                let raw = unsafe {
-                    *q.add(
-                        ((qs0 + tok) * q_tok_stride + (h * g_heads + gg) * d + perm_k(kl))
-                            as usize,
-                    )
-                };
-                cvt_f16x2_f32(bf16_to_f32(raw as u32), 0.0) & 0xFFFF
-            } else {
-                0
-            };
-            unsafe { *qs.add((row * qrow + kl) as usize) = v as u16 };
-            idx += THREADS;
+        // Q -> smem as f16 in logical (permuted) k order. 16-byte loads of 8
+        // physical dims, QB chunks in flight per thread; physical offset
+        // o = 8a + 4b + 2e + f inside a 32-dim block P sits at logical
+        // k = 16(2P + b) + 8e + 2a + f (inverse of perm_k), so each (f=0,1)
+        // pair stays adjacent: 4 u32 smem stores per chunk.
+        const QB: u32 = 4;
+        let nchunk = m_rows * d / 8;
+        let mut base = 0u32;
+        while base < nchunk {
+            let mut w = [[0u32; 4]; QB as usize];
+            let mut u = 0usize;
+            #[unroll]
+            while u < QB as usize {
+                let c = base + tid + u as u32 * THREADS;
+                if c < nchunk {
+                    let row = c / (d / 8);
+                    let i = row / g_heads;
+                    let gg = row % g_heads;
+                    let tok = qt * qt_n + i;
+                    if row < real_rows && tok < q_len {
+                        let off = (qs0 + tok) * q_tok_stride + (h * g_heads + gg) * d + (c % (d / 8)) * 8;
+                        w[u] = unsafe { ld_nc_v4(q.add(off as usize)) };
+                    }
+                }
+                u += 1;
+            }
+            let mut u = 0usize;
+            #[unroll]
+            while u < QB as usize {
+                let c = base + tid + u as u32 * THREADS;
+                if c < nchunk {
+                    let row = c / (d / 8);
+                    let ph = (c % (d / 8)) * 8; // physical dim of element 0
+                    let blk = ph / 32;
+                    let a = (ph % 32) / 8;
+                    let mut k = 0usize;
+                    #[unroll]
+                    while k < 4 {
+                        // element pair k: o = 8a + 2k (+f) -> b = k / 2, e = k % 2
+                        let kl = 16 * (2 * blk + k as u32 / 2) + 8 * (k as u32 % 2) + 2 * a;
+                        unsafe {
+                            *(qs.add((row * qrow + kl) as usize) as *mut u32) = bf16x2_to_f16x2(w[u][k]);
+                        }
+                        k += 1;
+                    }
+                }
+                u += 1;
+            }
+            base += QB * THREADS;
         }
         if tid < m_rows {
             unsafe {
-                *m_run.add(tid as usize) = NEG_INF;
+                *m_run0.add(tid as usize) = NEG_INF;
                 *l_run.add(tid as usize) = 0.0;
             }
         }
@@ -371,18 +470,17 @@ mod kernels {
         let mut j = t0;
         while j < t1 {
             let st = (j - t0) % 2;
-            thread::sync_threads(); // stage st^1 free: previous tile consumed
+            let m_run = if st == 0 { m_run0 } else { m_run1 };
+            let m_next = if st == 0 { m_run1 } else { m_run0 };
+            // tile j landed (the only group in flight); the barrier also
+            // retires tile j-1's O phase, freeing stage st^1 for tile j+1.
+            unsafe { cp_async_wait_all() };
+            thread::sync_threads();
             if j + 1 < t1 {
                 let (po, ht) = tile_src(j + 1);
                 let dst = unsafe { kv0.add(((st ^ 1) * stage_bytes) as usize) };
-                unsafe {
-                    issue_tile(dst, k_data, k_sf, v_data, v_sf, po, ht, tn, dh, sd, tid);
-                    cp_async_wait_group(1);
-                }
-            } else {
-                unsafe { cp_async_wait_all() };
+                unsafe { issue_tile(dst, k_data, k_sf, v_data, v_sf, po, ht, tn, dh, sd, tid) };
             }
-            thread::sync_threads();
             let tok0 = j * tn;
             let kd = unsafe { kv0.add((st * stage_bytes) as usize) };
             let ksf = unsafe { kd.add((tn * kp) as usize) };
@@ -533,13 +631,11 @@ mod kernels {
                 let m_safe = if m_new == NEG_INF { 0.0 } else { m_new };
                 let alpha = ex2(m_old - m_safe);
                 unsafe {
-                    *m_run.add(row as usize) = m_new;
+                    *m_next.add(row as usize) = m_new;
                     let l = *l_run.add(row as usize);
                     *l_run.add(row as usize) = l * alpha + psum;
-                    *alpha_s.add(row as usize) = alpha;
                 }
             }
-            thread::sync_threads();
 
             // ---- O[:, 64-col group cj] = O * alpha + P V ----------------------
             let mut slot = 0usize;
@@ -547,8 +643,8 @@ mod kernels {
             while slot < MTW {
                 let mt = o_grp + slot as u32 * o_wpj;
                 if mt < mtiles {
-                    let a0 = unsafe { *alpha_s.add((mt * 16 + gq) as usize) };
-                    let a8 = unsafe { *alpha_s.add((mt * 16 + gq + 8) as usize) };
+                    let a0 = row_alpha(m_run, red_max, mt * 16 + gq, ntc, m_rows);
+                    let a8 = row_alpha(m_run, red_max, mt * 16 + gq + 8, ntc, m_rows);
                     let mut jn = 0usize;
                     #[unroll]
                     while jn < 8 {
@@ -644,6 +740,9 @@ mod kernels {
             j += 1;
         }
 
+        thread::sync_threads(); // last tile's stats (l_run, m) visible
+        let m_fin = if (t1 - t0) % 2 == 0 { m_run0 } else { m_run1 };
+
         // ---- normalized partial O (bf16, 2 x 16 B per row) + lse --------------
         let mut slot = 0usize;
         #[unroll]
@@ -680,7 +779,7 @@ mod kernels {
             slot += 1;
         }
         if tid < m_rows {
-            let m = unsafe { *m_run.add(tid as usize) };
+            let m = unsafe { *m_fin.add(tid as usize) };
             let l = unsafe { *l_run.add(tid as usize) };
             let lse = if l == 0.0 { NEG_INF } else { m + lg2(l) };
             unsafe { *lse_part.add((slot_base + tid) as usize) = lse };

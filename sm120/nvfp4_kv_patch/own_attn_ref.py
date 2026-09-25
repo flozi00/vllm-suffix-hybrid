@@ -175,6 +175,11 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
         lo_t, hi_t = lo // tn, -(-hi // tn)
         n_t = max(hi_t - lo_t, 0)
         per = max(-(-n_t // ns), min_tiles)
+        # kernel: never finer than min_split_tokens unless one wave of CTA
+        # slots needs it (rows x splits >= slots)
+        if "min_split_tokens" in plan:
+            wave = -(-(n_t * rows) // plan["slots"])
+            per = max(per, min(wave, -(-plan["min_split_tokens"] // tn)))
         # rows token-major (i*G + g), padded rows / tokens past q_len = 0
         qm = np.zeros((m_rows, d))
         row_ok = np.zeros(m_rows, dtype=bool)

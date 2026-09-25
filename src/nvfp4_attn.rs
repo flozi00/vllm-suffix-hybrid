@@ -31,6 +31,10 @@ pub const MAX_ROWS: usize = 48;
 pub const MAX_SPLITS: usize = 256;
 pub const MAX_Q_LEN: usize = 16;
 pub const MIN_TILES_PER_SPLIT: usize = 2;
+/// Kernel mirror (MIN_SPLIT_TOKENS): a split covers >= this many KV tokens
+/// unless finer splits are needed to fill one wave of CTA slots. Decided on
+/// the device per request (from seq_lens), so the grid stays graph-stable.
+pub const MIN_SPLIT_TOKENS: usize = 512;
 pub const HEAD_DIMS: [usize; 3] = [128, 256, 512];
 /// SM120 opt-in dynamic shared memory per block.
 pub const SMEM_LIMIT: usize = 99 * 1024;

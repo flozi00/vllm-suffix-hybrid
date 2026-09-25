@@ -231,3 +231,20 @@ def test_pv_fragments_and_output_dim_mapping():
     want = P @ V
     cols = slice(64 * cj, 64 * cj + 64)
     np.testing.assert_allclose(out[:, cols], want[:, cols], rtol=1e-9, atol=1e-9)
+
+
+def test_vector_q_load_is_the_inverse_of_perm_k():
+    """Kernel Q prologue: 16-byte chunk at physical dims ph..ph+7, u32 pair
+    k -> logical kl = 16(2*blk + k//2) + 8(k%2) + 2a (+f); must place every
+    physical dim exactly where the scalar perm_k formulation put it."""
+    for d in (128, 256, 512):
+        dst = {}
+        for c in range(d // 8):
+            ph = 8 * c
+            blk, a = ph // 32, (ph % 32) // 8
+            for k in range(4):
+                kl = 16 * (2 * blk + k // 2) + 8 * (k % 2) + 2 * a
+                for f in range(2):
+                    dst[kl + f] = ph + 2 * k + f
+        assert sorted(dst) == list(range(d))
+        assert all(perm_k(kl) == phys for kl, phys in dst.items())
