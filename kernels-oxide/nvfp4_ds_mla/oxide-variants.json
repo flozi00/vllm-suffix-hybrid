@@ -1,0 +1,5 @@
+[
+ {"suffix": "_w1", "features": "w1", "ptxas": ["-maxrregcount=96"]},
+ {"suffix": "_w2", "features": "w2", "ptxas": []},
+ {"suffix": "_w3", "features": "w3", "ptxas": []}
+]

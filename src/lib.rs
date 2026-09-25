@@ -317,6 +317,9 @@ mod oxide;
 mod nvfp4_gemm_oxide;
 #[cfg(feature = "oxide-kernels")]
 mod nvfp4_moe_oxide;
+mod nvfp4_ds_mla;
+#[cfg(feature = "oxide-kernels")]
+mod nvfp4_ds_mla_oxide;
 #[cfg(feature = "oxide-kernels")]
 mod qgdn_oxide;
 mod qwen_gdn;
@@ -368,6 +371,37 @@ fn nvfp4_attn_plan(
     ]))
 }
 
+/// NVFP4 ds-MLA plan (src/nvfp4_ds_mla.rs) as a dict; ValueError when the
+/// shape is outside the kernel contract (the adapter must refuse, loudly).
+#[pyfunction]
+#[pyo3(signature = (tokens, hq, capacity, num_sms))]
+#[allow(clippy::too_many_arguments)]
+fn nvfp4_ds_mla_plan(
+    tokens: usize,
+    hq: usize,
+    capacity: usize,
+    num_sms: usize,
+) -> PyResult<HashMap<String, usize>> {
+    let p = nvfp4_ds_mla::plan(tokens, hq, capacity, num_sms)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok(HashMap::from([
+        ("hqt".to_string(), p.hqt),
+        ("rows".to_string(), p.rows),
+        ("merge_rows".to_string(), p.merge_rows),
+        ("c_per_split".to_string(), p.c_per_split),
+        ("ns".to_string(), p.ns),
+        (
+            "partial_smem_bytes".to_string(),
+            nvfp4_ds_mla::partial_smem_bytes(),
+        ),
+        (
+            "merge_smem_bytes".to_string(),
+            nvfp4_ds_mla::merge_smem_bytes(p.ns),
+        ),
+        ("min_split_rows".to_string(), nvfp4_ds_mla::MIN_SPLIT_ROWS),
+    ]))
+}
+
 /// Startup self-check shared by every prebuilt-cubin lane: load each
 /// installed cubin through the CUDA driver; a toolchain/driver skew surfaces
 /// here with the driver's error instead of as a tileiras JIT attempt on the
@@ -414,6 +448,24 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_splits, m)?)?;
     #[cfg(feature = "oxide-kernels")]
     m.add_function(wrap_pyfunction!(nvfp4_moe_oxide::nvfp4_moe_cuda, m)?)?;
+    // NVFP4 ds-MLA (GLM 5.3 sparse-MLA reader cache): plan module always
+    // built (CPU-verified sizes the split workspace); CUDA ops under
+    // oxide-kernels. HAS_NVFP4_DSMLA_CUDA is the startup kernel-path
+    // assertion's probe — armed + absent must refuse to start, never
+    // silently route decode to flashinfer with an fp8-sized cache.
+    m.add_function(wrap_pyfunction!(nvfp4_ds_mla_plan, m)?)?;
+    m.add("HAS_NVFP4_DSMLA_CUDA", cfg!(feature = "oxide-kernels"))?;
+    #[cfg(feature = "oxide-kernels")]
+    {
+        m.add_function(wrap_pyfunction!(
+            nvfp4_ds_mla_oxide::nvfp4_ds_mla_quant_store_cuda,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            nvfp4_ds_mla_oxide::nvfp4_ds_mla_decode_cuda,
+            m
+        )?)?;
+    }
     #[cfg(all(feature = "qwen-gdn-kernels", not(feature = "oxide-kernels")))]
     for f in [
         wrap_pyfunction!(qwen_gdn_gpu::gdn_decode_fused_cuda, m)?,
