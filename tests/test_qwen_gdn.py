@@ -140,9 +140,9 @@ def test_gate_off_is_inert(monkeypatch):
 def test_gate_on_without_gpu_op_fails_loud(monkeypatch):
     monkeypatch.setenv("SUFFIX_QWEN_GDN", "1")
     monkeypatch.setattr(qwen_gdn, "_state", dict(qwen_gdn._state, armed=False))
-    if getattr(_native, "HAS_QWEN_GDN_CUDA", False):
-        pytest.skip("wheel carries the GPU op; covered by the GPU test")
-    with pytest.raises(RuntimeError, match="qwen-gdn-kernels"):
+    if getattr(_native, "QWEN_GDN_BACKEND", "none") == "oxide":
+        pytest.skip("wheel carries the oxide GPU op; covered by the GPU test")
+    with pytest.raises(RuntimeError, match="oxide-kernels"):
         qwen_gdn.register()
 
 
@@ -229,27 +229,44 @@ def _fake_bundle(tmp, corrupt=False, version="13.2"):
     return man
 
 
-def test_manifest_missing_fails_closed(tmp_path, monkeypatch):
-    monkeypatch.setenv("SUFFIX_QWEN_GDN_CUBINS", str(tmp_path))
-    with pytest.raises(RuntimeError, match="no K-GDN1 cubin manifest"):
-        qwen_gdn.load_manifest()
+def _oxide_bundle(tmp, with_kgdn1=True):
+    import json
+    kernels = [{"name": "probe", "file": "probe.cubin", "sha256": "0" * 64,
+                "ptx_isa": "8.7", "entries": ["probe_add"]}]
+    if with_kgdn1:
+        kernels.append({"name": "kgdn1", "file": "kgdn1.cubin", "sha256": "ab" * 32,
+                        "ptx_isa": "8.7", "entries": ["kgdn1_decode_h16_hv48_k128"]})
+    (tmp / "manifest.json").write_text(json.dumps(
+        {"arch": "sm_120", "ptxas_version": "13.0.88", "kernels": kernels}))
 
 
-def test_manifest_sha_mismatch_fails_closed(tmp_path):
-    _fake_bundle(tmp_path, corrupt=True)
-    with pytest.raises(RuntimeError, match="sha256 mismatch"):
-        qwen_gdn.load_manifest(str(tmp_path))
+def test_oxide_manifest_without_kgdn1_fails_closed(tmp_path, monkeypatch):
+    from suffix_hybrid import oxide_kernels
+    _oxide_bundle(tmp_path, with_kgdn1=False)
+    monkeypatch.setenv("SUFFIX_OXIDE_CUBINS", str(tmp_path))
+    monkeypatch.setattr(oxide_kernels, "_MANIFEST", None)
+    with pytest.raises(RuntimeError, match="no 'kgdn1'"):
+        qwen_gdn.oxide_manifest_entry()
 
 
-def test_manifest_pins_bytecode_version(tmp_path, monkeypatch):
-    _fake_bundle(tmp_path)
-    monkeypatch.delenv("CUTILE_BYTECODE_VERSION", raising=False)
-    man = qwen_gdn.load_manifest(str(tmp_path))
-    assert os.environ["CUTILE_BYTECODE_VERSION"] == "13.2"
-    assert man["entries"][0]["_cubin"].startswith(b"\x7fELF")
-    monkeypatch.setenv("CUTILE_BYTECODE_VERSION", "13.4")
-    with pytest.raises(RuntimeError, match="!= manifest"):
-        qwen_gdn.load_manifest(str(tmp_path))
+def test_oxide_manifest_kgdn1_entry(tmp_path, monkeypatch):
+    from suffix_hybrid import oxide_kernels
+    _oxide_bundle(tmp_path)
+    monkeypatch.setenv("SUFFIX_OXIDE_CUBINS", str(tmp_path))
+    monkeypatch.setattr(oxide_kernels, "_MANIFEST", None)
+    ent = qwen_gdn.oxide_manifest_entry()
+    assert ent["entries"] == [qwen_gdn_oxide_entry()]
+    assert ent["ptxas_version"] == "13.0.88"
+
+
+def qwen_gdn_oxide_entry():
+    from suffix_hybrid.kernels import qwen_gdn_oxide
+    return qwen_gdn_oxide.interface()["entry"]
+
+
+def test_load_prebuilt_refuses_other_shapes():
+    with pytest.raises(ValueError, match="built for"):
+        qwen_gdn.load_prebuilt(16, 32, 128)
 
 
 def test_runtime_bundle_ships_qgdn_cubins(tmp_path):
@@ -279,25 +296,15 @@ def test_runtime_bundle_ships_qgdn_cubins(tmp_path):
         rb.bundle(wheel, tmp_path / "r2", "f" * 40, qgdn_cubins=bad)
 
 
-def test_default_cubin_dir_is_next_to_native(monkeypatch):
-    # Next to whichever suffix_hybrid package is imported (source checkout
-    # locally, site-packages in CI, /plugins on pods).
-    import suffix_hybrid
-    monkeypatch.delenv("SUFFIX_QWEN_GDN_CUBINS", raising=False)
-    pkg = os.path.dirname(os.path.abspath(suffix_hybrid.__file__))
-    assert qwen_gdn.cubin_dir() == os.path.join(pkg, "qgdn_cubins")
-
-
 # ---------------------------------------------------------------------------
-# GPU: the real kernel (SM120 + qwen-gdn-kernels wheel only)
+# GPU: the real kernel (SM120 + oxide-kernels wheel + bundle SASS only)
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
-@pytest.mark.skipif(not getattr(_native, "HAS_QWEN_GDN_CUDA", False),
-                    reason="wheel built without cargo feature qwen-gdn-kernels")
+@pytest.mark.skipif(getattr(_native, "QWEN_GDN_BACKEND", "none") != "oxide",
+                    reason="wheel built without cargo feature oxide-kernels")
 def test_gpu_kernel_oracle_and_graph_replay():
     qwen_gdn.check_sm120()
+    assert "prebuilt SASS loaded, ptxas 13.0" in qwen_gdn.load_prebuilt(16, 48, 128)
     for act in (0, 1):
-        qwen_gdn.install_prebuilt(_native, 16, 48, 128, act)  # bundle cubins
         worst = qwen_gdn.run_gpu_oracle(_native, 16, 48, 128, act, 1e-6)
         assert worst["out"] < 1.0
-    assert _native.qwen_gdn_jit_stats()[0] == 0  # no JIT, ever

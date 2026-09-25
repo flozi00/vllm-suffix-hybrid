@@ -315,8 +315,10 @@ mod nvfp4_attn_gpu;
 mod nvfp4_attn_oxide;
 #[cfg(feature = "oxide-kernels")]
 mod oxide;
+#[cfg(feature = "oxide-kernels")]
+mod qgdn_oxide;
 mod qwen_gdn;
-#[cfg(feature = "qwen-gdn-kernels")]
+#[cfg(all(feature = "qwen-gdn-kernels", not(feature = "oxide-kernels")))]
 mod qwen_gdn_gpu;
 mod verify_fusion;
 #[cfg(feature = "cutile-kernels")]
@@ -389,28 +391,39 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         verify_fusion_gpu::rejection_greedy_accept_cuda,
         m
     )?)?;
-    // K-GDN1 (qwen3.8-27b GDN decode): CPU reference always; the cutile GPU
-    // op only in `qwen-gdn-kernels` builds. HAS_QWEN_GDN_CUDA is what the
-    // SUFFIX_QWEN_GDN=1 startup assertion reads (absent op = hard error).
+    // K-GDN1 (qwen3.8-27b GDN decode): CPU reference always. GPU op: the
+    // cuda-oxide one (ships, sm_120 SASS from ptxas 13.0) under
+    // `oxide-kernels`; the retired cutile one only in cutile-only builds.
+    // HAS_QWEN_GDN_CUDA is what the SUFFIX_QWEN_GDN=1 startup assertion reads.
     m.add_function(wrap_pyfunction!(qwen_gdn::gdn_decode_fused_ref, m)?)?;
-    #[cfg(feature = "qwen-gdn-kernels")]
-    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::gdn_decode_fused_cuda, m)?)?;
-    #[cfg(feature = "qwen-gdn-kernels")]
-    m.add_function(wrap_pyfunction!(
-        qwen_gdn_gpu::qwen_gdn_variant_bytecode,
-        m
-    )?)?;
-    #[cfg(feature = "qwen-gdn-kernels")]
-    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_compile_cubin, m)?)?;
-    #[cfg(feature = "qwen-gdn-kernels")]
-    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_gpu_name, m)?)?;
-    #[cfg(feature = "qwen-gdn-kernels")]
-    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_install_cubin, m)?)?;
-    #[cfg(feature = "qwen-gdn-kernels")]
-    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_probe_bytecodes, m)?)?;
-    #[cfg(feature = "qwen-gdn-kernels")]
-    m.add_function(wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_jit_stats, m)?)?;
-    m.add("HAS_QWEN_GDN_CUDA", cfg!(feature = "qwen-gdn-kernels"))?;
+    #[cfg(feature = "oxide-kernels")]
+    m.add_function(wrap_pyfunction!(qgdn_oxide::gdn_decode_fused_cuda, m)?)?;
+    #[cfg(all(feature = "qwen-gdn-kernels", not(feature = "oxide-kernels")))]
+    for f in [
+        wrap_pyfunction!(qwen_gdn_gpu::gdn_decode_fused_cuda, m)?,
+        wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_variant_bytecode, m)?,
+        wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_compile_cubin, m)?,
+        wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_gpu_name, m)?,
+        wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_install_cubin, m)?,
+        wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_probe_bytecodes, m)?,
+        wrap_pyfunction!(qwen_gdn_gpu::qwen_gdn_jit_stats, m)?,
+    ] {
+        m.add_function(f)?;
+    }
+    m.add(
+        "QWEN_GDN_BACKEND",
+        if cfg!(feature = "oxide-kernels") {
+            "oxide"
+        } else if cfg!(feature = "qwen-gdn-kernels") {
+            "cutile"
+        } else {
+            "none"
+        },
+    )?;
+    m.add(
+        "HAS_QWEN_GDN_CUDA",
+        cfg!(any(feature = "qwen-gdn-kernels", feature = "oxide-kernels")),
+    )?;
     // K2-NVFP4 attention: the plan is always present (CPU, sizes the split-KV
     // workspace); the CUDA op only in feature-on builds. HAS_NVFP4_ATTN_CUDA
     // is the startup kernel-path assertion's probe — an armed pod without it

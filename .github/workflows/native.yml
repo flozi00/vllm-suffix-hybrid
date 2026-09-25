@@ -84,7 +84,7 @@ jobs:
         with:
           target: x86_64
           manylinux: '2_28'
-          args: --release --locked --features oxide-kernels,qwen-gdn-kernels --out dist
+          args: --release --locked --features oxide-kernels --out dist
           before-script-linux: dnf install -y clang-devel || yum install -y clang-devel
           docker-options: -e CUDA_TOOLKIT_PATH=${{ github.workspace }}/.cuda13/nvidia/cu13
       - name: Exercise installed Linux wheel

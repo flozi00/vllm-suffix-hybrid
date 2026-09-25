@@ -32,6 +32,7 @@ only implements the non-spec decode step.
 Startup kernel-path assertion (log markers, see the dossier §6 protocol):
   ``suffix qwen-gdn K-GDN1 armed``            register() succeeded
   ``suffix qwen-gdn K-GDN1 ACTIVE``           first layer constructed
+  ``suffix qwen-gdn K-GDN1 prebuilt SASS loaded, ptxas 13.0``  driver-load check
   ``suffix qwen-gdn K-GDN1 oracle PASS``      on-GPU identity check at profile run
   ``suffix qwen-gdn K-GDN1 decode-launch``    first real decode launch (graph capture)
 """
@@ -233,85 +234,43 @@ def _check(out, ref, state, ref_state, worst, tag):
 
 
 # ---------------------------------------------------------------------------
-# bundle-prebuilt cubins (CI: scripts/qwen_gdn_prebuild.py; no JIT on pods)
+# prebuilt sm_120 SASS (cuda-oxide track, docs/oxide-kernels.md): the cubin
+# kernels-oxide/kgdn1 -> ptxas 13.0 ships in suffix_hybrid/oxide_cubins/;
+# pods only driver-load it (no JIT of any kind).
 # ---------------------------------------------------------------------------
-CUBIN_DIR_ENV = "SUFFIX_QWEN_GDN_CUBINS"
-KERNEL_NAME = "gdn_decode_fused_k1"
+OXIDE_FAMILY = "kgdn1"
+OXIDE_SHAPE = (16, 48, 128)  # (H, HV, K) the shipped cubin is built for
 
 
-def cubin_dir() -> str:
-    return os.environ.get(CUBIN_DIR_ENV, "").strip() or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "qgdn_cubins")
+def oxide_manifest_entry() -> dict:
+    """The kgdn1 entry of the bundle's oxide manifest (RuntimeError if the
+    bundle lacks it — checked at register(), before any model build)."""
+    from suffix_hybrid import oxide_kernels
+
+    man = oxide_kernels.manifest()
+    for k in man["kernels"]:
+        if k["name"] == OXIDE_FAMILY:
+            return dict(k, ptxas_version=man.get("ptxas_version", "?"))
+    raise RuntimeError(f"{GATE}=1 but the oxide manifest has no {OXIDE_FAMILY!r} "
+                       "cubin (bundle built without kernels-oxide/kgdn1?)")
 
 
-def load_manifest(directory=None) -> dict:
-    """Read + validate the bundle manifest (every cubin present, sha256
-    matches). Pins CUTILE_BYTECODE_VERSION to the CI value so this process
-    serializes byte-identical Tile IR. Any problem = RuntimeError."""
-    import hashlib
-    import json
+def load_prebuilt(H, HV, K, device=None) -> str:
+    """Driver-load the kgdn1 SASS on this device (boot driver-load check;
+    idempotent). Returns the marker suffix for the log lines."""
+    if (H, HV, K) != OXIDE_SHAPE:
+        raise ValueError(f"K-GDN1 SASS is built for (H, HV, K)={OXIDE_SHAPE}, "
+                         f"layer has {(H, HV, K)}")
+    from suffix_hybrid import oxide_kernels
 
-    directory = directory or cubin_dir()
-    path = os.path.join(directory, "manifest.json")
-    if not os.path.isfile(path):
-        raise RuntimeError(f"{GATE}=1 but no K-GDN1 cubin manifest at {path} "
-                           "(bundle not built by the CI prebuild step)")
-    with open(path) as f:
-        man = json.load(f)
-    if man.get("kernel") != KERNEL_NAME or not man.get("entries"):
-        raise RuntimeError(f"K-GDN1 manifest {path}: wrong kernel or no entries")
-    for e in man["entries"]:
-        fp = os.path.join(directory, e["file"])
-        if not os.path.isfile(fp):
-            raise RuntimeError(f"K-GDN1 manifest lists missing cubin {fp}")
-        with open(fp, "rb") as f:
-            e["_cubin"] = f.read()
-        if hashlib.sha256(e["_cubin"]).hexdigest() != e["sha256"]:
-            raise RuntimeError(f"K-GDN1 cubin sha256 mismatch: {fp}")
-    want = str(man["bytecode_version"])
-    have = os.environ.get("CUTILE_BYTECODE_VERSION")
-    if have and have != want:
-        raise RuntimeError(f"CUTILE_BYTECODE_VERSION={have} != manifest {want}")
-    os.environ["CUTILE_BYTECODE_VERSION"] = want
-    man["_dir"] = directory
-    return man
-
-
-def install_prebuilt(native, H, HV, K, act, device=None) -> int:
-    """Install every manifest cubin for (H, HV, K, act) into the in-process
-    JIT store; the Rust side rebuilds each variant's bytecode and refuses a
-    sha256 mismatch. Returns the count (0 = RuntimeError)."""
-    key = (H, HV, K, act)
-    done = _state.setdefault("installed", {})
-    if key in done:
-        return done[key]
-    import torch
-
-    man = load_manifest()
-    gpu = native.qwen_gdn_gpu_name(
-        torch.cuda.current_device() if device is None else device)
-    if gpu != man["arch"]:
-        raise RuntimeError(f"K-GDN1 cubins are for {man['arch']}, device is {gpu}")
-    n = 0
-    for e in man["entries"]:
-        if (e["h"], e["hv"], e["k"], e["act"]) != key:
-            continue
-        native.qwen_gdn_install_cubin(H, HV, K, act, e["t_div"], e["s_div"], gpu,
-                                      e["bc_sha256"], e["_cubin"])
-        n += 1
-    if n == 0:
-        raise RuntimeError(f"K-GDN1 manifest has no cubins for H={H} HV={HV} K={K} "
-                           f"act={act}")
-    # Startup self-check: every installed cubin must load through the CUDA
-    # driver here (driver/toolchain skew = clear error now, not a tileiras
-    # JIT attempt on the first launch).
-    native.cubin_store_driver_check(
-        torch.cuda.current_device() if device is None else device)
-    done[key] = n
-    _log(f"K-GDN1 prebuilt: {n} cubins installed ({gpu}, tileiras "
-         f"{man['tileiras_version'].splitlines()[-1] if man['tileiras_version'] else '?'}, "
-         f"bytecode {man['bytecode_version']}); JIT disabled")
-    return n
+    ent = oxide_manifest_entry()
+    oxide_kernels.ensure_loaded(OXIDE_FAMILY, device)
+    tag = (f"prebuilt SASS loaded, ptxas {ent['ptxas_version']} "
+           f"(PTX ISA {ent.get('ptx_isa', '?')}, sha256 {ent['sha256'][:12]})")
+    if not _state.get("sass_logged"):
+        _state["sass_logged"] = True
+        _log(f"K-GDN1 {tag}")
+    return tag
 
 
 # ---------------------------------------------------------------------------
@@ -319,11 +278,13 @@ def install_prebuilt(native, H, HV, K, act, device=None) -> int:
 # ---------------------------------------------------------------------------
 def _native():
     from suffix_hybrid import _native as native
-    if not getattr(native, "HAS_QWEN_GDN_CUDA", False):
+    if (not getattr(native, "HAS_QWEN_GDN_CUDA", False)
+            or getattr(native, "QWEN_GDN_BACKEND", "none") != "oxide"):
         raise RuntimeError(
-            f"{GATE}=1 but suffix_hybrid._native was built WITHOUT cargo feature "
-            "`qwen-gdn-kernels` (no K-GDN1 GPU op) — refusing to serve the stock "
-            "GDN chain while the K-GDN1 gate is armed")
+            f"{GATE}=1 but suffix_hybrid._native has no cuda-oxide K-GDN1 op "
+            "(needs cargo feature `oxide-kernels`; the cutile build cannot load "
+            "on CUDA 13.0 nodes) — refusing to serve the stock GDN chain while "
+            "the K-GDN1 gate is armed")
     return native
 
 
@@ -397,8 +358,8 @@ def _make_layer_cls(native):
                                  f"K-GDN1 contract: {'; '.join(why)}")
             self._kgdn_act = ACT_CODES[self.norm.activation]
             self._kgdn_params = None
-            install_prebuilt(native, self.num_k_heads, self.num_v_heads,
-                             self.head_k_dim, self._kgdn_act)
+            self._kgdn_sass = load_prebuilt(self.num_k_heads, self.num_v_heads,
+                                            self.head_k_dim)
             _state["active_layers"] += 1
             if _state["active_layers"] == 1:
                 _log(f"K-GDN1 ACTIVE: {LAYER_NAME} -> SuffixQwenGDN (first layer "
@@ -427,14 +388,9 @@ def _make_layer_cls(native):
                         native, self.num_k_heads, self.num_v_heads, self.head_k_dim,
                         self._kgdn_act, self.layer_norm_epsilon,
                         row_stride=mixed_qkvz.stride(0))
-                    compiles, hits = native.qwen_gdn_jit_stats()
-                    if compiles:
-                        raise RuntimeError(
-                            f"K-GDN1: {compiles} tileiras JIT compile(s) in this "
-                            "process — pods serve bundle-prebuilt cubins only")
                     _log(f"K-GDN1 oracle PASS max|d_out|={_state['oracle']['out']:.3e} "
                          f"max|d_state|={_state['oracle']['state']:.3e} (+graph replay) "
-                         f"jit backend_compiles=0 disk_hits={hits}")
+                         f"{self._kgdn_sass}")
                 return super()._forward_core_fused_norm_packed(mixed_qkvz, ba,
                                                                core_attn_out)
             if not (md.spec_sequence_masks is None and md.num_prefills == 0
@@ -475,7 +431,7 @@ def register():
         return _state
     native = _native()
     cap = check_sm120()
-    load_manifest()  # fail closed now if the bundle lacks the cubins
+    oxide_manifest_entry()  # fail closed now if the bundle lacks the SASS
     from vllm.model_executor.custom_op import PluggableLayer, op_registry_oot
     if LAYER_NAME not in op_registry_oot:
         PluggableLayer.register_oot(_make_layer_cls(native), name=LAYER_NAME)
@@ -502,7 +458,7 @@ def bench(Ts=(1, 4, 8, 16), layers=48, iters=50, H=16, HV=48, K=128, eps=1e-6):
 
     native = _native()
     check_sm120()
-    install_prebuilt(native, H, HV, K, 0)
+    load_prebuilt(H, HV, K)
     dev = torch.device("cuda", torch.cuda.current_device())
     res = {}
     for T in Ts:
@@ -563,13 +519,11 @@ def main(argv=None):
     if args.cmd == "oracle":
         native = _native()
         check_sm120()
+        tag = load_prebuilt(16, 48, 128)
         for act in (0, 1):
-            install_prebuilt(native, 16, 48, 128, act)
             w = run_gpu_oracle(native, 16, 48, 128, act, 1e-6)
-            if native.qwen_gdn_jit_stats()[0]:
-                raise RuntimeError("K-GDN1 oracle: tileiras JIT happened")
             _log(f"K-GDN1 oracle PASS act={act} max|d_out|={w['out']:.3e} "
-                 f"max|d_state|={w['state']:.3e} (+graph replay)")
+                 f"max|d_state|={w['state']:.3e} (+graph replay) {tag}")
     else:
         bench()
     return 0

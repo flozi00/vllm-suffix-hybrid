@@ -9,7 +9,7 @@
 //! ## Interface (what the host plugin launches) — kept in sync with
 //! ## kernels-oxide/kgdn1/interface.json
 //! PTX entry `kgdn1_decode_h16_hv48_k128`, grid = (HV=48, T, 1),
-//! block = (256, 1, 1), dynamic smem = 0. Params, in order (all 8-byte
+//! block = (256, 1, 1), dynamic smem = 516 B (129 f32). Params, in order (all 8-byte
 //! pointers are device addresses of torch-owned memory):
 //!   0 out        *mut u16   bf16 [T, HV, V] contiguous (fully written)
 //!   1 mixed_qkv  *const u16 bf16 [T, 2HK+HV*V], row stride `qkv_stride`
@@ -42,14 +42,13 @@
 //! o goes to shared memory; warp 0 reduces sum(o^2); every thread < 128 then
 //! writes out[v] = o_v * rstd * w[v] * gate(z[v]) as bf16 (RNE).
 //! Estimate: ~40-56 regs/thread, 0 spills; 256 thr/CTA -> 4-6 CTAs/SM
-//! (48-warp SM limit); smem 516 B/CTA. UNVERIFIED until ptxas -v in CI.
+//! (48-warp SM limit); dynamic smem 516 B/CTA. UNVERIFIED until ptxas -v in CI.
 
 use cuda_device::cuda_module;
 
 #[cuda_module]
 pub mod kernels {
-    use cuda_device::float::{ex2_approx_f32, lg2_approx_f32};
-    use cuda_device::{SharedArray, debug, kernel, launch_bounds, thread, warp};
+    use cuda_device::{DynamicSharedArray, kernel, launch_bounds, ptx_asm, thread, warp};
 
     pub const H: u32 = 16;
     pub const HV: u32 = 48;
@@ -57,6 +56,40 @@ pub mod kernels {
     pub const WARP_ROWS: u32 = 16; // BV
     const LOG2E: f32 = core::f32::consts::LOG2_E;
     const LN2: f32 = core::f32::consts::LN_2;
+
+    // Special functions via ptx_asm (docs/oxide-kernels.md: no libdevice).
+    #[inline(always)]
+    fn ex2_approx_f32(x: f32) -> f32 {
+        let r: f32;
+        unsafe {
+            ptx_asm!("ex2.approx.ftz.f32 %0, %1;", out("=f") r, in("f") x, options(register_only));
+        }
+        r
+    }
+
+    #[inline(always)]
+    fn lg2_approx_f32(x: f32) -> f32 {
+        let r: f32;
+        unsafe {
+            ptx_asm!("lg2.approx.f32 %0, %1;", out("=f") r, in("f") x, options(register_only));
+        }
+        r
+    }
+
+    /// IEEE sqrt (sqrt.rn) — same rounding as the torch reference.
+    #[inline(always)]
+    fn sqrt_rn(x: f32) -> f32 {
+        let r: f32;
+        unsafe {
+            ptx_asm!("sqrt.rn.f32 %0, %1;", out("=f") r, in("f") x, options(register_only));
+        }
+        r
+    }
+
+    #[inline(always)]
+    fn trap() {
+        unsafe { ptx_asm!("trap;") };
+    }
 
     #[inline(always)]
     fn bf16_to_f32(x: u16) -> f32 {
@@ -115,8 +148,8 @@ pub mod kernels {
         scale: f32,
         norm_eps: f32,
     ) {
-        static mut O: SharedArray<f32, 128> = SharedArray::UNINIT;
-        static mut RSTD: SharedArray<f32, 1> = SharedArray::UNINIT;
+        // Dynamic smem (launch: SMEM_BYTES = 129 * 4): o[0..128], rstd at [128].
+        let o_sh: *mut f32 = DynamicSharedArray::<f32>::get();
 
         let hv = thread::blockIdx_x();
         let t = thread::blockIdx_y();
@@ -134,7 +167,7 @@ pub mod kernels {
             return;
         }
         if slot as u32 >= slots {
-            debug::trap(); // malformed slot: fail loud, never write elsewhere
+            trap(); // malformed slot: fail loud, never write elsewhere
         }
 
         // ---- q / k slices (bf16 -> f32), L2 norm, scale -----------------
@@ -151,8 +184,8 @@ pub mod kernels {
         }
         let qss = warp_sum(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
         let kss = warp_sum(k[0] * k[0] + k[1] * k[1] + k[2] * k[2] + k[3] * k[3]);
-        let qn = scale / (qss + 1e-6).sqrt();
-        let kn = 1.0 / (kss + 1e-6).sqrt();
+        let qn = scale / sqrt_rn(qss + 1e-6);
+        let kn = 1.0 / sqrt_rn(kss + 1e-6);
         let mut j = 0;
         while j < 4 {
             q[j] *= qn;
@@ -195,7 +228,7 @@ pub mod kernels {
                 j += 1;
             }
             if lane == 0 {
-                unsafe { O[v as usize] = pq + dv * kq };
+                unsafe { *o_sh.add(v as usize) = pq + dv * kq };
             }
             r += 1;
         }
@@ -206,13 +239,13 @@ pub mod kernels {
             let mut ss = 0.0f32;
             let mut j = 0;
             while j < 4 {
-                let o = unsafe { O[(lane + 32 * j) as usize] };
+                let o = unsafe { *o_sh.add((lane + 32 * j) as usize) };
                 ss += o * o;
                 j += 1;
             }
             ss = warp_sum(ss);
             if lane == 0 {
-                unsafe { RSTD[0] = 1.0 / (ss * (1.0 / K as f32) + norm_eps).sqrt() };
+                unsafe { *o_sh.add(K as usize) = 1.0 / sqrt_rn(ss * (1.0 / K as f32) + norm_eps) };
             }
         }
         thread::sync_threads();
@@ -220,7 +253,9 @@ pub mod kernels {
             let zv = bf16_to_f32(unsafe { *z.add((t * z_stride + hv * K + tid) as usize) });
             let sg = sigmoid(zv);
             let gate = if act == 0 { zv * sg } else { sg };
-            let y = unsafe { O[tid as usize] * RSTD[0] } * unsafe { *norm_w.add(tid as usize) } * gate;
+            let y = unsafe { *o_sh.add(tid as usize) * *o_sh.add(K as usize) }
+                * unsafe { *norm_w.add(tid as usize) }
+                * gate;
             unsafe { *out_row.add(tid as usize) = f32_to_bf16(y) };
         }
     }
