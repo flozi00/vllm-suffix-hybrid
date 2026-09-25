@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""In-pod engine-step profiler: SUFFIX_PROFILE_STEPS=<N>:<skip>.
+"""In-pod engine-step profiler: SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>].
 
 Default OFF. When set, the EngineCore process wraps
-``EngineCoreProc._process_engine_step`` (vllm/v1/engine/core.py): after
-<skip> model-executing steps under real traffic, the next <N> executing steps
-run under torch.profiler (CPU + CUDA activities, record_shapes off). Then the
-profiler stops, every temporary wrap is removed, the chrome trace is written
-to /tmp/suffix-prof-<pid>.json and ONE summary block is printed to stderr,
-every line prefixed with ``[suffix-prof]`` (grep it out of the pod log):
+``EngineCoreProc._process_engine_step`` (vllm/v1/engine/core.py). Windows
+are keyed by LOAD BUCKET (running requests: c1, c2-6, c7-12, c13-24, c25+),
+so one boot under a bench chain yields one window per concurrency cell:
+once the bucket has held for <skip> executing steps, the next <N> executing
+steps run under torch.profiler (CPU + CUDA activities, record_shapes off),
+at most <per> (default 1) windows per bucket, 12 per process. After each
+window the profiler stops, every temporary wrap is removed, the chrome trace
+goes to /tmp/suffix-prof-<pid>-<k>.json and ONE summary block is printed to
+stderr, every line prefixed with ``[suffix-prof]`` (grep the pod log):
 
   * top-40 GPU kernels (calls, total ms, % of summed GPU time)
   * CPU step wall vs GPU busy (union over streams) -> host gap per step
@@ -80,19 +83,30 @@ CATEGORIES = [
 _CAT_RE = [(n, re.compile(p, re.I)) for n, p in CATEGORIES]
 
 
-def parse_env(value: str | None) -> tuple[int, int] | None:
-    """'<N>:<skip>' or '<N>' -> (N, skip); None when unset/invalid."""
+MAX_WINDOWS = 12
+BUCKETS = ((1, "c1"), (6, "c2-6"), (12, "c7-12"), (24, "c13-24"))
+
+
+def parse_env(value: str | None) -> tuple[int, int, int] | None:
+    """'<N>[:<skip>[:<per>]]' -> (N, skip, per); None when unset/invalid."""
     if not value or not value.strip():
         return None
     parts = value.strip().split(":")
     try:
         n = int(parts[0])
         skip = int(parts[1]) if len(parts) > 1 and parts[1] else 50
+        per = int(parts[2]) if len(parts) > 2 and parts[2] else 1
     except ValueError:
         return None
-    if n <= 0 or skip < 0 or len(parts) > 2:
+    if n <= 0 or skip < 0 or per <= 0 or len(parts) > 3:
         return None
-    return n, skip
+    return n, skip, per
+
+
+def bucket(running: int) -> str | None:
+    if running <= 0:
+        return None
+    return next((lab for top, lab in BUCKETS if running <= top), "c25+")
 
 
 def category(name: str) -> str:
@@ -235,19 +249,42 @@ def _say(msg: str) -> None:
 
 
 class _Session:
-    """One profiling window per process. Every entry point is fail-soft."""
+    """Load-bucketed profiling windows. Every entry point is fail-soft."""
 
-    def __init__(self, n: int, skip: int):
-        self.n, self.skip = n, skip
-        self.phase = "skip"          # skip -> prof -> done
-        self.executed = 0
+    def __init__(self, n: int, skip: int, per: int = 1):
+        self.n, self.skip, self.per = n, skip, per
+        self.phase = "wait"          # wait -> prof -> wait ... -> done
+        self.cur, self.stable = None, 0
+        self.done: Counter = Counter()
+        self.windows = 0
+        self.label = "-"
         self.prof = None
         self.restore: list[tuple[object, str, object]] = []
-        self.cg: Counter = Counter()
         self.cg_step: Counter = Counter()
         self.cg_depth = 0
-        self.reqs = self.toks = self.emitted = 0
+        self._reset_window()
+
+    def _reset_window(self) -> None:
+        self.cg: Counter = Counter()
+        self.reqs = self.toks = self.emitted = self.steps = 0
         self.t_start = 0.0
+
+    def bucket_of(self, engine) -> str | None:
+        return bucket(len(getattr(getattr(engine, "scheduler", None),
+                                  "running", ()) or ()))
+
+    def observe(self, b: str | None, executed: bool) -> None:
+        """Track how long the load bucket has held (executing steps)."""
+        if not executed or b is None:
+            return
+        if b == self.cur:
+            self.stable += 1
+        else:
+            self.cur, self.stable = b, 1
+
+    def ready(self, b: str | None) -> bool:
+        return (b is not None and b == self.cur and self.stable >= self.skip
+                and self.done[b] < self.per)
 
     # -- temporary wraps (installed at start, removed at stop) --
     def _wrap(self, owner, name: str, label: str, hook=None) -> None:
@@ -361,11 +398,13 @@ class _Session:
         self.restore.clear()
 
     # -- lifecycle --
-    def start(self, engine) -> None:
+    def start(self, engine, label: str = "-") -> None:
         import torch
         from torch.profiler import ProfilerActivity, profile
         if not torch.cuda.is_available():
             raise RuntimeError("no CUDA in this process")
+        self._reset_window()
+        self.label = label
         self._instrument(engine)
         self.prof = profile(activities=[ProfilerActivity.CPU,
                                         ProfilerActivity.CUDA],
@@ -374,8 +413,8 @@ class _Session:
         self.prof.__enter__()
         self.phase = "prof"
         self.t_start = time.perf_counter()
-        _say(f"START profiling {self.n} steps after {self.skip} warm steps "
-             f"(pid {os.getpid()})")
+        _say(f"START window {self.windows + 1} [{label}]: {self.n} steps "
+             f"after {self.stable} steps in bucket (pid {os.getpid()})")
 
     def end_step(self, executed: bool) -> None:
         if getattr(self, "cg_tracked", False) and executed:
@@ -387,7 +426,10 @@ class _Session:
 
     def stop(self) -> None:
         import torch
-        self.phase = "done"
+        self.windows += 1
+        self.done[self.label] += 1
+        self.stable = 0
+        self.phase = "wait" if self.windows < MAX_WINDOWS else "done"
         wall = time.perf_counter() - self.t_start
         try:
             torch.cuda.synchronize()
@@ -397,10 +439,12 @@ class _Session:
                 prof.__exit__(None, None, None)
             finally:
                 self._uninstrument()
-        path = f"/tmp/suffix-prof-{os.getpid()}.json"
+        path = f"/tmp/suffix-prof-{os.getpid()}-{self.windows}.json"
         prof.export_chrome_trace(path)
         py = {"reqs": self.reqs / self.n, "toks": self.toks / self.n,
               "emitted": self.emitted / self.n, "cg": self.cg}
+        head = (f"BEGIN summary window {self.windows} [{self.label}] "
+                f"({self.n} steps, trace {path})")
         _say(f"STOP after {wall * 1e3:.0f} ms wall; trace {path}; "
              "summarizing in a background thread")
 
@@ -409,9 +453,8 @@ class _Session:
                 with open(path) as fh:
                     lines = summarize(json.load(fh), py)
                 block = "\n".join(f"{MARK} {ln}" for ln in
-                                  [f"BEGIN summary ({self.n} steps, skip "
-                                   f"{self.skip}, trace {path})"]
-                                  + lines + ["END summary"])
+                                  [head] + lines + [f"END summary window "
+                                                    f"{self.windows}"])
                 print(block, file=sys.stderr, flush=True)
             except Exception as exc:  # noqa: BLE001
                 _say(f"summary FAILED (trace kept at {path}): {exc!r}")
@@ -439,16 +482,24 @@ def wrap_step(orig, sess: _Session):
     def step(self, *a, **kw):
         if sess.phase == "done":
             return orig(self, *a, **kw)
-        if sess.phase == "skip" and sess.executed >= sess.skip:
+        if sess.phase == "wait":
             try:
-                sess.start(self)
-            except Exception as exc:  # noqa: BLE001
-                sess.abandon("start", exc)
-                return orig(self, *a, **kw)
-        if sess.phase != "prof":
-            r = orig(self, *a, **kw)
-            sess.executed += bool(r)
-            return r
+                b = sess.bucket_of(self)
+                go = sess.ready(b)
+            except Exception:  # noqa: BLE001
+                b, go = None, False
+            if go:
+                try:
+                    sess.start(self, b)
+                except Exception as exc:  # noqa: BLE001
+                    sess.abandon("start", exc)
+            if sess.phase != "prof":
+                r = orig(self, *a, **kw)
+                try:
+                    sess.observe(b, bool(r))
+                except Exception:  # noqa: BLE001
+                    pass
+                return r
         rf = None
         try:
             from torch.autograd.profiler import record_function
@@ -466,8 +517,8 @@ def wrap_step(orig, sess: _Session):
                     pass
         try:
             sess.end_step(bool(r))
-            sess.executed += bool(r)
-            if sess.executed >= sess.skip + sess.n:
+            sess.steps += bool(r)
+            if sess.steps >= sess.n:
                 sess.stop()
         except Exception as exc:  # noqa: BLE001
             sess.abandon("step", exc)
@@ -485,7 +536,8 @@ def _patch(module) -> None:
                                          _Session(*cfg))
     cls._suffix_step_profiler = True
     _say(f"armed on EngineCoreProc._process_engine_step: {cfg[0]} steps "
-         f"after {cfg[1]} warm steps")
+         f"per window after {cfg[1]} steady steps, {cfg[2]} window(s) per "
+         f"load bucket (c1, c2-6, c7-12, c13-24, c25+)")
 
 
 def install_post_import_hook() -> None:
@@ -493,7 +545,8 @@ def install_post_import_hook() -> None:
     value = os.environ.get(ENV)
     if parse_env(value) is None:
         if value:
-            _say(f"{ENV}={value!r} invalid (want <N>:<skip>); profiler off")
+            _say(f"{ENV}={value!r} invalid (want <N>:<skip>[:<per>]); "
+                 "profiler off")
         return
     if _TARGET_MODULE in sys.modules:
         _patch(sys.modules[_TARGET_MODULE])

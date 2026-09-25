@@ -6,11 +6,15 @@ import pytest
 from suffix_hybrid import step_profiler as sp
 
 
-def test_parse_env():
-    assert sp.parse_env("40:300") == (40, 300)
-    assert sp.parse_env("20") == (20, 50)
-    for bad in (None, "", "x", "0:5", "5:-1", "1:2:3"):
+def test_parse_env_and_buckets():
+    assert sp.parse_env("40:300") == (40, 300, 1)
+    assert sp.parse_env("40:300:2") == (40, 300, 2)
+    assert sp.parse_env("20") == (20, 50, 1)
+    for bad in (None, "", "x", "0:5", "5:-1", "5:1:0", "1:2:3:4"):
         assert sp.parse_env(bad) is None
+    assert [sp.bucket(r) for r in (0, 1, 2, 6, 7, 12, 13, 24, 25, 32)] == [
+        None, "c1", "c2-6", "c2-6", "c7-12", "c7-12", "c13-24", "c13-24",
+        "c25+", "c25+"]
 
 
 def test_categories():
@@ -58,22 +62,31 @@ def test_summarize_synthetic_trace():
 
 
 class _Sess(sp._Session):
-    def __init__(self, fail_start=False):
-        super().__init__(n=2, skip=1)
-        self.fail_start, self.started, self.stopped = fail_start, 0, 0
+    def __init__(self, fail_start=False, per=1):
+        super().__init__(n=2, skip=2, per=per)
+        self.fail_start, self.started = fail_start, []
 
-    def start(self, engine):
+    def start(self, engine, label="-"):
         if self.fail_start:
             raise RuntimeError("boom")
-        self.started += 1
+        self._reset_window()
+        self.started.append(label)
+        self.label = label
         self.phase = "prof"
 
     def stop(self):
-        self.stopped += 1
-        self.phase = "done"
+        self.windows += 1
+        self.done[self.label] += 1
+        self.stable = 0
+        self.phase = "wait"
 
 
-def test_wrap_step_lifecycle_and_passthrough():
+def _eng(running):
+    return types.SimpleNamespace(
+        scheduler=types.SimpleNamespace(running=[0] * running))
+
+
+def test_windows_follow_load_buckets():
     calls = []
 
     def orig(self, x):
@@ -82,16 +95,22 @@ def test_wrap_step_lifecycle_and_passthrough():
 
     sess = _Sess()
     step = sp.wrap_step(orig, sess)
-    eng = types.SimpleNamespace()
-    assert step(eng, "a") is True           # warm step 1 (skip=1)
-    assert sess.phase == "skip"
-    assert step(eng, "idle") is False       # still skip... start happens
-    assert sess.started == 1                # executed>=skip -> start
-    assert step(eng, "b") is True
-    assert step(eng, "c") is True           # 2 profiled executed steps
-    assert sess.stopped == 1 and sess.phase == "done"
-    assert step(eng, "d") is True
-    assert calls == ["a", "idle", "b", "c", "d"]
+    c1, c8 = _eng(1), _eng(8)
+    for x in "ab":                       # 2 steady c1 steps
+        assert step(c1, x) is True
+    assert sess.started == []
+    assert step(c1, "idle") is False     # window starts here (not counted)
+    assert sess.started == ["c1"] and sess.phase == "prof"
+    step(c1, "p1"), step(c1, "p2")       # 2 executed -> stop
+    assert sess.phase == "wait" and sess.done["c1"] == 1
+    for x in "cdef":                     # c1 already done: no new window
+        step(c1, x)
+    assert sess.started == ["c1"]
+    step(c8, "g"), step(_eng(7), "h")    # bucket c7-12 held 2 steps
+    step(c8, "i")
+    assert sess.started == ["c1", "c7-12"]
+    assert calls == ["a", "b", "idle", "p1", "p2", "c", "d", "e", "f", "g",
+                     "h", "i"]
 
 
 def test_wrap_step_fail_soft():
@@ -100,14 +119,16 @@ def test_wrap_step_fail_soft():
 
     sess = _Sess(fail_start=True)
     step = sp.wrap_step(orig, sess)
-    assert step(None) is True and step(None) is True and step(None) is True
+    for _ in range(5):
+        assert step(_eng(1)) is True
     assert sess.phase == "done"
+    assert step(object()) is True        # no scheduler attr: still serves
 
     def raising(self):
         raise ValueError("engine error must propagate")
 
     with pytest.raises(ValueError):
-        sp.wrap_step(raising, _Sess())(None)
+        sp.wrap_step(raising, _Sess())(_eng(1))
 
 
 def test_patch_is_idempotent(monkeypatch):

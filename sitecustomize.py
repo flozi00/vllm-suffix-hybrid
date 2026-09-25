@@ -13,7 +13,7 @@ PYTHONPATH. Each section is independently gated:
                                pod before serving (fatal only with NVP4KV=1)
   SUFFIX_FICACHE=seed|dump|both -> FlashInfer autotune cache seed/harvest
                                (inert otherwise, degrades on failure)
-  SUFFIX_PROFILE_STEPS=<N>:<skip> -> in-pod torch.profiler step summary
+  SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] -> in-pod torch.profiler summary
                                ("[suffix-prof]" lines; fail-soft)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
@@ -144,9 +144,10 @@ if os.environ.get("SUFFIX_SM120_NVP4KV", "").strip() == "1":
               f"ignoring): {exc}", file=sys.stderr, flush=True)
 
 # In-pod engine-step profiler (suffix_hybrid/step_profiler.py):
-# SUFFIX_PROFILE_STEPS=<N>:<skip> profiles N EngineCore steps after <skip>
-# warm steps and prints one "[suffix-prof]" summary block. Fail-soft: a
-# profiler error never touches serving.
+# SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] profiles N EngineCore steps once
+# the load bucket (c1/c2-6/c7-12/c13-24/c25+) held <skip> steps, <per>
+# windows per bucket; one "[suffix-prof]" summary block per window.
+# Fail-soft: a profiler error never touches serving.
 if os.environ.get("SUFFIX_PROFILE_STEPS", "").strip():
     try:
         from suffix_hybrid.step_profiler import (
