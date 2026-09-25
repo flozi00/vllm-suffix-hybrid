@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Single-GPU silicon oracle for the SM120 HiSparse+MTP patch (no GLM).
 
-    python -m hisparse_mtp_patch.oracle [--k 3] [--prompt-len 4096] ...
+    python -m hisparse_mtp_patch.oracle [--k 3 5] [--prompt-len 4096] ...
 
 Model: upstream tests/v1/e2e/general/test_hisparse.py recipe — DeepSeek-V3.2
 config (config.json only; ``load_format=dummy`` = seeded random weights, no
@@ -10,19 +10,31 @@ FULL_AND_PIECEWISE graphs. Differences: index_topk stays 2048 (the SM120
 backend rejects anything else) so prompts > 2048 tokens make top-k sparse,
 and max_num_seqs=1 keeps every run's batch shapes identical.
 
-Three child processes (fresh CUDA context each):
+Per k (prod GLM runs k=5), three child processes (fresh CUDA context each):
   ref     HiSparse off, MTP            (non-HiSparse spec-as-decode path)
   stock   HiSparse on, MTP, gate off   (verify tokens -> prefill staging)
   patched HiSparse on, MTP, SUFFIX_SM120_HISPARSE_MTP=1 (hot-buffer decode)
 Each generates greedily: target, 4 pressure prompts (spill target's pages
 to host), target again (restore from host through the hot buffer).
 
-PASS needs: patched run is patched + on FLASHINFER_MLA_SPARSE_SM120, took
-multi-token decode batches during generation (counter delta > 0; stock = 0),
-spilled (> 0), patched == stock token-for-token on every prompt, patched
-target before == after spill, and patched == ref. patched == stock but
-stock != ref is reported INCONCLUSIVE (exit 2: upstream HiSparse on/off is
-not bitwise here, not a patch fault).
+A child that crashes is REPORTED (its last error line) and the others still
+run: a stock crash is evidence that stock HiSparse+MTP is broken (vLLM 0.30.0:
+swap-row capacity off-by-one, fixed by the patch), never a reason to skip the
+patched run.
+
+PASS (per k) needs: patched completed, is patched + on
+FLASHINFER_MLA_SPARSE_SM120, took multi-token decode batches during
+generation (HISPARSE-MTP-DECODE counter delta > 0), spilled (> 0), patched
+target before == after spill, and patched == ref token-for-token on every
+prompt. patched != ref but == a completed stock is INCONCLUSIVE (exit 2:
+upstream HiSparse on/off not bitwise, not a patch fault); a crashed ref is
+INCONCLUSIVE too. A completed stock that reports multi-token decode = FAIL
+(gate leaked). Overall exit: any FAIL -> 1, else any INCONCLUSIVE -> 2.
+
+Caveat: dummy weights make decode near-bigram (streams fall into 2-cycles
+after the first, prompt-dependent token), so token parity mostly proves the
+prefill/staging path + no crash; the "distinct" counts in the summary line
+say how much the decode path could have shown.
 """
 
 import argparse
@@ -120,18 +132,23 @@ def child(mode: str, a) -> dict:
 
 
 def _run_child(mode: str, argv) -> dict:
+    """Never raises on a child failure: returns {"mode", "error"} instead."""
     env = dict(os.environ)
     env.pop("SUFFIX_SM120_HISPARSE_MTP", None)
     if mode == "patched":
         env["SUFFIX_SM120_HISPARSE_MTP"] = "1"
     proc = subprocess.run(
         [sys.executable, "-m", "hisparse_mtp_patch.oracle", "--child", mode]
-        + argv, env=env, stdout=subprocess.PIPE, text=True)
+        + argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True)
     sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
     for line in proc.stdout.splitlines():
         if line.startswith(RESULT):
             return json.loads(line[len(RESULT):])
-    raise RuntimeError(f"child {mode} exited {proc.returncode} without result")
+    errs = [ln.strip() for ln in proc.stderr.splitlines() if "Error" in ln]
+    return {"mode": mode, "error": f"exit {proc.returncode}: "
+            + (errs[-1] if errs else "no result line")}
 
 
 def _diff(a: dict, b: dict) -> list:
@@ -146,7 +163,15 @@ def _diff(a: dict, b: dict) -> list:
 
 
 def verdict(ref: dict, stock: dict, patched: dict) -> tuple[int, list]:
-    """Pure: (exit code, reasons). 0 PASS, 1 FAIL, 2 INCONCLUSIVE."""
+    """Pure: (exit code, reasons). 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
+    A crashed stock is only a note; it never blocks judging patched."""
+    note = [f"stock crashed ({stock['error']})"] if "error" in stock else []
+    if not note and "error" not in ref and _diff(ref["outputs"], stock["outputs"]):
+        note = [f"stock != ref at {_diff(ref['outputs'], stock['outputs'])}"]
+    if "error" in patched:
+        return 1, [f"patched crashed ({patched['error']})"] + note
+    if "error" in ref:
+        return 2, [f"ref crashed ({ref['error']}): no reference"] + note
     fail = []
     if not patched["patched"]:
         fail.append("patch not active in the patched run")
@@ -154,7 +179,8 @@ def verdict(ref: dict, stock: dict, patched: dict) -> tuple[int, list]:
         fail.append(f"SM120 sparse-MLA backend not selected: {patched['impls']}")
     if patched["mtp_decode_builds"] <= 0:
         fail.append("no multi-token HiSparse decode batch during generation")
-    if stock["mtp_decode_builds"] != 0:
+    stock_ok = "error" not in stock
+    if stock_ok and stock["mtp_decode_builds"] != 0:
         fail.append("stock run reports multi-token decode (gate leaked)")
     if not patched["spills"]:
         fail.append("no HiSparse spill: host path not exercised "
@@ -162,18 +188,16 @@ def verdict(ref: dict, stock: dict, patched: dict) -> tuple[int, list]:
     po = patched["outputs"]
     if po["target_1"] != po["target_2"]:
         fail.append("patched target changed after spill/restore")
-    d = _diff(stock["outputs"], po)
-    if d:
-        fail.append(f"patched != stock HiSparse at {d}")
-    if fail:
-        return 1, fail
     d = _diff(ref["outputs"], po)
-    if d:
-        if _diff(ref["outputs"], stock["outputs"]):
-            return 2, [f"patched == stock but both != ref at {d} "
-                       "(upstream HiSparse on/off not bitwise)"]
-        return 1, [f"patched != ref at {d} while stock == ref"]
-    return 0, []
+    if d and stock_ok and not _diff(stock["outputs"], po):
+        fail.append(f"INCONCLUSIVE: patched == stock but both != ref at {d} "
+                    "(upstream HiSparse on/off not bitwise)")
+    elif d:
+        fail.append(f"patched != ref at {d}")
+    if fail:
+        rc = 2 if all(f.startswith("INCONCLUSIVE") for f in fail) else 1
+        return rc, fail + note
+    return 0, note
 
 
 def main(argv=None) -> int:
@@ -182,7 +206,8 @@ def main(argv=None) -> int:
     # Vendored DeepSeek-V3.2 config.json (public, MIT): load_format=dummy +
     # skip_tokenizer_init need nothing else, so the pod needs no HF access.
     ap.add_argument("--model", default=str(Path(__file__).with_name("deepseek_v32")))
-    ap.add_argument("--k", type=int, default=3)
+    ap.add_argument("--k", type=int, nargs="+", default=[3],
+                    help="num_speculative_tokens; several = one sweep each")
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--prompt-len", type=int, default=4096)
     ap.add_argument("--max-tokens", type=int, default=32)
@@ -195,17 +220,27 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     a = ap.parse_args(argv)
     if a.child:
+        a.k = a.k[0]
         print(RESULT + json.dumps(child(a.child, a)), flush=True)
         return 0
-    runs = {m: _run_child(m, argv) for m in ("ref", "stock", "patched")}
-    for m, r in runs.items():
-        print(f"{MARK} {m}: impls={r['impls']} spills={r['spills']} "
-              f"mtp_decode_builds={r['mtp_decode_builds']} "
-              f"max_q_len={r['max_decode_query_len']}", flush=True)
-    rc, why = verdict(runs["ref"], runs["stock"], runs["patched"])
-    print(f"{MARK} {['PASS', 'FAIL', 'INCONCLUSIVE'][rc]}"
-          + (": " + "; ".join(why) if why else ""), flush=True)
-    return rc
+    codes = []
+    for k in a.k:
+        runs = {m: _run_child(m, argv + ["--k", str(k)])  # last --k wins
+                for m in ("ref", "stock", "patched")}
+        for m, r in runs.items():
+            if "error" in r:
+                print(f"{MARK} k={k} {m}: CRASHED {r['error']}", flush=True)
+                continue
+            distinct = sorted(len(set(v)) for v in r["outputs"].values())
+            print(f"{MARK} k={k} {m}: impls={r['impls']} spills={r['spills']} "
+                  f"mtp_decode_builds={r['mtp_decode_builds']} "
+                  f"max_q_len={r['max_decode_query_len']} "
+                  f"distinct={distinct}", flush=True)
+        rc, why = verdict(runs["ref"], runs["stock"], runs["patched"])
+        codes.append(rc)
+        print(f"{MARK} k={k} {['PASS', 'FAIL', 'INCONCLUSIVE'][rc]}"
+              + (": " + "; ".join(why) if why else ""), flush=True)
+    return 1 if 1 in codes else max(codes)
 
 
 if __name__ == "__main__":

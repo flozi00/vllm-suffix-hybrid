@@ -17,6 +17,9 @@ from nvfp4_kv_patch import _PostImportFinder  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/vllm_0.30.0/sparse_mla_attention.py"
 FIXTURE_SHA256 = "ae0aa4fee580a5fcb22f912078d2df142dd7e576c790383211e5c06e484c0e27"
+FIXTURES = FIXTURE.parent
+RUNTIME_FIXTURE = FIXTURES / "hisparse_runtime.py"  # vllm/v1/hisparse/runtime.py
+RUNTIME_SHA256 = "84a5305c3aa4a047c8ecb2906f6354b0d8bfe3dcd40e34f5a7422ddc15f56344"
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +30,82 @@ def _clean(monkeypatch):
 
 def test_fixture_is_pinned_wheel_copy():
     assert hashlib.sha256(FIXTURE.read_bytes()).hexdigest() == FIXTURE_SHA256
+    assert hashlib.sha256(RUNTIME_FIXTURE.read_bytes()).hexdigest() == RUNTIME_SHA256
+
+
+def _defs(path, *names, ns=None):
+    """exec the named top-level functions / class methods of a fixture."""
+    import ast
+    tree = ast.parse(path.read_text())
+    ns = {} if ns is None else ns
+    ns.setdefault("VllmConfig", object)  # annotation (runtime.py has no pep563 here)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            node.decorator_list = []
+            exec(compile(ast.Module([node], []), str(path), "exec"), ns)
+    return ns
+
+
+def _cfg(k, seqs=1, mbt=2048):
+    spec = None if k is None else types.SimpleNamespace(
+        num_speculative_tokens=k, parallel_drafting=False)
+    return types.SimpleNamespace(
+        speculative_config=spec,
+        scheduler_config=types.SimpleNamespace(
+            max_num_seqs=seqs, max_num_batched_tokens=mbt))
+
+
+def _step_rows(capacity):
+    ns = _defs(RUNTIME_FIXTURE, "_step_rows")
+    rt = types.SimpleNamespace(_swap_step=0, index_group=types.SimpleNamespace(
+        shared_topk=types.SimpleNamespace(
+            physical_topk_indices=types.SimpleNamespace(shape=(capacity, 2048)))))
+    return lambda n: ns["_step_rows"](rt, n)
+
+
+def test_silicon_capacity_error_replays_on_cpu_and_patch_fixes_it():
+    """k=3, max_num_seqs=1 (the oracle): index-group workspace has 4+1 rows
+    and admits a 5-token all-resident prefill into swap_in; stock swap state
+    has 4 rows -> the exact silicon ValueError. Patched: 5 rows, fits."""
+    ig = (FIXTURES / "index_group.py").read_text()
+    assert ig.count("        if num_tokens > self.physical_topk_indices.shape[0]:\n"
+                    "            # Prefill-sized batches do not fit") == 1
+    assert ig.count("(workspace_rows + 1, self.logical_topk_indices.shape[1])") == 1
+    group_rows = _defs(FIXTURES / "index_group.py",
+                       "get_sparse_mla_index_group_max_rows")[
+        "get_sparse_mla_index_group_max_rows"]
+    stock = _defs(RUNTIME_FIXTURE, "_get_max_decode_query_len",
+                  "_get_max_swap_rows")
+    patched = dict(stock)
+    exec(P.patch_runtime_source(RUNTIME_FIXTURE.read_text()), patched)
+    cfg = _cfg(3)
+    workspace = group_rows(cfg) + 1
+    assert (workspace, stock["_get_max_swap_rows"](cfg)) == (5, 4)
+    n = workspace  # largest batch index_group.py:236 routes to swap_in
+    with pytest.raises(ValueError, match=r"stop=5, capacity=4\.$"):
+        _step_rows(stock["_get_max_swap_rows"](cfg))(n)
+    assert _step_rows(patched["_get_max_swap_rows"](cfg))(n) == slice(0, 5)
+    # Multi-token decode (patched SM120 path): one swap per verify step.
+    step = _step_rows(patched["_get_max_swap_rows"](cfg))
+    assert [step(1) for _ in range(4)][-1] == slice(3, 4)
+    # Invariant for every shape: swap rows == index-group workspace rows.
+    for k in (None, 1, 3, 5):
+        for seqs in (1, 4, 64):
+            for mbt in (8, 2048):
+                c = _cfg(k, seqs, mbt)
+                assert patched["_get_max_swap_rows"](c) == group_rows(c) + 1
+                assert stock["_get_max_swap_rows"](c) == group_rows(c)
+
+
+def test_runtime_anchor_drift():
+    src = RUNTIME_FIXTURE.read_text()
+    assert P.HELPER_TAG in P.patch_runtime_source(src)
+    with pytest.raises(P.PatchDriftError, match="swap_rows_def: expected 1, found 0"):
+        P.patch_runtime_source(src.replace(P.RUNTIME_OLD, P.RUNTIME_NEW))
+    with pytest.raises(P.PatchDriftError, match="swap_rows_call: expected 1, found 2"):
+        P.patch_runtime_source(src + P.RUNTIME_CALL_SITE)
+    with pytest.raises(P.PatchDriftError, match="on disk"):
+        P.patch_runtime_source(src + "# " + P.HELPER_TAG)
 
 
 def test_replay_on_fixture():
@@ -125,7 +204,19 @@ _SYNTH = (
 )
 
 
+def _fake_runtime(monkeypatch, tmp_path, src=None):
+    path = tmp_path / "runtime.py"
+    path.write_text(RUNTIME_FIXTURE.read_text() if src is None else src)
+    rt = types.ModuleType(P.RUNTIME_MODULE)
+    rt.__file__ = str(path)
+    _defs(RUNTIME_FIXTURE, "_get_max_decode_query_len", "_get_max_swap_rows",
+          ns=rt.__dict__)
+    monkeypatch.setitem(sys.modules, P.RUNTIME_MODULE, rt)
+    return rt
+
+
 def _apply_synthetic(monkeypatch, tmp_path):
+    rt = _fake_runtime(monkeypatch, tmp_path)
     path = tmp_path / "sparse_mla_attention.py"
     path.write_text(_SYNTH)
     mod = types.ModuleType(P.TARGET_MODULE)
@@ -136,7 +227,24 @@ def _apply_synthetic(monkeypatch, tmp_path):
     monkeypatch.setattr(P, "is_sm120", lambda cap=None: True)
     monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(__version__="0.30.0"))
     assert P.apply(mod) is True
+    assert rt._get_max_swap_rows(_cfg(3)) == 5
     return mod
+
+
+def test_runtime_drift_fails_closed_before_any_rewrite(monkeypatch, tmp_path):
+    rt = _fake_runtime(monkeypatch, tmp_path, src="drifted\n")
+    path = tmp_path / "sparse_mla_attention.py"
+    path.write_text(_SYNTH)
+    mod = types.ModuleType(P.TARGET_MODULE)
+    mod.__file__ = str(path)
+    exec(compile(_SYNTH, str(path), "exec"), mod.__dict__)
+    monkeypatch.setenv(P.GATE_ENV, "1")
+    monkeypatch.setattr(P, "is_sm120", lambda cap=None: True)
+    monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(__version__="0.30.0"))
+    with pytest.raises(P.PatchDriftError, match="runtime.py"):
+        P.apply(mod)
+    assert not hasattr(mod, P.MARKER_ATTR) and not hasattr(mod, "_SUFFIX_HISPARSE_MTP_STATS")
+    assert rt._get_max_swap_rows(_cfg(3)) == 4
 
 
 def test_apply_semantics_on_synthetic(monkeypatch, tmp_path):
@@ -192,8 +300,45 @@ def test_oracle_verdict():
     ref, stock = _run(good, spills=None), _run(good)
     patched = _run(good, patched="r", mtp_decode_builds=5)
     assert oracle.verdict(ref, stock, patched) == (0, [])
+    # Gate is patched == ref; a diverging (completed) stock is only noted.
     rc, why = oracle.verdict(ref, _run(other), patched)
-    assert rc == 1 and "target_1@1" in why[0]
+    assert rc == 0 and why == ["stock != ref at ['target_1@1', 'target_2@1']"]
     assert oracle.verdict(ref, stock, dict(patched, mtp_decode_builds=0))[0] == 1
     assert oracle.verdict(ref, stock, dict(patched, spills=0))[0] == 1
     assert oracle.verdict(_run(other), stock, patched)[0] == 2
+    # Stock crash (the silicon case) is reported, never blocks judging patched.
+    crashed = {"mode": "stock", "error": "exit 1: ValueError: stop=5, capacity=4."}
+    rc, why = oracle.verdict(ref, crashed, patched)
+    assert rc == 0 and "stock crashed" in why[0]
+    rc, why = oracle.verdict(_run(other), crashed, patched)
+    assert rc == 1 and "patched != ref" in why[0] and "stock crashed" in why[-1]
+    assert oracle.verdict(ref, stock, {"mode": "patched", "error": "x"})[0] == 1
+    assert oracle.verdict({"mode": "ref", "error": "x"}, stock, patched)[0] == 2
+    bad = dict(patched, outputs=dict(good, target_2=[1, 3]))
+    assert oracle.verdict(ref, stock, bad)[0] == 1
+
+
+def test_oracle_main_runs_patched_after_stock_crash_for_each_k(monkeypatch, capsys):
+    good = {"target_1": [1, 2], "target_2": [1, 2]}
+    calls = []
+
+    def fake(mode, argv):
+        calls.append((mode, argv[-2:]))
+        if mode == "stock":
+            return {"mode": mode, "error": "exit 1: ValueError: capacity"}
+        return _run(good, spills=3 if mode == "patched" else None,
+                    patched="r" if mode == "patched" else None,
+                    mtp_decode_builds=4 if mode == "patched" else 0,
+                    max_decode_query_len=4)
+
+    monkeypatch.setattr(oracle, "_run_child", fake)
+    assert oracle.main(["--k", "3", "5", "--gpu-blocks", "200"]) == 0
+    assert calls == [(m, ["--k", k]) for k in ("3", "5")
+                     for m in ("ref", "stock", "patched")]
+    out = capsys.readouterr().out
+    assert "k=3 stock: CRASHED" in out and "k=5 PASS: stock crashed" in out
+    # argparse: the appended --k overrides the sweep list in the child.
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--k", type=int, nargs="+")
+    assert ap.parse_args(["--k", "3", "5", "--k", "5"]).k == [5]
