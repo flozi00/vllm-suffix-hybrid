@@ -95,7 +95,7 @@ jobs:
           cd "$RUNNER_TEMP"
           so=$(python -c "import suffix_hybrid._native as n; print(n.__file__)")
           if readelf -d "$so" | grep -Ei 'NEEDED.*(libcuda|libcudart|libcurand)'; then exit 1; fi
-          python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA and n.HAS_NVFP4_ATTN_CUDA and n.HAS_OXIDE_KERNELS"
+          python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA and n.HAS_NVFP4_ATTN_CUDA and n.HAS_NVFP4_DSMLA_CUDA and n.HAS_OXIDE_KERNELS"
           python -m pytest "$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/sm120/tests" -q --import-mode=importlib
       - name: Build cuda-oxide kernels -> sm_120 cubins (ptxas 13.0) + SASS/ISA assertions
         # kernels-oxide/<name>/ -> PTX (ISA <= 9.0) -> ptxas 13.0 -> cubin;

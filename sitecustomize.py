@@ -11,6 +11,8 @@ PYTHONPATH. Each section is independently gated:
                                (fail closed on SM120, inert elsewhere)
   SUFFIX_SM120_HISPARSE_MTP=1 -> arm the deferred SM120 HiSparse+MTP
                                builder patch (fail closed on SM120)
+  SUFFIX_SM120_NVP4DSMLA=1  -> arm the deferred SM120 nvfp4_ds_mla sparse-MLA
+                               KV patch (our kernels; fail closed on SM120)
   SUFFIX_SM120_NVP4KV_ORACLE=1 -> run the NVFP4-KV on-silicon oracle once per
                                pod before serving (fatal only with NVP4KV=1)
   SUFFIX_FICACHE=seed|dump|both -> FlashInfer autotune cache seed/harvest
@@ -168,6 +170,31 @@ if os.environ.get("SUFFIX_SM120_HISPARSE_MTP", "").strip() == "1":
                 f"suffix sm120 hisparse-mtp installation failed on SM120: {exc}"
             ) from exc
         print(f"suffix sm120 hisparse-mtp: hook install failed (not SM120, "
+              f"ignoring): {exc}", file=sys.stderr, flush=True)
+
+# sm120 NVFP4 DS-MLA patch (independent gate, nvfp4_ds_mla_patch/):
+# --kv-cache-dtype nvfp4_ds_mla on the SM120 sparse-MLA backend through our
+# cuda-oxide writer/decode kernels (GLM 5.3). Same deferred meta_path hooks
+# + fail-closed posture; composes with SUFFIX_SM120_HISPARSE_MTP (disjoint
+# target files). Unset = fully inert.
+if os.environ.get("SUFFIX_SM120_NVP4DSMLA", "").strip() == "1":
+    try:
+        from nvfp4_ds_mla_patch import install_post_import_hook as _dsmla_hook
+        _dsmla_hook()
+    except Exception as exc:
+        import sys
+        _sm120 = False
+        try:
+            import torch
+            _sm120 = (torch.cuda.is_available()
+                      and torch.cuda.get_device_capability()[0] == 12)
+        except Exception:
+            pass
+        if _sm120:
+            raise SystemExit(
+                f"suffix sm120 nvfp4-ds-mla installation failed on SM120: {exc}"
+            ) from exc
+        print(f"suffix sm120 nvfp4-ds-mla: hook install failed (not SM120, "
               f"ignoring): {exc}", file=sys.stderr, flush=True)
 
 # In-pod engine-step profiler (suffix_hybrid/step_profiler.py):

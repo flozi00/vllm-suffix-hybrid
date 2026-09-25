@@ -1,73 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SM120 NVFP4 DS-MLA (sparse MLA) enablement for vLLM 0.30.0 — DRAFT.
+"""SM120 NVFP4 DS-MLA KV cache (``--kv-cache-dtype nvfp4_ds_mla``) for vLLM
+0.30.0 sparse MLA (GLM 5.3 / DeepSeek-V3.2 geometry) on our cuda-oxide
+kernels (kernels-oxide/nvfp4_ds_mla, host ops src/nvfp4_ds_mla_oxide.rs).
 
-Gated on ``SUFFIX_SM120_NVP4DSMLA=1`` AND capability family 12. When set
-but not SM120: inert with one log line. Enabled on SM120: fail closed
-(every inconsistency raises; a pool that asked for nvfp4_ds_mla never
-silently serves a different config).
+Gate: ``SUFFIX_SM120_NVP4DSMLA=1`` AND compute capability family 12. Set but
+not SM120: inert with one log line. Enabled on SM120: fail closed (every
+inconsistency raises; a pool that asked for nvfp4_ds_mla never silently
+serves another config).
 
-Contract sources (pinned research dossier:
-``plugin-harness/dossiers/dsmla-kernel-contracts-glm53.md``):
-  * Row layout 352 B/token: [0,256) e2m1 NoPE (low nibble = even dim),
-    [256,320) UNSCALED e4m3 RoPE, [320,352) 32 e4m3 SF one-per-16-dims,
-    SF byte permutation ``s -> 8*(s&3) + (s>>2)``; SF = e4m3(max(amax16/6,
-    2^-9)); dequant x = e2m1 * sf. No global scale byte; kv_scale_format
-    is an fp8-only concept (nvfp4 rows carry per-16 e4m3 SFs only).
-  * Rejection chain today: (a) the SM120 backend's
-    supported_kv_cache_dtypes / supports_combination
-    (flashinfer_mla_sparse.py:162-167, :212-219); (b) the impl's
-    kv_cache_dtype hard check (flashinfer_mla_sparse_sm120.py:63-67);
-    (c) the C++ concat_and_cache_mla dispatcher's double SM100 gate
-    (CMake FP4_SM100_ARCHS build gate + runtime props->major == 10).
-    Sizing already yields 352 for nvfp4_ds_mla (MLAAttentionSpec builder,
-    mla_attention.py :1361) — NO spec/sizing change needed.
-  * Reader: flashinfer's wrapper hard-fails on a 352-row cache (656-byte
-    literal checks) — our cuda-oxide kernels (kernels-oxide/
-    nvfp4_ds_mla; host ops nvfp4_ds_mla_decode_cuda /
-    nvfp4_ds_mla_quant_store_cuda) fully replace the
-    ``flashinfer_trtllm_batch_decode_with_kv_cache_mla`` call inside
-    ``_run_mqa_kernel`` with the SAME wrapper signature: q [T,1,64,576]
-    bf16, kv uint8 flat, block_tables [T,1,2048] int32 PHYSICAL token
-    slots (-1 masked, NOT page indices), seq_lens=None (all columns
-    active), sm_scale float, bmm2_scale 1.0 — with no workspace_buffer /
-    max_seq_len dependency (o_part + lse_part ≈ 2.1 MiB per token at
-    topk 2048 versus the 394 MiB flashinfer workspace).
-  * Writer: replaces ``ops.concat_and_cache_mla`` for
-    kv_cache_dtype == nvfp4_ds_mla on SM120 (backend.py
-    do_kv_cache_update :1055-1073); kernel geometry mirrors the SM100
-    nvfp4 writer (grid (tokens,), block 64: warp 0 latent lanes, warp 1
-    rope lanes).
-  * GLM 5.3: HQ=64, index_topk=2048 (the backend requires exactly
-    2048), kv_lora_rank 512, rope 64, DSA arch (no kpool). GLM-5.3-Flash
-    (kpool / rope=0) is OUT OF SCOPE v1.
+Row contract (352 B/token, dossier dsmla-kernel-contracts-glm53.md §2):
+[0,256) e2m1 NoPE (low nibble = even dim), [256,320) unscaled e4m3 RoPE,
+[320,352) 32 e4m3 SFs at byte 8*(s&3)+(s>>2); sf = e4m3(max(amax16/6,
+2^-9)). MLAAttentionSpec already sizes 352 B rows; nothing to patch there.
 
-Anchor style: exact-text source rewrite with occurrence-count
-verification, the ``sm120/nvfp4_kv_patch`` conventions — every anchor
-fails closed with PatchDriftError before any replacement (all failing
-anchors reported at once); the transforms are pure functions replayable
-byte-exactly in the CPU suite. Anchors below are EXACT transcriptions of
-the pinned v0.30.0 sdist (verified count-exact against
-/tmp/vllm-0.30.0). TODO before ship: pin fixture copies under
-sm120-drafts/fixtures/ and wire the deferred sys.meta_path
-front-insertion hooks for BOTH target modules (backend may import
-before the sm120 impl module).
+What stock 0.30.0 does and what we rewrite (in memory, exact-text anchors,
+count-verified before any replacement, fixtures sm120/tests/fixtures/
+vllm_0.30.0/ pin the sources):
+  flashinfer_mla_sparse.py      SM120 backend rejects nvfp4_ds_mla (support
+                                list + supports_combination) -> accept it.
+  flashinfer_mla_sparse_sm120.py impl __init__ rejects it -> accept, and
+                                driver-load our cubin at init (never inside
+                                graph capture); _run_mqa_kernel -> our decode
+                                op (flashinfer rejects 352 B rows);
+                                do_kv_cache_update -> our writer (the C++
+                                concat_and_cache_mla nvfp4 path is SM100-only,
+                                build- and runtime-gated).
+  index_group.py                HiSparse register_layer sizes every non-fp8
+                                row as head_size (576) -> 352 for
+                                nvfp4_ds_mla (the HiSparse data plane is
+                                row-bytes generic; bind_source_cache
+                                re-checks the width, fail closed).
+The deepseek_v32 fused Triton writer (fused_norm_rope, non-HiSparse path)
+already emits the 352 B rows on any arch; the oracle checks our reader
+against it too.
+
+Composition with hisparse_mtp_patch: it rewrites sparse_mla_attention.py
+only; the files are disjoint and both hooks are one-shot front-inserted
+finders, so they compose in either arming order.
 """
 
-import importlib
-import math
 import os
 import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-ds-mla"
-PATCH_REVISION = "2026-09-25.1"
-
-TARGET_MODULE = "vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120"
-WRITER_TARGET = "vllm.v1.attention.backend"
-
+PATCH_REVISION = "2026-09-26.1"
 PINNED_VLLM = "0.30.0"
 GATE_ENV = "SUFFIX_SM120_NVP4DSMLA"
 MARKER_ATTR = "__suffix_nvfp4_ds_mla_revision__"
+HELPER_TAG = "suffix sm120 nvfp4-ds-mla patch"
+FAMILY = "nvfp4_ds_mla"  # oxide cubin / kernel family
+ROW_BYTES = 352
+
+BACKEND_MODULE = "vllm.v1.attention.backends.mla.flashinfer_mla_sparse"
+IMPL_MODULE = "vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120"
+INDEX_GROUP_MODULE = "vllm.v1.attention.backends.mla.index_group"
 
 
 class PatchDriftError(RuntimeError):
@@ -78,407 +65,310 @@ def gate_enabled() -> bool:
     return os.environ.get(GATE_ENV, "").strip() == "1"
 
 
-def _capability():
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return None
-        return tuple(torch.cuda.get_device_capability())
-    except Exception:
-        return None
-
-
 def is_sm120(capability=None) -> bool:
-    cap = capability if capability is not None else _capability()
-    return cap is not None and cap[0] == 12
+    if capability is None:
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return False
+            capability = tuple(torch.cuda.get_device_capability())
+        except Exception:
+            return False
+    return capability[0] == 12
 
 
 # ---------------------------------------------------------------------------
-# (1) flashinfer_mla_sparse.py — backend support list (:162-167) and
-#     supports_combination (:212-219). Exact text of the pinned file.
+# Anchors: (name, exact old text, new text, expected count in the pin).
 # ---------------------------------------------------------------------------
-# TodoDraft: exercise care with these anchors — the class-level list is
-# inside a ClassVar annotation on the SM120 backend class; the
-# supports_combination tuple is a plain `not in (...)` gate.
+_TAG = f"        # {HELPER_TAG}\n"
+
 BACKEND_EDITS = [
     (
-        "supported_kv_cache_dtypes_ext",
-        '    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [\n'
-        '        "auto",\n'
-        '        "fp8",\n'
+        "supported_kv_cache_dtypes",
         '        "fp8_e4m3",\n'
         '        "fp8_ds_mla",\n'
-        '    ]',
-        '    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [\n'
-        '        "auto",\n'
-        '        "fp8",\n'
+        '    ]\n'
+        '\n'
+        '    @staticmethod\n'
+        '    def get_name() -> str:\n'
+        '        return "FLASHINFER_MLA_SPARSE_SM120"\n',
         '        "fp8_e4m3",\n'
         '        "fp8_ds_mla",\n'
-        '        "nvfp4_ds_mla",\n'
-        '    ]',
+        f'        "nvfp4_ds_mla",  # {HELPER_TAG}\n'
+        '    ]\n'
+        '\n'
+        '    @staticmethod\n'
+        '    def get_name() -> str:\n'
+        '        return "FLASHINFER_MLA_SPARSE_SM120"\n',
         1,
     ),
     (
-        "supports_combination_nvfp4_ext",
-        '        if kv_cache_dtype not in (\n'
-        '            None,\n'
-        '            "auto",\n'
-        '            "fp8",\n'
+        "supports_combination",
         '            "fp8_e4m3",\n'
         '            "fp8_ds_mla",\n'
         '        ):\n'
-        '            return "kv_cache_dtype not supported"',
-        '        if kv_cache_dtype not in (\n'
-        '            None,\n'
-        '            "auto",\n'
-        '            "fp8",\n'
+        '            return "kv_cache_dtype not supported"\n',
         '            "fp8_e4m3",\n'
         '            "fp8_ds_mla",\n'
-        '            "nvfp4_ds_mla",\n'
+        f'            "nvfp4_ds_mla",  # {HELPER_TAG}\n'
         '        ):\n'
-        '            return "kv_cache_dtype not supported"',
+        '            return "kv_cache_dtype not supported"\n',
         1,
     ),
 ]
 
-# ---------------------------------------------------------------------------
-# (2) flashinfer_mla_sparse_sm120.py — impl gate (:63-67), split-workspace
-#     allocation (:211-215) and the _run_mqa_kernel flashinfer call
-#     (:218-246). Exact text of the pinned file.
-# ---------------------------------------------------------------------------
 IMPL_EDITS = [
     (
         "impl_kv_cache_dtype_gate",
-        '        if kv_cache_dtype != "fp8_ds_mla":\n'
-        '            raise NotImplementedError(\n'
-        '                "FLASHINFER_MLA_SPARSE_SM120 requires the packed fp8_ds_mla "\n'
-        '                f"KV cache layout; got kv_cache_dtype={kv_cache_dtype!r}."\n'
-        '            )',
-        '        if kv_cache_dtype == "nvfp4_ds_mla":\n'
-        '            if ' + GATE_ENV + ' gate check:\n'
-        '                pass\n'
-        '            # (expanded below — see applied f-string)',
+        '        if kv_cache_dtype != "fp8_ds_mla":\n',
+        _TAG
+        + '        self._use_nvfp4_ds_mla = kv_cache_dtype == "nvfp4_ds_mla"\n'
+        '        if kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):\n',
         1,
     ),
     (
-        "workspace_partials",
-        '        output = q.new_empty(\n'
-        '            (num_actual_toks, self.num_heads, self.kv_lora_rank),\n'
-        '            dtype=q.dtype,\n'
-        '        )',
-        '        output = q.new_empty(\n'
-        '            (num_actual_toks, self.num_heads, self.kv_lora_rank),\n'
-        '            dtype=q.dtype,\n'
-        '        )\n'
-        '        if getattr(self, "_use_nvfp4_ds_mla", False):\n'
-        '            # suffix nvfp4-ds-mla: split workspace o_part [T, H, NS,\n'
-        '            # 512] bf16 + lse_part [T, H, NS] f32 with NS =\n'
-        '            # ceil(sparse_capacity / 64) (flashinfer mid_out /\n'
-        '            # mid_lse split contract) — about 2.1 MiB per token\n'
-        '            # at topk 2048; none of the 394 MiB shared workspace.\n'
-            '            ns = (topk_indices_physical.shape[1] + 63) // 64\n'
-        '            self._nvfp4_o_part = q.new_empty(\n'
-        '                (num_actual_toks, self.num_heads, ns, self.kv_lora_rank),\n'
-        '                dtype=torch.bfloat16)\n'
-        '            self._nvfp4_lse_part = q.new_empty(\n'
-        '                (num_actual_toks, self.num_heads, ns),\n'
-        '                dtype=torch.float32)',
+        "impl_init_load_kernels",
+        '        self._workspace_buffer: torch.Tensor | None = None\n',
+        '        self._workspace_buffer: torch.Tensor | None = None\n'
+        + _TAG
+        + '        if self._use_nvfp4_ds_mla:\n'
+        '            _suffix_nvfp4_ds_mla_init(self)\n',
         1,
     ),
     (
-        "run_mqa_kernel_swap",
-        '        from vllm.utils.flashinfer import (\n'
-        '            flashinfer_trtllm_batch_decode_with_kv_cache_mla,\n'
+        "impl_writer_override",
+        '    def forward_mqa(\n',
+        '    def do_kv_cache_update(\n'
+        '        self, kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype,\n'
+        '        k_scale,\n'
+        '    ) -> None:\n'
+        + _TAG
+        + '        if kv_cache_dtype == "nvfp4_ds_mla":\n'
+        '            _suffix_nvfp4_ds_mla_write(kv_c_normed, k_pe, kv_cache, slot_mapping)\n'
+        '            return\n'
+        '        super().do_kv_cache_update(\n'
+        '            kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale\n'
         '        )\n'
         '\n'
-        '        sparse_capacity = topk_indices_physical.shape[1]\n'
-        '        out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(\n'
-        '            query=q.unsqueeze(1),\n'
-        '            kv_cache=kv_cache.view(torch.uint8).unsqueeze(1),\n'
-        '            workspace_buffer=self._workspace_buffer,\n'
-        '            qk_nope_head_dim=self.qk_nope_head_dim,\n'
-        '            kv_lora_rank=self.kv_lora_rank,\n'
-        '            qk_rope_head_dim=self.qk_rope_head_dim,\n'
-        '            block_tables=topk_indices_physical.unsqueeze(1),\n'
-        '            seq_lens=None,\n'
-        '            max_seq_len=sparse_capacity,\n'
-        '            out=output.unsqueeze(1),\n'
-        '            bmm1_scale=self.scale,\n'
-        '            bmm2_scale=1.0,\n'
-        '            sparse_mla_top_k=sparse_capacity,\n'
-        '            kv_scale_format=self.kv_scale_format,\n'
+        '    def forward_mqa(\n',
+        1,
+    ),
+    (
+        "run_mqa_kernel_decode",
+        '            dtype=q.dtype,\n'
         '        )\n'
-        '        return out.squeeze(1)',
-        '        if getattr(self, "_use_nvfp4_ds_mla", False):\n'
-        '            # suffix nvfp4-ds-mla: our cuda-oxide kernels (family\n'
-        '            # nvfp4_ds_mla via suffix_hybrid.oxide_kernels) — same\n'
-        '            # wrapper contract: q [T,1,H,576] bf16, kv uint8 flat\n'
-        '            # [blocks, page, 352], block_tables [T,1,C] int32\n'
-        '            # physical token slots (-1 masked), seq_lens=None (all\n'
-        '            # columns active), sm_scale float, bmm2_scale 1.0; no\n'
-        '            # flashinfer workspace / max_seq_len.\n'
-        '            from suffix_hybrid import _native, oxide_kernels\n'
         '\n'
-        '            oxide_kernels.ensure_loaded("nvfp4_ds_mla")\n'
-        '            _native.nvfp4_ds_mla_decode_cuda(\n'
-        '                q.unsqueeze(1),\n'
-        '                kv_cache.view(torch.uint8),\n'
-        '                topk_indices_physical.unsqueeze(1),\n'
-        '                output.unsqueeze(1),\n'
-        '                self._nvfp4_o_part,\n'
-        '                self._nvfp4_lse_part,\n'
-        '                float(self.scale),\n'
-        '                torch.cuda.current_stream(q.device).cuda_stream,\n'
+        '        if self._workspace_buffer is None:\n',
+        '            dtype=q.dtype,\n'
+        '        )\n'
+        + _TAG
+        + '        if self._use_nvfp4_ds_mla:\n'
+        '            return _suffix_nvfp4_ds_mla_decode(\n'
+        '                self, q, kv_cache, topk_indices_physical, output\n'
         '            )\n'
-        '            return output\n'
-        '        from vllm.utils.flashinfer import (\n'
-        '            flashinfer_trtllm_batch_decode_with_kv_cache_mla,\n'
-        '        )\n'
         '\n'
-        '        sparse_capacity = topk_indices_physical.shape[1]\n'
-        '        out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(\n'
-        '            query=q.unsqueeze(1),\n'
-        '            kv_cache=kv_cache.view(torch.uint8).unsqueeze(1),\n'
-        '            workspace_buffer=self._workspace_buffer,\n'
-        '            qk_nope_head_dim=self.qk_nope_head_dim,\n'
-        '            kv_lora_rank=self.kv_lora_rank,\n'
-        '            qk_rope_head_dim=self.qk_rope_head_dim,\n'
-        '            block_tables=topk_indices_physical.unsqueeze(1),\n'
-        '            seq_lens=None,\n'
-        '            max_seq_len=sparse_capacity,\n'
-        '            out=output.unsqueeze(1),\n'
-        '            bmm1_scale=self.scale,\n'
-        '            bmm2_scale=1.0,\n'
-        '            sparse_mla_top_k=sparse_capacity,\n'
-        '            kv_scale_format=self.kv_scale_format,\n'
-        '        )\n'
-        '        return out.squeeze(1)',
+        '        if self._workspace_buffer is None:\n',
         1,
     ),
 ]
 
-# The impl dtype gate: full replacement body (built separately because
-# its new text embeds the env-var name twice — keep it a plain literal).
-IMPL_EDITS[0] = (
-    "impl_kv_cache_dtype_gate",
-    IMPL_EDITS[0][1],
-    '        if kv_cache_dtype == "nvfp4_ds_mla":\n'
-    '            import os\n'
-    '\n'
-    '            if os.environ.get("%s", "").strip() != "1":\n'
-    '                raise NotImplementedError(\n'
-    '                    "FLASHINFER_MLA_SPARSE_SM120 requires the packed "\n'
-    '                    "fp8_ds_mla KV cache layout; got "\n'
-    '                    f"kv_cache_dtype={kv_cache_dtype!r}. Set "\n'
-    '                    "%s=1 for the suffix nvfp4_ds_mla kernels."\n'
-    '                )\n'
-    '            # suffix nvfp4-ds-mla: our cuda-oxide reader/writer\n'
-    '            # kernels consume and produce the exact 352 B rows on\n'
-    '            # SM120 (the C++ dispatcher is SM100-gated twice).\n'
-    '            self._use_nvfp4_ds_mla = True\n'
-    '        elif kv_cache_dtype != "fp8_ds_mla":\n'
-    '            raise NotImplementedError(\n'
-    '                "FLASHINFER_MLA_SPARSE_SM120 requires the packed fp8_ds_mla "\n'
-    '                f"KV cache layout; got kv_cache_dtype={kv_cache_dtype!r}."\n'
-    '            )\n'
-    '        else:\n'
-    '            self._use_nvfp4_ds_mla = False' % (GATE_ENV, GATE_ENV),
-    1,
-)
-
-# ---------------------------------------------------------------------------
-# (3b) index_group.py — HiSparse row-width dtype fork (register_layer
-#      :189-198): stock forks ONLY on fp8_ds_mla (656); anything else,
-#      including nvfp4_ds_mla, falls into the generic branch that sets
-#      row_width = head_size (576 for ds-MLA) — WRONG for the packed
-#      352 B nvfp4 row, corrupting hot/hw-mirror/host pool geometry.
-#      The HiSparse data plane itself is dtype-blind raw-uint8 over
-#      row_width bytes (hisparse_gather_plan, mirror writes, host
-#      copies), so ONLY the width must be fixed. Exact pinned text.
-# ---------------------------------------------------------------------------
-HISPARSE_EDITS = [
+INDEX_GROUP_EDITS = [
     (
-        "hisparse_register_layer_row_width",
+        "hisparse_row_width",
         '        if kv_cache_dtype == "fp8_ds_mla":\n'
-        '            row_width = FP8_DS_MLA_ROW_BYTES\n'
-        '            kv_dtype = torch.uint8\n'
-        '        else:\n'
-        '            from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype\n'
-        '\n'
-        '            row_width = head_size\n'
-        '            kv_dtype = kv_cache_dtype_str_to_dtype(\n'
-        '                kv_cache_dtype, vllm_config.model_config\n'
-        '            )',
+        '            row_width = FP8_DS_MLA_ROW_BYTES\n',
+        _TAG
+        + '        # packed 352 B nvfp4_ds_mla rows; the HiSparse data plane is\n'
+        '        # row-bytes generic and bind_source_cache re-checks the width.\n'
         '        if kv_cache_dtype == "nvfp4_ds_mla":\n'
-        '            # suffix nvfp4-ds-mla + HiSparse: the packed 352 B row\n'
-        '            # (256 e2m1 NoPE + 64 unscaled e4m3 RoPE + 32 permuted\n'
-        '            # e4m3 SFs) — the HiSparse data plane is dtype-blind\n'
-        '            # raw-uint8 over row_width bytes, so the width is the\n'
-        '            # only geometry input; matches MLAAttentionSpec\n'
-        '            # state_content_bytes (mla_attention.py:1361).\n'
-        '            import os\n'
-        '\n'
-        '            if os.environ.get("SUFFIX_SM120_NVP4DSMLA", "").strip() != "1":\n'
-        '                raise NotImplementedError(\n'
-        '                    "HiSparse register_layer: nvfp4_ds_mla host/hot "\n'
-        '                    "pools need the suffix nvfp4_ds_mla kernels; "\n'
-        '                    "set SUFFIX_SM120_NVP4DSMLA=1."\n'
-        '                )\n'
-        '            row_width = 352\n'
+        f'            row_width = {ROW_BYTES}\n'
         '            kv_dtype = torch.uint8\n'
         '        elif kv_cache_dtype == "fp8_ds_mla":\n'
-        '            row_width = FP8_DS_MLA_ROW_BYTES\n'
-        '            kv_dtype = torch.uint8\n'
-        '        else:\n'
-        '            from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype\n'
-        '\n'
-        '            row_width = head_size\n'
-        '            kv_dtype = kv_cache_dtype_str_to_dtype(\n'
-        '                kv_cache_dtype, vllm_config.model_config\n'
-        '            )',
+        '            row_width = FP8_DS_MLA_ROW_BYTES\n',
         1,
     ),
 ]
 
-HISPARSE_TARGET = "vllm.v1.attention.backends.mla.index_group"
-WRITER_EDITS = [
-    (
-        "concat_and_cache_mla_route",
-        '        from vllm import _custom_ops as ops\n'
-        '\n'
-        '        ops.concat_and_cache_mla(\n'
-        '            kv_c_normed,\n'
-        '            k_pe.squeeze(1),\n'
-        '            kv_cache,\n'
-        '            slot_mapping.flatten(),\n'
-        '            kv_cache_dtype=kv_cache_dtype,\n'
-        '            scale=k_scale,\n'
-        '        )',
-        '        if kv_cache_dtype == "nvfp4_ds_mla":\n'
-            '            import os\n'
-            '\n'
-            '            if os.environ.get("%s", "").strip() == "1":\n'
-        '                # suffix nvfp4-ds-mla: the C++ concat_and_cache_mla\n'
-        '                # dispatch is SM100-gated (build + runtime); our\n'
-        '                # cuda-oxide writer (nvfp4_ds_mla_quant_store)\n'
-        '                # writes the exact 352 B rows on SM120. Negative\n'
-        '                # slot ids are skipped by contract.\n'
-        '                from suffix_hybrid import _native, oxide_kernels\n'
-        '\n'
-        '                oxide_kernels.ensure_loaded("nvfp4_ds_mla")\n'
-        '                _native.nvfp4_ds_mla_quant_store_cuda(\n'
-        '                    kv_c_normed,\n'
-        '                    k_pe.squeeze(1),\n'
-        '                    kv_cache.view(torch.uint8).reshape(-1, 352),\n'
-        '                    slot_mapping.flatten(),\n'
-        '                    torch.cuda.current_stream(\n'
-        '                        kv_c_normed.device\n'
-        '                    ).cuda_stream,\n'
-        '                )\n'
-        '                return\n'
-        '        from vllm import _custom_ops as ops\n'
-        '\n'
-        '        ops.concat_and_cache_mla(\n'
-        '            kv_c_normed,\n'
-        '            k_pe.squeeze(1),\n'
-        '            kv_cache,\n'
-        '            slot_mapping.flatten(),\n'
-        '            kv_cache_dtype=kv_cache_dtype,\n'
-        '            scale=k_scale,\n'
-        '        )' % GATE_ENV,
-        1,
-    ),
-]
+# module -> (fixture file name, edits)
+TARGETS = {
+    BACKEND_MODULE: ("flashinfer_mla_sparse.py", BACKEND_EDITS),
+    IMPL_MODULE: ("flashinfer_mla_sparse_sm120.py", IMPL_EDITS),
+    INDEX_GROUP_MODULE: ("index_group.py", INDEX_GROUP_EDITS),
+}
 
 
-def _apply_edits(name: str, src: str, edits) -> tuple[str, list[str]]:
-    """Count-verify every anchor BEFORE any replacement (nvfp4_kv_patch
-    convention): a drifted file raises PatchDriftError naming every bad
-    anchor at once; the file is untouched unless all counts pass."""
-    bad = [
-        f"{n}: expected {c}, found {src.count(old)}"
-        for n, old, _new, c in edits
-        if src.count(old) != c
-    ]
+def patch_source(module_name: str, src: str) -> tuple[str, list[str]]:
+    """Pure transform of one target file. Every anchor is count-verified
+    BEFORE any replacement (all failures reported at once)."""
+    fname, edits = TARGETS[module_name]
+    bad = [f"{n}: expected {c}, found {src.count(old)}"
+           for n, old, _new, c in edits if src.count(old) != c]
     if bad:
         raise PatchDriftError(
-            f"{name} does not match the pinned anchor text (expected vLLM "
-            f"{PINNED_VLLM}): " + "; ".join(bad)
-        )
-    applied = []
+            f"{fname} does not match the pinned anchor text (expected vLLM "
+            f"{PINNED_VLLM}): " + "; ".join(bad))
     out = src
-    for n, old, new, c in edits:
-        if out.count(old) != c:
+    for n, old, new, _c in edits:
+        if out.count(old) != 1:
             raise PatchDriftError(f"internal error: anchor {n} overlaps")
         out = out.replace(old, new)
-        applied.append(n)
-    compile(out, f"<{PATCH_NAME}-{name}>", "exec")  # syntax gate
-    return out, applied
-
-
-def patch_backend_source(src: str) -> tuple[str, list[str]]:
-    return _apply_edits("flashinfer_mla_sparse", src, BACKEND_EDITS)
-
-
-def patch_impl_source(src: str) -> tuple[str, list[str]]:
-    return _apply_edits("flashinfer_mla_sparse_sm120", src, IMPL_EDITS)
-
-
-def patch_writer_source(src: str) -> tuple[str, list[str]]:
-    return _apply_edits("backend.do_kv_cache_update", src, WRITER_EDITS)
-
-
-def patch_hisparse_source(src: str) -> tuple[str, list[str]]:
-    """HiSparse row-width fork: nvfp4_ds_mla -> 352 B rows, fail-closed."""
-    return _apply_edits("index_group.register_layer", src, HISPARSE_EDITS)
+    compile(out, f"<{PATCH_NAME}:{fname}>", "exec")  # syntax gate
+    return out, [n for n, *_ in edits]
 
 
 # ---------------------------------------------------------------------------
-# apply(): gate -> version pin -> source rewrite exec into the live module
-# dict. Fail-closed doctrine: an enabled-but-broken pool never serves.
-# TODO(draft):
-#   * deferred sys.meta_path front-insertion hooks for BOTH targets
-#     (nvfp4_kv_patch _PostImportFinder pattern — backend.py may import
-#     before the sm120 impl module; the writer edit must fire on
-#     WRITER_TARGET too),
-#   * pre-launch ensure_loaded("nvfp4_ds_mla") at the pod boot gate,
-#     outside graph capture (SUFFIX_OXIDE_PROBE marker wiring),
-#   * fixture copies pinned under sm120-drafts/fixtures/ so the CPU
-#     suite replays the transforms without the sdist.
+# Runtime helpers injected into the impl module (torch/_native imported
+# lazily: this package is imported by sitecustomize before torch exists).
 # ---------------------------------------------------------------------------
+def _native():
+    from suffix_hybrid import _native as n
 
-def apply(module=None, *, force: bool = False) -> bool:
+    if not getattr(n, "HAS_NVFP4_DSMLA_CUDA", False):
+        raise RuntimeError(
+            f"{GATE_ENV}=1 but suffix_hybrid._native lacks the nvfp4_ds_mla "
+            "CUDA ops (bundle built without the oxide-kernels feature)")
+    return n
+
+
+def _suffix_nvfp4_ds_mla_init(impl) -> None:
+    """Impl __init__: geometry check + driver-load the cubin now, on this
+    worker's device, outside any graph capture (fails closed at startup)."""
+    import torch
+    from suffix_hybrid import oxide_kernels
+
+    geo = (impl.kv_lora_rank, impl.qk_rope_head_dim)
+    if geo != (512, 64):
+        raise NotImplementedError(
+            f"[suffix {PATCH_NAME}] kernels need kv_lora_rank 512 / rope 64, "
+            f"got {geo}")
+    _native()
+    dev = torch.cuda.current_device()
+    oxide_kernels.ensure_loaded(FAMILY, dev)
+    impl._nvfp4_num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    print(f"[suffix {PATCH_NAME}] NVFP4-DSMLA impl on cuda:{dev} "
+          f"(heads/rank {impl.num_heads}, {impl._nvfp4_num_sms} SMs, rev "
+          f"{PATCH_REVISION})", file=sys.stderr, flush=True)
+
+
+def _suffix_nvfp4_ds_mla_decode(impl, q, kv_cache, topk, output):
+    """_run_mqa_kernel body: q [T, H, 576] bf16, topk [T, C] int32 physical
+    slots (-1 masked), output [T, H, 512] bf16 (filled and returned)."""
+    import torch
+
+    n = _native()
+    t, h = q.shape[0], q.shape[1]
+    if t == 0:
+        return output
+    ns = n.nvfp4_ds_mla_plan(t, h, topk.shape[-1], impl._nvfp4_num_sms)["ns"]
+    o_part = q.new_empty((t, h, ns, 512), dtype=torch.bfloat16)
+    lse_part = q.new_empty((t, h, ns), dtype=torch.float32)
+    n.nvfp4_ds_mla_decode_cuda(
+        q, kv_cache.view(torch.uint8), topk.contiguous(), output, o_part,
+        lse_part, float(impl.scale),
+        torch.cuda.current_stream(q.device).cuda_stream)
+    return output
+
+
+def _suffix_nvfp4_ds_mla_write(kv_c, k_pe, kv_cache, slot_mapping) -> None:
+    """do_kv_cache_update for nvfp4_ds_mla (HiSparse write/mirror targets
+    included): kv_c [T, 512], k_pe [T, 64] or [T, 1, 64] bf16."""
+    if kv_cache.numel() == 0:
+        return
+    import torch
+
+    if k_pe.dim() == 3:
+        k_pe = k_pe.squeeze(1)
+    _native().nvfp4_ds_mla_quant_store_cuda(
+        kv_c, k_pe, kv_cache.view(torch.uint8), slot_mapping.flatten(),
+        torch.cuda.current_stream(kv_c.device).cuda_stream)
+
+
+_HELPERS = {
+    "_suffix_nvfp4_ds_mla_init": _suffix_nvfp4_ds_mla_init,
+    "_suffix_nvfp4_ds_mla_decode": _suffix_nvfp4_ds_mla_decode,
+    "_suffix_nvfp4_ds_mla_write": _suffix_nvfp4_ds_mla_write,
+}
+
+
+# ---------------------------------------------------------------------------
+# apply(): gate -> SM120 -> version pin -> rewrite -> exec into the live
+# module dict (fail closed: an enabled-but-broken pool never serves).
+# ---------------------------------------------------------------------------
+def exec_patched_source(module, new_src: str, src_path: Path) -> None:
+    """exec under a linecache-registered name (source-introspectable)."""
+    import linecache
+
+    fname = f"{src_path}.{PATCH_NAME}-{PATCH_REVISION}.py"
+    linecache.cache[fname] = (
+        len(new_src), None, new_src.splitlines(keepends=True), fname)
+    exec(compile(new_src, fname, "exec"), module.__dict__)
+
+
+def apply(module) -> bool:
+    """Patch one target module. True = active; False = cleanly inert (gate
+    off / not SM120). Raises on any inconsistency while enabled on SM120."""
     if not gate_enabled():
         return False
     if not is_sm120():
-        print(
-            f"[suffix {PATCH_NAME}] present but inert: {GATE_ENV}=1 is set "
-            "but this is not an SM120 (cc 12.x) GPU.",
-            file=sys.stderr, flush=True,
-        )
+        print(f"[suffix {PATCH_NAME}] present but inert: {GATE_ENV}=1 but "
+              "this is not an SM120 (cc 12.x) GPU.", file=sys.stderr, flush=True)
         return False
-    if module is None:
-        module = importlib.import_module(TARGET_MODULE)
-    if getattr(module, MARKER_ATTR, None) == PATCH_REVISION and not force:
-        return True  # idempotent
+    name = module.__name__
+    if name not in TARGETS:
+        raise PatchDriftError(f"{name} is not a {PATCH_NAME} target")
+    if getattr(module, MARKER_ATTR, None) == PATCH_REVISION:
+        return True
     import vllm
 
-    vllm_ver = getattr(vllm, "__version__", "")
-    if not vllm_ver.startswith(PINNED_VLLM):
-        raise RuntimeError(
-            f"[suffix {PATCH_NAME}] version drift: vllm {vllm_ver!r} != "
-            f"{PINNED_VLLM}; this patch is validated for {PINNED_VLLM} only."
-        )
+    ver = getattr(vllm, "__version__", "")
+    if not ver.startswith(PINNED_VLLM):
+        raise PatchDriftError(f"vllm {ver!r} != pinned {PINNED_VLLM}")
     src_path = Path(module.__file__)
-    src = src_path.read_text(errors="replace")
-    new_src, applied = patch_impl_source(src)
-    exec(compile(new_src, str(src_path), "exec"), module.__dict__)
+    src = src_path.read_text()
+    if HELPER_TAG in src:
+        raise PatchDriftError(f"{src_path} already carries the rewrite on disk")
+    new_src, applied = patch_source(name, src)
+    if name == IMPL_MODULE:
+        module.__dict__.update(_HELPERS)
+    exec_patched_source(module, new_src, src_path)
     setattr(module, MARKER_ATTR, PATCH_REVISION)
-    print(
-        f"[suffix {PATCH_NAME}] ACTIVE on SM120: nvfp4_ds_mla sparse-MLA "
-        f"decode/writer on our cuda-oxide kernels (rev {PATCH_REVISION}; "
-        f"{len(applied)} anchors applied; vllm {vllm_ver}).",
-        file=sys.stderr, flush=True,
-    )
+    print(f"[suffix {PATCH_NAME}] ACTIVE on SM120: {name} rewritten "
+          f"({', '.join(applied)}; rev {PATCH_REVISION}; vllm {ver}).",
+          file=sys.stderr, flush=True)
+    return True
+
+
+def _hook_callback(module) -> None:
+    try:
+        applied = apply(module)
+    except Exception as exc:
+        raise SystemExit(
+            f"[suffix {PATCH_NAME}] enabled but installation FAILED on "
+            f"{module.__name__}: {exc}") from exc
+    if not applied and is_sm120():
+        raise SystemExit(f"[suffix {PATCH_NAME}] hook fired but apply() declined "
+                         "on SM120 with the gate on (armed-but-inert guard).")
+
+
+def install_post_import_hook() -> bool:
+    """sitecustomize entry (stdlib only): arm one front-inserted one-shot
+    finder per target (nvfp4_kv_patch._PostImportFinder, crash-1 lesson).
+    A target imported before arming may already be bound by its importers
+    (classes, register_layer) — refuse instead of patching half the world."""
+    if not gate_enabled():
+        return False
+    from nvfp4_kv_patch import _PostImportFinder
+
+    early = sorted(t for t in TARGETS if t in sys.modules)
+    if early:
+        raise SystemExit(f"[suffix {PATCH_NAME}] {early} imported before the "
+                         "hook armed; refusing to patch a live module graph.")
+    for target in TARGETS:
+        if not any(isinstance(f, _PostImportFinder) and f.target == target
+                   and f.armed for f in sys.meta_path):
+            sys.meta_path.insert(0, _PostImportFinder(target, _hook_callback))
+    print(f"[suffix {PATCH_NAME}] armed at sys.meta_path[0]: will patch "
+          f"{len(TARGETS)} sparse-MLA modules on first import.",
+          file=sys.stderr, flush=True)
     return True
