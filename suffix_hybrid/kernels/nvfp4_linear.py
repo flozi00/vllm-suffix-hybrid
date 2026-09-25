@@ -49,7 +49,7 @@ FAMILY = "nvfp4_gemm"
 MAX_M = 16
 ORACLE_REL = 2e-2
 _state = {"armed": False, "oracle": {}, "layers_ours": 0, "layers_stock": 0,
-          "ws": {}}
+          "ws": {}, "instances": 0, "shapes": {}, "checked": False, "hook": None}
 
 
 def _log(msg: str) -> None:
@@ -104,6 +104,10 @@ def _make_kernel_cls():
     class SuffixNvFp4LinearKernel(FlashInferCutlassNvFp4LinearKernel):
         """FlashInfer-CUTLASS NVFP4 linear + our sm_120a decode GEMM for M<=16."""
 
+        def __init__(self, config):
+            super().__init__(config)
+            _state["instances"] += 1  # selection witness (checked at first forward)
+
         @classmethod
         def is_supported(cls, compute_capability=None):
             ok, why = super().is_supported(compute_capability)
@@ -122,6 +126,9 @@ def _make_kernel_cls():
             why = eligible(n, k, layer.output_size_per_partition,
                            nvfp4_weight_padding_bytes(layer))
             layer._sfx_nvfp4 = None
+            route = "flashinfer" if why is not None else "ours"
+            key = f"{n}x{k}:{route}"
+            _state["shapes"][key] = _state["shapes"].get(key, 0) + 1
             if why is not None:
                 _state["layers_stock"] += 1
                 _log(f"layer N={n} K={k} stays on FlashInfer CUTLASS: {why}")
@@ -211,6 +218,51 @@ def _make_kernel_cls():
     return SuffixNvFp4LinearKernel
 
 
+def selection_verdict(instances: int, quantization, disabled: list[str]) -> str | None:
+    """None when SuffixNvFp4LinearKernel was selected for >= 1 NVFP4 linear,
+    else the loud startup error text."""
+    if instances > 0:
+        return None
+    if quantization in (None, "None", ""):
+        why = ("the served checkpoint is NOT NVFP4-quantized (quantization=None, "
+               "bf16 weights) — there is no NVFP4 linear to replace")
+    else:
+        why = (f"quantization={quantization} built no NVFP4 linear through "
+               "init_nvfp4_linear_kernel with SuffixNvFp4LinearKernel "
+               f"(VLLM_DISABLED_KERNELS={','.join(disabled) or '-'})")
+    return f"{MARKER} NVFP4-GEMM NOT SELECTED with {GATE}=1: {why}"
+
+
+def _first_forward_check(module, args):
+    """Global forward pre-hook (PyTorch API, not a vLLM patch): fires on the
+    first module call after model load (profile / encoder warmup, eager, before
+    any CUDA-graph capture), removes itself, and fails startup if our kernel
+    was never selected; otherwise logs the per-shape selection marker."""
+    h = _state.pop("hook", None)
+    if h is not None:
+        h.remove()
+    if _state["checked"]:
+        return
+    _state["checked"] = True
+    quant = None
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+        cfg = get_current_vllm_config_or_none()
+        quant = getattr(getattr(cfg, "model_config", None), "quantization", None)
+    except Exception:  # verdict below still fires on instances == 0
+        pass
+    disabled = [x for x in os.environ.get("VLLM_DISABLED_KERNELS", "").split(",") if x]
+    err = selection_verdict(_state["instances"], quant, disabled)
+    if err is not None:
+        _log(err)
+        raise RuntimeError(err)
+    shapes = ", ".join(f"{k} x{v}" for k, v in sorted(_state["shapes"].items()))
+    _log(f"NVFP4-GEMM SELECTION: NVFP4 linear kernel = SuffixNvFp4LinearKernel "
+         f"({_state['instances']} instances; quantization={quant}); per shape "
+         f"(NxK:route x layers): {shapes}")
+    _log(summary())
+
+
 def _disable_earlier(names: list[str]) -> list[str]:
     cur = [s for s in os.environ.get("VLLM_DISABLED_KERNELS", "").split(",") if s]
     add = [n for n in names if n not in cur]
@@ -250,6 +302,10 @@ def register():
         raise RuntimeError(f"{GATE}=1: VLLM_DISABLED_KERNELS is cached; cannot route "
                            "NVFP4 selection to SuffixNvFp4LinearKernel")
     register_linear_kernel(cls, PlatformEnum.CUDA, "nvfp4")
+    if cls not in _POSSIBLE_NVFP4_KERNELS.get(PlatformEnum.CUDA, []):
+        raise RuntimeError(f"{GATE}=1: register_linear_kernel did not add our kernel")
+    _state["hook"] = torch.nn.modules.module.register_module_forward_pre_hook(
+        _first_forward_check)
     _state["armed"] = True
     _log(f"NVFP4-GEMM armed: SuffixNvFp4LinearKernel registered (M<={MAX_M} -> "
          f"sm_120a mxf4nvf4 SASS, sha256 {ent[0]['sha256'][:12]}; else FlashInfer "

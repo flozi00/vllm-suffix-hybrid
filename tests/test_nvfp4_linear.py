@@ -51,3 +51,33 @@ def test_entry_point():
     cfg.read(ROOT / "suffix_qwen_gdn_ep-1.0.dist-info" / "entry_points.txt")
     assert cfg["vllm.general_plugins"]["suffix_nvfp4_gemm"] == \
         "suffix_hybrid.kernels.nvfp4_linear:register"
+
+
+def test_selection_verdict_fails_loud_on_bf16_checkpoint():
+    msg = nl.selection_verdict(0, None, [])
+    assert "NOT NVFP4-quantized" in msg and "NOT SELECTED" in msg
+    msg = nl.selection_verdict(0, "modelopt_fp4", ["A"])
+    assert "modelopt_fp4" in msg and "VLLM_DISABLED_KERNELS=A" in msg
+    assert nl.selection_verdict(3, "modelopt_fp4", []) is None
+
+
+def test_first_forward_hook_raises_when_not_selected(monkeypatch):
+    import torch
+    monkeypatch.setattr(nl, "_state", dict(nl._state, instances=0, checked=False,
+                                           shapes={}, hook=None))
+    h = torch.nn.modules.module.register_module_forward_pre_hook(nl._first_forward_check)
+    nl._state["hook"] = h
+    with pytest.raises(RuntimeError, match="NOT SELECTED"):
+        torch.nn.Linear(2, 2)(torch.zeros(1, 2))
+    torch.nn.Linear(2, 2)(torch.zeros(1, 2))  # hook removed: no second raise
+
+
+def test_first_forward_hook_logs_selection(monkeypatch, capsys):
+    import torch
+    monkeypatch.setattr(nl, "_state", dict(nl._state, instances=4, checked=False,
+                                           shapes={"5120x17408:ours": 64}, hook=None))
+    nl._state["hook"] = torch.nn.modules.module.register_module_forward_pre_hook(
+        nl._first_forward_check)
+    torch.nn.Linear(2, 2)(torch.zeros(1, 2))
+    err = capsys.readouterr().err
+    assert "NVFP4-GEMM SELECTION" in err and "5120x17408:ours x64" in err

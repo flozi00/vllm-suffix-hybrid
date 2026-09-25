@@ -82,3 +82,11 @@ def test_kernel_source_uses_nvf4_block_scale_mma_and_sm120a():
     assert '"arch": "sm_120a"' in var
     entries = re.findall(r"pub unsafe fn (\w+)\(", src)
     assert entries == ["nvfp4_quant_act", "nvfp4_gemm_m16", "nvfp4_splitk_reduce"]
+
+
+def test_oracle_gate_is_relative_to_vllm():
+    # silicon 87fdbc80: bit-identical to vLLM, vLLM itself 1.27e-2 from ref
+    assert ng.oracle_ok(1.27e-2, 0.0, 1.27e-2)
+    assert ng.oracle_ok(9e-3, 1e-3, 1e-3)          # floor 1e-2
+    assert not ng.oracle_ok(1.5e-2, 1e-3, 1.27e-2)  # > 1.1 x vLLM's error
+    assert not ng.oracle_ok(5e-3, 3e-2, 5e-3)       # disagrees with vLLM
