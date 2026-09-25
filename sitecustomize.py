@@ -153,6 +153,20 @@ if (os.environ.get("SUFFIX_OXIDE_PROBE", "").strip() == "1"
     os.environ["SUFFIX_OXIDE_PROBE_DONE"] = "1"
     subprocess.run([sys.executable, "-m", "suffix_hybrid.oxide_kernels"])
 
+# NVFP4 W4A4 decode-GEMM spike (qwen38-27b-kernels.md §7): SUFFIX_NVFP4_GEMM_
+# SPIKE=oracle|bench|both runs `python -m suffix_hybrid.kernels.nvfp4_gemm`
+# once per pod in a CHILD process (its CUDA context is gone before vLLM sizes
+# memory). Evidence only: markers "[suffix nvfp4-gemm] NVFP4-GEMM ORACLE
+# PASS|FAIL" and "bench ..." lines; never gates serving.
+_nvfp4_gemm = os.environ.get("SUFFIX_NVFP4_GEMM_SPIKE", "").strip().lower()
+if _nvfp4_gemm in ("oracle", "bench", "both") and not os.environ.get(
+        "SUFFIX_NVFP4_GEMM_SPIKE_DONE"):
+    import subprocess
+    import sys
+    os.environ["SUFFIX_NVFP4_GEMM_SPIKE_DONE"] = "1"
+    subprocess.run([sys.executable, "-m", "suffix_hybrid.kernels.nvfp4_gemm",
+                    _nvfp4_gemm])
+
 # NVFP4-KV pod warmup oracle (gemma-hd512 dossier c.4). The console pins the
 # pod command to `vllm serve`, so the on-silicon numerics gate runs here: once
 # per pod (the _DONE marker is inherited by every child), in a CHILD process so

@@ -1,0 +1,14 @@
+# NVFP4 W4A4 decode GEMM capability spike (qwen3.8-27b): sm_120a block-scaled
+# FP4 mma (kind::mxf4nvf4, ue4m3 scales). Standalone crate (own [workspace]);
+# built only by scripts/oxide_build.py (arch from oxide-variants.json).
+[package]
+name = "nvfp4_gemm"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-core = "0.3.1"

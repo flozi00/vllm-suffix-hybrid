@@ -28,6 +28,7 @@ import subprocess
 from pathlib import Path
 
 ARCH = "sm_120"
+ALLOWED_ARCHS = ("sm_120", "sm_120a")
 MAX_PTX_ISA = (9, 0)  # CUDA 13.0 ptxas accepts PTX ISA <= 9.0
 PTXAS_RELEASE = "13.0"
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,10 +50,16 @@ def ptx_facts(ptx: str):
 
 def build_one(crate, var, nightly, ptxas, cuobjdump, out):
     name = crate.name + var["suffix"]
+    # Per-variant target: "sm_120" (default) or the arch-specific "sm_120a"
+    # (needed by e.g. block-scaled FP4 mma kind::mxf4nvf4; the driver loads
+    # sm_120a SASS on cc 12.0 devices only).
+    arch = var.get("arch", ARCH)
+    if arch not in ALLOWED_ARCHS:
+        raise SystemExit(f"{name}: arch {arch} not in {ALLOWED_ARCHS}")
     ptx_path = crate / f"{crate.name}.ptx"
     if ptx_path.exists():
         ptx_path.unlink()
-    cmd = ["cargo", f"+{nightly}", "oxide", "build", "--arch", ARCH]
+    cmd = ["cargo", f"+{nightly}", "oxide", "build", "--arch", arch]
     if var["features"]:
         cmd += ["--features", var["features"]]
     run(cmd, cwd=crate)
@@ -60,13 +67,13 @@ def build_one(crate, var, nightly, ptxas, cuobjdump, out):
         raise SystemExit(f"{name}: cargo-oxide produced no {ptx_path.name}")
     ptx = ptx_path.read_text()
     isa, target, entries = ptx_facts(ptx)
-    if target != ARCH or isa > MAX_PTX_ISA or not entries:
+    if target != arch or isa > MAX_PTX_ISA or not entries:
         raise SystemExit(f"{name}: .target {target} .version {isa} entries {entries} "
-                         f"(need {ARCH}, <= {MAX_PTX_ISA}, >= 1 entry)")
+                         f"(need {arch}, <= {MAX_PTX_ISA}, >= 1 entry)")
     if ".local" in ptx:
         print(f"WARNING {name}: PTX uses local memory (register arrays spilled)")
     cubin = out / f"{name}.cubin"
-    run([ptxas, f"-arch={ARCH}", "-O3", *var["ptxas"], "-o", str(cubin), str(ptx_path)])
+    run([ptxas, f"-arch={arch}", "-O3", *var["ptxas"], "-o", str(cubin), str(ptx_path)])
     elf = run([cuobjdump, "--list-elf", str(cubin)]).stdout
     if ARCH not in elf:
         raise SystemExit(f"{name}: cubin has no {ARCH} SASS:\n{elf}")
@@ -80,6 +87,7 @@ def build_one(crate, var, nightly, ptxas, cuobjdump, out):
         "bytes": len(data),
         "ptx_isa": f"{isa[0]}.{isa[1]}",
         "ptxas_flags": var["ptxas"],
+        "arch": arch,
         "entries": entries,
     }
 

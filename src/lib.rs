@@ -314,6 +314,8 @@ mod nvfp4_attn_oxide;
 #[cfg(feature = "oxide-kernels")]
 mod oxide;
 #[cfg(feature = "oxide-kernels")]
+mod nvfp4_gemm_oxide;
+#[cfg(feature = "oxide-kernels")]
 mod qgdn_oxide;
 mod qwen_gdn;
 #[cfg(all(feature = "qwen-gdn-kernels", not(feature = "oxide-kernels")))]
@@ -397,6 +399,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qwen_gdn::gdn_decode_fused_ref, m)?)?;
     #[cfg(feature = "oxide-kernels")]
     m.add_function(wrap_pyfunction!(qgdn_oxide::gdn_decode_fused_cuda, m)?)?;
+    #[cfg(feature = "oxide-kernels")]
+    m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_cuda, m)?)?;
     #[cfg(all(feature = "qwen-gdn-kernels", not(feature = "oxide-kernels")))]
     for f in [
         wrap_pyfunction!(qwen_gdn_gpu::gdn_decode_fused_cuda, m)?,
