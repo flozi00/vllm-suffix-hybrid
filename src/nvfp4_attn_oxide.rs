@@ -9,26 +9,15 @@
 //! Grid depends only on (batch, q_len, heads) — never on seq_lens — so a
 //! captured CUDA graph replays correctly for any KV lengths.
 
-use crate::nvfp4_attn::{plan, round16, AttnPlan};
+use crate::nvfp4_attn::{merge_smem_bytes, partial_smem_bytes, plan, round16, AttnPlan, THREADS};
 use crate::oxide::{function, launch, Arg};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
 pub const FAMILY: &str = "k2_nvfp4_attn";
-const PAD: usize = 8;
-const WARPS: usize = 4;
-const TN: usize = 16;
-
-/// Dynamic shared memory of nvfp4_attn_partial (mirror of its carve-up).
-pub fn partial_smem_bytes(m: usize, d: usize) -> usize {
-    let row = d + PAD;
-    (m * row + 2 * TN * row) * 2 + WARPS * m * TN * 4 + m * TN * 2 + 3 * m * 4
-}
-
-pub fn merge_smem_bytes(ns: usize, m: usize) -> usize {
-    (ns * m + m) * 4
-}
+/// e4m3 -> f16 in-kernel yields scale * 2^-8 (exact bit shift); undone here.
+const SCALE_FIX: f32 = 256.0;
 
 struct TInfo {
     ptr: u64,
@@ -142,12 +131,6 @@ pub fn nvfp4_paged_attn_cuda<'py>(
     }
     let p: AttnPlan =
         plan(batch, q_len, hq, hkv, d, page, num_sms).map_err(PyValueError::new_err)?;
-    if p.m % 16 != 0 || (p.m / 16) * (d / 32) > 16 {
-        return Err(PyValueError::new_err(format!(
-            "plan M={} D={d} outside the oxide kernel's 16 mma-slot budget",
-            p.m
-        )));
-    }
     let (dh, sd) = (d / 2, d / 16);
     need("q", &qi, "torch.bfloat16", &[tokens, hq, d])?;
     if qi.stride[1] != d {
@@ -171,10 +154,11 @@ pub fn nvfp4_paged_attn_cuda<'py>(
             )));
         }
     }
-    // 4-byte packed-data loads: every word address must be 4-aligned.
-    if kd.ptr % 4 != 0 || vd.ptr % 4 != 0 || page_bytes % 4 != 0 || dh % 4 != 0 {
+    // cp.async 16 B copies of every page run: all four view bases and the
+    // page stride must be 16-byte aligned (torch allocations + HND views are).
+    if [kd.ptr, ks.ptr, vd.ptr, vs.ptr].iter().any(|p| p % 16 != 0) || page_bytes % 16 != 0 {
         return Err(PyValueError::new_err(
-            "k/v data views must be 4-byte aligned",
+            "k/v data and scale views must be 16-byte aligned (cp.async)",
         ));
     }
     if page_bytes > u32::MAX as usize {
@@ -229,7 +213,6 @@ pub fn nvfp4_paged_attn_cuda<'py>(
         u(bt.stride[0]),
         u(hkv),
         u(p.g),
-        u(p.gp),
         u(p.qt),
         u(p.m),
         u(d),
@@ -237,8 +220,9 @@ pub fn nvfp4_paged_attn_cuda<'py>(
         u(q_len),
         u(page),
         u(p.ns),
+        u(p.tn),
         Arg::I32(window_left),
-        Arg::F32(qk_scale_log2),
+        Arg::F32(qk_scale_log2 * SCALE_FIX),
     ];
     let merge_args = vec![
         Arg::Ptr(oo.ptr),
@@ -246,34 +230,29 @@ pub fn nvfp4_paged_attn_cuda<'py>(
         Arg::Ptr(lp.ptr),
         u(hkv),
         u(p.g),
-        u(p.gp),
         u(p.qt),
         u(p.m),
         u(d),
         u(p.nqt),
         u(q_len),
         u(p.ns),
-        Arg::F32(v_scale),
+        Arg::F32(v_scale * SCALE_FIX),
     ];
-    let (rows, ns, m) = (p.rows as u32, p.ns as u32, p.m);
+    let (rows, ns) = (p.rows as u32, p.ns as u32);
+    let psmem = partial_smem_bytes(p.m, d, p.tn) as u32;
+    let msmem = merge_smem_bytes(p.ns, p.m) as u32;
+    let block = (THREADS as u32, 1, 1);
     py.detach(move || {
         crate::guard_py("nvfp4_paged_attn_cuda", move || {
             let run = || -> Result<(), String> {
                 let fp = function(FAMILY, "nvfp4_attn_partial", ord)?;
                 let fm = function(FAMILY, "nvfp4_attn_merge", ord)?;
-                launch(
-                    fp,
-                    (rows, ns, 1),
-                    (128, 1, 1),
-                    partial_smem_bytes(m, d) as u32,
-                    stream_ptr,
-                    &partial_args,
-                )?;
+                launch(fp, (rows, ns, 1), block, psmem, stream_ptr, &partial_args)?;
                 launch(
                     fm,
-                    (rows, 1, 1),
-                    (128, 1, 1),
-                    merge_smem_bytes(ns as usize, m) as u32,
+                    (rows, (d / 64) as u32, 1),
+                    block,
+                    msmem,
                     stream_ptr,
                     &merge_args,
                 )
@@ -281,25 +260,4 @@ pub fn nvfp4_paged_attn_cuda<'py>(
             run().map_err(|e| PyRuntimeError::new_err(format!("K2-NVFP4 launch failed: {e}")))
         })
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn smem_fits_sm120_for_every_served_plan() {
-        for &(hq, hkv, d) in &[(16, 2, 512), (16, 8, 256), (24, 4, 256), (8, 8, 128)] {
-            for q_len in 1..=16 {
-                for batch in [1, 7, 256] {
-                    let p = plan(batch, q_len, hq, hkv, d, 16, 188).unwrap();
-                    assert!(p.m % 16 == 0 && (p.m / 16) * (d / 32) <= 16, "{p:?}");
-                    assert!(partial_smem_bytes(p.m, d) <= 99 * 1024);
-                    assert!(merge_smem_bytes(p.ns, p.m) <= 99 * 1024);
-                }
-            }
-        }
-        // gemma hd512 decode: the documented 54,720-byte carve-up
-        assert_eq!(partial_smem_bytes(16, 512), 54_720);
-    }
 }

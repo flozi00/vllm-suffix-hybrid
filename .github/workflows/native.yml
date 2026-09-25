@@ -61,7 +61,6 @@ jobs:
           cargo test --release
           cargo test --release --features oxide-kernels,qwen-gdn-kernels
           cargo check --release --features cutile-kernels
-          cargo check --release --features nvfp4-attn-kernels
       - name: cuda-oxide toolchain (pinned nightly + its llc/NVPTX) + ptxas 13.0
         run: |
           rustup toolchain install "$OXIDE_NIGHTLY" --profile minimal -c rust-src,rustc-dev,llvm-tools

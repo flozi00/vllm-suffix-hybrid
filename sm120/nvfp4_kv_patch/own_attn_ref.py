@@ -126,21 +126,30 @@ def reference(q, cache, block_table, seq_lens, q_len, sm_scale, k_scale=1.0,
     return out
 
 
+def f16(x):
+    """Round float -> f16 (nearest-even), returned as float64."""
+    return np.asarray(x, dtype=np.float64).astype(np.float16).astype(np.float64)
+
+
 def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
                 k_scale=1.0, v_scale=1.0, window_left=-1):
-    """Transcription of nvfp4_attn_partial + nvfp4_attn_merge."""
+    """Transcription of nvfp4_attn_partial + nvfp4_attn_merge (v2 layout:
+    rows = q tokens x GQA heads packed token-major, TN-token tiles, f16
+    Q/K/V/P operands, NS splits of >= min_tiles tiles, bf16 partials)."""
     tokens, hq, d = q.shape
     hkv, page = cache.hkv, cache.page
-    g, gp, qt_n, m_rows = hq // hkv, plan["gp"], plan["qt"], plan["m"]
+    g, qt_n, m_rows = hq // hkv, plan["qt"], plan["m"]
     tn, ns, nqt = plan["tn"], plan["ns"], plan["nqt"]
+    min_tiles = plan.get("min_tiles", 1)
     sd, sg, tq = d // 16, d // 64, tn // 4
     batch = tokens // q_len
     qk_scale_log2 = sm_scale * k_scale * math.log2(math.e)
-    q5 = bf16(q).reshape(batch, q_len, hkv, g, d)
+    q5 = f16(bf16(q)).reshape(batch, q_len, hkv, g, d)
     rows = batch * hkv * nqt
     o_part = np.zeros((rows, ns, m_rows, d))
-    lse_part = np.zeros((rows, ns, m_rows))
+    lse_part = np.full((rows, ns, m_rows), -np.inf)
     tiles_per_page = page // tn
+    real = qt_n * g
     for r in range(rows):
         b, h, qt = r // (hkv * nqt), (r // nqt) % hkv, r % nqt
         kv_len = int(seq_lens[b])
@@ -149,16 +158,21 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
         lo = max(q0 - window_left, 0) if window_left >= 0 else 0
         lo_t, hi_t = lo // tn, -(-hi // tn)
         n_t = max(hi_t - lo_t, 0)
-        per = -(-n_t // ns)
-        # Q tile [1, QT, 1, GP, D], zero-padded outside the view.
-        qm = np.zeros((qt_n, gp, d))
-        tok = q5[b, qt * qt_n:qt * qt_n + qt_n, h]
-        qm[:tok.shape[0], :g] = tok
-        qm = qm.reshape(m_rows, d)
-        qpos = np.repeat(q0 + np.arange(qt_n), gp)[:, None]
+        per = max(-(-n_t // ns), min_tiles)
+        # rows token-major (i*G + g), padded rows / tokens past q_len = 0
+        qm = np.zeros((m_rows, d))
+        row_ok = np.zeros(m_rows, dtype=bool)
+        for row in range(real):
+            i = row // g
+            if qt * qt_n + i < q_len:
+                qm[row] = q5[b, qt * qt_n + i, h, row % g]
+                row_ok[row] = True
+        qpos = (q0 + np.arange(m_rows) // g)[:, None]
         for s in range(ns):
             t0 = lo_t + s * per
             t1 = min(t0 + per, hi_t)
+            if t0 >= t1:
+                continue  # empty split: lse -inf, O never read
             m_i = np.full((m_rows, 1), -np.inf)
             l_i = np.zeros((m_rows, 1))
             acc = np.zeros((m_rows, d))
@@ -169,11 +183,11 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
                 kb = cache.k_data[pg, h, rows_]
                 kq = np.stack((E2M1[kb & 0xF], E2M1[kb >> 4]), -1).reshape(tn, d)
                 ks = np.repeat(e4m3(cache.k_sf[pg, h, rows_]), 16, axis=-1)
-                kt = bf16(kq * ks)
+                kt = kq * ks  # exact in f16
                 with np.errstate(invalid="ignore"):
                     sc = (qm @ kt.T) * qk_scale_log2
                 kpos = (tok0 + np.arange(tn))[None, :]
-                ok = (kpos <= qpos) & (kpos < kv_len)
+                ok = (kpos <= qpos) & (kpos < kv_len) & row_ok[:, None]
                 if window_left >= 0:
                     ok &= kpos + window_left >= qpos
                 sc = np.where(ok, sc, -np.inf)
@@ -190,10 +204,10 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
                 vs = np.repeat(vsf.transpose(0, 3, 1, 2).reshape(tn, sd), 16, -1)
                 valid = (tok0 + np.arange(tn) < kv_len)[:, None]
                 with np.errstate(invalid="ignore"):
-                    vt = bf16(np.where(valid, vq * vs, 0.0))
-                acc = bf16(p) @ vt + acc * alpha
+                    vt = np.where(valid, vq * vs, 0.0)
+                acc = f16(p) @ vt + acc * alpha
             l_safe = np.where(l_i == 0, 1.0, l_i)
-            o_part[r, s] = bf16(acc / l_safe)
+            o_part[r, s] = bf16(np.where(l_i == 0, 0.0, acc / l_safe))
             with np.errstate(divide="ignore"):
                 lse_part[r, s] = (m_i + np.log2(l_i))[:, 0]
     out = np.zeros((tokens, hq, d))
@@ -205,9 +219,10 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
         mx = np.where(mx == -np.inf, 0.0, mx)
         w = np.exp2(lse - mx)
         wsum = w.sum(0)[:, None]
-        wsum = np.where(wsum == 0, 1.0, wsum)
-        o = (o_part[r] * w[:, :, None]).sum(0) * (v_scale / wsum)
-        o = bf16(o).reshape(qt_n, gp, d)
-        n_tok = min(qt_n, q_len - qt * qt_n)
-        out5[b, qt * qt_n:qt * qt_n + n_tok, h] = o[:n_tok, :g]
+        inv = np.where(wsum == 0, 0.0, v_scale / np.where(wsum == 0, 1.0, wsum))
+        o = bf16((o_part[r] * w[:, :, None]).sum(0) * inv)
+        for row in range(real):
+            i = row // g
+            if qt * qt_n + i < q_len:
+                out5[b, qt * qt_n + i, h, row % g] = o[row]
     return out

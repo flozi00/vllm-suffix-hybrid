@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! K2-NVFP4: launch planning + layout contract for our SM120 NVFP4-KV paged
-//! decode / spec-verify attention kernel (kernel + host op:
-//! src/nvfp4_attn_gpu.rs, feature `nvfp4-attn-kernels`). Always built: the
-//! plan is pure integer math, unit-tested on any host and exposed to Python
-//! (`nvfp4_attn_plan`) so the adapter sizes the split-KV workspace with the
-//! exact numbers the kernel is specialized on.
+//! decode / spec-verify attention (kernel kernels-oxide/k2_nvfp4_attn, host
+//! op src/nvfp4_attn_oxide.rs). Always built: pure integer math, unit-tested
+//! on any host and exposed to Python (`nvfp4_attn_plan`) so the adapter sizes
+//! the split-KV workspace with the exact numbers the kernel runs with.
 //!
 //! Layout contract (vLLM 0.30.0 nvfp4_kv_cache_kernels.cu, HND pages; split
 //! views = vllm.utils.torch_utils.nvfp4_split_data_scale):
@@ -12,51 +11,66 @@
 //!   k_sf          [P, HKV, PAGE, D/16] e4m3, linear (token, block)
 //!   v_sf          same bytes, 4-token swizzled per (page, head):
 //!                 logical (t, g) at ((t/4)*4 + g/(S/4))*S + (g%(S/4))*4 + t%4
-//!                 => viewed as [P, HKV, PAGE/4, 4 (g/SG), SG (g%SG), 4 (t%4)]
-//!   value = e2m1 * e4m3 * global scale (k_scale folded into the logit scale,
-//!   v_scale applied once in the merge).
+//!   value = e2m1 * e4m3 * global scale.
 //!
-//! Tile plan (all tile dims powers of two — a Tile IR requirement):
-//!   GP = next_pow2(G)          query heads of one KV group (G = HQ/HKV)
-//!   QT q tokens per CTA, M = QT*GP rows, M*D <= ACC_ELEMS (f32 accumulator
-//!      budget per CTA) and M >= 16 where the budget allows (mma row tile)
-//!   NQT = ceil(q_len/QT) CTAs per (request, kv head)
-//!   TN = 16 KV tokens per tile (cuda-oxide kernel), 16 | page_size
-//!   NS split-KV partitions: a function of the launch rows ONLY (never of
-//!      seq_lens) so the grid is CUDA-graph replay-stable; each CTA derives
-//!      its chunk from seq_lens on the device.
-//!   DT merge D-chunk: NS*M*DT <= MERGE_ELEMS.
+//! Tile plan (v2, performance layout):
+//!   rows of one CTA = QT q-tokens x G heads of ONE kv head, packed
+//!      token-major (row = i*G + g) — every KV byte a CTA streams feeds all
+//!      of them (MTP verify q_len 9 x G 8 = 72 rows share the KV reads).
+//!   M = round16(QT*G) <= MAX_ROWS (O accumulator / Q smem budget); QT is
+//!      the balanced split of q_len into NQT = ceil(q_len*G / MAX_ROWS) CTAs.
+//!   TN KV tokens per pipelined smem stage: largest of 64/32/16 dividing the
+//!      page and fitting the 99 KB opt-in smem with a 2-stage cp.async ring.
+//!   NS split-KV partitions = ceil(num_sms / R): one wave of CTAs, a
+//!      function of the launch rows ONLY (never of seq_lens) so the grid is
+//!      CUDA-graph replay-stable; each CTA derives its chunk from seq_lens on
+//!      the device (>= MIN_TILES_PER_SPLIT tiles, so short contexts use fewer
+//!      splits and less partial traffic).
 
-pub const ACC_ELEMS: usize = 8192;
-#[allow(dead_code)] // cutile-track budget (retired kernels + tests)
-pub const KV_TILE_ELEMS: usize = 8192;
-pub const MERGE_ELEMS: usize = 8192;
-pub const MAX_SPLITS: usize = 64;
+pub const MAX_ROWS: usize = 48;
+pub const MAX_SPLITS: usize = 256;
 pub const MAX_Q_LEN: usize = 16;
+pub const MIN_TILES_PER_SPLIT: usize = 2;
 pub const HEAD_DIMS: [usize; 3] = [128, 256, 512];
+/// SM120 opt-in dynamic shared memory per block.
+pub const SMEM_LIMIT: usize = 99 * 1024;
+/// Threads per CTA of both kernels (8 warps).
+pub const THREADS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttnPlan {
     pub d: usize,
     pub g: usize,
-    pub gp: usize,
     pub qt: usize,
     pub nqt: usize,
     pub m: usize,
     pub tn: usize,
     pub ns: usize,
-    pub dt: usize,
     /// Launch rows R = batch * hkv * nqt (partial grid = (R, NS, 1), merge
-    /// grid = (R, D/DT, 1)).
+    /// grid = (R, D/64, 1)).
     pub rows: usize,
 }
 
-fn floor_pow2(x: usize) -> usize {
-    if x == 0 {
-        0
-    } else {
-        1 << (usize::BITS - 1 - x.leading_zeros())
-    }
+pub fn round16(x: usize) -> usize {
+    x.div_ceil(16) * 16
+}
+
+/// Dynamic shared memory of nvfp4_attn_partial (mirror of its carve-up):
+/// Q f16 [M][D+8] | 2 x KV stage (per side TN rows of D/2+16 padded data
+/// bytes + TN x D/16 scales) | P f16 [M][TN+8] | row max + row sum
+/// [TN/8][M] f32 | m, l, alpha [M] f32.
+pub fn partial_smem_bytes(m: usize, d: usize, tn: usize) -> usize {
+    m * (d + 8) * 2
+        + 2 * tn * (d / 2 + 16 + d / 16) * 2
+        + m * (tn + 8) * 2
+        + 2 * (tn / 8) * m * 4
+        + 3 * m * 4
+}
+
+/// Dynamic shared memory of nvfp4_attn_merge: weights [NS][M] + scale [M] +
+/// 2-way split-reduction buffer [M*8 items][8] f32.
+pub fn merge_smem_bytes(ns: usize, m: usize) -> usize {
+    (ns * m + m) * 4 + m * 8 * 8 * 4
 }
 
 pub fn plan(
@@ -81,87 +95,41 @@ pub fn plan(
     if q_len == 0 || q_len > MAX_Q_LEN {
         return Err(format!("q_len {q_len} outside 1..={MAX_Q_LEN}"));
     }
-    if page_size == 0 || page_size % 4 != 0 {
-        return Err(format!(
-            "page_size {page_size} must be a positive multiple of 4 (V-SF groups)"
-        ));
-    }
     if batch == 0 || num_sms == 0 {
         return Err("batch and num_sms must be positive".into());
     }
     let g = hq / hkv;
-    let gp = g.next_power_of_two();
-    if gp * d > ACC_ELEMS {
-        return Err(format!(
-            "GQA group {g} x head_dim {d} exceeds the per-CTA accumulator budget"
-        ));
+    if g > MAX_ROWS {
+        return Err(format!("GQA group {g} exceeds {MAX_ROWS} rows per CTA"));
     }
-    let qt_max = ACC_ELEMS / (d * gp);
-    let qt = q_len.next_power_of_two().max(16 / gp.min(16)).min(qt_max);
+    let mut nqt = (q_len * g).div_ceil(MAX_ROWS);
+    let mut qt = q_len.div_ceil(nqt);
+    while round16(qt * g) > MAX_ROWS {
+        nqt += 1;
+        qt = q_len.div_ceil(nqt);
+    }
     let nqt = q_len.div_ceil(qt);
-    let m = qt * gp;
-    // The cuda-oxide kernel tiles KV in fixed 16-token tiles (one mma
-    // n16 pair); a tile never straddles a page.
-    let tn = 16;
-    if page_size % tn != 0 {
-        return Err(format!(
-            "page_size {page_size} must be a multiple of 16 (K2 KV tile)"
-        ));
-    }
+    let m = round16(qt * g);
+    let tn = [64, 32, 16]
+        .into_iter()
+        .find(|&t| page_size % t == 0 && partial_smem_bytes(m, d, t) <= SMEM_LIMIT)
+        .ok_or_else(|| {
+            format!(
+                "page_size {page_size} has no KV tile in {{64, 32, 16}} fitting smem (M={m}, D={d})"
+            )
+        })?;
     let rows = batch * hkv * nqt;
-    let ns = (2 * num_sms)
-        .div_ceil(rows)
-        .next_power_of_two()
-        .clamp(1, MAX_SPLITS);
-    let dt = merge_dt(ns, m, d);
+    let ns = num_sms.div_ceil(rows).clamp(1, MAX_SPLITS);
     Ok(AttnPlan {
         d,
         g,
-        gp,
         qt,
         nqt,
         m,
         tn,
         ns,
-        dt,
         rows,
     })
-}
-
-/// Merge D-chunk: NS*M*DT <= MERGE_ELEMS (powers of two throughout).
-pub fn merge_dt(ns: usize, m: usize, d: usize) -> usize {
-    floor_pow2(MERGE_ELEMS / (ns * m)).clamp(1, d)
-}
-
-/// Round up to a multiple of 16. Batch-, page- and row-count dims are handed
-/// to the kernel rounded up (views only ever index real rows), so cutile's
-/// divisibility specialization of those dims is constant (16): the prebuilt
-/// cubin set is independent of the live batch size and cache size.
-pub fn round16(x: usize) -> usize {
-    x.div_ceil(16) * 16
-}
-
-/// Every split count `plan` can pick for batch 1..=max_batch at this shape —
-/// the prebuilt-cubin variant axis (everything else is shape-determined).
-#[allow(dead_code)] // cutile prebuild variant axis
-pub fn split_set(
-    q_len: usize,
-    hq: usize,
-    hkv: usize,
-    d: usize,
-    page_size: usize,
-    num_sms: usize,
-    max_batch: usize,
-) -> Result<Vec<usize>, String> {
-    let mut v = Vec::new();
-    for b in 1..=max_batch {
-        let ns = plan(b, q_len, hq, hkv, d, page_size, num_sms)?.ns;
-        if !v.contains(&ns) {
-            v.push(ns);
-        }
-    }
-    v.sort_unstable();
-    Ok(v)
 }
 
 #[cfg(test)]
@@ -172,26 +140,27 @@ mod tests {
 
     #[test]
     fn gemma_full_attn_hd512() {
-        // 16 q / 2 kv heads, decode and MTP k=8 verify.
-        let p = plan(1, 1, 16, 2, 512, 16, SMS).unwrap();
-        assert_eq!((p.gp, p.qt, p.m, p.nqt, p.tn), (8, 2, 16, 1, 16));
-        assert_eq!((p.rows, p.ns), (2, 64));
-        assert!(p.ns * p.m * p.dt <= MERGE_ELEMS);
-        let v = plan(4, 9, 16, 2, 512, 16, SMS).unwrap();
-        assert_eq!((v.qt, v.nqt, v.m, v.rows), (2, 5, 16, 40));
-        assert_eq!(v.ns, 16); // ceil(376/40)=10 -> 16
+        // 16 q / 2 kv heads, page 64 (live), decode and MTP k=8 verify.
+        let p = plan(1, 1, 16, 2, 512, 64, SMS).unwrap();
+        assert_eq!((p.g, p.qt, p.m, p.nqt, p.tn), (8, 1, 16, 1, 64));
+        assert_eq!((p.rows, p.ns), (2, 94));
+        // q_len 9: 72 rows -> 2 CTAs of 5 + 4 tokens (40 -> M 48), TN 32.
+        let v = plan(1, 9, 16, 2, 512, 64, SMS).unwrap();
+        assert_eq!(
+            (v.qt, v.nqt, v.m, v.tn, v.rows, v.ns),
+            (5, 2, 48, 32, 4, 47)
+        );
     }
 
     #[test]
     fn gemma_swa_hd256_and_qwen() {
         let s = plan(1, 9, 16, 8, 256, 64, SMS).unwrap();
-        assert_eq!((s.g, s.gp, s.qt, s.nqt, s.m, s.tn), (2, 2, 16, 1, 32, 16));
+        assert_eq!((s.g, s.qt, s.nqt, s.m, s.tn), (2, 9, 1, 32, 64));
         let s1 = plan(32, 1, 16, 8, 256, 64, SMS).unwrap();
-        assert_eq!((s1.qt, s1.m, s1.rows, s1.ns), (8, 16, 256, 2));
-        // qwen3.8-27b: 24/4 heads (G=6 -> GP=8), page 2816 = 16*176.
+        assert_eq!((s1.qt, s1.m, s1.rows, s1.ns), (1, 16, 256, 1));
+        // qwen3.8-27b: 24/4 heads (G=6), page 2816 = 64*44.
         let q = plan(8, 1, 24, 4, 256, 2816, SMS).unwrap();
-        assert_eq!((q.g, q.gp, q.qt, q.m, q.tn), (6, 8, 2, 16, 16));
-        assert_eq!(2816 % q.tn, 0);
+        assert_eq!((q.g, q.qt, q.m, q.tn), (6, 1, 16, 64));
     }
 
     #[test]
@@ -201,35 +170,26 @@ mod tests {
                 for q_len in 1..=MAX_Q_LEN {
                     for batch in [1, 2, 7, 32, 256] {
                         let p = plan(batch, q_len, hq, hkv, d, page, SMS).unwrap();
-                        assert!(p.m * d <= ACC_ELEMS);
-                        assert!(p.tn * d <= KV_TILE_ELEMS && page % p.tn == 0 && p.tn % 4 == 0);
+                        assert!(p.m % 16 == 0 && p.m <= MAX_ROWS && p.qt * p.g <= p.m);
+                        assert!(page % p.tn == 0 && p.tn % 16 == 0);
+                        assert!(partial_smem_bytes(p.m, d, p.tn) <= SMEM_LIMIT, "{p:?}");
+                        assert!(merge_smem_bytes(p.ns, p.m) <= SMEM_LIMIT, "{p:?}");
                         assert!(p.qt * p.nqt >= q_len && p.qt * (p.nqt - 1) < q_len);
-                        assert!(p.ns.is_power_of_two() && p.ns <= MAX_SPLITS);
-                        assert!(p.dt.is_power_of_two() && d % p.dt == 0);
-                        assert!(p.ns * p.m * p.dt <= MERGE_ELEMS.max(p.ns * p.m));
-                        assert!(p.gp >= p.g && p.gp.is_power_of_two());
+                        assert!(p.ns >= 1 && p.ns <= MAX_SPLITS);
+                        assert!(p.rows * p.ns >= SMS.min(p.rows * MAX_SPLITS));
                     }
                 }
             }
-        }
-    }
-
-    #[test]
-    fn split_set_is_small_and_covers_every_batch() {
-        let s = split_set(9, 16, 2, 512, 16, SMS, 256).unwrap();
-        assert!(s.len() <= 7, "{s:?}");
-        for b in 1..=256 {
-            assert!(s.contains(&plan(b, 9, 16, 2, 512, 16, SMS).unwrap().ns));
         }
         assert_eq!((round16(1), round16(16), round16(17)), (16, 16, 32));
     }
 
     #[test]
     fn rejects_out_of_contract() {
-        assert!(plan(1, 1, 16, 2, 576, 16, SMS).is_err());
-        assert!(plan(1, 17, 16, 2, 512, 16, SMS).is_err());
-        assert!(plan(1, 1, 15, 2, 512, 16, SMS).is_err());
-        assert!(plan(1, 1, 16, 2, 512, 18, SMS).is_err());
-        assert!(plan(1, 1, 64, 2, 512, 16, SMS).is_err()); // G=32 x 512 > budget
+        assert!(plan(1, 1, 16, 2, 576, 64, SMS).is_err());
+        assert!(plan(1, 17, 16, 2, 512, 64, SMS).is_err());
+        assert!(plan(1, 1, 15, 2, 512, 64, SMS).is_err());
+        assert!(plan(1, 1, 16, 2, 512, 24, SMS).is_err()); // no tile divides 24
+        assert!(plan(1, 1, 128, 2, 512, 64, SMS).is_err()); // G=64 > 48 rows
     }
 }

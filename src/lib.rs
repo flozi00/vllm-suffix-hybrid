@@ -304,13 +304,11 @@ impl SuffixCache {
         lock_cache(&self.inner).stats()
     }
 }
-#[cfg(any(feature = "qwen-gdn-kernels", feature = "nvfp4-attn-kernels"))]
+#[cfg(feature = "qwen-gdn-kernels")]
 mod cubin_store;
 mod engine;
 mod mixer;
 mod nvfp4_attn;
-#[cfg(all(feature = "nvfp4-attn-kernels", not(feature = "oxide-kernels")))]
-mod nvfp4_attn_gpu;
 #[cfg(feature = "oxide-kernels")]
 mod nvfp4_attn_oxide;
 #[cfg(feature = "oxide-kernels")]
@@ -349,14 +347,13 @@ fn nvfp4_attn_plan(
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
     Ok(HashMap::from([
         ("g".to_string(), p.g),
-        ("gp".to_string(), p.gp),
         ("qt".to_string(), p.qt),
         ("nqt".to_string(), p.nqt),
         ("m".to_string(), p.m),
         ("tn".to_string(), p.tn),
         ("ns".to_string(), p.ns),
-        ("dt".to_string(), p.dt),
         ("rows".to_string(), p.rows),
+        ("min_tiles".to_string(), nvfp4_attn::MIN_TILES_PER_SPLIT),
     ]))
 }
 
@@ -364,7 +361,7 @@ fn nvfp4_attn_plan(
 /// installed cubin through the CUDA driver; a toolchain/driver skew surfaces
 /// here with the driver's error instead of as a tileiras JIT attempt on the
 /// first launch. Returns the number of cubins loaded.
-#[cfg(any(feature = "qwen-gdn-kernels", feature = "nvfp4-attn-kernels"))]
+#[cfg(feature = "qwen-gdn-kernels")]
 #[pyfunction]
 fn cubin_store_driver_check(py: Python<'_>, device_ordinal: usize) -> PyResult<usize> {
     py.detach(|| {
@@ -429,13 +426,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // is the startup kernel-path assertion's probe — an armed pod without it
     // refuses to start, it never silently keeps the FA2 decode route.
     m.add_function(wrap_pyfunction!(nvfp4_attn_plan, m)?)?;
-    m.add(
-        "HAS_NVFP4_ATTN_CUDA",
-        cfg!(any(
-            feature = "nvfp4-attn-kernels",
-            feature = "oxide-kernels"
-        )),
-    )?;
+    m.add("HAS_NVFP4_ATTN_CUDA", cfg!(feature = "oxide-kernels"))?;
     // cuda-oxide track (ships): shared cubin loader + probe + K2 host op.
     m.add("HAS_OXIDE_KERNELS", cfg!(feature = "oxide-kernels"))?;
     #[cfg(feature = "oxide-kernels")]
@@ -447,24 +438,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
             m
         )?)?;
     }
-    // Retired cutile K2 (kept buildable, never shipped with oxide-kernels).
-    #[cfg(all(feature = "nvfp4-attn-kernels", not(feature = "oxide-kernels")))]
-    {
-        m.add_function(wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_paged_attn_cuda, m)?)?;
-        for f in [
-            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_split_set, m)?,
-            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_variant_bytecode, m)?,
-            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_compile_cubin, m)?,
-            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_gpu_name, m)?,
-            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_install_cubin, m)?,
-            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_allow_jit, m)?,
-            wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_selfcheck, m)?,
-        ] {
-            m.add_function(f)?;
-        }
-        m.add_function(wrap_pyfunction!(nvfp4_attn_gpu::nvfp4_attn_jit_stats, m)?)?;
-    }
-    #[cfg(any(feature = "qwen-gdn-kernels", feature = "nvfp4-attn-kernels"))]
+    #[cfg(feature = "qwen-gdn-kernels")]
     m.add_function(wrap_pyfunction!(cubin_store_driver_check, m)?)?;
     m.add("VERSION", "0.2.0-rust-v1")?;
     Ok(())
