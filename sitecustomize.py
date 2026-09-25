@@ -13,6 +13,8 @@ PYTHONPATH. Each section is independently gated:
                                pod before serving (fatal only with NVP4KV=1)
   SUFFIX_FICACHE=seed|dump|both -> FlashInfer autotune cache seed/harvest
                                (inert otherwise, degrades on failure)
+  SUFFIX_PROFILE_STEPS=<N>:<skip> -> in-pod torch.profiler step summary
+                               ("[suffix-prof]" lines; fail-soft)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -140,6 +142,20 @@ if os.environ.get("SUFFIX_SM120_NVP4KV", "").strip() == "1":
             ) from exc
         print(f"suffix sm120 nvfp4-kv: hook install failed (not SM120, "
               f"ignoring): {exc}", file=sys.stderr, flush=True)
+
+# In-pod engine-step profiler (suffix_hybrid/step_profiler.py):
+# SUFFIX_PROFILE_STEPS=<N>:<skip> profiles N EngineCore steps after <skip>
+# warm steps and prints one "[suffix-prof]" summary block. Fail-soft: a
+# profiler error never touches serving.
+if os.environ.get("SUFFIX_PROFILE_STEPS", "").strip():
+    try:
+        from suffix_hybrid.step_profiler import (
+            install_post_import_hook as _prof_hook)
+        _prof_hook()
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        import sys
+        print(f"[suffix-prof] hook install failed (profiler off): {exc!r}",
+              file=sys.stderr, flush=True)
 
 # cuda-oxide toolchain probe (docs/oxide-kernels.md): SUFFIX_OXIDE_PROBE=1
 # driver-loads every bundle cubin (suffix_hybrid/oxide_cubins) and runs the
