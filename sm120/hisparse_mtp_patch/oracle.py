@@ -131,22 +131,54 @@ def child(mode: str, a) -> dict:
     }
 
 
+CHILD_TIMEOUT = int(os.environ.get("SUFFIX_HISPARSE_ORACLE_CHILD_TIMEOUT", "1200"))
+
+
 def _run_child(mode: str, argv) -> dict:
     """Never raises on a child failure: returns {"mode", "error"} instead."""
     env = dict(os.environ)
     env.pop("SUFFIX_SM120_HISPARSE_MTP", None)
     if mode == "patched":
         env["SUFFIX_SM120_HISPARSE_MTP"] = "1"
-    proc = subprocess.run(
+    # Own process group: a crashed child can leave vLLM engine-core / worker
+    # processes holding the GPU; the group is killed after EVERY child so the
+    # next one starts clean. Output is streamed live (a hang stays visible)
+    # and captured for the verdict; CHILD_TIMEOUT bounds a hung child.
+    import signal
+    import threading
+    proc = subprocess.Popen(
         [sys.executable, "-m", "hisparse_mtp_patch.oracle", "--child", mode]
         + argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True)
-    sys.stdout.write(proc.stdout)
-    sys.stderr.write(proc.stderr)
-    for line in proc.stdout.splitlines():
+        text=True, start_new_session=True)
+    out, err = [], []
+
+    def pump(src, sink, buf):
+        for line in src:
+            buf.append(line)
+            sink.write(line)
+            sink.flush()
+    pumps = [threading.Thread(target=pump, args=(proc.stdout, sys.stdout, out), daemon=True),
+             threading.Thread(target=pump, args=(proc.stderr, sys.stderr, err), daemon=True)]
+    for t in pumps:
+        t.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=CHILD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    for t in pumps:
+        t.join(timeout=10)
+    for line in out:
         if line.startswith(RESULT):
             return json.loads(line[len(RESULT):])
-    errs = [ln.strip() for ln in proc.stderr.splitlines() if "Error" in ln]
+    if timed_out:
+        return {"mode": mode, "error": f"TIMEOUT after {CHILD_TIMEOUT}s (hung)"}
+    errs = [ln.strip() for ln in err if "Error" in ln]
     return {"mode": mode, "error": f"exit {proc.returncode}: "
             + (errs[-1] if errs else "no result line")}
 
