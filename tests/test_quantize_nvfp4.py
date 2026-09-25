@@ -140,3 +140,75 @@ def test_refuses_nonempty_out(tmp_path):
     _tiny_checkpoint(src)
     with pytest.raises(SystemExit, match="not empty"):
         q.main(["--src", str(src), "--out", str(out), "--calib", "none"])
+
+
+# --- checkpoint <-> transformers naming (in-cluster run 1: the checkpoint
+# stored `model.layers.N.*`, the calibration model is `model.language_model.*`)
+MODEL = {  # Qwen3_5ForConditionalGeneration naming (transformers 5.10.4)
+    "model.language_model.embed_tokens.weight": (128, 64),
+    "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": (96, 64),
+    "model.language_model.layers.0.linear_attn.out_proj.weight": (64, 64),
+    "model.language_model.layers.3.self_attn.q_proj.weight": (128, 64),
+    "model.language_model.norm.weight": (64,),
+    "model.visual.blocks.0.attn.qkv.weight": (96, 32),
+    "lm_head.weight": (128, 64),
+}
+
+
+@pytest.mark.parametrize("layout", ["hf", "text_only", "legacy"])
+def test_checkpoint_layouts_map_onto_the_model(layout):
+    def rename(k):
+        if layout == "text_only":
+            return k.replace("model.language_model.", "model.")
+        if layout == "legacy":
+            return (k.replace("model.language_model.", "language_model.model.")
+                    .replace("model.visual.", "visual."))
+        return k
+    ckpt = {rename(k): v for k, v in MODEL.items()} | {"mtp.fc.weight": (64, 128)}
+    mapping, missing = q.match_checkpoint(ckpt, MODEL)
+    assert missing == [] and sorted(mapping.values()) == sorted(MODEL)
+    quant = [k for k in ckpt if q.classify(k)]
+    assert len(quant) == 3  # every layout is recognised by the allowlist
+    assert {q.canonical(q.module_name(k)) for k in quant} == \
+        {q.canonical(q.module_name(k)) for k in MODEL if q.classify(k)}
+
+
+def test_checkpoint_mapping_fails_loud():
+    ckpt = {k.replace("model.language_model.", "model."): v for k, v in MODEL.items()}
+    bad = dict(ckpt, **{"model.layers.3.self_attn.q_proj.weight": (64, 64)})
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        q.match_checkpoint(bad, MODEL)
+    del ckpt["model.layers.0.linear_attn.out_proj.weight"]
+    ckpt.pop("model.visual.blocks.0.attn.qkv.weight")  # vision absent: tolerated
+    _, missing = q.match_checkpoint(ckpt, MODEL)
+    assert missing == ["model.language_model.layers.0.linear_attn.out_proj.weight"]
+
+
+def test_names_from_the_real_transformers_class():
+    """Builds Qwen3_5ForConditionalGeneration (meta device) from a tiny config
+    with the real architecture + layer_types, then maps a text-only-layout
+    checkpoint onto it."""
+    tf = pytest.importorskip("transformers")
+    if not hasattr(tf, "Qwen3_5Config"):
+        pytest.skip("transformers without Qwen3.5")
+    cfg = tf.Qwen3_5Config(
+        text_config=dict(hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+                         num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+                         layer_types=["linear_attention"] * 3 + ["full_attention"],
+                         linear_num_key_heads=2, linear_num_value_heads=4,
+                         linear_key_head_dim=16, linear_value_head_dim=16, vocab_size=128),
+        vision_config=dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=2,
+                           out_hidden_size=64))
+    with torch.device("meta"):
+        model = tf.AutoModelForImageTextToText.from_config(cfg)
+    assert type(model).__name__ == "Qwen3_5ForConditionalGeneration"
+    shapes = {n: tuple(p.shape) for n, p in model.named_parameters()}
+    hooked = {n for n, m in model.named_modules()
+              if isinstance(m, torch.nn.Linear) and q.classify(n + ".weight")}
+    assert len(hooked) == 3 * 6 + 7  # 3 GDN layers x 6 + 1 full-attn layer x 7
+    ckpt = {n.replace("model.language_model.", "model."): s for n, s in shapes.items()
+            if not n.startswith("model.visual.")}
+    mapping, missing = q.match_checkpoint(ckpt, shapes)
+    assert missing == []
+    assert {q.canonical(q.module_name(k)) for k in ckpt if q.classify(k)} == \
+        {q.canonical(n) for n in hooked}

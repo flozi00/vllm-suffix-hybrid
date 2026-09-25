@@ -55,7 +55,7 @@ TOOL_VERSION = "1"
 # vision tower, MTP head, conv1d, in_proj_b / in_proj_a gates, A_log,
 # dt_bias, all norms) is copied bf16/fp32 byte-identical.
 QUANT_RE = re.compile(
-    r"^(?:model\.language_model\.|model\.)layers\.(\d+)\."
+    r"^(?:model\.language_model\.|language_model\.model\.|model\.)layers\.(\d+)\."
     r"(self_attn\.(?:q_proj|k_proj|v_proj|o_proj)"
     r"|mlp\.(?:gate_proj|up_proj|down_proj)"
     r"|linear_attn\.(?:in_proj_qkv|in_proj_z|out_proj))\.weight$"
@@ -89,6 +89,57 @@ def classify(key: str):
 
 def module_name(key: str) -> str:
     return key[: -len(".weight")]
+
+
+# Checkpoint <-> transformers naming. Qwen3.5 checkpoints come in several
+# layouts: `model.language_model.layers.N` (HF release), `model.layers.N`
+# (text-only / transformers>=5 save: its Qwen3_5ForConditionalGeneration
+# conversion is PrefixChange ^model.language_model.(.+) <-> model.\1),
+# legacy `language_model.model.layers.N`; vision `model.visual.` or `visual.`.
+# Both sides are reduced to one canonical name, so calibration never depends
+# on which layout the source or the transformers class uses.
+_TEXT_PREFIX = re.compile(
+    r"^(?:model\.language_model\.|language_model\.model\.|language_model\.(?!lm_head)"
+    r"|model\.(?!visual\.))")
+_VISUAL_PREFIX = re.compile(r"^(?:model\.)?visual\.")
+_HEAD_PREFIX = re.compile(r"^(?:language_model\.)?lm_head\.")
+
+
+def canonical(name: str) -> str:
+    """'model.language_model.layers.3.mlp.up_proj' == 'model.layers.3.mlp.up_proj'
+    -> 'text.layers.3.mlp.up_proj' (also visual. / lm_head. / mtp. as-is)."""
+    if _HEAD_PREFIX.match(name):
+        return _HEAD_PREFIX.sub("lm_head.", name)
+    if _VISUAL_PREFIX.match(name):
+        return _VISUAL_PREFIX.sub("visual.", name)
+    if _TEXT_PREFIX.match(name):
+        return _TEXT_PREFIX.sub("text.", name)
+    return name
+
+
+def match_checkpoint(ckpt_shapes: dict, model_shapes: dict) -> tuple[dict, list]:
+    """-> ({ckpt_key: model_param}, missing model params). Fails loud on a
+    canonical-name collision or a shape mismatch (never skips silently).
+    Missing vision params are tolerated (calibration is text-only)."""
+    by_canon = {}
+    for name in model_shapes:
+        c = canonical(name)
+        if c in by_canon:
+            raise RuntimeError(f"canonical name collision: {by_canon[c]} / {name}")
+        by_canon[c] = name
+    mapping = {}
+    for key, shape in ckpt_shapes.items():
+        name = by_canon.get(canonical(key))
+        if name is None:
+            continue  # e.g. mtp.* (not in the transformers model)
+        if tuple(model_shapes[name]) != tuple(shape):
+            raise RuntimeError(f"shape mismatch {key} {tuple(shape)} vs model {name} "
+                               f"{tuple(model_shapes[name])}")
+        mapping[key] = name
+    loaded = set(mapping.values())
+    missing = [n for n in model_shapes
+               if n not in loaded and not canonical(n).startswith("visual.")]
+    return mapping, missing
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +256,7 @@ def build_manifest(src: Path, source_hashes: dict, args, stats: dict) -> dict:
 # calibration (GPU; transformers; offline)
 # ---------------------------------------------------------------------------
 def calibrate(src: Path, args) -> dict[str, float]:
-    """-> {module_name: input |x| max} for every allowlisted linear."""
+    """-> {canonical(module name): input |x| max} for every allowlisted linear."""
     import torch
     from safetensors import safe_open
     from transformers import AutoConfig, AutoModelForImageTextToText, AutoTokenizer
@@ -214,35 +265,45 @@ def calibrate(src: Path, args) -> dict[str, float]:
 
     torch.manual_seed(args.seed)
     cfg = AutoConfig.from_pretrained(src)
+    # transformers>=5 prints "incorrect regex pattern ... fix_mistral_regex" for
+    # any local tokenizer whose config.json lacks transformers_version
+    # (tokenization_utils_tokenizers.py:1332-1374), not only Mistral. Setting
+    # it would swap in Mistral's pre-tokenizer regex -> wrong for Qwen. The
+    # calibration text is self-generated, so tokenization only has to be
+    # self-consistent: keep the checkpoint's own tokenizer untouched.
     tok = AutoTokenizer.from_pretrained(src)
     # Build directly on the GPU (host RAM on the pods is ~52 GB < 54 GB model),
     # then copy the checkpoint in shard by shard.
     with torch.device("cuda"):
         model = AutoModelForImageTextToText.from_config(cfg, dtype=torch.bfloat16)
     model.eval()
-    params = dict(model.named_parameters()) | dict(model.named_buffers())
-    loaded, missing_lm = set(), []
-    for f in sorted(src.glob("*.safetensors")):
+    params = dict(model.named_parameters())  # tied lm_head appears once
+    shards = sorted(src.glob("*.safetensors"))
+    ckpt_shapes, where = {}, {}
+    for f in shards:
+        with safe_open(str(f), framework="pt", device="cpu") as st:
+            for key in st.keys():
+                ckpt_shapes[key] = st.get_slice(key).get_shape()
+                where[key] = f
+    mapping, missing = match_checkpoint(
+        ckpt_shapes, {n: tuple(p.shape) for n, p in params.items()})
+    if missing:
+        raise RuntimeError(f"calibration model ({type(model).__name__}) has {len(missing)} "
+                           f"params not in the checkpoint, e.g. {missing[:3]}")
+    for f in shards:
         with safe_open(str(f), framework="pt", device="cuda") as st:
             for key in st.keys():
-                p = params.get(key)
-                if p is None or p.shape != st.get_slice(key).get_shape():
-                    continue
-                with torch.no_grad():
-                    p.copy_(st.get_tensor(key))
-                loaded.add(key)
-    for key in params:
-        if classify(key) and key not in loaded:
-            missing_lm.append(key)
-    if missing_lm:
-        raise RuntimeError(f"calibration model missing {len(missing_lm)} quantized "
-                           f"linears from the checkpoint, e.g. {missing_lm[:3]}")
+                if key in mapping:
+                    with torch.no_grad():
+                        params[mapping[key]].copy_(st.get_tensor(key))
+    print(f"[quantize-nvfp4] calibration model {type(model).__name__}: "
+          f"{len(mapping)} checkpoint tensors loaded", flush=True)
 
     amax: dict[str, float] = {}
     hooks = []
     for name, mod in model.named_modules():
         if isinstance(mod, torch.nn.Linear) and classify(name + ".weight"):
-            def hook(m, inp, _n=name):
+            def hook(m, inp, _n=canonical(name)):
                 v = float(inp[0].detach().abs().amax())
                 if v > amax.get(_n, 0.0):
                     amax[_n] = v
@@ -297,7 +358,7 @@ def act_group_amax(act: dict[str, float], key_group: dict[str, str]) -> dict[str
     """Calibrated input amax per fused group (shards share their input)."""
     out: dict[str, float] = {}
     for key, g in key_group.items():
-        v = act.get(module_name(key))
+        v = act.get(canonical(module_name(key)))
         if v is None:
             raise RuntimeError(f"no calibration activations for {module_name(key)}")
         out[g] = max(out.get(g, 0.0), v)
@@ -380,7 +441,7 @@ def main(argv=None) -> int:
     if args.calib == "selfgen":
         act = calibrate(src, args)
     else:
-        act = {module_name(k): 1.0 for k in key_group}
+        act = {canonical(module_name(k)): 1.0 for k in key_group}
     a_amax = act_group_amax(act, key_group)
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
