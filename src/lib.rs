@@ -401,6 +401,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qgdn_oxide::gdn_decode_fused_cuda, m)?)?;
     #[cfg(feature = "oxide-kernels")]
     m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_cuda, m)?)?;
+    #[cfg(feature = "oxide-kernels")]
+    m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_q_cuda, m)?)?;
+    #[cfg(feature = "oxide-kernels")]
+    m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_splits, m)?)?;
     #[cfg(all(feature = "qwen-gdn-kernels", not(feature = "oxide-kernels")))]
     for f in [
         wrap_pyfunction!(qwen_gdn_gpu::gdn_decode_fused_cuda, m)?,

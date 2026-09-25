@@ -39,6 +39,18 @@ SHAPES = {
     "attn_o": (5120, 6144),
 }
 SPIKE_SHAPE = "mlp_gate_up"
+# gemma-4-26b-a4b-nvfp4 dense linears (hidden 2816; sliding attn 16 q / 8 kv
+# heads x 256; full attn 16 q x 512 + 2 kv x 512 with k_eq_v; dense MLP
+# 2112). MoE experts (128 x 704) run FusedMoE, not this kernel family.
+GEMMA_SHAPES = {
+    "gemma_sliding_qkv": (8192, 2816),
+    "gemma_full_qkv": (9216, 2816),
+    "gemma_sliding_o": (2816, 4096),
+    "gemma_full_o": (2816, 8192),
+    "gemma_mlp_gate_up": (4224, 2816),
+    "gemma_mlp_down": (2816, 2112),
+}
+ALL_SHAPES = {**SHAPES, **GEMMA_SHAPES}
 
 
 # ---------------------------------------------------------------------------
@@ -126,66 +138,81 @@ def gemm_ref(p):
 # ---------------------------------------------------------------------------
 # CPU twin of nvfp4_gemm_m16's addressing + the mma fragment layouts
 # ---------------------------------------------------------------------------
-def kernel_twin(p):
-    """Replays the kernel's per-lane u32 loads from flat buffers and the
+def kernel_twin(p, mode=0, splits=1):
+    """Replays nvfp4_gemm_m16's per-lane u32 loads from flat buffers with the
     mxf4nvf4 m16n8k64 fragment/scale layouts (cute MMA_Traits
-    SM120_16x8x64_TN_VS), returning the fp32 [M, N] result. Any addressing
-    bug in the kernel (fragment rows/k, scale bytes, swizzle) shows up here."""
+    SM120_16x8x64_TN_VS), its split-K ranges and nvfp4_splitk_reduce's sum,
+    returning the fp32 [M, N] result. mode 0: our quant buffers ([16, K/2],
+    row-major scales, a_rows=16); mode 1: vLLM's pre-quantized activation
+    ([M, K/2], 128x4-swizzled scales, a_rows=M). Any addressing bug
+    (fragment rows/k, scale bytes, swizzles, split ranges) shows up here."""
     xf = p["x"].float().numpy()
     m, k = xf.shape
     n = p["w_packed"].shape[0]
-    aq = np.zeros((16, k // 2), np.uint8)
-    asf_bits = np.zeros((16, k // 16), np.uint8)
     xq, xsf_bits, _ = quantize(xf, p["g_x"])
-    aq[:m], asf_bits[:m] = xq, xsf_bits
-    aq, asf = aq.reshape(-1), asf_bits.reshape(-1)
-    w, wsf = p["w_packed"].reshape(-1), p["w_sf_swz"]
     kh, nkb = k // 2, k // 16
     kb_pad = -(-nkb // 4) * 4
+    if mode == 0:
+        aq = np.zeros((16, kh), np.uint8)
+        asf_bits = np.zeros((16, nkb), np.uint8)
+        aq[:m], asf_bits[:m] = xq, xsf_bits
+        a_rows, a_stride = 16, kh
+        aq, asf = aq.reshape(-1), asf_bits.reshape(-1)
+        sfa_off = lambda row, kb: row * nkb + kb
+    else:
+        aq, asf = xq.reshape(-1), swizzle_sf(xsf_bits)
+        a_rows, a_stride = m, kh
+        sfa_off = lambda row, kb: sf_offset(row, kb, kb_pad)
+    w, wsf = p["w_packed"].reshape(-1), p["w_sf_swz"]
     f8 = lambda b: e4m3_bits_to_f32(np.asarray(b, np.uint8))
-    out = np.zeros((m, n), np.float32)
+    steps = k // 64
+    kps = -(-steps // splits)
+    splits = -(-steps // kps)
+    partial = np.zeros((splits, 16, n), np.float32)
 
-    def u32(buf, off):
-        return buf[off:off + 4]
+    def u32(buf, off, ok=True):
+        return buf[off:off + 4] if ok else np.zeros(4, np.uint8)
 
     def nib(bytes4, j):
         byte = bytes4[j // 2]
         c = (byte >> 4) if j % 2 else (byte & 0xF)
         return E2M1[c & 7] * (-1.0 if c & 8 else 1.0)
 
-    for n0 in range(0, n, 8):
-        acc = np.zeros((16, 8), np.float64)
-        for k0 in range(0, k, 64):
-            A = np.full((16, 64), np.nan)
-            B = np.full((8, 64), np.nan)
-            SA = np.full((16, 4), np.nan)
-            SB = np.full((8, 4), np.nan)
-            for lane in range(32):
-                g, t = lane // 4, lane % 4
-                off = k0 // 2 + 4 * t
-                regs_a = [u32(aq, g * kh + off), u32(aq, (g + 8) * kh + off),
-                          u32(aq, g * kh + off + 16), u32(aq, (g + 8) * kh + off + 16)]
-                for r, reg in enumerate(regs_a):
-                    for j in range(8):
-                        mm, kk = g + 8 * (r & 1), 8 * t + j + 32 * (r >> 1)
-                        _put(A, mm, kk, nib(reg, j))
-                regs_b = [u32(w, (n0 + g) * kh + off), u32(w, (n0 + g) * kh + off + 16)]
-                for r, reg in enumerate(regs_b):
-                    for j in range(8):
-                        _put(B, g, 8 * t + j + 32 * r, nib(reg, j))
-                sfa_row = 8 * (lane & 1) + lane // 4
-                sfa = u32(asf, sfa_row * nkb + k0 // 16)
-                sfb = u32(wsf, sf_offset(n0 + g, k0 // 16, kb_pad))
-                for b in range(4):
-                    _put(SA, sfa_row, b, f8(sfa[b]))
-                    _put(SB, lane // 4, b, f8(sfb[b]))
-            assert not np.isnan(A).any() and not np.isnan(B).any()
-            assert not np.isnan(SA).any() and not np.isnan(SB).any()
-            As = A * np.repeat(SA, 16, axis=1)
-            Bs = B * np.repeat(SB, 16, axis=1)
-            acc += As @ Bs.T
-        out[:, n0:n0 + 8] = (acc[:m] * p["alpha"]).astype(np.float32)
-    return out
+    for sp in range(splits):
+        ks = range(sp * kps * 64, min(k, (sp + 1) * kps * 64), 64)
+        for n0 in range(0, n, 8):
+            acc = np.zeros((16, 8), np.float64)
+            for k0 in ks:
+                A = np.full((16, 64), np.nan)
+                B = np.full((8, 64), np.nan)
+                SA = np.full((16, 4), np.nan)
+                SB = np.full((8, 4), np.nan)
+                for lane in range(32):
+                    g, t = lane // 4, lane % 4
+                    off = k0 // 2 + 4 * t
+                    ok0, ok1 = g < a_rows, g + 8 < a_rows
+                    regs_a = [u32(aq, g * a_stride + off, ok0),
+                              u32(aq, (g + 8) * a_stride + off, ok1),
+                              u32(aq, g * a_stride + off + 16, ok0),
+                              u32(aq, (g + 8) * a_stride + off + 16, ok1)]
+                    for r, reg in enumerate(regs_a):
+                        for j in range(8):
+                            _put(A, g + 8 * (r & 1), 8 * t + j + 32 * (r >> 1), nib(reg, j))
+                    regs_b = [u32(w, (n0 + g) * kh + off), u32(w, (n0 + g) * kh + off + 16)]
+                    for r, reg in enumerate(regs_b):
+                        for j in range(8):
+                            _put(B, g, 8 * t + j + 32 * r, nib(reg, j))
+                    sfa_row = 8 * (lane & 1) + lane // 4
+                    sfa = u32(asf, sfa_off(sfa_row, k0 // 16), sfa_row < a_rows)
+                    sfb = u32(wsf, sf_offset(n0 + g, k0 // 16, kb_pad))
+                    for b in range(4):
+                        _put(SA, sfa_row, b, f8(sfa[b]))
+                        _put(SB, lane // 4, b, f8(sfb[b]))
+                assert not np.isnan(A).any() and not np.isnan(B).any()
+                assert not np.isnan(SA).any() and not np.isnan(SB).any()
+                acc += (A * np.repeat(SA, 16, axis=1)) @ (B * np.repeat(SB, 16, axis=1)).T
+            partial[sp, :, n0:n0 + 8] = acc.astype(np.float32)
+    return (partial.sum(0)[:m] * p["alpha"]).astype(np.float32)
 
 
 def _put(arr, i, j, v):
@@ -212,6 +239,7 @@ def _dev_problem(m, n, k, dev, seed=0):
         w_sf=torch.from_numpy(p["w_sf_swz"]).to(dev).view(torch.float8_e4m3fn),
         aq=torch.empty(16, k // 2, dtype=torch.uint8, device=dev),
         asf=torch.empty(16, k // 16, dtype=torch.uint8, device=dev),
+        partial=torch.empty(8 * 16 * n, dtype=torch.float32, device=dev),
         out=torch.empty(m, n, dtype=torch.bfloat16, device=dev),
         g=torch.tensor([p["g_x"]], dtype=torch.float32, device=dev),
         alpha=torch.tensor([p["alpha"]], dtype=torch.float32, device=dev),
@@ -220,9 +248,19 @@ def _dev_problem(m, n, k, dev, seed=0):
     return p, t
 
 
-def _ours(native, t, stream):
-    native.nvfp4_gemm_cuda(t["x"], t["w"], t["w_sf"], t["aq"], t["asf"], t["out"],
-                           t["g_f"], t["alpha_f"], stream)
+def _ours(native, t, stream, splits=None):
+    n, k = t["w"].shape[0], t["x"].shape[1]
+    s = native.nvfp4_gemm_splits(n, k) if splits is None else splits
+    native.nvfp4_gemm_cuda(t["x"], t["w"], t["w_sf"], t["aq"], t["asf"], t["partial"],
+                           t["out"], t["g_f"], t["alpha_f"], s, stream)
+    return t["out"]
+
+
+def _ours_q(native, t, xq, xsf, stream, splits=None):
+    n, k = t["w"].shape[0], t["x"].shape[1]
+    s = native.nvfp4_gemm_splits(n, k) if splits is None else splits
+    native.nvfp4_gemm_q_cuda(xq, xsf, t["w"], t["w_sf"], t["partial"], t["out"],
+                             t["alpha_f"], s, stream)
     return t["out"]
 
 
@@ -253,43 +291,53 @@ def _native_ready():
     return native
 
 
-def oracle(ms=(1, 4, 16), shapes=("mlp_gate_up", "mlp_down", "gdn_in_proj_qkvz")):
+def oracle(ms=(1, 4, 16), shapes=("mlp_gate_up", "mlp_down", "gdn_in_proj_qkvz",
+                                  "attn_o", "gemma_mlp_down")):
+    """Both entry paths (bf16 x -> our quant; vLLM-prequantized x with
+    swizzled scales, i.e. the fused SiLU*mul / RMSNorm quant route) with the
+    production split-K policy, vs the exact reference and vs vLLM's op."""
     import torch
+    from vllm import _custom_ops as ops
     native = _native_ready()
     dev = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.current_stream(dev).cuda_stream
     lines = []
     for name in shapes:
-        n, k = SHAPES[name]
+        n, k = ALL_SHAPES[name]
         for m in ms:
             p, t = _dev_problem(m, n, k, dev, seed=m)
             t["g_f"], t["alpha_f"] = float(p["g_x"]), float(p["alpha"])
-            ours = _ours(native, t, stream).float()
             ref = torch.from_numpy(gemm_ref(p)).to(dev)
             ref16 = ref.bfloat16().float()
-            rel = float((ours - ref16).norm() / ref16.norm())
-            cos_v = float(torch.nn.functional.cosine_similarity(
-                ours.flatten(), ref.flatten(), dim=0))
             vl = _vllm(t, n).float()
-            rel_v = float((ours - vl).norm() / vl.norm())
-            ok = rel <= 1e-2 and cos_v >= 0.9999 and rel_v <= 2e-2
-            lines.append(f"{name} M={m} N={n} K={k}: rel_vs_ref={rel:.2e} cos={cos_v:.6f} "
-                         f"rel_vs_vllm={rel_v:.2e} {'OK' if ok else 'FAIL'}")
-            if not ok:
-                raise RuntimeError(f"{MARKER} NVFP4-GEMM ORACLE FAIL: {lines[-1]}")
+            xq, xsf = ops.scaled_fp4_quant(t["x"], t["g"])
+            for path in ("bf16", "prequant"):
+                ours = (_ours(native, t, stream) if path == "bf16"
+                        else _ours_q(native, t, xq, xsf, stream)).float()
+                rel = float((ours - ref16).norm() / ref16.norm())
+                cos_v = float(torch.nn.functional.cosine_similarity(
+                    ours.flatten(), ref.flatten(), dim=0))
+                rel_v = float((ours - vl).norm() / vl.norm())
+                ok = rel <= 1e-2 and cos_v >= 0.9999 and rel_v <= 2e-2
+                lines.append(
+                    f"{name} {path} M={m} N={n} K={k} splits="
+                    f"{native.nvfp4_gemm_splits(n, k)}: rel_vs_ref={rel:.2e} "
+                    f"cos={cos_v:.6f} rel_vs_vllm={rel_v:.2e} {'OK' if ok else 'FAIL'}")
+                if not ok:
+                    raise RuntimeError(f"{MARKER} NVFP4-GEMM ORACLE FAIL: {lines[-1]}")
     for ln in lines:
         print(f"{MARKER} {ln}", file=sys.stderr, flush=True)
     return f"{MARKER} NVFP4-GEMM ORACLE PASS ({len(lines)} cases, sm_120a mxf4nvf4 mma)"
 
 
-def bench(ms=(1, 4, 8, 16), shapes=tuple(SHAPES), iters=200):
+def bench(ms=(1, 4, 8, 16), shapes=tuple(ALL_SHAPES), iters=200):
     """us per call (quant + gemm), each path captured in one CUDA graph."""
     import torch
     native = _native_ready()
     dev = torch.device("cuda", torch.cuda.current_device())
     res = {}
     for name in shapes:
-        n, k = SHAPES[name]
+        n, k = ALL_SHAPES[name]
         for m in ms:
             p, t = _dev_problem(m, n, k, dev, seed=1)
             t["g_f"], t["alpha_f"] = float(p["g_x"]), float(p["alpha"])
@@ -318,7 +366,7 @@ def bench(ms=(1, 4, 8, 16), shapes=tuple(SHAPES), iters=200):
             bytes_w = n * k // 2 + n * k // 16
             roof = bytes_w / 1.79e12 * 1e6
             res[(name, m)] = tuple(times)
-            print(f"{MARKER} bench {name} M={m} N={n} K={k}: vllm {times[0]:.1f} us, "
+            print(f"{MARKER} bench {name} M={m} N={n} K={k} splits={native.nvfp4_gemm_splits(n, k)}: vllm {times[0]:.1f} us, "
                   f"ours {times[1]:.1f} us (x{times[1] / times[0]:.2f}), "
                   f"weight-roofline {roof:.1f} us", file=sys.stderr, flush=True)
     return res

@@ -48,12 +48,20 @@ def test_swizzle_matches_kernel_sf_offset():
             assert flat[ng.sf_offset(row, kb, kb_pad)] == bits[row, kb]
 
 
-@pytest.mark.parametrize("m", [1, 5, 16])
-def test_kernel_twin_matches_reference(m):
+@pytest.mark.parametrize("m,mode,splits", [(1, 0, 1), (5, 0, 2), (16, 0, 3),
+                                           (1, 1, 1), (5, 1, 3), (16, 1, 2)])
+def test_kernel_twin_matches_reference(m, mode, splits):
+    # mode 0: our quant buffers; mode 1: vLLM's pre-quantized activation with
+    # swizzled scales (fused SiLU*mul quant route); splits: split-K + reduce
     p = ng.make_problem(m, 16, 192, seed=m)
     ref = ng.gemm_ref(p)
-    twin = ng.kernel_twin(p)
+    twin = ng.kernel_twin(p, mode=mode, splits=splits)
     np.testing.assert_allclose(twin, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_gemma_and_qwen_shapes_are_kernel_eligible():
+    for name, (n, k) in ng.ALL_SHAPES.items():
+        assert n % 32 == 0 and k % 64 == 0, name
 
 
 def test_reference_tracks_bf16_matmul():
@@ -73,4 +81,4 @@ def test_kernel_source_uses_nvf4_block_scale_mma_and_sm120a():
     var = (ROOT / "kernels-oxide" / "nvfp4_gemm" / "oxide-variants.json").read_text()
     assert '"arch": "sm_120a"' in var
     entries = re.findall(r"pub unsafe fn (\w+)\(", src)
-    assert entries == ["nvfp4_quant_act", "nvfp4_gemm_m16"]
+    assert entries == ["nvfp4_quant_act", "nvfp4_gemm_m16", "nvfp4_splitk_reduce"]

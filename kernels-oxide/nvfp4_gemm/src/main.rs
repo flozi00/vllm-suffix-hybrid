@@ -168,11 +168,106 @@ pub mod kernels {
         unsafe { *asf.add((row * nkb + kb) as usize) = sf as u8 };
     }
 
-    /// y[m, n] = alpha * (A_q x W_q^T), M <= 16, one warp per 8 columns.
+    #[inline(always)]
+    fn ld32(p: *const u8, off: usize) -> u32 {
+        unsafe { *(p.add(off) as *const u32) }
+    }
+
+    /// One k64 step's operands for this lane.
+    #[derive(Clone, Copy)]
+    struct Step {
+        a: [u32; 4],
+        b: [u32; 2],
+        sfa: u32,
+        sfb: u32,
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn load_step(
+        k0: u32,
+        t: u32,
+        g: u32,
+        a_row0: *const u8,
+        a_row1: *const u8,
+        a0_ok: bool,
+        a1_ok: bool,
+        w_row: *const u8,
+        asf: *const u8,
+        wsf: *const u8,
+        sfa_row: u32,
+        sfa_ok: bool,
+        asf_mode: u32,
+        nkb: u32,
+        kb_pad: u32,
+        n0: u32,
+    ) -> Step {
+        let off = (k0 / 2 + 4 * t) as usize;
+        let kb = k0 / 16;
+        let a0 = if a0_ok { ld32(a_row0, off) } else { 0 };
+        let a1 = if a1_ok { ld32(a_row1, off) } else { 0 };
+        let a2 = if a0_ok { ld32(a_row0, off + 16) } else { 0 };
+        let a3 = if a1_ok { ld32(a_row1, off + 16) } else { 0 };
+        let sfa = if !sfa_ok {
+            0
+        } else if asf_mode == 0 {
+            ld32(asf, (sfa_row * nkb + kb) as usize)
+        } else {
+            ld32(asf, sf_offset(sfa_row, kb, kb_pad))
+        };
+        Step {
+            a: [a0, a1, a2, a3],
+            b: [ld32(w_row, off), ld32(w_row, off + 16)],
+            sfa,
+            sfb: ld32(wsf, sf_offset(n0 + g, kb, kb_pad)),
+        }
+    }
+
+    #[inline(always)]
+    fn mma(c: [f32; 4], s: Step) -> [f32; 4] {
+        let zero: u16 = 0;
+        let (d0, d1, d2, d3): (f32, f32, f32, f32);
+        unsafe {
+            ptx_asm!(
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};",
+                out("=f") d0,
+                out("=f") d1,
+                out("=f") d2,
+                out("=f") d3,
+                in("r") s.a[0],
+                in("r") s.a[1],
+                in("r") s.a[2],
+                in("r") s.a[3],
+                in("r") s.b[0],
+                in("r") s.b[1],
+                in("f") c[0],
+                in("f") c[1],
+                in("f") c[2],
+                in("f") c[3],
+                in("r") s.sfa,
+                in("h") zero,
+                in("h") zero,
+                in("r") s.sfb,
+                in("h") zero,
+                in("h") zero,
+                options(register_only),
+            );
+        }
+        [d0, d1, d2, d3]
+    }
+
+    /// y[m, n] = alpha * (A_q x W_q^T), M <= 16, one warp per 8 columns,
+    /// split-K over blockIdx.y (`kps` k64 steps per split). partial == null:
+    /// write bf16 `out` (alpha applied); else write fp32 partials
+    /// partial[(split*16 + row) * n + col] for nvfp4_splitk_reduce.
+    /// A: `a_rows` rows of `a_stride` bytes (rows >= a_rows read as 0);
+    /// asf_mode 0 = row-major [a_rows, K/16] (our quant), 1 = vLLM's
+    /// 128x4-swizzled activation scales (fused SiLU*mul / RMSNorm quant).
     #[kernel]
     #[launch_bounds(128)]
     pub unsafe fn nvfp4_gemm_m16(
         out: *mut u16,
+        partial: *mut f32,
         aq: *const u8,
         asf: *const u8,
         w: *const u8,
@@ -181,6 +276,10 @@ pub mod kernels {
         n: u32,
         k: u32,
         out_stride: u32,
+        a_stride: u32,
+        a_rows: u32,
+        asf_mode: u32,
+        kps: u32,
         alpha: f32,
     ) {
         let tid = thread::threadIdx_x();
@@ -192,66 +291,95 @@ pub mod kernels {
         if n0 >= n {
             return; // warp-uniform
         }
+        let split = thread::blockIdx_y();
+        let k_begin = split * kps * 64;
+        let mut k_end = k_begin + kps * 64;
+        if k_end > k {
+            k_end = k;
+        }
         let kh = k / 2;
         let nkb = k / 16;
         let kb_pad = (nkb + 3) / 4 * 4;
-        let a_row0 = unsafe { aq.add((g * kh) as usize) };
-        let a_row1 = unsafe { aq.add(((g + 8) * kh) as usize) };
+        let a_row0 = unsafe { aq.add((g * a_stride) as usize) };
+        let a_row1 = unsafe { aq.add(((g + 8) * a_stride) as usize) };
         let sfa_row = 8 * (lane & 1) + lane / 4;
         let w_row = unsafe { w.add(((n0 + g) * kh) as usize) };
+        let (a0_ok, a1_ok, sfa_ok) = (g < a_rows, g + 8 < a_rows, sfa_row < a_rows);
         let mut c = [0.0f32; 4];
-        let tid_zero: u16 = 0;
-        let mut k0 = 0;
-        while k0 < k {
-            let off = (k0 / 2 + 4 * t) as usize;
-            let a0 = unsafe { *(a_row0.add(off) as *const u32) };
-            let a1 = unsafe { *(a_row1.add(off) as *const u32) };
-            let a2 = unsafe { *(a_row0.add(off + 16) as *const u32) };
-            let a3 = unsafe { *(a_row1.add(off + 16) as *const u32) };
-            let b0 = unsafe { *(w_row.add(off) as *const u32) };
-            let b1 = unsafe { *(w_row.add(off + 16) as *const u32) };
-            let kb = k0 / 16;
-            let sfa = unsafe { *(asf.add((sfa_row * nkb + kb) as usize) as *const u32) };
-            let sfb = unsafe { *(wsf.add(sf_offset(n0 + g, kb, kb_pad)) as *const u32) };
-            let (d0, d1, d2, d3): (f32, f32, f32, f32);
-            unsafe {
-                ptx_asm!(
-                    "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};",
-                    out("=f") d0,
-                    out("=f") d1,
-                    out("=f") d2,
-                    out("=f") d3,
-                    in("r") a0,
-                    in("r") a1,
-                    in("r") a2,
-                    in("r") a3,
-                    in("r") b0,
-                    in("r") b1,
-                    in("f") c[0],
-                    in("f") c[1],
-                    in("f") c[2],
-                    in("f") c[3],
-                    in("r") sfa,
-                    in("h") tid_zero,
-                    in("h") tid_zero,
-                    in("r") sfb,
-                    in("h") tid_zero,
-                    in("h") tid_zero,
-                    options(register_only),
+        if k_begin < k_end {
+            // 2-stage software pipeline: next step's loads are in flight
+            // while the current mma issues.
+            let mut cur = load_step(
+                k_begin, t, g, a_row0, a_row1, a0_ok, a1_ok, w_row, asf, wsf, sfa_row,
+                sfa_ok, asf_mode, nkb, kb_pad, n0,
+            );
+            let mut k0 = k_begin + 64;
+            while k0 < k_end {
+                let nxt = load_step(
+                    k0, t, g, a_row0, a_row1, a0_ok, a1_ok, w_row, asf, wsf, sfa_row,
+                    sfa_ok, asf_mode, nkb, kb_pad, n0,
                 );
+                c = mma(c, cur);
+                cur = nxt;
+                k0 += 64;
             }
-            c = [d0, d1, d2, d3];
-            k0 += 64;
+            c = mma(c, cur);
         }
         let col = n0 + 2 * t;
-        if g < m {
-            let v = f32_to_bf16(c[0] * alpha) | (f32_to_bf16(c[1] * alpha) << 16);
-            unsafe { *(out.add((g * out_stride + col) as usize) as *mut u32) = v };
+        if partial.is_null() {
+            if g < m {
+                let v = f32_to_bf16(c[0] * alpha) | (f32_to_bf16(c[1] * alpha) << 16);
+                unsafe { *(out.add((g * out_stride + col) as usize) as *mut u32) = v };
+            }
+            if g + 8 < m {
+                let v = f32_to_bf16(c[2] * alpha) | (f32_to_bf16(c[3] * alpha) << 16);
+                unsafe { *(out.add(((g + 8) * out_stride + col) as usize) as *mut u32) = v };
+            }
+        } else {
+            let base = split * 16;
+            if g < m {
+                let p = unsafe { partial.add(((base + g) * n + col) as usize) };
+                unsafe {
+                    *p = c[0];
+                    *p.add(1) = c[1];
+                }
+            }
+            if g + 8 < m {
+                let p = unsafe { partial.add(((base + g + 8) * n + col) as usize) };
+                unsafe {
+                    *p = c[2];
+                    *p.add(1) = c[3];
+                }
+            }
         }
-        if g + 8 < m {
-            let v = f32_to_bf16(c[2] * alpha) | (f32_to_bf16(c[3] * alpha) << 16);
-            unsafe { *(out.add(((g + 8) * out_stride + col) as usize) as *mut u32) = v };
+    }
+
+    /// out[row, col] = bf16(alpha * sum_s partial[(s*16 + row) * n + col]),
+    /// one thread per (row < m, col); fixed summation order (deterministic).
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn nvfp4_splitk_reduce(
+        out: *mut u16,
+        partial: *const f32,
+        m: u32,
+        n: u32,
+        splits: u32,
+        out_stride: u32,
+        alpha: f32,
+    ) {
+        let i = thread::blockIdx_x() * 256 + thread::threadIdx_x();
+        if i >= m * n {
+            return;
         }
+        let row = i / n;
+        let col = i % n;
+        let mut acc = 0.0f32;
+        let mut s = 0;
+        while s < splits {
+            acc += unsafe { *partial.add(((s * 16 + row) * n + col) as usize) };
+            s += 1;
+        }
+        unsafe { *out.add((row * out_stride + col) as usize) = f32_to_bf16(acc * alpha) as u16 };
     }
 }
 
