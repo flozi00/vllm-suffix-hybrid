@@ -44,7 +44,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-ds-mla"
-PATCH_REVISION = "2026-09-26.1"
+PATCH_REVISION = "2026-09-26.2"
 PINNED_VLLM = "0.30.0"
 GATE_ENV = "SUFFIX_SM120_NVP4DSMLA"
 MARKER_ATTR = "__suffix_nvfp4_ds_mla_revision__"
@@ -246,9 +246,54 @@ def _suffix_nvfp4_ds_mla_init(impl) -> None:
     dev = torch.cuda.current_device()
     oxide_kernels.ensure_loaded(FAMILY, dev)
     impl._nvfp4_num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    if dev not in _SELFTESTED:
+        _suffix_nvfp4_ds_mla_selftest(impl, torch.device("cuda", dev))
+        _SELFTESTED.add(dev)
     print(f"[suffix {PATCH_NAME}] NVFP4-DSMLA impl on cuda:{dev} "
           f"(heads/rank {impl.num_heads}, {impl._nvfp4_num_sms} SMs, rev "
           f"{PATCH_REVISION})", file=sys.stderr, flush=True)
+
+
+_SELFTESTED = set()
+
+
+def _suffix_nvfp4_ds_mla_selftest(impl, dev) -> None:
+    """Boot guard, once per device at impl init (eager, never in a graph
+    capture): writer + decode on 128 rows with max-SF rows and |q| ~ 1e5 —
+    the cases a stale (pre-prescale) cubin turns into NaN — against an f64
+    reference. Fails closed; costs a few ms."""
+    import torch
+
+    from .oracle import attention_ref, dequant_rows_ref, row_rel_l2
+
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)  # vLLM inits models under bf16
+    try:
+        g = torch.Generator().manual_seed(0)
+        kv_c = torch.randn(128, 512, generator=g)
+        kv_c[:32] = kv_c[:32].sign() * 5000.0  # SF 448, every nibble +-6
+        k_pe = torch.randn(128, 64, generator=g)
+        q = torch.randn(2, 8, 576, generator=g)
+        q[0] *= 2.0 ** 15  # |q| > f16 max on every dim (exact rescale:
+        # as well-conditioned as q[1]; single-dim outliers live in the oracle)
+        topk = torch.stack([torch.randperm(128, generator=g) for _ in range(2)]).int()
+        topk[1, 100:] = -1
+        kv_c, k_pe, q, topk = (kv_c.bfloat16().to(dev), k_pe.bfloat16().to(dev),
+                               q.bfloat16().to(dev), topk.to(dev))
+        cache = torch.zeros(2, 64, ROW_BYTES, dtype=torch.uint8, device=dev)
+        _suffix_nvfp4_ds_mla_write(kv_c, k_pe, cache, torch.arange(128, device=dev))
+        out = torch.empty(2, 8, 512, dtype=torch.bfloat16, device=dev)
+        _suffix_nvfp4_ds_mla_decode(impl, q, cache, topk, out)
+        lat, rope = (x.double() for x in dequant_rows_ref(cache.view(-1, ROW_BYTES)))
+        ref = attention_ref(q.double(), lat, rope, topk, float(impl.scale))
+        err = row_rel_l2(out, ref, torch.ones(2, 8, dtype=torch.bool, device=dev))
+    finally:
+        torch.set_default_dtype(prev)
+    if not (bool(torch.isfinite(out).all()) and err <= 2e-2):
+        raise RuntimeError(
+            f"[suffix {PATCH_NAME}] boot self-test FAILED on {dev}: max row "
+            f"rel-L2 {err:.3e} vs f64 reference, finite "
+            f"{bool(torch.isfinite(out).all())} (stale / pre-prescale cubin?)")
 
 
 def _suffix_nvfp4_ds_mla_decode(impl, q, kv_cache, topk, output):

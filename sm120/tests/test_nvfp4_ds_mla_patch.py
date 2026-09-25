@@ -402,7 +402,7 @@ def test_plan_via_native_when_built():
     assert (p(1, 8, 2048, 188)["ns"], p(6, 8, 2048, 188)["ns"]) == (32, 32)
     assert (p(32, 8, 2048, 188)["ns"], p(32, 8, 2048, 188)["c_per_split"]) == (6, 384)
     assert p(8192, 8, 2048, 188)["ns"] == 1  # prefill: bounded workspace
-    assert p(1, 8, 2048, 188)["partial_smem_bytes"] == 69312
+    assert p(1, 8, 2048, 188)["partial_smem_bytes"] == 69376
     with pytest.raises(ValueError):
         p(0, 8, 2048, 188)
 
@@ -496,12 +496,64 @@ def test_oracle_gates_dry_run_on_cpu(monkeypatch):
         results.append((name, ok, detail))
 
     gen = torch.Generator().manual_seed(0)
+    monkeypatch.setattr(O, "PREFILL_T", 96)  # CPU emulation: keep it quick
     O.gate_writer(_EmuOurs(), "cpu", gen, report)
     O.gate_reader(_EmuOurs(), _EmuStock(), "cpu", gen, report)
+    O.gate_adversarial(_EmuOurs(), "cpu", gen, report)
     names = [r[0] for r in results]
-    assert len(results) == 16 and "reader_cuda_graph_replay" in names
+    assert len(results) == 23 and "reader_cuda_graph_replay" in names
+    assert "adversarial_prefill_T96" in names
     print(*results, sep="\n")
     assert all(ok for _n, ok, _d in results), [r for r in results if not r[1]]
+
+
+def test_adversarial_gate_fails_on_f16_staged_q(monkeypatch):
+    """The pre-prescale kernel staged bf16 q as plain f16: emulate exactly
+    that (q -> f16 -> scores) and the adversarial gate must FAIL, while the
+    exact emulation passes (test_oracle_gates_dry_run_on_cpu)."""
+    import torch
+
+    class _OldStaging(_EmuOurs):
+        def decode(self, q, cache, topk, out=None):
+            q16 = q.to(torch.float16).float()  # inf above 65504
+            lat, rope = O.dequant_rows_ref(cache.reshape(-1, O.ROW))
+            return O.attention_ref(q16, lat, rope, topk, O.SCALE).bfloat16()
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a: None)
+    monkeypatch.setattr(O, "PREFILL_T", 16)
+    results = {}
+    O.gate_adversarial(_OldStaging(), "cpu", torch.Generator().manual_seed(0),
+                       lambda n, ok, d: results.__setitem__(n, ok))
+    for n in ("q1e5_T6_H8", "q1e5_T1_H64", "mixed_T32_H8", "maxsf_q1e5_T6_H8",
+              "prefill_T16"):
+        assert results[f"adversarial_{n}"] is False, n
+    assert results["adversarial_maxsf_T6_H8"] and results["adversarial_all_masked_q1e5"]
+
+
+def test_boot_selftest_passes_exact_decode_and_rejects_nan(monkeypatch):
+    import torch
+
+    emu = _EmuOurs()
+    monkeypatch.setattr(P, "_suffix_nvfp4_ds_mla_write",
+                        lambda kv_c, k_pe, cache, slots: emu.write(kv_c, k_pe, cache, slots))
+    impl = types.SimpleNamespace(scale=O.SCALE, _nvfp4_num_sms=188)
+
+    def good(impl, q, cache, topk, out):
+        return emu.decode(q, cache, topk, out)
+    monkeypatch.setattr(P, "_suffix_nvfp4_ds_mla_decode", good)
+    torch.set_default_dtype(torch.bfloat16)  # as under vLLM model init
+    try:
+        P._suffix_nvfp4_ds_mla_selftest(impl, torch.device("cpu"))
+        assert torch.get_default_dtype() == torch.bfloat16
+
+        def stale(impl, q, cache, topk, out):  # pre-prescale cubin: NaN rows
+            out.fill_(float("nan"))
+            return out
+        monkeypatch.setattr(P, "_suffix_nvfp4_ds_mla_decode", stale)
+        with pytest.raises(RuntimeError, match="self-test FAILED"):
+            P._suffix_nvfp4_ds_mla_selftest(impl, torch.device("cpu"))
+    finally:
+        torch.set_default_dtype(torch.float32)
 
 
 # ---- sitecustomize integration (subprocess, fake /plugins bundle) ---------

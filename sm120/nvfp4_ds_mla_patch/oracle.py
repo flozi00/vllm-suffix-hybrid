@@ -26,7 +26,15 @@ Every gate is fatal (exit 1); exit 2 = could not run (no SM120 / imports).
     HQ 8 (TP=8) and 64, -1 padding / holes / an all -1 token (exact 0),
     split-capacity merge (ns 32 / 6 / 1), padded block stride (bitwise),
     CUDA-graph replay with new indices (bitwise).
-(c) --bench  graph-replayed us/call, ours vs stock, T in 1..64, HQ 8.
+(c) adversarial magnitudes vs an f64 reference of the same cache: |q| ~ 1e5
+    on every dim (bf16 -> f16 staging overflowed before the per-row
+    power-of-two prescale: NaN rows), 1e5 on single latent/RoPE dims,
+    1e-6 and 1e30 rows, max-SF cache rows (every nibble +-6 x SF 448, RoPE
+    +-448), all -1 top-k tokens (exact 0), T 1/6/32 (ns 32/32/6) and HQ 64,
+    and a T=8192 prefill batch (ns 1; sampled rows checked).
+(d) --bench  graph-replayed us/call, ours vs stock, T in 1..64, HQ 8, plus
+    T=8192 (prefill through the decode kernel; stock skipped: its decode
+    kernel is <= 64 tokens).
 """
 
 import argparse
@@ -397,6 +405,106 @@ def gate_reader(ours, stock, dev, gen, report):
            "graph replay with new indices bitwise == eager")
 
 
+PREFILL_T = 8192  # vLLM max-num-batched-tokens: prefill rides the decode kernel
+
+
+def conditioned_err(out, q, lat, rope, topk, keep):
+    """(max row rel-L2 of `out` vs an f64 reference over the rows f32 can
+    resolve, #rows exempted). A single 1e5 dim against ties in the
+    discrete e2m1 x SF grid makes some rows' softmax hinge on score
+    differences below f32 resolution of the dominant term — ANY f32-
+    accumulating kernel (ours, FlashInfer) is arbitrary there. Such rows
+    (an f32 torch reference is itself > 1e-3 off f64) only need finiteness;
+    every other row must match the f64 reference within 2e-2."""
+    ref = attention_ref(q.double(), lat, rope, topk, SCALE)
+    ref32 = attention_ref(q.float(), lat.float(), rope.float(), topk, SCALE)
+    n = ref.norm(dim=-1).clamp_min(1e-30)
+    noise = (ref32 - ref).norm(dim=-1) / n
+    err = (out.float() - ref).norm(dim=-1) / n
+    ok_rows = keep & (noise <= 1e-3)
+    e = float(err[ok_rows].max()) if ok_rows.any() else 0.0
+    return e, int((keep & ~ok_rows).sum())
+
+
+def gate_adversarial(ours, dev, gen, report):
+    import torch
+
+    bs, nb = 64, 64
+    nslots = bs * nb
+    kv_c, k_pe = make_kv(nslots, dev, gen, special=False)
+    hot = nslots // 4  # slots [0, hot): max-SF rows
+    sign = torch.where(randn(gen, dev, hot, DIM) > 0, 1.0, -1.0)
+    kv_c[:hot] = (sign * 5000.0).bfloat16()          # sf 448, nibbles +-6
+    k_pe[:hot] = (sign[:, :PE] * 1000.0).bfloat16()  # e4m3 +-448
+    cache = torch.zeros((nb, bs, ROW), dtype=torch.uint8, device=dev)
+    ours.write(kv_c, k_pe, cache, torch.arange(nslots, device=dev))
+    torch.cuda.synchronize()
+    lat, rope = (x.double() for x in dequant_rows_ref(cache.view(-1, ROW)))
+    big = 2.0 ** 15  # randn * 2^15: |q| up to ~1.3e5 > f16 max 65504
+
+    def q_of(t, h, mode):
+        q = randn(gen, dev, t, h, DIM + PE)
+        if mode == "big":
+            q *= big
+        elif mode == "mixed":
+            q[:, h // 2, 7] = 1e5       # one huge latent dim
+            q[:, h - 1, 520] = -1e5     # one huge RoPE dim
+            q[0] *= big                 # a whole huge token
+            q[-1] *= 1e-6               # a tiny token
+            q[t // 2, 0] *= 1e30        # one far-out head row
+        return q.bfloat16()
+
+    def maxsf_topk(t):
+        topk = torch.full((t, TOPK), -1, dtype=torch.int32, device=dev)
+        for i in range(t):
+            topk[i, :hot] = randperm(gen, dev, hot).int()
+        return topk
+
+    cases = [
+        ("q1e5_T6_H8", 6, 8, "big", make_topk(6, nslots, dev, gen)),
+        ("q1e5_T1_H64", 1, 64, "big", make_topk(1, nslots, dev, gen)),
+        ("mixed_T32_H8", 32, 8, "mixed", make_topk(32, nslots, dev, gen)),
+        ("maxsf_q1e5_T6_H8", 6, 8, "big", maxsf_topk(6)),
+        ("maxsf_T6_H8", 6, 8, "plain", maxsf_topk(6)),
+        ("all_masked_q1e5", 2, 8, "big",
+         torch.full((2, TOPK), -1, dtype=torch.int32, device=dev)),
+    ]
+    for name, t, h, mode, topk in cases:
+        q = q_of(t, h, mode)
+        out = ours.decode(q, cache, topk)
+        torch.cuda.synchronize()
+        valid = (topk >= 0).any(-1)
+        zero_ok = bool((out[~valid] == 0).all())
+        finite = bool(torch.isfinite(out).all())
+        keep = valid[:, None].expand(t, h)
+        e_row, exempt = conditioned_err(out, q, lat, rope, topk, keep)
+        report(f"adversarial_{name}", finite and zero_ok and e_row <= 2e-2
+               and exempt * 4 <= int(keep.sum()),
+               f"finite {finite}, max row rel-L2 vs f64 ref {e_row:.2e} "
+               f"({exempt} f32-unresolvable rows exempt), all-masked tokens "
+               f"zero {zero_ok}")
+
+    # prefill: T = max-num-batched-tokens through the decode kernel (ns 1)
+    t = PREFILL_T
+    q = q_of(t, 8, "mixed")
+    topk = torch.randint(0, nslots, (t, TOPK), generator=gen,
+                         device=gen.device).int().to(dev)
+    topk[::7, 1000:] = -1
+    topk[1] = -1
+    out = ours.decode(q, cache, topk)
+    torch.cuda.synchronize()
+    pick = torch.cat([torch.arange(4), torch.arange(4, t, max(1, t // 60)),
+                      torch.tensor([t // 2, t - 1])]).unique().to(dev)
+    keep = (topk[pick] >= 0).any(-1)[:, None].expand(-1, 8)
+    e_row, exempt = conditioned_err(out[pick], q[pick], lat, rope, topk[pick], keep)
+    ok = (bool(torch.isfinite(out).all()) and bool((out[1] == 0).all())
+          and e_row <= 2e-2 and exempt * 4 <= int(keep.sum()))
+    report(f"adversarial_prefill_T{t}", ok,
+           f"finite {bool(torch.isfinite(out).all())}, all-masked token zero, "
+           f"sampled {pick.numel()} tokens max row rel-L2 {e_row:.2e} "
+           f"({exempt} f32-unresolvable rows exempt)")
+
+
 def bench(ours, stock, dev, args):
     import torch
 
@@ -413,9 +521,13 @@ def bench(ours, stock, dev, args):
     rows = []
     for t in args.bench_tokens:
         q = randn(gen, dev, t, args.heads, DIM + PE).bfloat16()
-        topk = torch.stack([randperm(gen, dev, nslots)[:TOPK] for _ in range(t)]).int()
+        topk = torch.randint(0, nslots, (t, TOPK), generator=gen, device=dev,
+                             dtype=torch.int32)
         res = {"T": t, "HQ": args.heads, "topk": TOPK}
-        for name, impl, c in (("ours_us", ours, cache), ("stock_us", stock, fp8)):
+        impls = [("ours_us", ours, cache)]
+        if t <= 64:  # stock's SM120 sparse decode kernel is <= 64 tokens
+            impls.append(("stock_us", stock, fp8))
+        for name, impl, c in impls:
             out = torch.empty(t, args.heads, DIM, dtype=torch.bfloat16, device=dev)
             impl.decode(q, c, topk, out)
             torch.cuda.synchronize()
@@ -432,11 +544,13 @@ def bench(ours, stock, dev, args):
             e1.record()
             torch.cuda.synchronize()
             res[name] = round(e0.elapsed_time(e1) * 1e3 / (10 * args.iters), 2)
-        res["speedup"] = round(res["stock_us"] / res["ours_us"], 3)
+        stock_us = res.get("stock_us")
+        res["speedup"] = round(stock_us / res["ours_us"], 3) if stock_us else None
         rows.append(res)
-        print(f"{MARK} bench T={t:3d} HQ={args.heads} topk={TOPK}: ours "
-              f"{res['ours_us']:8.2f} us  stock fp8_ds_mla {res['stock_us']:8.2f} us"
-              f"  speedup {res['speedup']:.2f}x", flush=True)
+        vs = (f"stock fp8_ds_mla {stock_us:8.2f} us  speedup {res['speedup']:.2f}x"
+              if stock_us else "stock n/a (prefill-sized T)")
+        print(f"{MARK} bench T={t:4d} HQ={args.heads} topk={TOPK}: ours "
+              f"{res['ours_us']:8.2f} us  {vs}", flush=True)
     return rows
 
 
@@ -446,7 +560,7 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--heads", type=int, default=8, help="bench per-rank heads")
     ap.add_argument("--bench-tokens", type=lambda s: [int(x) for x in s.split(",")],
-                    default=[1, 2, 4, 6, 8, 16, 32, 64])
+                    default=[1, 2, 4, 6, 8, 16, 32, 64, PREFILL_T])
     ap.add_argument("--bench-slots", type=int, default=1 << 20)
     ap.add_argument("--iters", type=int, default=50)
     args = ap.parse_args(argv)
@@ -474,10 +588,10 @@ def main(argv=None) -> int:
         print(f"{MARK} {'PASS' if ok else 'FAIL'} {name}: {detail}", flush=True)
 
     gen = torch.Generator().manual_seed(0)  # CPU: reproducible across GPUs
-    for gate in (gate_writer, gate_reader):
+    for gate in (gate_writer, gate_reader, gate_adversarial):
         try:
-            gate(ours, dev, gen, report) if gate is gate_writer else gate(
-                ours, stock, dev, gen, report)
+            gate(ours, stock, dev, gen, report) if gate is gate_reader else gate(
+                ours, dev, gen, report)
         except Exception as exc:  # noqa: BLE001
             report(gate.__name__, False, f"raised {type(exc).__name__}: {exc}")
     ok = all(r["pass"] for r in results)
