@@ -111,7 +111,7 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     only = {x for x in args.only.split(",") if x}
-    kernels = []
+    kernels, failed = [], []
     for crate in sorted(Path(args.kernels).iterdir()):
         if not (crate / "Cargo.toml").is_file() or (only and crate.name not in only):
             continue
@@ -121,9 +121,17 @@ def main():
         variants = (json.loads(vf.read_text()) if vf.is_file()
                     else [{"suffix": "", "features": "", "ptxas": []}])
         for var in variants:
-            kernels.append(build_one(crate, var, nightly, ptxas, cuobjdump, out))
+            # Per-cubin isolation: one crate's toolchain failure must not
+            # drop every other lane's cubins from the bundle (lanes whose
+            # cubin is missing fail closed at ensure_loaded). Still exit 1.
+            try:
+                kernels.append(build_one(crate, var, nightly, ptxas, cuobjdump, out))
+            except (SystemExit, subprocess.CalledProcessError) as exc:
+                detail = getattr(exc, "stderr", None) or exc
+                print(f"FAILED {crate.name}{var['suffix']}: {detail}", flush=True)
+                failed.append(crate.name + var["suffix"])
     if not kernels:
-        raise SystemExit("no kernel crates found")
+        raise SystemExit(f"no kernel cubins built (failed: {failed})")
     manifest = {
         "arch": ARCH,
         "ptxas_version": ptxas_version,
@@ -133,6 +141,8 @@ def main():
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     print(f"oxide build: {len(kernels)} cubins ({ARCH}, ptxas {ptxas_version}) -> {out}")
+    if failed:
+        raise SystemExit(f"oxide build: FAILED {failed} (manifest lists the rest)")
 
 
 if __name__ == "__main__":

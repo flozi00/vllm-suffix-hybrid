@@ -105,7 +105,9 @@ jobs:
         # the rest of the bundle, stay visibly red.
         continue-on-error: true
         run: |
-          python scripts/oxide_build.py --out oxide_cubins || { rm -rf oxide_cubins; exit 1; }
+          # per-cubin isolation: a failing crate exits 1 but the manifest
+          # still ships every cubin that built (missing lanes fail closed)
+          python scripts/oxide_build.py --out oxide_cubins
       - name: Create directly mountable runtime bundle
         run: |
           python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA" \
