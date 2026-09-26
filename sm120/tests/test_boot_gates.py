@@ -106,3 +106,12 @@ def test_nvfp4_kv_gates(tmp_path):
     assert seen["argv"][:2] == ["--bench", "--json"] and "SUFFIX_SM120_NVP4KV_OWN_ATTN" not in seen["env"]
     # argv mirrors the kernel lab's K2 preset (--page 64 --max-gb 8 fixed)
     assert seen["argv"][-4:] == ["--page", "64", "--max-gb", "8"]
+
+
+def test_nvfp4_lmhead_gates_are_allowlisted():
+    src = (REPO / "sitecustomize.py").read_text()
+    ns = {}
+    exec(src[src.index("_BOOT_GATES = {"):src.index("\n_boot_gates = ")], ns)
+    for mode in ("oracle", "bench"):
+        argv, env = ns["_BOOT_GATES"][f"nvfp4_lmhead_{mode}"]
+        assert argv == ["-m", "suffix_hybrid.kernels.nvfp4_lm_head", mode] and env == {}
