@@ -78,8 +78,19 @@ def child(mode: str, a) -> dict:
         kw["kv_transfer_config"] = KVTransferConfig(
             kv_connector="HiSparseConnector", kv_role="kv_both",
             kv_connector_extra_config={"host_pool_gib": a.host_gib})
-        if a.gpu_blocks:
-            kw["num_gpu_blocks_override"] = a.gpu_blocks
+        blocks = a.gpu_blocks
+        if blocks < 0:
+            # Auto: room for the per-request hot regions + indexer + one
+            # request's pages, but not for all prompts resident -> spills
+            # happen and admission still progresses. G = layers + MTP layer.
+            g = a.layers + 1
+            mml = a.prompt_len + a.max_tokens + 64
+            blocks = (g * -(-(a.k + 2) * 2048 // 64) + -(-mml // 64)
+                      + g * 16 + 32)
+        if blocks:
+            kw["num_gpu_blocks_override"] = blocks
+            print(f"[suffix sm120-hisparse-mtp] ORACLE {mode}: num_gpu_blocks_override={blocks}",
+                  flush=True)
     llm = LLM(
         a.model, load_format="dummy", seed=0, hf_overrides=shrink,
         skip_tokenizer_init=True, kv_cache_dtype=a.kv_cache_dtype,
@@ -112,10 +123,16 @@ def child(mode: str, a) -> dict:
                                  use_tqdm=False)[0].outputs[0].token_ids)
 
     prompts = _prompts(a.prompt_len)
-    out = {"target_1": gen(prompts[0])}
+    def step(name, p):
+        out[name] = gen(p)
+        print(f"[suffix sm120-hisparse-mtp] ORACLE {mode}: {name} done "
+              f"({len(out[name])} tokens)", flush=True)
+
+    out = {}
+    step("target_1", prompts[0])
     for i, p in enumerate(prompts[1:]):
-        out[f"pressure_{i}"] = gen(p)
-    out["target_2"] = gen(prompts[0])
+        step(f"pressure_{i}", p)
+    step("target_2", prompts[0])
 
     spills = None
     if hisparse:
@@ -245,7 +262,7 @@ def main(argv=None) -> int:
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--batched-tokens", type=int, default=2048)
     ap.add_argument("--gpu-blocks", type=int, default=0,
-                    help="num_gpu_blocks_override for HiSparse runs (0=auto)")
+                    help="num_gpu_blocks_override for HiSparse runs (0=vLLM sizing, -1=spill-forcing auto)")
     ap.add_argument("--host-gib", type=int, default=4)
     ap.add_argument("--gpu-util", type=float, default=0.5)
     ap.add_argument("--kv-cache-dtype", default="fp8_ds_mla")
