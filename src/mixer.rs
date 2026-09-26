@@ -1036,27 +1036,26 @@ impl V2SuffixProposer {
                 }
                 _ => false,
             };
-            let tokens_row: Vec<i64> = if cont {
-                let t = tracked.unwrap();
-                let mut v = t.clone();
-                v.extend(
-                    row.iter()
-                        .skip(t.len())
-                        .take(total - t.len())
-                        .map(|&x| x.into()),
-                );
-                v
+            // Extend the tracked mirror IN PLACE: cloning it to append the
+            // delta was an O(context) copy per row per step.
+            if cont {
+                let t = self.mirror.get_mut(rid).unwrap();
+                let l = t.len();
+                t.extend(row.iter().skip(l).take(total - l).map(|&x| x.into()));
             } else {
                 if tracked.is_some() {
                     self.resets += 1;
                 }
-                row.iter().take(total).map(|&x| x.into()).collect()
-            };
+                self.mirror
+                    .insert(rid.clone(), row.iter().take(total).map(|&x| x.into()).collect());
+            }
+            let tokens_row = &self.mirror[rid];
+            let pad = tokens_row.first().copied().unwrap_or(0);
             // Cache lookup: the continuation starts at the true next token
             // (the buffer read happens AFTER postprocess_sampled wrote the
             // last sampled token — the mirror is EXACT, no shift needed).
             let (suffix, _score, _matched) =
-                lock_cache(&self.cache.inner).speculate(&tokens_row, k);
+                lock_cache(&self.cache.inner).speculate(tokens_row, k);
             let (mut tokens, mut real_w) = if !suffix.is_empty() && suffix.len() >= min_len {
                 let w = suffix.len().min(k);
                 (suffix[..w].to_vec(), w)
@@ -1155,7 +1154,6 @@ impl V2SuffixProposer {
             // plausibility is irrelevant.
             let out_row = if self.uniform_k {
                 let mut t = tokens;
-                let pad = tokens_row.first().copied().unwrap_or(0);
                 while t.len() < k {
                     t.push(pad);
                 }
@@ -1175,7 +1173,6 @@ impl V2SuffixProposer {
                 self.hits += 1;
                 self.hit_tokens += out_row.real_w as u64;
             }
-            self.mirror.insert(rid.clone(), tokens_row);
             self.widths.insert(rid.clone(), out_row.width);
             padded_self += usize::from(self.uniform_k && out_row.real_w < out_row.width);
             out.push(out_row);
