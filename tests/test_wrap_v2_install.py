@@ -730,3 +730,54 @@ def test_verifier_win_verified_win_rearms(monkeypatch):
                num_rejected=torch.tensor([0]))
     # Verified wins the whole way: gate stays reset, full path keeps running.
     assert len(mixer2.calls) >= 4
+
+
+def test_probe_skip_still_broadcasts_in_multirank_broadcast_mode(monkeypatch):
+    # Non-owner ranks post a broadcast EVERY step; rank 0's probe/frozen
+    # skips must send one too or the next collective pairs with the wrong op.
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    monkeypatch.delenv("SUFFIX_HYBRID_TP_MODE", raising=False)
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+
+    class Count(TP):
+        world_size = 8
+        sent = 0
+
+        def broadcast(self, value, src=0):
+            Count.sent += 1
+            return value
+
+    mixer = ProbeMix([[9, 10, 11, 12, 99]], tokens=1000, hit=False)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, Count())
+    for _ in range(3):
+        invoke(wrapped, None)
+    assert len(mixer.calls) <= 1          # probe skips (mirror seeds first)
+    assert Count.sent == 3                # every step still broadcast
+
+
+def test_diverge_bypasses_probe_and_mixes_every_step(monkeypatch):
+    # The probe only sees global-cache evidence; diverge's in-request lookup
+    # would be starved by it, so diverge always takes the full path.
+    monkeypatch.setenv("SUFFIX_HYBRID_SPLIT", "diverge")
+    monkeypatch.setenv("SUFFIX_HYBRID_PROBE_MIN_LEN", "2")
+    native = torch.tensor([[9, 10, 11, 12, 99]], dtype=torch.int64)
+    runner, batch, invoke = _probe_fixture(native)
+    mixer = ProbeMix([[9, 10, 11, 12, 99]], tokens=1000, hit=False)
+    wrapped = wrap_v2._wrap_propose(runner, lambda *a, **k: native,
+                                    mixer, TP())
+    for _ in range(3):
+        invoke(wrapped, None)
+    assert len(mixer.calls) == 3
+    assert mixer.probe_calls == 0
+
+
+def test_row_mirror_grows_and_views():
+    r = wrap_v2._Row([1, 2, 3])
+    for step in range(100):
+        r.extend([step, step + 1])
+    assert len(r) == 203
+    assert r.view()[:3].tolist() == [1, 2, 3]
+    assert r.view()[-2:].tolist() == [99, 100]
+    assert not wrap_v2._Row([])

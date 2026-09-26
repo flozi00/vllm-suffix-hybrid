@@ -254,6 +254,40 @@ def _pipe_enqueue(staging, stream, prod_ev, st_ev, totals_gpu, idx_np):
         st_ev.record(stream)
 
 
+class _Row:
+    """Growable int64 token row for the hybrid mirror.
+
+    The mirror used to hold Python int lists, and every full-path mix
+    rebuilt the [n, max_len] history ndarray from them: a list->ndarray
+    conversion of the WHOLE context per row per step (~4 ms/step at c8 x 32k
+    on the critical path, where MTP decode steps are tens of ms). ndarray
+    rows make that a memcpy (~50x cheaper) with identical content.
+    """
+    __slots__ = ("buf", "n")
+
+    def __init__(self, toks=()):
+        a = np.asarray(toks, dtype=np.int64)
+        self.buf = np.empty(max(64, 2 * a.size), dtype=np.int64)
+        self.buf[:a.size] = a
+        self.n = int(a.size)
+
+    def __len__(self):
+        return self.n
+
+    def extend(self, toks):
+        a = np.asarray(toks, dtype=np.int64)
+        m = self.n + int(a.size)
+        if m > self.buf.size:
+            grown = np.empty(2 * m, dtype=np.int64)
+            grown[:self.n] = self.buf[:self.n]
+            self.buf = grown
+        self.buf[self.n:m] = a
+        self.n = m
+
+    def view(self):
+        return self.buf[:self.n]
+
+
 class _PipeInvariantError(RuntimeError):
     """Raised by the pipelined path on an I1-I10 invariant violation.
 
@@ -1470,6 +1504,15 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
     # bench-window share, wakeup #23). Default OFF = p17 semantics.
     verifier_win = os.environ.get(
         "SUFFIX_HYBRID_VERIFIER_WIN", "").strip() == "1"
+    # SPLIT=diverge (Rust mixer reads the same env): the mix must see the
+    # CURRENT context, so absorb this step's window right after the native
+    # D2H fenced the main stream (legacy CUDA mixes a one-step-stale mirror:
+    # suffix keys miss the a+1 newest tokens, and sampled/rejected staging is
+    # read while this step's async copy into it is still in flight). The
+    # probe/frozen gates only see global-cache evidence, never the in-request
+    # lookup, so diverge always takes the full path.
+    split_diverge = os.environ.get(
+        "SUFFIX_HYBRID_SPLIT", "").strip() == "diverge"
     hook_times = {"absorb": [0.0, 0], "mix": [0.0, 0],
                   "write": [0.0, 0], "bcast": [0.0, 0]}
     sync_run = _sync_body(runner, mixer, group, probabilistic,
@@ -1501,7 +1544,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
     # st["w"] is the optimistic per-step window width K+2 (a step appends at
     # most K verified draft tokens + 1 sampled token). From install k when
     # given, else inferred from the first native draft's row width.
-    st = {"mirror": {},             # req_id -> [int] CPU-authoritative row
+    st = {"mirror": {},             # req_id -> _Row CPU-authoritative row
           "staging": None,          # pinned tail/count/sample buffers
           "cap": 0,
           "w": (int(k) + 2) if int(k or 0) > 0 else 0,
@@ -1531,6 +1574,15 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         # evaluate rank 0's cold/unchanged predicate — keep the (cheap)
         # native broadcast instead of deadlocking their receive.
         return int(getattr(group, "world_size", 1)) <= 1 or _replay()
+
+    def _native_out(native):
+        # Rank-0 skip paths. Non-owner ranks post group.broadcast on EVERY
+        # step, so in multi-rank broadcast mode rank 0 must send too; a bare
+        # return pairs their receive with rank 0's NEXT collective (hang or
+        # shifted drafts). Only probe/frozen skips took that bare return.
+        if _can_skip_collective():
+            return native
+        return group.broadcast(native, src=0)
 
     def _ensure_staging(n_rows, row_width):
         if st["w"] <= 0:
@@ -1565,7 +1617,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         # request lifetime, never per decode step.
         total = max(int(total), 0)
         upto = min(total, int(gpu_row.shape[0]))
-        st["mirror"][rid] = [int(t) for t in gpu_row[:upto].tolist()]
+        st["mirror"][rid] = _Row(gpu_row[:upto].tolist())
 
     def _window_slice(gpu_row, L):
         # Bounded optimistic window [L, L+W): never needs a GPU-side length
@@ -1664,7 +1716,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
                 # Window overshot: same full re-seed path from position 0.
                 mirror.pop(rid, None)
                 continue
-            toks.extend(int(t) for t in tail_row[:new_len - last])
+            toks.extend(tail_row[:new_len - last])
 
     def _greedy_rows(temperature, idx):
         # Probabilistic mode: arbitrate only temperature==0 rows (the
@@ -1702,6 +1754,12 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         mirror = st["mirror"]
         bufs = st["staging"]
         n = len(ids)
+        if split_diverge:
+            # The native D2H drains the main stream; the side-stream window
+            # copy behind it is then ~done: absorb so the mirror and the
+            # sampled/rejected feedback are THIS step's.
+            native_rows = native.detach().cpu().tolist()
+            _absorb_pending()
         counts_np = np.zeros(max(n, 1), dtype=np.int64)
         for i, rid in enumerate(ids):
             counts_np[i] = len(mirror.get(rid, ()))
@@ -1714,11 +1772,12 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         for i, rid in enumerate(ids):
             toks = mirror.get(rid)
             if toks:
-                history_np[i, :len(toks)] = toks
+                history_np[i, :len(toks)] = toks.view()
         # ONE small D2H for the whole step (the native draft rows). Replaces
         # the old clone + full-history blocking buffer read + two small
         # blocking sampler-feedback reads.
-        native_rows = native.detach().cpu().tolist()
+        if not split_diverge:
+            native_rows = native.detach().cpu().tolist()
         sampled = bufs["sampled"][:n].tolist() if n else []
         rejected = bufs["rejected"][:n].tolist() if n else []
         greedy_rows = _greedy_rows(temperature, idx)
@@ -1919,11 +1978,11 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
                 # Un-mirrored (fresh request): full path — the first suffix
                 # hit often happens right at prompt-echo time.
                 return True
-            tail = row[-depth:]
+            tail = row.view()[-depth:].tolist()
             if len(tail) < n_gram:
                 continue        # shorter than the index n-gram: no lookup
             try:
-                suffix, _score, _matched = cache.speculate(list(tail), w)
+                suffix, _score, _matched = cache.speculate(tail, w)
             except Exception:
                 return True     # probe itself failed: full path
             if len(suffix) >= min_len:
@@ -1977,7 +2036,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
         except Exception:
             warm = False
         gate = st["gate"]
-        if (cooldown > 0 and warm
+        if (cooldown > 0 and warm and not split_diverge
                 and all(gate.get(rid, 0) >= cooldown for rid in ids)
                 and all(rid in st["mirror"] for rid in ids)):
             # Advance the step counter here so the heartbeat modulo keeps
@@ -1996,7 +2055,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
                 _note_skip("skips_frozen")
                 previous_widths.update(
                     zip(ids, [int(native.shape[1])] * len(ids)))
-                return native
+                return _native_out(native)
         idx_cpu = _lut_index(input_batch, ids)
         t = time.perf_counter()
         # Absorb last step's async copies (one engine step old: the event
@@ -2011,7 +2070,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
             _absorb_pending()      # CPU-only: copies already landed
         _bump("absorb", t)
         state["steps"] += 1
-        if not _mirror_probe(ids, int(native.shape[1])):
+        if not split_diverge and not _mirror_probe(ids, int(native.shape[1])):
             # No suffix evidence on any row and the corpus is warm: the
             # native echo is byte-identical to the mix's output. Publish
             # verbatim — zero GPU reads, no clone, no mix. Keep the
@@ -2020,7 +2079,7 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
             _note_skip("skips_probe")
             previous_widths.update(
                 zip(ids, [int(native.shape[1])] * len(ids)))
-            return native
+            return _native_out(native)
         t = time.perf_counter()
         # Mix purely from the CPU mirror. Greedy mode never touches idx;
         # probabilistic mode needs a tensor for temperature[idx] (CPU
