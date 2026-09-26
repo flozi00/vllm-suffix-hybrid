@@ -41,7 +41,8 @@ Serving (gate ``SUFFIX_NVFP4_MOE=1``, default OFF; entry point
 ``SuffixNvFp4RoutedExperts``. After vLLM's own weight processing (FlashInfer
 CUTLASS layout) each eligible layer runs a LAYER ORACLE on its real weights:
 ours vs the parent ``forward_modular`` (= vLLM's FlashInfer
-cutlass_fused_moe path) vs the exact fp32 reference, fatal on mismatch.
+cutlass_fused_moe path) vs the f64 spec reference + per-stage readback of our
+workspace (`stages`), fatal on mismatch.
 Shared experts: MoERunner runs them itself unless the modular kernel
 overlaps them (prepare_finalize.supports_async); the latter is ineligible,
 so ignoring the forward_modular shared_experts argument matches stock.
@@ -50,7 +51,7 @@ everything else calls the parent unchanged. Gated on but no layer engaged ->
 startup error naming why.
 
 CLI (in-pod, SM120 + oxide bundle):
-  python -m suffix_hybrid.kernels.nvfp4_moe oracle   # ours vs FlashInfer vs exact ref
+  python -m suffix_hybrid.kernels.nvfp4_moe oracle   # ours vs FlashInfer vs f64 ref, per stage
   python -m suffix_hybrid.kernels.nvfp4_moe bench    # us: ours vs FlashInfer (CUDA graphs)
   (gemma + GLM-5.3 EP rank + GLM-5.3 TP=8 shard, synthetic weights, one GPU)
 """
@@ -98,13 +99,38 @@ def _r(v: int, a: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# reference (torch fp32, any device) — identical math to the kernel
+# reference (torch f64, any device): the NVFP4 spec our kernel implements
 # ---------------------------------------------------------------------------
-def act_ref(x, kind: int):
+# Accuracy anatomy (2026-09-26; CPU emulation, gemma shapes, vs this f64
+# reference): the intermediate is RE-QUANTIZED to FP4 after act*up, so any
+# sub-ulp perturbation before that point flips e2m1 codes / e4m3 block scales
+# near rounding boundaries; each flip is a whole FP4 quantum (12-25 % of the
+# element), which amplifies a relative perturbation d to ~sqrt(d * quantum)
+# end-to-end. The dense GEMM has no second quantization, hence no such gain.
+#   bf16 output rounding only (the floor, = this kernel)       1.7e-3
+#   tanh.approx.f32 in gelu (rel 2^-11; kernel before 26.09)    2.5e-3..1.7e-2
+#   FlashInfer: fc1 GEMM output stored bf16 before act          2.1e-2..2.8e-2
+#   FlashInfer: act*up cast to bf16 before its FP4 quant        1.9e-2..3.3e-2
+#   FlashInfer: fc2 output stored bf16 before finalize          2.3e-3
+#   FlashInfer: erf GeGLU (vLLM maps GELU_TANH -> Geglu)        2.7e-3..6.5e-3
+# (TRT-LLM cutlass_fused_moe_kernels.cuh: GemmOutputType = bf16 for fc1/fc2,
+# quantizePackedFPXValue casts post_act to bf16; flashinfer_utils.py maps
+# GELU_TANH to ActivationType.Geglu although FI 0.6.18 has GegluTanh.)
+# So ours-vs-FlashInfer (1.3e-2..8e-2 on silicon) is FlashInfer's own
+# distance from the spec; `fi=True` below emulates it so the oracle proves
+# that attribution on silicon instead of assuming it.
+def act_ref(x, kind: int, erf: bool = False):
     import torch
     if kind == 1:
+        if erf:
+            return 0.5 * x * (1.0 + torch.erf(x * 0.7071067811865476))
         return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
     return x * torch.sigmoid(x)
+
+
+def _bf(t):
+    import torch
+    return t.to(torch.bfloat16).to(t.dtype)
 
 
 def quant_codes(x, g: float):
@@ -182,34 +208,41 @@ def _groups(ids, e_count: int):
     return out
 
 
-def fc1_ref(p, x, ids):
-    """f32 [P, I] intermediate h = act(g1*gate) * g1*up per routed pair."""
+def fc1_ref(p, x, ids, fi=False):
+    """f64 [P, I] intermediate h = act(g1*gate) * g1*up per routed pair.
+    fi=True: FlashInfer's numerics (bf16 GEMM output, erf GeGLU, bf16 act)."""
     import torch
     e_count, two_i = p["w13"].shape[0], p["w13"].shape[1]
     i = two_i // 2
     topk = ids.shape[1]
-    xd = qdq(x.float(), p["a1g"])
-    h = torch.zeros(ids.numel(), i, dtype=torch.float32, device=x.device)
+    xd = qdq(x.float(), p["a1g"]).double()
+    h = torch.zeros(ids.numel(), i, dtype=torch.float64, device=x.device)
     for e, pairs in _groups(ids, e_count).items():
-        gu = p["g1"][e].float() * (xd[pairs // topk] @ _expert_w(p["w13"], p["w13_sf"], e).T)
-        h[pairs] = act_ref(gu[:, i:], p["act"]) * gu[:, :i]
+        gu = float(p["g1"][e]) * (xd[pairs // topk] @ _expert_w(p["w13"], p["w13_sf"], e).double().T)
+        if fi:
+            gu = _bf(gu)
+        a = act_ref(gu[:, i:], p["act"], erf=fi) * gu[:, :i]
+        h[pairs] = _bf(a) if fi else a
     return h
 
 
-def moe_ref(p, x, ids, tw):
-    """Exact f32 [M, H] routed-experts output of the quantized problem (what
-    the kernel computes, before the final bf16 rounding)."""
+def moe_ref(p, x, ids, tw, fi=False):
+    """Exact f64 [M, H] routed-experts output of the quantized problem: the
+    NVFP4 spec with f64 arithmetic between the two FP4 quantizations (the
+    kernel keeps f32 there). fi=True: emulation of FlashInfer's numerics."""
     import torch
     m, topk = ids.shape
     e_count, hdim = p["w2"].shape[0], p["w2"].shape[1]
-    hd = qdq(fc1_ref(p, x, ids), p["a2g"])
-    y = torch.zeros(m * topk, hdim, dtype=torch.float32, device=x.device)
+    hd = qdq(fc1_ref(p, x, ids, fi).float(), p["a2g"]).double()
+    y = torch.zeros(m * topk, hdim, dtype=torch.float64, device=x.device)
     for e, pairs in _groups(ids, e_count).items():
-        y[pairs] = (p["g2"][e].float() * (hd[pairs] @ _expert_w(p["w2"], p["w2_sf"], e).T)
-                    * tw.reshape(-1)[pairs, None].float())
+        yy = float(p["g2"][e]) * (hd[pairs] @ _expert_w(p["w2"], p["w2_sf"], e).double().T)
+        if fi:
+            yy = _bf(yy)
+        y[pairs] = yy * tw.reshape(-1)[pairs, None].double()
     valid = ((ids >= 0) & (ids < e_count)).reshape(-1, 1).float()
     y = (y * valid).reshape(m, topk, hdim)
-    out = torch.zeros(m, hdim, dtype=torch.float32, device=x.device)
+    out = torch.zeros(m, hdim, dtype=torch.float64, device=x.device)
     for k in range(topk):  # the kernel's fixed k order
         out += y[:, k]
     return out
@@ -302,33 +335,90 @@ def rand_routing(m, e_count, topk, device, seed=0, base=0, local=None, dead=None
     return ids.to(device), tw.to(device)
 
 
+REF_TOL = 5e-3  # ours vs the f64 spec, end to end (see oracle_ok)
+STAGE_TOL = {"xq": 1e-3, "fc1": 1e-4, "hq": 1e-3, "fc2": 1e-4, "comb": 1e-3}
+
+
 def oracle_ok(rel_vs_ref: float, rel_vs_fi: float, fi_rel_vs_ref: float) -> bool:
-    """Relative to vLLM's own error (like the dense gate): our error vs the
-    exact reference within 10 % of FlashInfer's own (floor 1e-2), and our
-    distance to FlashInfer bounded by the triangle inequality of both errors
-    (floor 2e-2). NVFP4 requant of the intermediate makes bit-parity with a
-    differently-ordered accumulation impossible; FlashInfer additionally maps
-    gelu_tanh to erf-GeGLU (flashinfer_utils.py:47)."""
-    return (rel_vs_ref <= max(1e-2, 1.1 * fi_rel_vs_ref)
-            and rel_vs_fi <= max(2e-2, 2.2 * fi_rel_vs_ref))
+    """Ours vs the f64 spec <= REF_TOL: the floor is the bf16 output
+    rounding (~1.1e-3 rms) plus requant flips from f32-vs-f64 intermediates,
+    1.7e-3 emulated; tanh.approx-class drift (2.5e-3..1.7e-2) or any
+    layout/scale bug trips it. FlashInfer's own distance to the spec is NOT
+    a tolerance for us (it is 1-3e-2 from bf16 intermediates, see the
+    accuracy anatomy above). Ours vs FlashInfer only has to respect the
+    triangle bound of both errors (floor 2e-2)."""
+    return (rel_vs_ref <= REF_TOL
+            and rel_vs_fi <= max(2e-2, 1.1 * (rel_vs_ref + fi_rel_vs_ref)))
 
 
 def _rel(a, b) -> float:
-    return float((a - b).norm() / b.norm().clamp_min(1e-30))
+    return float((a.double() - b.double()).norm() / b.double().norm().clamp_min(1e-30))
 
 
-def judge(ours, fi, ref, local_ids):
+def judge(ours, fi, ref, local_ids, fi_emu=None):
     """(ok, metrics) for one oracle case: oracle_ok vs FlashInfer and the
-    exact reference, finite, and the EP zero contract — tokens with no
-    local expert are exactly 0 in ours AND in vLLM's stock output."""
+    f64 reference, finite, and the EP zero contract — tokens with no local
+    expert are exactly 0 in ours AND in vLLM's stock output. fi_emu (our
+    emulation of FlashInfer's numerics) is evidence only: flashinfer ~
+    fi_emulation << flashinfer ~ ref attributes FlashInfer's error."""
     import torch
     r_ref, r_fi, fi_ref = _rel(ours, ref), _rel(ours, fi), _rel(fi, ref)
     dead = (local_ids < 0).all(1)
     zero = bool((ours[dead] == 0).all() and (fi[dead] == 0).all())
     ok = oracle_ok(r_ref, r_fi, fi_ref) and zero and bool(torch.isfinite(ours).all())
+    emu = "" if fi_emu is None else f"flashinfer_vs_fi_emulation={_rel(fi, fi_emu):.2e} "
     return ok, (f"rel_vs_ref={r_ref:.2e} rel_vs_flashinfer={r_fi:.2e} "
-                f"flashinfer_rel_vs_ref={fi_ref:.2e} nonlocal_tokens={int(dead.sum())} "
+                f"flashinfer_rel_vs_ref={fi_ref:.2e} {emu}nonlocal_tokens={int(dead.sum())} "
                 f"nonlocal_zero={zero}")
+
+
+def stages(p, x, ids, tw, ws, out):
+    """Per-stage drift of OUR kernel, read back from its workspace right
+    after a run (`ids` LOCAL, -1 = off-rank). Each stage is checked against
+    the f64 spec fed with the kernel's own previous-stage output, so a drift
+    is pinned to the stage that made it:
+      xq    x -> NVFP4 (a1 gscale)        frac of dequantized values differing
+      fc1   act(g1*gate) * g1*up           rel vs f64 from the kernel's xq
+      hq    inter -> NVFP4 (a2 gscale)    frac differing vs quant of its inter
+      fc2   g2 * tw * (hq @ w2^T)          rel vs f64 from the kernel's hq
+      comb  bf16(sum_k y), fixed k order   frac differing
+    Tolerances STAGE_TOL: quant/combine are the same f32 ops as the spec
+    (bit-exact expected, 1e-3 allows rare rounding ties); GEMM stages are
+    f32 accumulation over K <= 6144 (~sqrt(K) * 2^-24 ~ 5e-6), 20x headroom.
+    Returns (ok, msg)."""
+    import torch
+    aq, asf, inter, hq, hsf, y, _ = ws
+    m, topk = ids.shape
+    e_count, hdim, ih = p["w2"].shape
+    idim, pairs = ih * 2, m * topk
+    f8 = lambda b: b.view(torch.float8_e4m3fn).float()
+    frac = lambda a, b: float((a != b).float().mean()) if a.numel() else 0.0
+    xq = dequant(aq[:m * hdim // 2].view(m, -1), f8(asf[:m * hdim // 16].view(m, -1)))
+    got = {"xq": frac(xq, qdq(x.float(), p["a1g"]))}
+    vp = torch.nonzero(ids.reshape(-1) >= 0).reshape(-1)
+    h = inter[:pairs * idim].view(pairs, idim)[vp]
+    h_ref = torch.zeros(pairs, idim, dtype=torch.float64, device=x.device)
+    y_ref = torch.zeros(pairs, hdim, dtype=torch.float64, device=x.device)
+    hd = dequant(hq[:pairs * idim // 2].view(pairs, -1), f8(hsf[:pairs * idim // 16].view(pairs, -1)))
+    for e, pr in _groups(ids, e_count).items():
+        gu = float(p["g1"][e]) * (xq[pr // topk].double()
+                                  @ _expert_w(p["w13"], p["w13_sf"], e).double().T)
+        h_ref[pr] = act_ref(gu[:, idim:], p["act"]) * gu[:, :idim]
+        y_ref[pr] = (float(p["g2"][e]) * (hd[pr].double()
+                                          @ _expert_w(p["w2"], p["w2_sf"], e).double().T)
+                     * tw.reshape(-1)[pr, None].double())
+    got["fc1"] = _rel(h, h_ref[vp]) if vp.numel() else 0.0
+    got["hq"] = frac(hd[vp], qdq(h, p["a2g"]))
+    yk = y[:pairs * hdim].view(pairs, hdim)
+    got["fc2"] = _rel(yk[vp], y_ref[vp]) if vp.numel() else 0.0
+    acc = torch.zeros(m, hdim, dtype=torch.float32, device=x.device)
+    valid = (ids >= 0)
+    yk = yk.view(m, topk, hdim)
+    for k in range(topk):  # the kernel's order, f32
+        acc = torch.where(valid[:, k, None], acc + yk[:, k], acc)
+    got["comb"] = frac(out.float(), acc.bfloat16().float())
+    ok = all(got[k] <= STAGE_TOL[k] for k in got)
+    return ok, "stages " + " ".join(f"{k}={v:.1e}" for k, v in got.items())
 
 
 # ---------------------------------------------------------------------------
@@ -496,11 +586,11 @@ def _make_layer_cls():
 
         def _sfx_oracle(self, cfg, info):
             """Ours vs the parent (vLLM FlashInfer cutlass_fused_moe, with
-            this rank's real ep_size/ep_rank) vs the exact reference on this
+            this rank's real ep_size/ep_rank) vs the f64 reference on this
             layer's REAL weights, GLOBAL routing ids. EP adds a batch whose
             tokens all route to other ranks (must be exact 0). Fatal."""
             dev = self.w13_weight.device
-            worst = 0.0
+            worst, worst_ref, worst_fi_ref, worst_emu = 0.0, 0.0, 0.0, 0.0
             base, local = cfg["id_base"], info["E"]
             mm = cfg["max_m"]  # workspace capacity: every case M <= max_m
             cases = [(m, None) for m in sorted({1, min(8, mm), mm})]
@@ -515,11 +605,19 @@ def _make_layer_cls():
                 ids, tw = rand_routing(m, cfg["E_global"], cfg["topk"], dev, seed,
                                        base, local, dead)
                 fi = super().forward_modular(x, tw, ids).float()
-                ours = self._sfx_run(cfg, x, tw, ids).float()
+                out = self._sfx_run(cfg, x, tw, ids)
                 lid = to_local(ids, base, local)
-                ref = moe_ref(cfg, x, lid, tw).bfloat16().float()
-                ok, msg = judge(ours, fi, ref, lid)
-                worst = max(worst, _rel(ours, fi) if fi.norm() > 0 else 0.0)
+                st_ok, st = stages(cfg, x, lid, tw, _state["ws"][dev], out)
+                ours = out.float()
+                ref = moe_ref(cfg, x, lid, tw)
+                emu = moe_ref(cfg, x, lid, tw, fi=True).bfloat16()
+                ok, msg = judge(ours, fi, ref, lid, emu)
+                ok, msg = ok and st_ok, f"{msg} {st}"
+                if fi.norm() > 0:
+                    worst = max(worst, _rel(ours, fi))
+                    worst_ref = max(worst_ref, _rel(ours, ref))
+                    worst_fi_ref = max(worst_fi_ref, _rel(fi, ref))
+                    worst_emu = max(worst_emu, _rel(fi, emu))
                 if not ok:
                     raise RuntimeError(
                         f"{MARKER} LAYER ORACLE FAIL {self.layer_name} M={m} "
@@ -527,7 +625,9 @@ def _make_layer_cls():
             torch.cuda.synchronize(dev)
             _log(f"LAYER ORACLE PASS {self.layer_name} E={local}/{cfg['E_global']} "
                  f"id_base={base} H={info['H']} I={info['I']} act={info['act']} "
-                 f"max_rel_vs_flashinfer={worst:.2e}")
+                 f"max_rel_vs_flashinfer={worst:.2e} max_rel_vs_ref={worst_ref:.2e} "
+                 f"flashinfer_max_rel_vs_ref={worst_fi_ref:.2e} "
+                 f"flashinfer_max_rel_vs_fi_emulation={worst_emu:.2e} (last case {st})")
             return worst
 
         def forward_modular(self, x, topk_weights, topk_ids, shared_experts=None,
@@ -686,8 +786,9 @@ BENCH_CASES = ((GEMMA_MOE, CONCURRENCY), (GLM_EP, (1, 6, 12, 24, 48, 64, 96, 192
 
 
 def oracle(cases=ORACLE_CASES):
-    """Per case: ours vs vLLM's FlashInfer (same EP rank) vs the exact
-    reference; EP cases add rows routed only off-rank plus one batch whose
+    """Per case: ours vs vLLM's FlashInfer (same EP rank) vs the f64
+    reference, FlashInfer vs our emulation of its numerics, and our kernel's
+    per-stage drift read back from its workspace (`stages`); EP cases add rows routed only off-rank plus one batch whose
     tokens ALL route off-rank (exact-zero contract). Fatal on mismatch."""
     import torch
     native = _native_ready()
@@ -705,16 +806,20 @@ def oracle(cases=ORACLE_CASES):
                                    dead=dead)
             x = torch.randn(m, hdim, device=dev).bfloat16()
             lid = to_local(ids, base, local)
-            ref = moe_ref(p, x, lid, tw).bfloat16().float()
+            ref = moe_ref(p, x, lid, tw)
+            emu = moe_ref(p, x, lid, tw, fi=True).bfloat16()
             fi = _fi_call(p, x, ids, tw, torch.full((m, hdim), float("nan"),
                                                     dtype=torch.bfloat16, device=dev)).float()
-            ours = run_ours(native, p, x, ids, tw, ws, stream).float()
             again = run_ours(native, p, x, ids, tw, ws, stream).float()
+            out = run_ours(native, p, x, ids, tw, ws, stream)
+            st_ok, st = stages(p, x, lid, tw, ws, out)
+            ours = out.float()
             det = bool(torch.equal(ours, again))
-            ok, msg = judge(ours, fi, ref, lid)
-            ok = ok and det
+            ok, msg = judge(ours, fi, ref, lid, emu)
+            ok = ok and det and st_ok
             lines.append(f"{_case_name(case)} M={m}{' all-nonlocal' if dead else ''} "
-                         f"P={m * topk}: {msg} deterministic={det} {'OK' if ok else 'FAIL'}")
+                         f"P={m * topk}: {msg} {st} deterministic={det} "
+                         f"{'OK' if ok else 'FAIL'}")
             if not ok:
                 raise RuntimeError(f"{MARKER} NVFP4-MOE ORACLE FAIL: {lines[-1]}")
         del p, ws

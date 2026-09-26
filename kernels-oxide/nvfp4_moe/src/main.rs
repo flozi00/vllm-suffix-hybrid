@@ -97,24 +97,46 @@ pub mod kernels {
         r
     }
 
-    #[inline(always)]
-    fn tanh(x: f32) -> f32 {
-        let r: f32;
-        unsafe {
-            ptx_asm!("tanh.approx.f32 %0, %1;", out("=f") r, in("f") x, options(register_only));
-        }
-        r
-    }
-
     /// act_and_mul activation: 0 = silu, 1 = gelu_tanh (gemma-4).
+    /// gelu_tanh = 0.5x(1 + tanh u) = x * sigmoid(2u), u = sqrt(2/pi)(x +
+    /// 0.044715x^3), evaluated with ex2 (rel err ~2^-22). NOT tanh.approx.f32
+    /// (rel err 2^-11): the intermediate is re-quantized to FP4 right after,
+    /// and a 2^-11 perturbation flips enough e2m1 codes / e4m3 block scales
+    /// to cost 3e-3..1.7e-2 end-to-end (CPU emulation, see nvfp4_moe.py).
     #[inline(always)]
     fn act(x: f32, kind: u32) -> f32 {
-        if kind == 1 {
-            let u = 0.797_884_6 * (x + 0.044_715 * x * x * x);
-            0.5 * x * (1.0 + tanh(u))
-        } else {
-            x / (1.0 + ex2(-x * 1.442_695))
-        }
+        let z = if kind == 1 { 2.302_208_2 * (x + 0.044_715 * x * x * x) } else { x * 1.442_695 };
+        x / (1.0 + ex2(-z))
+    }
+
+    /// One k64 step of an A (routed rows) fragment: 4 regs + 4 row scales.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn load_a(
+        k0: u32,
+        t: u32,
+        a_row0: *const u8,
+        a_row1: *const u8,
+        ok0: bool,
+        ok1: bool,
+        sfa_base: *const u8,
+        oks: bool,
+    ) -> [u32; 5] {
+        let o = (k0 / 2 + 4 * t) as usize;
+        [
+            if ok0 { ld32(a_row0, o) } else { 0 },
+            if ok1 { ld32(a_row1, o) } else { 0 },
+            if ok0 { ld32(a_row0, o + 16) } else { 0 },
+            if ok1 { ld32(a_row1, o + 16) } else { 0 },
+            if oks { ld32(sfa_base, (k0 / 16) as usize) } else { 0 },
+        ]
+    }
+
+    /// One k64 step of a B (weight row) fragment: 2 regs + swizzled scales.
+    #[inline(always)]
+    fn load_b(k0: u32, t: u32, w_row: *const u8, sf_e: *const u8, row: u32, kb_pad: u32) -> [u32; 3] {
+        let o = (k0 / 2 + 4 * t) as usize;
+        [ld32(w_row, o), ld32(w_row, o + 16), ld32(sf_e, sf_offset(row, k0 / 16, kb_pad))]
     }
 
     /// CUTLASS 128x4 swizzled scale byte offset (vLLM swizzle_blockscale).
@@ -126,7 +148,8 @@ pub mod kernels {
 
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    fn mma(c: [f32; 4], a: [u32; 4], b0: u32, b1: u32, sfa: u32, sfb: u32) -> [f32; 4] {
+    fn mma(c: [f32; 4], a: [u32; 5], b: [u32; 3]) -> [f32; 4] {
+        let (b0, b1, sfa, sfb) = (b[0], b[1], a[4], b[2]);
         let zero: u16 = 0;
         let (d0, d1, d2, d3): (f32, f32, f32, f32);
         unsafe {
@@ -357,34 +380,28 @@ pub mod kernels {
             let sfa_base = unsafe { asf.add(((ps / topk) * nkb) as usize) };
             let mut cu = [0.0f32; 4];
             let mut cg = [0.0f32; 4];
-            let mut k0 = 0;
-            while k0 < hdim {
-                let o = (k0 / 2 + 4 * t) as usize;
-                let kb = k0 / 16;
-                let a = [
-                    if ok0 { ld32(a_row0, o) } else { 0 },
-                    if ok1 { ld32(a_row1, o) } else { 0 },
-                    if ok0 { ld32(a_row0, o + 16) } else { 0 },
-                    if ok1 { ld32(a_row1, o + 16) } else { 0 },
-                ];
-                let sfa = if oks { ld32(sfa_base, kb as usize) } else { 0 };
-                cu = mma(
-                    cu,
-                    a,
-                    ld32(w_up, o),
-                    ld32(w_up, o + 16),
-                    sfa,
-                    ld32(sf_e, sf_offset(up_row, kb, kb_pad)),
-                );
-                cg = mma(
-                    cg,
-                    a,
-                    ld32(w_gate, o),
-                    ld32(w_gate, o + 16),
-                    sfa,
-                    ld32(sf_e, sf_offset(gate_row, kb, kb_pad)),
-                );
-                k0 += 64;
+            // 3-stage register pipeline: steps s+1, s+2 in flight while
+            // step s's mma issues (the loop is latency-bound, not BW-bound).
+            let la = |k0: u32| load_a(k0, t, a_row0, a_row1, ok0, ok1, sfa_base, oks);
+            let lu = |k0: u32| load_b(k0, t, w_up, sf_e, up_row, kb_pad);
+            let lg = |k0: u32| load_b(k0, t, w_gate, sf_e, gate_row, kb_pad);
+            let steps = hdim / 64;
+            let (mut a0, mut u0, mut q0) = (la(0), lu(0), lg(0));
+            let (mut a1, mut u1, mut q1) = if steps > 1 { (la(64), lu(64), lg(64)) } else { (a0, u0, q0) };
+            let mut s = 2;
+            while s < steps {
+                let (a2, u2, q2) = (la(s * 64), lu(s * 64), lg(s * 64));
+                cu = mma(cu, a0, u0);
+                cg = mma(cg, a0, q0);
+                (a0, u0, q0) = (a1, u1, q1);
+                (a1, u1, q1) = (a2, u2, q2);
+                s += 1;
+            }
+            cu = mma(cu, a0, u0);
+            cg = mma(cg, a0, q0);
+            if steps > 1 {
+                cu = mma(cu, a1, u1);
+                cg = mma(cg, a1, q1);
             }
             let col = (j0 + 2 * t) as usize;
             if ok0 {
@@ -460,26 +477,23 @@ pub mod kernels {
             let a_row1 = unsafe { hq.add((p1 * kh) as usize) };
             let sfa_base = unsafe { hsf.add((ps * nkb) as usize) };
             let mut c = [0.0f32; 4];
-            let mut k0 = 0;
-            while k0 < idim {
-                let o = (k0 / 2 + 4 * t) as usize;
-                let kb = k0 / 16;
-                let a = [
-                    if ok0 { ld32(a_row0, o) } else { 0 },
-                    if ok1 { ld32(a_row1, o) } else { 0 },
-                    if ok0 { ld32(a_row0, o + 16) } else { 0 },
-                    if ok1 { ld32(a_row1, o + 16) } else { 0 },
-                ];
-                let sfa = if oks { ld32(sfa_base, kb as usize) } else { 0 };
-                c = mma(
-                    c,
-                    a,
-                    ld32(w_row, o),
-                    ld32(w_row, o + 16),
-                    sfa,
-                    ld32(sf_e, sf_offset(h0 + g, kb, kb_pad)),
-                );
-                k0 += 64;
+            // same 3-stage register pipeline as moe_fc1
+            let la = |k0: u32| load_a(k0, t, a_row0, a_row1, ok0, ok1, sfa_base, oks);
+            let lb = |k0: u32| load_b(k0, t, w_row, sf_e, h0 + g, kb_pad);
+            let steps = idim / 64;
+            let (mut a0, mut b0) = (la(0), lb(0));
+            let (mut a1, mut b1) = if steps > 1 { (la(64), lb(64)) } else { (a0, b0) };
+            let mut s = 2;
+            while s < steps {
+                let (a2, b2) = (la(s * 64), lb(s * 64));
+                c = mma(c, a0, b0);
+                (a0, b0) = (a1, b1);
+                (a1, b1) = (a2, b2);
+                s += 1;
+            }
+            c = mma(c, a0, b0);
+            if steps > 1 {
+                c = mma(c, a1, b1);
             }
             let col = (h0 + 2 * t) as usize;
             if ok0 {

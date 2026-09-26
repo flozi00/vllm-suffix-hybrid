@@ -110,7 +110,7 @@ def test_kernel_twin_matches_reference(act, m, e_count, topk):
     ref = nm.moe_ref(p, x, ids, tw)
     twin = kernel_twin(p, x, ids, tw)
     assert torch.isfinite(ref).all() and ref.abs().max() > 0
-    torch.testing.assert_close(twin, ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(twin, ref.float(), rtol=1e-4, atol=1e-4)
 
 
 def test_invalid_expert_ids_are_skipped():
@@ -119,7 +119,7 @@ def test_invalid_expert_ids_are_skipped():
     tw = torch.tensor([[0.5, 0.5], [1.0, 9.0]])
     x = torch.randn(2, 64).bfloat16()
     ref = nm.moe_ref(p, x, ids, tw)
-    torch.testing.assert_close(kernel_twin(p, x, ids, tw), ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(kernel_twin(p, x, ids, tw), ref.float(), rtol=1e-4, atol=1e-4)
     only = nm.moe_ref(p, x, ids.clamp(min=0), torch.tensor([[0.5, 0.5], [1.0, 0.0]]))
     torch.testing.assert_close(ref, only)  # id -1 contributes nothing
 
@@ -137,7 +137,7 @@ def test_ep_twin_global_ids_match_local_reference_and_zero_offrank_tokens():
     x = torch.randn(7, 128).bfloat16()
     ref = nm.moe_ref(p, x, lid, tw)
     twin = kernel_twin(p, x, ids, tw, base)
-    torch.testing.assert_close(twin, ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(twin, ref.float(), rtol=1e-4, atol=1e-4)
     dead = (lid < 0).all(1)
     assert dead.any() and (twin[dead] == 0).all() and (ref[dead] == 0).all()
     ids, tw = nm.rand_routing(5, e_global, 3, "cpu", seed=3, base=base, local=local, dead=True)
@@ -195,11 +195,75 @@ def test_reference_approximates_dense_bf16_moe():
     assert rel < 0.3, rel  # 2x activation FP4 quant ~0.17; swapped up/gate ~0.7
 
 
-def test_oracle_gate_is_relative_to_flashinfer():
-    assert nm.oracle_ok(5e-3, 1e-2, 5e-3)
-    assert nm.oracle_ok(3e-2, 5e-2, 3e-2)  # both far from ref, equally
-    assert not nm.oracle_ok(3e-2, 1e-2, 5e-3)  # we are worse than FlashInfer
-    assert not nm.oracle_ok(5e-3, 9e-2, 5e-3)  # we disagree with FlashInfer
+def test_oracle_gate_is_absolute_vs_spec_and_triangle_vs_flashinfer():
+    assert nm.oracle_ok(2e-3, 3e-2, 3e-2)  # FlashInfer far from spec: not our problem
+    assert not nm.oracle_ok(1e-2, 3e-2, 3e-2)  # tanh.approx-class drift fails
+    assert not nm.oracle_ok(2e-3, 9e-2, 3e-2)  # we disagree beyond both errors
+    assert nm.oracle_ok(4e-3, 1.9e-2, 1e-3)  # floor 2e-2
+
+
+def test_gelu_tanh_sigmoid_form_matches_kernel_constant():
+    """Kernel: gelu_tanh(x) = x / (1 + 2^-(C*(x + 0.044715x^3))), C =
+    2*sqrt(2/pi)*log2(e), == 0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3)))."""
+    src = (ROOT / "kernels-oxide" / "nvfp4_moe" / "src" / "main.rs").read_text()
+    assert '"tanh.approx' not in src  # no tanh.approx asm
+    c = float(re.search(r"if kind == 1 \{ ([0-9._]+) \*", src).group(1).replace("_", ""))
+    x = torch.linspace(-12, 12, 4001, dtype=torch.float64)
+    got = x / (1 + torch.exp2(-c * (x + 0.044715 * x ** 3)))
+    torch.testing.assert_close(got, nm.act_ref(x, 1), rtol=1e-7, atol=1e-9)
+
+
+def _ws_from_spec(p, x, ids, tw):
+    """The workspace a spec-exact kernel would leave (f32 intermediates)."""
+    m, topk = ids.shape
+    e_count, hdim, ih = p["w2"].shape
+    ws = nm.workspace("cpu", m, topk, hdim, ih * 2, e_count)
+    aq, asf = nm.quant_codes(x.float(), p["a1g"])
+    inter = nm.fc1_ref(p, x, ids).float()
+    hq, hsf = nm.quant_codes(inter, p["a2g"])
+    hd = nm.qdq(inter, p["a2g"]).double()
+    y = torch.zeros(m * topk, hdim, dtype=torch.float64)
+    for e, pr in nm._groups(ids, e_count).items():
+        y[pr] = (float(p["g2"][e]) * (hd[pr] @ nm._expert_w(p["w2"], p["w2_sf"], e).double().T)
+                 * tw.reshape(-1)[pr, None].double())
+    y = y.float()
+    for t, v in zip(ws, (aq, asf, inter, hq, hsf, y)):
+        t[:v.numel()] = v.reshape(-1)
+    acc = torch.zeros(m, hdim)
+    for k in range(topk):
+        acc = torch.where((ids[:, k] >= 0)[:, None], acc + y.view(m, topk, hdim)[:, k], acc)
+    return ws, acc.bfloat16()
+
+
+def test_stages_pin_drift_to_the_stage_that_made_it():
+    p = nm.make_problem(4, 128, 64, "gelu_tanh", seed=4)
+    ids, tw = nm.rand_routing(6, 4, 2, "cpu", seed=4)
+    ids[1, 1] = -1  # off-rank pair: its rows are garbage and must be ignored
+    x = torch.randn(6, 128).bfloat16()
+    ws, out = _ws_from_spec(p, x, ids, tw)
+    ws[2].view(12, 64)[3] = float("nan")  # inter row of pair 3 (= token 1, k 1)
+    ok, msg = nm.stages(p, x, ids, tw, ws, out)
+    assert ok, msg
+    for idx, stage, bump in [(2, "fc1", lambda t: t.mul_(1 + 2 ** -11)),
+                             (5, "fc2", lambda t: t.mul_(1 + 1e-3)),
+                             (0, "xq", lambda t: t[:4].fill_(0x77))]:
+        bad = list(ws)
+        bad[idx] = ws[idx].clone()
+        bump(bad[idx])
+        ok, msg = nm.stages(p, x, ids, tw, bad, out)
+        assert not ok and msg.split(f" {stage}=")[1].split()[0] != "0.0e+00", msg
+
+
+def test_fi_emulation_is_farther_from_spec_than_ours():
+    """The accuracy anatomy in nvfp4_moe.py, pinned: FlashInfer's bf16
+    intermediates alone cost more than REF_TOL; our f32 path does not."""
+    p = nm.make_problem(8, 512, 256, "gelu_tanh", seed=9)
+    ids, tw = nm.rand_routing(8, 8, 4, "cpu", seed=9)
+    x = torch.randn(8, 512).bfloat16()
+    ref = nm.moe_ref(p, x, ids, tw)
+    ours = kernel_twin(p, x, ids, tw).bfloat16()
+    emu = nm.moe_ref(p, x, ids, tw, fi=True).bfloat16()
+    assert nm._rel(ours, ref) < nm.REF_TOL < nm._rel(emu, ref)
 
 
 GOOD = dict(quant_dtype="nvfp4", backend="FLASHINFER_CUTLASS", scale_swizzled=True,
