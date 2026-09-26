@@ -43,6 +43,7 @@ import os
 from pathlib import Path
 import random
 import subprocess
+import time
 import sys
 
 MARK = "[suffix sm120-hisparse-mtp] ORACLE"
@@ -85,8 +86,10 @@ def child(mode: str, a) -> dict:
             # happen and admission still progresses. G = layers + MTP layer.
             g = a.layers + 1
             mml = a.prompt_len + a.max_tokens + 64
-            blocks = (g * -(-(a.k + 2) * 2048 // 64) + -(-mml // 64)
-                      + g * 16 + 32)
+            # silicon (2 layers + MTP): 8 KV groups of 64-token blocks; one
+            # request = hot regions of g groups + its pages in ~3g groups.
+            blocks = (g * -(-(a.k + 2) * 2048 // 64) + 3 * g * -(-mml // 64)
+                      + 64)
         if blocks:
             kw["num_gpu_blocks_override"] = blocks
             print(f"[suffix sm120-hisparse-mtp] ORACLE {mode}: num_gpu_blocks_override={blocks}",
@@ -126,9 +129,10 @@ def child(mode: str, a) -> dict:
     def step(name, p):
         out[name] = gen(p)
         print(f"[suffix sm120-hisparse-mtp] ORACLE {mode}: {name} done "
-              f"({len(out[name])} tokens)", flush=True)
+              f"({len(out[name])} tokens, {time.monotonic() - t0:.1f}s)", flush=True)
 
     out = {}
+    t0 = time.monotonic()
     step("target_1", prompts[0])
     for i, p in enumerate(prompts[1:]):
         step(f"pressure_{i}", p)
