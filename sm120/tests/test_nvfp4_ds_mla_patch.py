@@ -541,7 +541,8 @@ def test_oracle_gates_dry_run_on_cpu(monkeypatch):
     O.gate_reader(_EmuOurs(), _EmuStock(), "cpu", gen, report)
     O.gate_adversarial(_EmuOurs(), "cpu", gen, report)
     names = [r[0] for r in results]
-    assert len(results) == 26 and "reader_cuda_graph_replay" in names
+    assert len(results) == 28 and "reader_cuda_graph_replay" in names
+    assert "reader_tail_tile_C1000_T96" in names
     assert "adversarial_prefill_T96" in names
     print(*results, sep="\n")
     assert all(ok for _n, ok, _d in results), [r for r in results if not r[1]]

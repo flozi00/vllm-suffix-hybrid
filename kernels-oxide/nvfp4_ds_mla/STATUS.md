@@ -61,3 +61,11 @@ are that close. Single 1e5 dims against e2m1 x SF ties are ill-conditioned
 for any f32 kernel (the oracle exempts rows an f32 reference cannot
 resolve). NVFP4 vs fp8_ds_mla attention output differs ~15-18 % rel-L2 on
 synthetic data (format noise) — model-level eval needed.
+
+Review 2026-09-26 (branch rev-kernel, NOT on silicon yet): issue_tile now
+maps 4 threads per row (one index load + one slot division per thread per
+tile) instead of chunk-major (~6 dependent index loads per thread, each
+cp.async behind its own global round trip, on every tile's critical path).
+Staged bytes identical; PTX checked (1 ld.global + 1 div per issue, no
+.local). Oracle: + reader_tail_tile_C1000_T{1,96} (ln < 64 partial tile,
+never hit with C=2048); bench default adds T 96/128/192 (prod decode 32x6).

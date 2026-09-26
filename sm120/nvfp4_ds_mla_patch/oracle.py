@@ -388,6 +388,19 @@ def gate_reader(ours, stock, dev, gen, report):
                f"== FlashInfer's); ours~stock {e_ours_stock:.3e} <= {bound:.3e} "
                f"(format noise nvfp4ref~fp8ref {e_fmt:.3e})")
 
+    # capacity not a multiple of the 64-row tile (partial last tile, ln < 64)
+    # at T=1 (ns 32 -> 1-tile splits) and T=96 (ns 1 -> 16-tile ring)
+    for t in (1, 96):
+        q = randn(gen, dev, t, 8, DIM + PE).bfloat16()
+        topk = make_topk(t, nslots, dev, gen, full_first=True)[:, :1000].contiguous()
+        out = ours.decode(q, cache, topk)
+        torch.cuda.synchronize()
+        ref = attention_ref(q.float(), lat, rope, topk, SCALE)
+        keep = (topk >= 0).any(-1)[:, None].expand(t, 8)
+        e_row = row_rel_l2(out, ref, keep)
+        report(f"reader_tail_tile_C1000_T{t}", e_row <= 2e-2
+               and bool(torch.isfinite(out).all()), f"max row rel-L2 {e_row:.2e}")
+
     # padded block stride: bitwise equal to the dense cache
     pitch = bs * ROW + 128
     raw = torch.zeros((nb * pitch,), dtype=torch.uint8, device=dev)
@@ -572,7 +585,7 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--heads", type=int, default=8, help="bench per-rank heads")
     ap.add_argument("--bench-tokens", type=lambda s: [int(x) for x in s.split(",")],
-                    default=[1, 2, 4, 6, 8, 16, 32, 64, PREFILL_T])
+                    default=[1, 2, 4, 6, 8, 16, 32, 64, 96, 128, 192, PREFILL_T])
     ap.add_argument("--bench-slots", type=int, default=1 << 20)
     ap.add_argument("--iters", type=int, default=50)
     args = ap.parse_args(argv)
