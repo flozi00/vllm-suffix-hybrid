@@ -30,13 +30,19 @@
 //!   TN = 64 gathered rows per 2-stage cp.async smem ring (row pitch
 //!   368 B, 22 x 16 B chunks per 352 B row);
 //!   NS splits cover C: the partial CTA holds 69 KB of smem, so ONE CTA
-//!   runs per SM; the grid must fit ONE wave: at most floor(num_sms /
-//!   (T * HQT)) splits (>= 1, capped at ceil(C / TN)), c_per_split = TN *
-//!   ceil(ceil(C / TN) / that), ns = ceil(C / c_per_split) — the fewest
-//!   splits at the shortest one-wave critical path (ceil would overshoot:
-//!   T=6 HQ=8 on 188 SMs launched 192 CTAs = 2 waves). Chosen from (T, HQ, C,
-//!   num_sms) ONLY (CUDA-graph stable). Large T (prefill chunks) collapse to
-//!   ns = 1, which bounds the o_part workspace at T * HQ * 1 KiB.
+//!   runs per SM and R * NS CTAs run in ceil(R * NS / num_sms) waves. The
+//!   plan is WAVE-AWARE: over the canonical split counts (ns with
+//!   ceil(tiles / ceil(tiles / ns)) == ns, tiles = ceil(C / TN)) it takes
+//!   argmin ceil(R * ns / num_sms) * (k + c), k = ceil(tiles / ns) tiles
+//!   per split, c = WAVE_OVERHEAD_HALF_TILES / 2 the fixed per-CTA cost
+//!   in tiles; ties keep the fewer splits. Among one-wave plans this picks
+//!   the old rule's (most splits that fit: T=1/6/32/64 at HQ 8 keep ns
+//!   32/16/5/2); it leaves one wave only where that models faster, e.g.
+//!   the ns = 1 cliff (T=192 HQ 8: 192 CTAs = 2 waves x 32 tiles) becomes
+//!   ns = 4 (5 waves x 8 tiles).
+//!   c_per_split = TN * k, ns = ceil(C / c_per_split). Chosen from (T, HQ,
+//!   C, num_sms) ONLY (CUDA-graph stable). Large T (prefill chunks) collapse
+//!   to ns = 1 (T=8192), which bounds the o_part workspace at T*HQ*1 KiB.
 
 pub const DIM: usize = 512; // kv_lora_rank / latent (and value) dims
 pub const PE_DIM: usize = 64; // RoPE dims (raw e4m3)
@@ -54,6 +60,13 @@ pub const THREADS: usize = 256;
 /// Gathered rows per smem stage (kernel TN; kernel mirror).
 pub const TN: usize = 64;
 pub const MAX_SPLITS: usize = 256;
+/// Fixed per-CTA cost of a wave in half tiles (c = 2 tiles). Silicon bench
+/// at e59e3165 (HQ 8, one wave): us = 5.17 * k + 7.10, i.e. <= 1.37 tiles
+/// even counting launch + merge as per-wave; 2 is conservative (issue_tile
+/// shrinks the per-tile time, which raises c in tile units) and keeps every
+/// HQ-8 plan T <= 64 identical to the benchmarked one. Silicon A/B knob:
+/// SUFFIX_NVFP4_DSMLA_WAVE_C2 (half tiles, read once per process).
+pub const WAVE_OVERHEAD_HALF_TILES: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DsMlaPlan {
@@ -122,6 +135,34 @@ pub fn check_launch(tokens: usize, hq: usize, capacity: usize, ns: usize) -> Res
     }
 }
 
+fn wave_c2() -> usize {
+    static C2: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C2.get_or_init(|| {
+        std::env::var("SUFFIX_NVFP4_DSMLA_WAVE_C2")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(WAVE_OVERHEAD_HALF_TILES)
+    })
+}
+
+/// Wave-aware split count (module doc): argmin over canonical ns of
+/// ceil(rows * ns / num_sms) * (2k + c2), k = ceil(tiles / ns); ties keep
+/// the fewer splits. One partial CTA per SM (smem-bound).
+pub fn wave_splits(rows: usize, tiles: usize, num_sms: usize, c2: usize) -> usize {
+    let mut best = (usize::MAX, 1);
+    for ns in 1..=tiles.min(MAX_SPLITS) {
+        let k = tiles.div_ceil(ns);
+        if tiles.div_ceil(k) != ns {
+            continue; // same k as a smaller ns: more CTAs, no shorter split
+        }
+        let cost = (rows * ns).div_ceil(num_sms) * (2 * k + c2);
+        if cost < best.0 {
+            best = (cost, ns);
+        }
+    }
+    best.1
+}
+
 /// Plan from (T, HQ, C, num_sms) ONLY (CUDA-graph stable).
 pub fn plan(
     tokens: usize,
@@ -143,13 +184,9 @@ pub fn plan(
     }
     let hqt = hq.div_ceil(8);
     let rows = tokens * hqt;
-    // One partial CTA per SM (smem-bound): the grid must fit one wave
-    // (rows * ns <= num_sms, a second wave doubles the critical path), and
-    // among those the fewest splits (each adds o_part traffic + merge work).
-    let tiles = capacity.div_ceil(TN);
-    let want = (num_sms / rows).clamp(1, tiles.min(MAX_SPLITS));
-    let c_per_split = split_rows(capacity, want);
-    let ns = capacity.div_ceil(c_per_split);
+    let ns = wave_splits(rows, capacity.div_ceil(TN), num_sms, wave_c2());
+    let c_per_split = split_rows(capacity, ns);
+    debug_assert_eq!(capacity.div_ceil(c_per_split), ns);
     check_launch(tokens, hq, capacity, ns)?;
     Ok(DsMlaPlan {
         hqt,
@@ -353,8 +390,6 @@ mod tests {
                 c
             );
             assert_eq!(p.merge_rows, t * hq);
-            // one wave (1 CTA/SM) unless ns is already 1
-            assert!(p.ns == 1 || p.rows * p.ns <= SMS, "t={t} hq={hq} ns={}", p.ns);
             // deterministic: same inputs, same plan (CUDA-graph replay).
             assert_eq!(plan(t, hq, c, SMS).unwrap(), p);
         }
@@ -375,6 +410,48 @@ mod tests {
         assert_eq!((p.ns, p.c_per_split), (1, 2048));
         let p = plan(1, 64, 2048, SMS).unwrap(); // TP=1
         assert_eq!((p.hqt, p.ns, p.c_per_split), (8, 16, 128));
+        // past one wave: the ns = 1 cliff (2 waves x 32 tiles at T=192)
+        for (t, ns, cps) in [(96, 3, 704), (128, 4, 512), (192, 4, 512), (256, 2, 1024)] {
+            let p = plan(t, 8, 2048, SMS).unwrap();
+            assert_eq!((p.ns, p.c_per_split), (ns, cps), "T={t}");
+        }
+    }
+
+    /// The pre-wave-aware rule: most splits that fit one wave.
+    fn one_wave_ns(rows: usize, c: usize) -> usize {
+        let tiles = c.div_ceil(TN);
+        c.div_ceil(split_rows(c, (SMS / rows).clamp(1, tiles.min(MAX_SPLITS))))
+    }
+
+    #[test]
+    fn wave_plan_keeps_benchmarked_plans_and_never_models_slower() {
+        let cost = |rows: usize, tiles: usize, ns: usize| {
+            (rows * ns).div_ceil(SMS) * (2 * tiles.div_ceil(ns) + WAVE_OVERHEAD_HALF_TILES)
+        };
+        for c in [2048usize, 1000, 64, 65, 100, 4096] {
+            let tiles = c.div_ceil(TN);
+            for t in 1..=8192 {
+                for hq in [8usize, 16, 64] {
+                    let rows = t * hq.div_ceil(8);
+                    let (old, new) = (one_wave_ns(rows, c), wave_splits(rows, tiles, SMS, WAVE_OVERHEAD_HALF_TILES));
+                    assert!(cost(rows, tiles, new) <= cost(rows, tiles, old), "t={t} hq={hq} c={c}");
+                    // among one-wave plans the cost picks the old rule's
+                    // (the silicon-benchmarked one); it only departs by
+                    // leaving one wave where that models strictly faster.
+                    assert!(new == old || (rows * new > SMS && cost(rows, tiles, new) < cost(rows, tiles, old)));
+                    if hq == 8 && t <= 64 && c == 2048 {
+                        assert_eq!(new, old, "benchmarked HQ-8 plan changed at T={t}");
+                    }
+                    let p = plan(t, hq, c, SMS).unwrap();
+                    assert_eq!(p.ns, new);
+                    assert_eq!(split_rows(c, p.ns), p.c_per_split, "host re-derivation");
+                    assert!((p.ns - 1) * p.c_per_split < c && p.ns * p.c_per_split >= c);
+                }
+            }
+        }
+        for hq in [8, 16, 64] {
+            assert_eq!(plan(8192, hq, 2048, SMS).unwrap().ns, 1);
+        }
     }
 
     #[test]

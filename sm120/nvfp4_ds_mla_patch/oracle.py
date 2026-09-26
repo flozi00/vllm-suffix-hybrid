@@ -389,16 +389,19 @@ def gate_reader(ours, stock, dev, gen, report):
                f"(format noise nvfp4ref~fp8ref {e_fmt:.3e})")
 
     # capacity not a multiple of the 64-row tile (partial last tile, ln < 64)
-    # at T=1 (ns 32 -> 1-tile splits) and T=96 (ns 1 -> 16-tile ring)
-    for t in (1, 96):
+    # at T=1 (ns 16 -> 1-tile splits), T=96 (ns 3 -> 6,6,4-tile splits,
+    # 2 waves on 188 SMs) and T=192 (ns 2); plus the prod wave cliff
+    # C=2048 T=192 (wave plan ns 4 = 768 CTAs, 5 waves on 188 SMs)
+    for t, c, name in ((1, 1000, "tail_tile_C1000_T1"), (96, 1000, "tail_tile_C1000_T96"),
+                       (192, 1000, "tail_tile_C1000_T192"), (192, TOPK, "wave_split_C2048_T192")):
         q = randn(gen, dev, t, 8, DIM + PE).bfloat16()
-        topk = make_topk(t, nslots, dev, gen, full_first=True)[:, :1000].contiguous()
+        topk = make_topk(t, nslots, dev, gen, full_first=True)[:, :c].contiguous()
         out = ours.decode(q, cache, topk)
         torch.cuda.synchronize()
         ref = attention_ref(q.float(), lat, rope, topk, SCALE)
         keep = (topk >= 0).any(-1)[:, None].expand(t, 8)
         e_row = row_rel_l2(out, ref, keep)
-        report(f"reader_tail_tile_C1000_T{t}", e_row <= 2e-2
+        report(f"reader_{name}", e_row <= 2e-2
                and bool(torch.isfinite(out).all()), f"max row rel-L2 {e_row:.2e}")
 
     # padded block stride: bitwise equal to the dense cache
@@ -548,7 +551,9 @@ def bench(ours, stock, dev, args):
         q = randn(gen, dev, t, args.heads, DIM + PE).bfloat16()
         topk = torch.randint(0, nslots, (t, TOPK), generator=gen, device=dev,
                              dtype=torch.int32)
-        res = {"T": t, "HQ": args.heads, "topk": TOPK}
+        res = {"T": t, "HQ": args.heads, "topk": TOPK,
+               "ns": ours.P._native().nvfp4_ds_mla_plan(
+                   t, args.heads, TOPK, ours.impl._nvfp4_num_sms)["ns"]}
         impls = [("ours_us", ours, cache)]
         if t <= 64:  # stock's SM120 sparse decode kernel is <= 64 tokens
             impls.append(("stock_us", stock, fp8))
@@ -574,7 +579,7 @@ def bench(ours, stock, dev, args):
         rows.append(res)
         vs = (f"stock fp8_ds_mla {stock_us:8.2f} us  speedup {res['speedup']:.2f}x"
               if stock_us else "stock n/a (prefill-sized T)")
-        print(f"{MARK} bench T={t:4d} HQ={args.heads} topk={TOPK}: ours "
+        print(f"{MARK} bench T={t:4d} HQ={args.heads} topk={TOPK} ns={res['ns']:2d}: ours "
               f"{res['ours_us']:8.2f} us  {vs}", flush=True)
     return rows
 
