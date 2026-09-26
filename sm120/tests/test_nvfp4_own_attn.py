@@ -583,3 +583,21 @@ def test_twin_split_choice_is_wave_aware():
     assert waves(8, 2, 512, 129) == 1
     assert waves(16, 2, 512, 129) == 2
     assert waves(8, 8, 256, 33) == 1
+
+
+def test_twin_split_tiles_matches_host_and_kernel():
+    """Third copy of split_tiles (numpy twin) == the Rust host one, which
+    cargo test pins to the kernel source token for token
+    (nvfp4_attn::tests::device_split_tiles_copy_is_the_kernel_source)."""
+    if not hasattr(_native, "nvfp4_attn_split_tiles"):
+        pytest.skip("native module predates nvfp4_attn_split_tiles (rebuild)")
+    rng = np.random.default_rng(0)
+    n_ts = list(range(0, 130)) + [255, 256, 257, 1023, 4097, 16384, 16385]
+    for _ in range(3000):
+        rows, ns, slots = (int(rng.integers(1, 4097)), int(rng.integers(1, 257)),
+                           int(rng.integers(1, 377)))
+        tn = int(rng.choice([16, 32, 64]))
+        for n_t in (n_ts[int(rng.integers(len(n_ts)))], int(rng.integers(0, 16386))):
+            assert ref.split_tiles(n_t, rows, ns, slots, tn) == \
+                _native.nvfp4_attn_split_tiles(n_t, rows, ns, slots, tn), \
+                (n_t, rows, ns, slots, tn)
