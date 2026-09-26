@@ -11,6 +11,8 @@ PYTHONPATH. Each section is independently gated:
                                (fail closed on SM120, inert elsewhere)
   SUFFIX_SM120_HISPARSE_MTP=1 -> arm the deferred SM120 HiSparse+MTP
                                builder patch (fail closed on SM120)
+    + SUFFIX_SM120_HISPARSE_PREFETCH=1 -> also prefetch IndexShare follower
+                               rows for multi-token decode (perf A/B knob)
   SUFFIX_SM120_NVP4DSMLA=1  -> arm the deferred SM120 nvfp4_ds_mla sparse-MLA
                                KV patch (our kernels; fail closed on SM120)
   SUFFIX_SM120_NVP4KV_ORACLE=1 -> run the NVFP4-KV on-silicon oracle once per

@@ -245,6 +245,120 @@ def patch_runtime_source(src: str) -> str:
     return RUNTIME_NEW
 
 
+# --- Follower prefetch under MTP (SUFFIX_SM120_HISPARSE_PREFETCH=1, perf) ---
+# Stock: _resolve_and_stage_group (runtime.py:994) stages the followers' rows
+# on the copy stream only when resident.decode_batch, i.e.
+# is_hisparse_decode_batch (runtime.py:40-46: max_query_len == 1). Every MTP
+# verify batch (q_len 1+k, decode via this patch) fails that, so each IndexShare
+# follower re-stages per step in swap_in (_stage_this_layer: copy stream waits
+# for ALL prior compute, compute then waits for the copy = critical path).
+# is_hisparse_decode_batch itself stays: write_target (runtime.py:1117) caps
+# decode KV writes at max_num_seqs rows and would drop MTP KV.
+# Rewrite (methods of HiSparseRuntime, rebound on the live class):
+#   begin_forward  resets a per-runtime "prefetched through row" mark;
+#   _resolve_and_stage_group  also prefetches followers for a pure decode batch
+#     (0 < num_actual_tokens == num_decode_tokens) and marks them through
+#     shared_rows.stop;
+#   swap_in  a follower whose rows are covered by the mark does not re-stage
+#     (the leader recorded its _layer_ready_event after the last prefetched
+#     step on the same in-order copy stream, so waiting on it covers them).
+# Values are unchanged: the swap copies the same host rows into the same hot
+# slots the follower would have staged itself (the leader's residency result
+# for the step is fixed; the buffer holds every step's union, runtime.py:124).
+# Only applied together with SUFFIX_SM120_HISPARSE_MTP=1 (without it no verify
+# batch is a decode batch, so there is nothing to prefetch).
+PREFETCH_ENV = "SUFFIX_SM120_HISPARSE_PREFETCH"
+PREFETCH_STATS = "_SUFFIX_HISPARSE_PREFETCH_STATS"
+PREFETCH_EDITS = [
+    (
+        "begin_forward",
+        "    def begin_forward(self) -> None:\n"
+        "        self._swap_step = 0\n",
+        "    def begin_forward(self) -> None:\n"
+        "        self._swap_step = 0\n"
+        "        self._suffix_prefetched_through = 0\n",
+    ),
+    (
+        "_resolve_and_stage_group",
+        "            runtimes = [self]\n"
+        "            if resident.decode_batch:\n"
+        "                runtimes.extend(group.followers)\n",
+        "            runtimes = [self]\n"
+        "            if resident.decode_batch or (\n"
+        "                0 < resident.num_actual_tokens == resident.num_decode_tokens\n"
+        "            ):\n"
+        "                runtimes.extend(group.followers)\n"
+        "                for follower in group.followers:\n"
+        "                    follower._suffix_prefetched_through = shared_rows.stop\n"
+        f"                {PREFETCH_STATS}['follower_prefetched'] += len(group.followers)\n",
+    ),
+    (
+        "swap_in",
+        "        if not self._swap_staged:\n"
+        "            self._stage_this_layer(shared_rows)\n",
+        "        if not self._swap_staged:\n"
+        "            if shared_rows.stop <= self._suffix_prefetched_through:\n"
+        "                self._swap_staged = True  # leader prefetched these rows\n"
+        "            else:\n"
+        "                self._stage_this_layer(shared_rows)\n"
+        "                if not self.is_group_leader:\n"
+        f"                    {PREFETCH_STATS}['follower_staged'] += 1\n",
+    ),
+]
+
+
+def prefetch_gate_enabled() -> bool:
+    return os.environ.get(PREFETCH_ENV, "").strip() == "1"
+
+
+def patch_prefetch_source(src: str) -> dict:
+    """Pure check of runtime.py; returns {method name: rewritten source}
+    (dedented, compilable). Every hunk must occur once, inside its method."""
+    import ast
+    import textwrap
+
+    bad = [f"{n}: expected 1, found {src.count(old)}"
+           for n, old, _new in PREFETCH_EDITS if src.count(old) != 1]
+    if bad:
+        raise PatchDriftError(
+            "hisparse/runtime.py does not match the pinned prefetch anchors "
+            f"(expected vLLM {PINNED_VLLM}): " + "; ".join(bad))
+    cls = next((n for n in ast.parse(src).body
+                if isinstance(n, ast.ClassDef) and n.name == "HiSparseRuntime"), None)
+    lines = src.splitlines(keepends=True)
+    methods = {n.name: "".join(lines[n.lineno - 1:n.end_lineno])
+               for n in (cls.body if cls else []) if isinstance(n, ast.FunctionDef)}
+    out = {}
+    for name, old, new in PREFETCH_EDITS:
+        body = methods.get(name) or ""
+        if body.count(old) != 1:
+            raise PatchDriftError(
+                f"prefetch anchor {name}: not inside HiSparseRuntime.{name}")
+        out[name] = textwrap.dedent(body.replace(old, new))
+        compile(out[name], f"<{PATCH_NAME}:prefetch>", "exec")
+    return out
+
+
+def install_prefetch(runtime, methods: dict, rt_path: Path) -> None:
+    """Bind the rewritten methods on the live HiSparseRuntime class (its
+    instances and importers keep the class identity)."""
+    import __future__
+    import linecache
+
+    cls = runtime.HiSparseRuntime
+    runtime.__dict__[PREFETCH_STATS] = {"follower_prefetched": 0,
+                                         "follower_staged": 0}
+    cls._suffix_prefetched_through = 0
+    for name, src in methods.items():
+        fname = f"{rt_path}.{PATCH_NAME}-prefetch-{name}.py"
+        linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)
+        ns: dict = {}
+        exec(compile(src, fname, "exec", __future__.annotations.compiler_flag,
+                     dont_inherit=True), runtime.__dict__, ns)
+        ns[name].__qualname__ = f"HiSparseRuntime.{name}"
+        setattr(cls, name, ns[name])
+
+
 def patch_source(src: str) -> tuple[str, list[str]]:
     """Pure transform of sparse_mla_attention.py. Every anchor is
     count-verified BEFORE any replacement (all failures reported at once)."""
@@ -299,14 +413,21 @@ def apply(module=None) -> bool:
     new_src, applied = patch_source(src)
     runtime = importlib.import_module(RUNTIME_MODULE)
     rt_path = Path(runtime.__file__)
-    rt_new = patch_runtime_source(rt_path.read_text())
-    # Both files verified before either changes (fail closed, all or nothing).
+    rt_src = rt_path.read_text()
+    rt_new = patch_runtime_source(rt_src)
+    prefetch = patch_prefetch_source(rt_src) if prefetch_gate_enabled() else None
+    # Every file verified before any changes (fail closed, all or nothing).
     exec_patched_source(runtime, rt_new, rt_path)
+    if prefetch is not None:
+        install_prefetch(runtime, prefetch, rt_path)
     exec_patched_source(module, new_src, src_path)
     setattr(module, MARKER_ATTR, PATCH_REVISION)
     print(f"[suffix {PATCH_NAME}] ACTIVE on SM120: HiSparse spec-verify tokens "
           f"-> multi-token hot-buffer decode + swap rows = max_rows+1 "
           f"+ prefill staging plan w/o prefill backend "
+          + ("+ follower prefetch for multi-token decode "
+             if prefetch is not None else "")
+          +
           f"(rev {PATCH_REVISION}; {len(applied) + 1} anchors; vllm {ver}).",
           file=sys.stderr, flush=True)
     return True
