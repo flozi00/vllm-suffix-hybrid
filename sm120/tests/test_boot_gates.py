@@ -61,3 +61,15 @@ def test_glm_stack_multi_oracle_gate(tmp_path):
     # The oracle sets the patch gates per child itself; nothing else leaks in.
     assert {k: v for k, v in seen["env"].items() if not k.endswith("_DONE")} == {
         "SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}
+
+
+def test_nvfp4_kv_gates(tmp_path):
+    import json
+    r = _boot({"SUFFIX_BOOT_GATES": "nvfp4_kv_oracle_own,nvfp4_kv_bench",
+               "SUFFIX_SM120_NVP4KV_OWN_ATTN": "1"}, tmp_path, "nvfp4_kv_patch")
+    assert "[suffix boot-gate] nvfp4_kv_oracle_own: exit 0" in r.stderr, r.stderr
+    assert "[suffix boot-gate] nvfp4_kv_bench: exit 0" in r.stderr, r.stderr
+    seen = json.loads((tmp_path / "seen.json").read_text())  # last gate run
+    assert seen["argv"][:2] == ["--bench", "--json"] and "SUFFIX_SM120_NVP4KV_OWN_ATTN" not in seen["env"]
+    # argv mirrors the kernel lab's K2 preset (--page 64 --max-gb 8 fixed)
+    assert seen["argv"][-4:] == ["--page", "64", "--max-gb", "8"]

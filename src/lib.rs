@@ -366,7 +366,7 @@ fn nvfp4_attn_plan(
         ("wv".to_string(), p.wv),
         ("cps".to_string(), p.cps),
         ("min_tiles".to_string(), nvfp4_attn::MIN_TILES_PER_SPLIT),
-        ("min_split_tokens".to_string(), nvfp4_attn::MIN_SPLIT_TOKENS),
+        ("split_cost_tokens".to_string(), nvfp4_attn::SPLIT_COST_TOKENS),
         ("slots".to_string(), num_sms * p.cps),
     ]))
 }

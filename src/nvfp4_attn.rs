@@ -21,20 +21,21 @@
 //!      the balanced split of q_len into NQT = ceil(q_len*G / MAX_ROWS) CTAs.
 //!   TN KV tokens per pipelined smem stage: largest of 64/32/16 dividing the
 //!      page and fitting the 99 KB opt-in smem with a 2-stage cp.async ring.
-//!   NS split-KV partitions = ceil(num_sms / R): one wave of CTAs, a
-//!      function of the launch rows ONLY (never of seq_lens) so the grid is
-//!      CUDA-graph replay-stable; each CTA derives its chunk from seq_lens on
-//!      the device (>= MIN_TILES_PER_SPLIT tiles, so short contexts use fewer
-//!      splits and less partial traffic).
+//!   NS split-KV partitions (grid cap) = choose_splits: a function of the
+//!      launch rows ONLY (never of seq_lens) so the grid is CUDA-graph
+//!      replay-stable. Each CTA derives its request's split from seq_lens on
+//!      the device (split_tiles: wave-aware, <= NS); launched splits past the
+//!      need exit at once.
 
 pub const MAX_ROWS: usize = 48;
 pub const MAX_SPLITS: usize = 256;
 pub const MAX_Q_LEN: usize = 16;
 pub const MIN_TILES_PER_SPLIT: usize = 2;
-/// Kernel mirror (MIN_SPLIT_TOKENS): a split covers >= this many KV tokens
-/// unless finer splits are needed to fill one wave of CTA slots. Decided on
-/// the device per request (from seq_lens), so the grid stays graph-stable.
-pub const MIN_SPLIT_TOKENS: usize = 512;
+/// Kernel mirror (SPLIT_COST_TOKENS): fixed cost of one split (Q load,
+/// pipeline fill, partial-O write + merge read) in KV-token equivalents.
+// ponytail: one calibration knob for all shapes; tune from oracle --bench
+// (K2 hd512/hd256 b8..32 rows) if the silicon curve says otherwise.
+pub const SPLIT_COST_TOKENS: usize = 64;
 pub const HEAD_DIMS: [usize; 3] = [128, 256, 512];
 /// SM120 opt-in dynamic shared memory per block.
 pub const SMEM_LIMIT: usize = 99 * 1024;
@@ -198,6 +199,26 @@ pub fn choose_splits(rows: usize, slots: usize) -> usize {
         .unwrap_or(1)
 }
 
+/// Tiles per split for one request (kernel mirror of the device-side
+/// choice; `n_t` = its KV tiles, `rows` = launch rows, `slots` = SMs x CTAs
+/// per SM). Candidates: the most splits fitting 1, 2 and 3 full waves of
+/// `rows` CTAs, and the grid cap `ns`; cost = waves x (tiles + per-split
+/// cost), first minimum wins (fewest splits). One wave never spills into a
+/// partial second one (ds-MLA lesson: 192 CTAs on 188 SMs cost 21%).
+pub fn split_tiles(n_t: usize, rows: usize, ns: usize, slots: usize, tn: usize) -> usize {
+    let c0 = SPLIT_COST_TOKENS.div_ceil(tn);
+    let (mut best, mut best_per) = (usize::MAX, MIN_TILES_PER_SPLIT);
+    for k in 1..=4 {
+        let s = if k == 4 { ns } else { (k * slots / rows).clamp(1, ns) };
+        let per = n_t.div_ceil(s).max(MIN_TILES_PER_SPLIT);
+        let cost = (rows * n_t.div_ceil(per)).div_ceil(slots) * (per + c0);
+        if cost < best {
+            (best, best_per) = (cost, per);
+        }
+    }
+    best_per
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +299,78 @@ mod tests {
             }
         }
         assert_eq!((round16(1), round16(16), round16(17)), (16, 16, 32));
+    }
+
+    /// (active CTAs, waves) of one request shape's device split choice.
+    fn launched(p: &AttnPlan, n_t: usize, per: usize) -> (usize, usize) {
+        let ctas = p.rows * n_t.div_ceil(per);
+        (ctas, ctas.div_ceil(SMS * p.cps))
+    }
+
+    /// KV tiles of one q tile: full attention over kv, or a sliding window.
+    fn tiles(kv: usize, win: Option<usize>, tn: usize) -> usize {
+        match win {
+            None => kv.div_ceil(tn),
+            Some(w) => {
+                let lo = (kv - 1).saturating_sub(w);
+                kv.div_ceil(tn) - lo / tn
+            }
+        }
+    }
+
+    #[test]
+    fn split_choice_is_wave_aware_on_gemma_shapes() {
+        // gemma-4 26B-A4B per GPU: hd512 16/2 full attn, hd256 16/8 SWA.
+        for &(hkv, d, win) in &[(2, 512, None), (8, 256, Some(1023usize)), (8, 256, Some(511))] {
+            for batch in [1, 2, 4, 8, 16, 32] {
+                for q_len in 1..=9 {
+                    for kv in [4096, 8192, 16384, 32768, 65536, 131072] {
+                        let p = plan(batch, q_len, 16, hkv, d, 64, SMS).unwrap();
+                        let slots = SMS * p.cps;
+                        let n_t = tiles(kv, win, p.tn);
+                        let per = split_tiles(n_t, p.rows, p.ns, slots, p.tn);
+                        let eff = n_t.div_ceil(per);
+                        assert!(per >= MIN_TILES_PER_SPLIT && eff <= p.ns, "{p:?} {n_t}");
+                        // one-wave grids stay one wave
+                        if p.rows * p.ns <= slots {
+                            assert!(p.rows * eff <= slots, "{p:?} {n_t} {per}");
+                        }
+                        // never worse (same model) than the old floor rule
+                        let c0 = SPLIT_COST_TOKENS.div_ceil(p.tn);
+                        let fill = (n_t * p.rows).div_ceil(slots);
+                        let old = n_t.div_ceil(p.ns).max(2).max(fill.min(512 / p.tn));
+                        let cost = |x: usize| launched(&p, n_t, x).1 * (x + c0);
+                        assert!(cost(per) <= cost(old), "{p:?} n_t {n_t}: {per} vs {old}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_choice_fixes_partial_waves() {
+        // hd512 b8 MTP verify at 4k: the old floor (16 tiles) launched 288
+        // CTAs on 188 SMs (1.5 waves); now one full wave.
+        let p = plan(8, 9, 16, 2, 512, 64, SMS).unwrap();
+        let n_t = tiles(4096 + 9, None, p.tn);
+        let per = split_tiles(n_t, p.rows, p.ns, SMS * p.cps, p.tn);
+        assert_eq!(launched(&p, n_t, 16), (288, 2));
+        assert_eq!(launched(&p, n_t, per).1, 1);
+        // hd512 b16 verify at 4k (the c13-24 prod sink): 4 waves -> 2.
+        let p = plan(16, 9, 16, 2, 512, 64, SMS).unwrap();
+        let per = split_tiles(n_t, p.rows, p.ns, SMS * p.cps, p.tn);
+        assert_eq!(launched(&p, n_t, 16).1, 4);
+        assert_eq!(launched(&p, n_t, per).1, 2);
+        // hd256 SWA (window 1024) b8 verify: 384 CTAs on 376 slots -> one wave.
+        let s = plan(8, 9, 16, 8, 256, 64, SMS).unwrap();
+        let w = tiles(32768, Some(1023), s.tn);
+        let per = split_tiles(w, s.rows, s.ns, SMS * s.cps, s.tn);
+        assert_eq!(launched(&s, w, 6), (384, 2));
+        assert_eq!(launched(&s, w, per).1, 1);
+        // long context, many rows: the grid cap ns still wins (no change).
+        let b = plan(32, 9, 16, 2, 512, 64, SMS).unwrap();
+        let n = tiles(131072, None, b.tn);
+        assert_eq!(n.div_ceil(split_tiles(n, b.rows, b.ns, SMS, b.tn)), b.ns);
     }
 
     #[test]
