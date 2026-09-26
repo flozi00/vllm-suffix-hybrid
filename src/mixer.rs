@@ -19,6 +19,31 @@ struct Previous {
     suffix_estimate: Option<f64>,
     // Whether the last proposal for this row carried a suffix tail.
     had_suffix: bool,
+    // SPLIT=diverge: the first native/suffix disagreement of the last
+    // proposal, resolved against the verified token next step.
+    div: Option<Divergence>,
+}
+
+/// First position where the suffix candidate disagrees with the native
+/// draft. Next step's context delta holds the TRUE token at `j` whenever
+/// verification reached it (accepted >= j), whichever source was
+/// published, so both sources are graded on the same event: a
+/// counterfactual signal that needs no exploration.
+#[derive(Clone, Copy)]
+struct Divergence {
+    j: usize,
+    suffix_tok: i64,
+    native_tok: i64,
+    bucket: usize,
+}
+
+/// Evidence buckets for divergence trust: global-cache match length
+/// (<16, <32, >=32) and in-request n-gram order (<8, <16, >=16).
+const DIV_BUCKETS: usize = 6;
+
+fn div_bucket(self_lookup: bool, matched: usize) -> usize {
+    let tier = if matched < 16 { 0 } else if matched < 32 { 1 } else { 2 };
+    tier + if self_lookup { 3 } else { 0 }
 }
 
 /// How this row's context relates to the tracked one. The list API (`mix`)
@@ -74,6 +99,17 @@ pub struct HybridMixer {
     native_proposed: u64,
     suffix_proposed: u64,
     elapsed_ns: u64,
+    // SUFFIX_HYBRID_SPLIT=diverge (default off = legacy split-bandit).
+    diverge: bool,
+    div_threshold: f64,
+    self_lo: usize,
+    self_hi: usize,
+    self_window: usize,
+    // Discounted [suffix right, native right] counts per bucket.
+    div_wins: [[f64; 2]; DIV_BUCKETS],
+    div_observed: u64,
+    div_suffix_published: u64,
+    self_hits: u64,
 }
 
 #[pymethods]
@@ -103,6 +139,16 @@ impl HybridMixer {
             native_proposed: 0,
             suffix_proposed: 0,
             elapsed_ns: 0,
+            diverge: std::env::var("SUFFIX_HYBRID_SPLIT").is_ok_and(|v| v.trim() == "diverge"),
+            div_threshold: env_float("DIVERGE_THRESHOLD", 0.5).clamp(0.0, 1.0),
+            self_lo: env_usize("SELF_NGRAM_MIN", 4, 1, 128),
+            self_hi: env_usize("SELF_NGRAM_MAX", 16, 1, 128),
+            // Bounded by default: this scan is on the decode critical path.
+            self_window: env_usize("SELF_NGRAM_WINDOW", 8192, 0, 16_777_216),
+            div_wins: [[0.0; 2]; DIV_BUCKETS],
+            div_observed: 0,
+            div_suffix_published: 0,
+            self_hits: 0,
         })
     }
     #[getter]
@@ -334,12 +380,134 @@ impl HybridMixer {
         };
         d.set_item("mean_accept_estimate", est_mean)?;
         d.set_item("active_tracked", self.previous.len())?;
+        d.set_item("split_mode", if self.diverge { "diverge" } else { "legacy" })?;
+        d.set_item("div_observed", self.div_observed)?;
+        d.set_item("div_suffix_published", self.div_suffix_published)?;
+        d.set_item("self_hits", self.self_hits)?;
+        d.set_item("div_trust", self.div_wins.iter().map(|w| Self::trust(w)).collect::<Vec<_>>())?;
         d.set_item("cache", self.cache.stats())?;
         Ok(d)
     }
 }
 
 impl HybridMixer {
+    /// P(suffix right | the two sources disagree), Laplace prior: an
+    /// unobserved bucket sits at exactly 0.5, so native wins the tie.
+    fn trust(w: &[f64; 2]) -> f64 {
+        (w[0] + 1.0) / (w[0] + w[1] + 2.0)
+    }
+
+    /// SPLIT=diverge per-row body. Suffix candidate is conditioned on the
+    /// VERIFIED context only (global cache, else an in-request n-gram scan
+    /// = prompt lookup over prompt + generation). If it agrees with native
+    /// on every slot, native is published. At the first disagreement `j`
+    /// the bucket's learned trust picks the source: suffix -> the draft is
+    /// the suffix over its own length (slots < j are identical anyway),
+    /// native filler past it keeps the published width == cap, so V2's
+    /// fixed-K verify still yields feedback. The decision never reads
+    /// native tokens beyond `j`: the same draft is an overlay of the
+    /// suffix onto the native buffer, which a sync-free GPU merge can do.
+    #[allow(clippy::too_many_arguments)]
+    fn diverge_row(
+        &mut self,
+        cache: &mut Cache,
+        id: String,
+        i: usize,
+        native: &[i64],
+        accepted: i64,
+        decide: &Decide<'_>,
+    ) -> (Vec<i64>, usize) {
+        use std::collections::hash_map::Entry;
+        let slot = self.previous.entry(id);
+        let tracked = match &slot {
+            Entry::Occupied(o) => Some(&o.get().context),
+            Entry::Vacant(_) => None,
+        };
+        let (continuity, delta) = decide(i, tracked);
+        let p = match slot {
+            Entry::Occupied(o) => {
+                let p = o.into_mut();
+                if continuity == Continuity::Continuing {
+                    if let Some(d) = p.div.take() {
+                        // delta[..a] = accepted drafts, delta[a] = bonus:
+                        // the true token at j is known iff j <= a.
+                        if accepted >= d.j as i64 && delta.len() > d.j {
+                            let truth = delta[d.j];
+                            let w = &mut self.div_wins[d.bucket];
+                            w[0] *= 0.999;
+                            w[1] *= 0.999;
+                            w[0] += f64::from(u8::from(truth == d.suffix_tok));
+                            w[1] += f64::from(u8::from(truth == d.native_tok));
+                            self.div_observed += 1;
+                        }
+                    }
+                    p.context.extend_from_slice(&delta);
+                } else {
+                    cache.add(std::mem::take(&mut p.context));
+                    p.context = delta;
+                    p.div = None;
+                }
+                p
+            }
+            Entry::Vacant(v) => v.insert(Previous {
+                context: delta,
+                native: 0,
+                length: 0,
+                arm: 0,
+                accept_estimate: self.initial as f64,
+                suffix_estimate: None,
+                had_suffix: false,
+                div: None,
+            }),
+        };
+        let ctx = &p.context;
+        let cap = self
+            .k
+            .min(self.max_model_len.saturating_sub(ctx.len()))
+            .min(native.len());
+        let (mut cand, mut matched) = {
+            let (s, _, m) = cache.speculate(ctx, cap);
+            (s, m)
+        };
+        let mut self_lookup = false;
+        if cand.len() < cap && self.self_hi >= self.self_lo {
+            let (s, score) = super::engine::ngram(ctx, self.self_lo, self.self_hi, cap, self.self_window);
+            // ngram scores order n as n/(n+1).
+            let order = (score / (1.0 - score)).round() as usize;
+            if s.len() > cand.len() || (!s.is_empty() && order > matched) {
+                cand = s;
+                matched = order;
+                self_lookup = true;
+                self.self_hits += 1;
+            }
+        }
+        cand.truncate(cap);
+        let mut draft = native[..cap].to_vec();
+        let mut native_count = cap;
+        p.div = None;
+        if let Some(j) = (0..cand.len()).find(|&t| cand[t] != native[t]) {
+            let bucket = div_bucket(self_lookup, matched);
+            p.div = Some(Divergence {
+                j,
+                suffix_tok: cand[j],
+                native_tok: native[j],
+                bucket,
+            });
+            if Self::trust(&self.div_wins[bucket]) > self.div_threshold {
+                draft[..cand.len()].copy_from_slice(&cand);
+                native_count = j;
+                self.div_suffix_published += 1;
+                self.suffix_proposed += (cand.len() - j) as u64;
+            }
+        }
+        self.native_proposed += native_count as u64;
+        p.native = native_count;
+        p.length = draft.len();
+        p.arm = cap;
+        p.had_suffix = native_count < cap;
+        (draft, native_count)
+    }
+
     /// Shape validation shared by both entry points; runs BEFORE any state
     /// mutation so a rejected call leaves the mixer untouched (contract test).
     fn validate(
@@ -468,7 +636,10 @@ impl HybridMixer {
         // NOTE: SuffixCache wraps Arc<Mutex<Cache>> shared with Python, so a
         // per-row lock was also a per-row contention point with add_sequence
         // callers on other threads; holding one guard shortens that window.
-        let mut cache = super::lock_cache(&self.cache.inner);
+        // Own Arc handle so the guard does not borrow `self` (diverge_row
+        // needs &mut self while the one per-call lock is held).
+        let cache_handle = self.cache.inner.clone();
+        let mut cache = super::lock_cache(&cache_handle);
         // Reuses `conditioned` scratch across rows: the speculate window is
         // the last `depth` tokens plus the kept native prefix, pre-sized once
         // and truncated per row instead of cloned per row.
@@ -486,6 +657,15 @@ impl HybridMixer {
             (est.ceil() as usize).clamp(1, k)
         };
         for (i, (id, native)) in request_ids.into_iter().zip(native_drafts).enumerate() {
+            if self.diverge {
+                let accepted = accepted_lengths.map_or(-1, |a| a[i]);
+                let (draft, native_count) =
+                    self.diverge_row(&mut cache, id, i, native, accepted, decide);
+                self.last_native.push(native_count);
+                result.push(draft);
+                self.decisions += 1;
+                continue;
+            }
             // ONE entry lookup per row: continuity, estimate, freshness,
             // gate and the final insert all read it (was: get + contains_key
             // + entry = three hashes/row).
@@ -691,6 +871,7 @@ impl HybridMixer {
                         accept_estimate,
                         suffix_estimate,
                         had_suffix,
+                        div: None,
                     });
                 }
             }
