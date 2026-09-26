@@ -131,7 +131,7 @@ def child(mode: str, a) -> dict:
     }
 
 
-CHILD_TIMEOUT = int(os.environ.get("SUFFIX_HISPARSE_ORACLE_CHILD_TIMEOUT", "1200"))
+CHILD_TIMEOUT = int(os.environ.get("SUFFIX_HISPARSE_ORACLE_CHILD_TIMEOUT", "600"))
 
 
 def _run_child(mode: str, argv) -> dict:
@@ -253,6 +253,10 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.child:
         a.k = a.k[0]
+        # Hang forensics: all thread stacks to stderr every 240 s (the engine
+        # core runs in-process here, so this shows scheduler/HiSparse frames).
+        import faulthandler
+        faulthandler.dump_traceback_later(240, repeat=True, file=sys.stderr)
         print(RESULT + json.dumps(child(a.child, a)), flush=True)
         return 0
     codes = []
