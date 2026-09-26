@@ -112,6 +112,10 @@ def max_decode_q_len(vllm_config) -> int:
 
 
 FAMILY = "k2_nvfp4_attn"
+# Kernel parameter counts the host op launches with (src/nvfp4_attn_oxide.rs;
+# tests/test_oxide_abi.py pins them to the kernel): prepare() refuses a
+# cubin built for another ABI (e.g. pre-`slots` partial = 24 params).
+K2_PARAMS = {"nvfp4_attn_partial": 25, "nvfp4_attn_merge": 13}
 
 
 def prepare(nat, served, q_lens) -> str:
@@ -131,7 +135,7 @@ def prepare(nat, served, q_lens) -> str:
     if len(names) != 3:
         raise RuntimeError(f"oxide manifest lacks the K2 variants (found {names})")
     for name in names:
-        oxide_kernels.ensure_loaded(name, dev)
+        oxide_kernels.ensure_loaded(name, dev, params=K2_PARAMS)
     if dev not in _PROBED:
         print(oxide_kernels.probe(dev), file=sys.stderr, flush=True)
         _PROBED.add(dev)
