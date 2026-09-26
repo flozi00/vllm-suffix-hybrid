@@ -310,6 +310,11 @@ mod kernels {
     /// `ln` rows (the CTA's tile split may end mid-stage); rows past `ln`
     /// up to TN are ZEROED (16 B chunks) so stale smem can never leak into
     /// P (masked S = -inf) or O (data and SF both zero — 0 * NaN safety).
+    /// 4 threads per row (THREADS == 4 * TN), thread q copies chunks q,
+    /// q+4, ...: ONE index load + slot division per thread per tile. The
+    /// old chunk-major loop re-loaded the index for each of its ~6 chunks,
+    /// each cp.async behind its own dependent global load (~6 serialized
+    /// L2/DRAM round trips per tile, on the critical path). Same bytes.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn issue_tile(
@@ -324,30 +329,33 @@ mod kernels {
         block_size: u32,
         block_stride: u32,
     ) {
+        const _: () = assert!(THREADS == 4 * TN);
         unsafe {
-            let mut c = tid;
-            while c < TN * ROW_CHUNKS {
-                let row = c / ROW_CHUNKS;
-                let chunk = c % ROW_CHUNKS;
-                let live = row < ln;
-                let cc = c0 + row;
-                let slot = if live && cc < cap_len {
-                    *capacity.add((cap_base + cc as u64) as usize)
-                } else {
-                    -1
-                };
-                let d = dst.add((row * ROW_PITCH + chunk * 16) as usize) as *mut u32;
+            let row = tid / 4;
+            let cc = c0 + row;
+            let slot = if row < ln && cc < cap_len {
+                *capacity.add((cap_base + cc as u64) as usize)
+            } else {
+                -1
+            };
+            let drow = dst.add((row * ROW_PITCH) as usize);
+            let src = if slot >= 0 {
+                rows.add(row_offset(slot as u64, block_size, block_stride))
+            } else {
+                rows
+            };
+            let mut chunk = tid % 4;
+            while chunk < ROW_CHUNKS {
+                let d = drow.add((chunk * 16) as usize) as *mut u32;
                 if slot >= 0 {
-                    let src = rows
-                        .add(row_offset(slot as u64, block_size, block_stride) + (chunk * 16) as usize);
-                    cp_async_cg_16(d, src as *const u32);
+                    cp_async_cg_16(d, src.add((chunk * 16) as usize) as *const u32);
                 } else {
                     *d = 0;
                     *d.add(1) = 0;
                     *d.add(2) = 0;
                     *d.add(3) = 0;
                 }
-                c += THREADS;
+                chunk += 4;
             }
             cp_async_commit_group();
         }

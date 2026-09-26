@@ -263,7 +263,7 @@ def _s_mask_src(fixed):
     return src
 
 
-def emulate_decode(q, lat, rope, topk, ns, fixed=True):
+def emulate_decode(q, lat, rope, topk, ns, fixed=True, with_lse=False):
     """Index-level transcription of nvfp4_ds_mla_attn_partial + _merge with
     the host op's launch args (grid (T*HQT, NS), c_per_split = split_rows,
     topk_stride = topk_len = C, q_stride = HQ*576) over flat buffers."""
@@ -282,6 +282,7 @@ def emulate_decode(q, lat, rope, topk, ns, fixed=True):
             ht, t = r % hqt, r // hqt
             h0 = ht * 8
             c0, c1 = s * cps, min(s * cps + cps, C)
+            assert c0 < c1, "empty split launched"  # kernel would exit -inf
             heads = [h for h in range(8) if h0 + h < HQ]
             Q = np.zeros((16, 576))
             for h in heads:
@@ -316,6 +317,8 @@ def emulate_decode(q, lat, rope, topk, ns, fixed=True):
         acc = sum(w[s] * o_part[(r * ns + s) * 512:(r * ns + s + 1) * 512]
                   for s in range(ns) if w[s] != 0)
         out[r * 512:(r + 1) * 512] = 0 if w.sum() == 0 else acc / w.sum()
+    if with_lse:
+        return out.reshape(T, HQ, 512), lse.reshape(T, HQ, ns)
     return out.reshape(T, HQ, 512)
 
 
@@ -363,3 +366,163 @@ def test_multi_token_decode_grid_offsets_mask_and_merge():
     tk = rng.permutation(nslots)[None, :C]
     np.testing.assert_allclose(emulate_decode(q, lat, rope, tk, 8, fixed=False),
                                decode_ref(q, lat, rope, tk), rtol=1e-9, atol=1e-12)
+
+
+# ---- wave-aware plan (src/nvfp4_ds_mla.rs wave_splits mirror) -------------
+SMS, WAVE_C2 = 188, 4  # RTX PRO 6000; WAVE_OVERHEAD_HALF_TILES
+
+
+def cdiv(a, b):
+    return -(-a // b)
+
+
+def wave_splits(rows, tiles, sms=SMS, c2=WAVE_C2):
+    best = (None, 1)
+    for ns in range(1, min(tiles, 256) + 1):
+        k = cdiv(tiles, ns)
+        if cdiv(tiles, k) != ns:
+            continue
+        cost = cdiv(rows * ns, sms) * (2 * k + c2)
+        if best[0] is None or cost < best[0]:
+            best = (cost, ns)
+    return best[1]
+
+
+def plan_ns(T, HQ, C):
+    return wave_splits(T * cdiv(HQ, 8), cdiv(C, 64))
+
+
+def split_rows(C, ns):
+    return 64 * cdiv(cdiv(C, 64), ns)
+
+
+PLAN_CS = (2048, 1000, 2000, 65)
+
+
+def emitted_plans():
+    """{(HQ, C, ns)} over T 1..8192 x HQ {8,16,64} x C (2048 + tails)."""
+    return {(hq, C, plan_ns(T, hq, C)) for hq in (8, 16, 64) for C in PLAN_CS
+            for T in range(1, 8193)}
+
+
+def test_wave_plan_pins_and_native_agreement():
+    old = lambda T, C: cdiv(C, split_rows(C, max(1, min(SMS // T, cdiv(C, 64)))))  # noqa: E731
+    assert [plan_ns(T, 8, 2048) for T in (1, 6, 32, 64, 96, 128, 192, 256, 8192)] \
+        == [32, 16, 5, 2, 3, 4, 4, 2, 1]
+    assert all(plan_ns(T, 8, 2048) == old(T, 2048) for T in range(1, 65))
+    for hq in (8, 16, 64):
+        assert plan_ns(8192, hq, 2048) == 1
+    try:
+        from suffix_hybrid import _native
+        native = _native.nvfp4_ds_mla_plan
+    except (ImportError, AttributeError):
+        return  # Rust twin: src/nvfp4_ds_mla.rs wave_plan_* tests
+    if native(192, 8, 2048, SMS)["ns"] != 4:
+        return  # stale local _native (pre wave plan)
+    for T in (1, 6, 12, 32, 64, 96, 97, 192, 500, 1411, 8192):
+        for hq in (8, 16, 64):
+            for C in PLAN_CS:
+                assert native(T, hq, C, SMS)["ns"] == plan_ns(T, hq, C), (T, hq, C)
+
+
+def test_every_emitted_plan_decodes_exactly():
+    """Every (HQ, C, ns) the planner emits over T 1..8192: the host op's
+    launch (c_per_split = split_rows(C, ns), ceil(C / c_per_split) == ns),
+    no empty split, and partial + merge == reference, with the merged lse
+    == the full-row logsumexp (merge weights exact) and all-masked splits /
+    tokens at lse -inf (weight 0)."""
+    plans = emitted_plans()
+    assert {ns for hq, C, ns in plans if C == 2048} >= {1, 2, 3, 4, 5, 16, 32}
+    nslots = 4096
+    lat, rope = rng.standard_normal((nslots, 512)), rng.standard_normal((nslots, 64))
+    K = np.concatenate([lat, rope], -1)
+    for hq, C, ns in sorted(plans):
+        cps = split_rows(C, ns)
+        assert cdiv(C, cps) == ns and (ns - 1) * cps < C <= ns * cps
+        T = 3
+        q = rng.standard_normal((T, hq, 576)) * 0.05
+        tk = oracle_topk(T, C, nslots)
+        tk[2, cps:] = -1  # token 2: every split past the first all -1
+        out, lse = emulate_decode(q, lat, rope, tk, ns, with_lse=True)
+        np.testing.assert_allclose(out, decode_ref(q, lat, rope, tk), rtol=1e-9, atol=1e-12)
+        assert (out[1] == 0).all() and np.isneginf(lse[1]).all()
+        assert np.isneginf(lse[2, :, 1:]).all()
+        for t in (0, 2):
+            idx = tk[t][tk[t] >= 0]
+            S = q[t] @ K[idx].T
+            full = S.max(1) + np.log(np.exp(S - S.max(1, keepdims=True)).sum(1))
+            mx = lse[t].max(1, keepdims=True)
+            merged = mx[:, 0] + np.log(np.exp(lse[t] - mx).sum(1))
+            np.testing.assert_allclose(merged, full, rtol=1e-12, atol=1e-12)
+
+
+# ---- issue_tile row ownership (4 threads / row) == old chunk-major -------
+TN, THREADS, ROW_PITCH, ROW_CHUNKS = 64, 256, 368, 22
+
+
+def _row_offset(slot, bs, stride):
+    return (slot // bs) * stride + (slot % bs) * ROW
+
+
+def _issue(new, dst, cache, tk, cap_base, cap_len, c0, ln, bs, stride):
+    """Transcription of issue_tile (new: row = tid/4, chunks tid%4 + 4j;
+    old: c = tid + 256j, row = c/22, chunk = c%22). Returns per-(row,
+    chunk) write counts and the set of cp.async (dst, src) pairs."""
+    hits, cps = np.zeros((TN, ROW_CHUNKS), int), set()
+    for tid in range(THREADS):
+        work = ([(tid // 4, ch) for ch in range(tid % 4, ROW_CHUNKS, 4)] if new
+                else [divmod(c, ROW_CHUNKS) for c in range(tid, TN * ROW_CHUNKS, THREADS)])
+        for row, ch in work:
+            cc = c0 + row
+            slot = int(tk[cap_base + cc]) if row < ln and cc < cap_len else -1
+            d = row * ROW_PITCH + ch * 16
+            hits[row, ch] += 1
+            if slot >= 0:
+                src = _row_offset(slot, bs, stride) + ch * 16
+                cps.add((d, src))
+                dst[d:d + 16] = cache[src:src + 16]
+            else:
+                dst[d:d + 16] = 0
+    return hits, cps
+
+
+def test_issue_tile_row_ownership_stages_identical_bytes():
+    """New 4-threads-per-row mapping vs the silicon-proven chunk-major one:
+    bitwise-identical staged stage (pad bytes untouched), identical cp.async
+    set, every (row, chunk) written exactly once — for every (c0, ln) tile
+    of every emitted plan, C 2048 / tails 1000, 2000, 65, -1 holes and
+    trailing -1s, dense and padded block strides, block_size 64 and 1."""
+    tiles = {(C, j, min(TN, min(s * split_rows(C, ns) + split_rows(C, ns), C) - j))
+             for _, C, ns in emitted_plans() for s in range(ns)
+             for j in range(s * split_rows(C, ns), min((s + 1) * split_rows(C, ns), C), TN)}
+    assert any(ln < TN for _, _, ln in tiles)  # tail tiles present
+    # ln < TN with capacity left (off-plan today: split ends are TN-aligned)
+    tiles |= {(C, j, ln) for C in PLAN_CS for j in (0, 64) for ln in (1, 13, 40)
+              if j + ln < C}
+    for bs, pad in ((64, 0), (64, 128), (1, 48)):
+        nb = 300 if bs == 64 else 4000
+        stride = bs * ROW + pad
+        cache = rng.integers(0, 256, nb * stride, dtype=np.uint8)
+        nslots = nb * bs
+        for C in PLAN_CS:
+            tk = oracle_topk(3, C, nslots).reshape(-1)  # T=3, token 1 all -1
+            for t in (0, 1, 2):
+                for (c, j, ln) in sorted(tiles):
+                    if c != C:
+                        continue
+                    stages, res = [], []
+                    for new in (True, False):
+                        dst = np.full(TN * ROW_PITCH, 0xA5, np.uint8)
+                        res.append(_issue(new, dst, cache, tk, t * C, C, j, ln, bs, stride))
+                        stages.append(dst)
+                    assert (stages[0] == stages[1]).all(), (bs, pad, C, t, j, ln)
+                    assert res[0][1] == res[1][1]
+                    assert (res[0][0] == 1).all() and (res[1][0] == 1).all()
+                    st = stages[0].reshape(TN, ROW_PITCH)
+                    assert (st[:, ROW:] == 0xA5).all()  # row pad untouched
+                    for row in range(TN):  # staged == gather reference
+                        cc = j + row
+                        slot = tk[t * C + cc] if row < ln and cc < C else -1
+                        ref = (cache[_row_offset(slot, bs, stride):][:ROW] if slot >= 0
+                               else np.zeros(ROW, np.uint8))
+                        assert (st[row, :ROW] == ref).all()

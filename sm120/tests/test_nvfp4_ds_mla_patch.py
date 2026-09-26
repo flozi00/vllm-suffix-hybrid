@@ -402,6 +402,8 @@ def test_plan_via_native_when_built():
     assert (p(1, 8, 2048, 188)["ns"], p(6, 8, 2048, 188)["ns"]) == (32, 16)
     assert (p(32, 8, 2048, 188)["ns"], p(32, 8, 2048, 188)["c_per_split"]) == (5, 448)
     assert p(8192, 8, 2048, 188)["ns"] == 1  # prefill: bounded workspace
+    # wave-aware past one wave (T=192: ns 1 = 2 waves x 32 tiles -> ns 4)
+    assert [p(t, 8, 2048, 188)["ns"] for t in (64, 96, 192, 256)] == [2, 3, 4, 2]
     assert p(1, 8, 2048, 188)["partial_smem_bytes"] == 69376
     with pytest.raises(ValueError):
         p(0, 8, 2048, 188)
@@ -541,7 +543,9 @@ def test_oracle_gates_dry_run_on_cpu(monkeypatch):
     O.gate_reader(_EmuOurs(), _EmuStock(), "cpu", gen, report)
     O.gate_adversarial(_EmuOurs(), "cpu", gen, report)
     names = [r[0] for r in results]
-    assert len(results) == 26 and "reader_cuda_graph_replay" in names
+    assert len(results) == 30 and "reader_cuda_graph_replay" in names
+    assert "reader_tail_tile_C1000_T96" in names
+    assert "reader_wave_split_C2048_T192" in names
     assert "adversarial_prefill_T96" in names
     print(*results, sep="\n")
     assert all(ok for _n, ok, _d in results), [r for r in results if not r[1]]
