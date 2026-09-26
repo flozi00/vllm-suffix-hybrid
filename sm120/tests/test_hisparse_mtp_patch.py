@@ -35,6 +35,7 @@ def test_fixture_is_pinned_wheel_copy():
 
 def _defs(path, *names, ns=None):
     """exec the named top-level functions / class methods of a fixture."""
+    import __future__
     import ast
     tree = ast.parse(path.read_text())
     ns = {} if ns is None else ns
@@ -42,7 +43,10 @@ def _defs(path, *names, ns=None):
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name in names:
             node.decorator_list = []
-            exec(compile(ast.Module([node], []), str(path), "exec"), ns)
+            # Postponed annotations: CI (Python 3.11) evaluates them eagerly,
+            # and fixtures annotate with names (torch, Any) not in ns.
+            exec(compile(ast.Module([node], []), str(path), "exec",
+                         flags=__future__.annotations.compiler_flag), ns)
     return ns
 
 
