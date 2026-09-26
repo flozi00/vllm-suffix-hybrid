@@ -17,6 +17,9 @@ that the SM120 NVFP4-KV overlay is a no-op against these exact versions:
   this file; the tests replay the patch over the fixture and byte-verify the
   result.
 
+- `vllm_0.30.0/attention_backends_utils.py` — `vllm/v1/attention/backends/utils.py`
+  at v0.30.0 (`split_decodes_and_prefills`, for the HiSparse staging-plan replay).
+
 Do not edit these files; they are regression fixtures. If upstream drifts
 (newer vLLM/FI in the image), the patch layer must fail closed and a new
 fixture + anchor set is required.

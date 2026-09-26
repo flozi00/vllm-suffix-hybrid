@@ -111,12 +111,13 @@ def test_runtime_anchor_drift():
 def test_replay_on_fixture():
     src = FIXTURE.read_text()
     new, applied = P.patch_source(src)
-    assert applied == ["helper_block", "hisparse_spec_as_decode", "build_marker"]
+    assert applied == ["helper_block", "hisparse_spec_as_decode", "build_marker",
+                       "hisparse_prefill_without_backend", "prepare_metadata_guard"]
     for _name, old, rep, _c in P.EDITS:
         assert new.count(rep) == 1
     assert "if not self.hisparse_supports_multi_token_decode:" not in new
-    assert new.count(P.HELPER_TAG) == 2
-    # Byte-exact inverse: nothing outside the three hunks changed.
+    assert new.count(P.HELPER_TAG) == 3
+    # Byte-exact inverse: nothing outside the hunks changed.
     back = new
     for _name, old, rep, _c in reversed(P.EDITS):
         back = back.replace(rep, old)
@@ -135,7 +136,7 @@ def test_drift_missing_and_duplicate_anchor(name):
     src = FIXTURE.read_text()
     old = next(e[1] for e in P.EDITS if e[0] == name)
     with pytest.raises(P.PatchDriftError, match=f"{name}: expected 1, found 0"):
-        P.patch_source(src.replace(old, old.replace("=", "= ", 1)))
+        P.patch_source(src.replace(old, old[:-1] + " \n"))
     with pytest.raises(P.PatchDriftError, match=f"{name}: expected 1, found 2"):
         P.patch_source(src + "\n" + old)
 
@@ -192,12 +193,17 @@ _SYNTH = (
     "    hisparse_supports_multi_token_decode = False\n"
     "    def __init__(self, hs):\n"
     "        self.vllm_config = _Cfg(hs)\n"
+    "        self._prefill_backend = None\n"
     "    def _init_reorder_batch_threshold(self, reorder_batch_threshold=128,\n"
     "                                      supports_spec_as_decode=True):\n"
     + P.EDITS[1][1]
     + "        return reorder_batch_threshold, supports_spec_as_decode\n"
     "    def build(self, num_decodes, num_decode_tokens, decode_max_query_len):\n"
     + P.EDITS[2][1]
+    + "        num_prefills = 0\n"
+    + P.EDITS[3][1]
+    + "            prefill = 1\n"
+    + P.EDITS[4][1]
     + "        return prefill_max_seq_len\n"
     "class OtherBuilder(FlashInferMLASparseMetadataBuilder):\n"
     "    pass\n"
@@ -342,3 +348,110 @@ def test_oracle_main_runs_patched_after_stock_crash_for_each_k(monkeypatch, caps
     ap = argparse.ArgumentParser()
     ap.add_argument("--k", type=int, nargs="+")
     assert ap.parse_args(["--k", "3", "5", "--k", "5"]).k == [5]
+
+
+UTILS_FIXTURE = FIXTURES / "attention_backends_utils.py"  # v1/attention/backends/utils.py
+UTILS_SHA256 = "fbc221360d2d54cb21ef3f625dc8711500de345a355801548b4337bb9b8abee0"
+
+
+def _build_fn(src):
+    """The real SparseMLACommonMetadataBuilder.build (+ helpers) from src."""
+    import torch
+    ns = {"torch": torch, "T": object, "_suffix_hisparse_mtp_mark": None,
+          "SparseMLAPrefillMetadata": types.SimpleNamespace,
+          "build_hisparse_prefill_staging_plan":
+              lambda bt, sl, bs, cap: types.SimpleNamespace(block_table=bt, cap=cap)}
+    _defs(UTILS_FIXTURE, "split_decodes_and_prefills", ns=ns)
+    import ast
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in (
+                "build", "_build_prefill_fields", "_use_dense_mha_prefill"):
+            node.decorator_list = []
+            exec(compile(ast.Module([node], []), "sparse_mla", "exec"), ns)
+    return ns
+
+
+def test_silicon_staging_plan_assert_replays_on_cpu_and_patch_fixes_it():
+    """target_2 of the oracle: 4096-token prompt again, 63 blocks prefix-hit
+    (pages spilled to host), 64 new tokens -> one prefill, not all resident.
+    SM120 has no MLA prefill backend -> stock build() leaves prefill=None ->
+    index_group.stage_prefill_rows asserts (the silicon AssertionError)."""
+    import hashlib as h
+    import torch
+    assert h.sha256(UTILS_FIXTURE.read_bytes()).hexdigest() == UTILS_SHA256
+    sm120 = (FIXTURES / "flashinfer_mla_sparse_sm120.py").read_text()
+    assert sm120.count("    supports_dense_mha_prefill = False\n") == 1
+    assert sm120.count("if num_decode_tokens == 0 and cache.all_context_pages_resident:") == 1
+    src = FIXTURE.read_text()
+    assert src.count("layer_prefill_backend.clone() if layer_prefill_backend "
+                     "is not None else None") == 1
+
+    def make_self(ns):
+        s = types.SimpleNamespace(
+            _build_prefill_fields=ns["_build_prefill_fields"],
+            _prefill_backend=None,  # SM120 (mla_attention.py:600-607)
+            reorder_batch_threshold=4, use_pcp=False, require_uniform_decodes=False,
+            kv_cache_spec=types.SimpleNamespace(block_size=64),
+            model_config=types.SimpleNamespace(dtype=torch.bfloat16),
+            topk_tokens=2048, topk_mask_workspace=None, dcp_world_size=1,
+            cp_kv_cache_interleave_size=1, metadata_cls=types.SimpleNamespace,
+            vllm_config=types.SimpleNamespace(attention_config=types.SimpleNamespace(
+                hisparse_config=object(), sparse_mla_force_mqa=False)),
+            _build_req_id_per_token=lambda cm: torch.zeros(64, dtype=torch.int32),
+            _build_chunked_context_fields=lambda *a: None)
+        return s
+
+    qsl = torch.tensor([0, 64], dtype=torch.int32)
+    cm = types.SimpleNamespace(
+        num_reqs=1, num_actual_tokens=64, max_query_len=64, max_seq_len=4096,
+        query_start_loc=qsl, query_start_loc_cpu=qsl, max_logits_per_req=None,
+        seq_lens=torch.tensor([4096]), seq_lens_cpu_upper_bound=torch.tensor([4096]),
+        block_table_tensor=torch.zeros(1, 66, dtype=torch.int32),
+        slot_mapping=None, is_prefilling=torch.tensor([True]))
+
+    ig = _defs(FIXTURES / "index_group.py", "stage_prefill_rows")
+    cache = types.SimpleNamespace(view=None, block_table=None,
+                                  runtime=types.SimpleNamespace(
+                                      gather_prefill_cache=lambda kv, plan, **k: "staged"))
+    group = types.SimpleNamespace(cache=lambda i: cache)
+
+    def forward_stage(md):  # flashinfer_mla_sparse_sm120.py:142-165
+        assert md.num_decode_tokens < md.num_actual_tokens
+        return ig["stage_prefill_rows"](group, 0, None, md)
+
+    stock = _build_fn(src)
+    md = stock["build"](make_self(stock), 0, cm)
+    assert (md.num_decodes, md.num_prefills, md.prefill) == (0, 1, None)
+    with pytest.raises(AssertionError):
+        forward_stage(md)
+
+    patched = _build_fn(P.patch_source(src)[0])
+    md = patched["build"](make_self(patched), 0, cm)
+    assert md.prefill.host_staging_plan.cap == 64  # ceil(4096/64) blocks
+    staged, bt, _ = forward_stage(md)
+    assert staged == "staged" and bt is md.prefill.host_staging_plan.block_table
+    # With a prefill backend the section is unchanged and still prepared.
+    seen = []
+    s = make_self(patched)
+    s._prefill_backend = types.SimpleNamespace(prepare_metadata=seen.append)
+    assert patched["build"](s, 0, cm).prefill is seen[0]
+
+
+def test_oracle_error_names_the_prompt_being_generated(monkeypatch):
+    import subprocess as sp
+
+    class Proc:
+        pid, returncode = 1, 1
+        stdout = iter([f"{oracle.MARK} patched: target_1 start\n",
+                       f"{oracle.MARK} patched: target_1 done (32 tokens, 0.8s)\n",
+                       f"{oracle.MARK} patched: target_2 start\n"])
+        stderr = iter(["[rank0]: AssertionError\n"])
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(sp, "Popen", lambda *a, **k: Proc())
+    monkeypatch.setattr(oracle.os, "killpg", lambda *a: None)
+    r = oracle._run_child("patched", [])
+    assert r["error"] == "exit 1 during target_2: [rank0]: AssertionError"

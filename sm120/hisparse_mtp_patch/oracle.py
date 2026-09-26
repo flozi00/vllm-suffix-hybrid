@@ -127,6 +127,7 @@ def child(mode: str, a) -> dict:
 
     prompts = _prompts(a.prompt_len)
     def step(name, p):
+        print(f"{MARK} {mode}: {name} start", flush=True)  # crash forensics
         out[name] = gen(p)
         print(f"[suffix sm120-hisparse-mtp] ORACLE {mode}: {name} done "
               f"({len(out[name])} tokens, {time.monotonic() - t0:.1f}s)", flush=True)
@@ -197,10 +198,13 @@ def _run_child(mode: str, argv) -> dict:
     for line in out:
         if line.startswith(RESULT):
             return json.loads(line[len(RESULT):])
+    started = [ln.split(": ")[-1][:-len(" start")] for ln in map(str.strip, out)
+               if ln.startswith(f"{MARK} {mode}: ") and ln.endswith(" start")]
+    during = f" during {started[-1]}" if started else ""
     if timed_out:
-        return {"mode": mode, "error": f"TIMEOUT after {CHILD_TIMEOUT}s (hung)"}
+        return {"mode": mode, "error": f"TIMEOUT after {CHILD_TIMEOUT}s{during} (hung)"}
     errs = [ln.strip() for ln in err if "Error" in ln]
-    return {"mode": mode, "error": f"exit {proc.returncode}: "
+    return {"mode": mode, "error": f"exit {proc.returncode}{during}: "
             + (errs[-1] if errs else "no result line")}
 
 

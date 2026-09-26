@@ -34,6 +34,28 @@ two patches share no file and compose in any order):
      uses it; SM90's builder is a subclass and is excluded);
   3. ``build()``: count + log (once) real multi-token decode batches —
      marker ``[suffix sm120-hisparse-mtp] HISPARSE-MTP-DECODE``.
+  4./5. ``build()``: build the prefill metadata (host staging plan) under
+     HiSparse even with no MLA prefill backend; see below.
+
+HiSparse prefill staging plan on SM120 (rev 2026-09-26.1; upstream bug)
+-----------------------------------------------------------------------
+Silicon (patched child, k=3): target_1 and pressure_0..3 pass, then target_2
+(same prompt again -> prefix-cache hit on pages spilled to host) dies in
+``index_group.py:368 stage_prefill_rows: assert staging_plan is not None``.
+Not a decode/prefill split disagreement: ``FlashInferMLASparseSM120Impl.
+supports_dense_mha_prefill = False`` (flashinfer_mla_sparse_sm120.py:36) ->
+``MLAAttention.prefill_backend = None`` (mla_attention.py:600-607) -> builder
+``_prefill_backend = None`` (sparse_mla_attention.py:250-252) -> ``build()``
+skips the whole prefill section (sparse_mla_attention.py:374), so
+``attn_metadata.prefill`` is None and there is never a
+``host_staging_plan`` (built only inside that section, :387-403). The SM120
+forward stages prefill rows whenever a prefill is not all-resident
+(flashinfer_mla_sparse_sm120.py:142-165): the first prefill whose context
+touches a host-spilled page crashes (stock too, masked there by the
+capacity crash). Rewrites 4+5 enter the section when HiSparse is on and
+skip only ``prepare_metadata`` without a backend. Safe: with HiSparse
+``_use_sparse_mha`` returns False first (mla_attention.py:1187-1188), so
+the prefill metadata is read only by index_group's staging.
 
 Swap-row capacity off-by-one (rev .2; upstream, not SM120-specific)
 ------------------------------------------------------------------
@@ -60,7 +82,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-09-25.2"
+PATCH_REVISION = "2026-09-26.1"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
@@ -166,6 +188,24 @@ EDITS = [
         "        prefill: SparseMLAPrefillMetadata | None = None\n",
         1,
     ),
+    (
+        "hisparse_prefill_without_backend",
+        "        if num_prefills > 0 and self._prefill_backend is not None:\n",
+        f"        # {HELPER_TAG}: SM120 has no MLA prefill backend, but HiSparse\n"
+        "        # stage_prefill_rows still needs prefill.host_staging_plan.\n"
+        "        if num_prefills > 0 and (\n"
+        "            self._prefill_backend is not None\n"
+        "            or self.vllm_config.attention_config.hisparse_config is not None\n"
+        "        ):\n",
+        1,
+    ),
+    (
+        "prepare_metadata_guard",
+        "            self._prefill_backend.prepare_metadata(prefill)\n",
+        "            if self._prefill_backend is not None:\n"
+        "                self._prefill_backend.prepare_metadata(prefill)\n",
+        1,
+    ),
 ]
 
 
@@ -266,6 +306,7 @@ def apply(module=None) -> bool:
     setattr(module, MARKER_ATTR, PATCH_REVISION)
     print(f"[suffix {PATCH_NAME}] ACTIVE on SM120: HiSparse spec-verify tokens "
           f"-> multi-token hot-buffer decode + swap rows = max_rows+1 "
+          f"+ prefill staging plan w/o prefill backend "
           f"(rev {PATCH_REVISION}; {len(applied) + 1} anchors; vllm {ver}).",
           file=sys.stderr, flush=True)
     return True
