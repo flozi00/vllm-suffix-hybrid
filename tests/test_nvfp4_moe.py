@@ -369,3 +369,247 @@ def test_host_launch_args_match_kernel_abi():
         assert f'f("{kern}")' in host
     assert '"arch": "sm_120a"' in (ROOT / "kernels-oxide" / "nvfp4_moe"
                                    / "oxide-variants.json").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Lane-level emulator of kernels-oxide/nvfp4_moe: moe_route (per-thread
+# counting + tid-0 prefix), moe_fc1 / moe_fc2 transcribed per lane (g, t,
+# sfa_row, ok0/ok1/oks masks, load_a / load_b byte offsets, the 3-stage
+# register pipeline exactly as written) over the PTX m16n8k64
+# mxf4nvf4.scale_vec::4X fragment layout (A: a0/a1 rows g/g+8 k 8t.., a2/a3
+# k 32+8t..; B: b0/b1 col g; scale A row r from lane 4r (r<8) / 4(r-8)+1,
+# scale B col n from lane 4n (thread-id selectors 0); C: rows g/g+8 cols
+# 2t,2t+1), and moe_combine. Workspace starts NaN so any read of an unwritten
+# row or a wrong lane->row mapping poisons the output.
+# ---------------------------------------------------------------------------
+_LANE = np.arange(32)
+_LG, _LT = _LANE // 4, _LANE % 4
+_LUT = np.array(nm._E2M1 + tuple(-v for v in nm._E2M1))
+_F8 = torch.arange(256, dtype=torch.int32).to(torch.uint8).view(torch.float8_e4m3fn).double().numpy()
+
+
+def _ld32(buf, off, ok):
+    off = np.where(ok, off, 0).astype(np.int64)
+    assert (off[ok] % 4 == 0).all() and (off[ok] + 4 <= buf.size).all(), "misaligned/OOB ld32"
+    v = sum(buf[off + i].astype(np.uint64) << np.uint64(8 * i) for i in range(4))
+    return np.where(ok, v, 0).astype(np.uint64)
+
+
+def _nib(v, j):
+    return ((v >> np.uint64(4 * j)) & np.uint64(0xF)).astype(np.int64)
+
+
+def _mma(c, a, b):
+    """c (32,4) f32, a (32,5) [a0..a3, sfa], b (32,3) [b0, b1, sfb] -> (32,4)."""
+    A, B = np.zeros((16, 64)), np.zeros((8, 64))
+    sa, sb = np.zeros((16, 4)), np.zeros((8, 4))
+    for r in range(4):
+        for j in range(8):
+            A[_LG + 8 * (r & 1), 8 * _LT + 32 * (r >> 1) + j] = _LUT[_nib(a[:, r], j)]
+    for r in range(2):
+        for j in range(8):
+            B[_LG, 8 * _LT + 32 * r + j] = _LUT[_nib(b[:, r], j)]
+    for i in range(4):
+        byte = lambda v: ((v >> np.uint64(8 * i)) & np.uint64(0xFF)).astype(np.int64)
+        sa[_LG[_LT == 0], i] = _F8[byte(a[_LT == 0, 4])]
+        sa[_LG[_LT == 1] + 8, i] = _F8[byte(a[_LT == 1, 4])]
+        sb[_LG[_LT == 0], i] = _F8[byte(b[_LT == 0, 2])]
+    d = (A * np.repeat(sa, 16, 1)) @ (B * np.repeat(sb, 16, 1)).T
+    cm = np.zeros((16, 8))
+    for q in range(4):
+        cm[_LG + 8 * (q >> 1), 2 * _LT + (q & 1)] = c[:, q]
+    d = (d + cm).astype(np.float32)
+    return np.stack([d[_LG + 8 * (q >> 1), 2 * _LT + (q & 1)] for q in range(4)], 1)
+
+
+def _act32(x, kind):
+    x = x.astype(np.float32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        z = (np.float32(2.3022082) * (x + np.float32(0.044715) * x * x * x) if kind == 1
+             else x * np.float32(1.442695))
+        return (x / (np.float32(1) + np.exp2(-z))).astype(np.float32)
+
+
+def _route_emu(ids_flat, id_base, e_count, slots):
+    loc = ids_flat.astype(np.int64) - id_base
+    cnt = np.array([(loc == tid).sum() for tid in range(e_count)], np.int32)
+    se, so, sc = np.full(slots, -1), np.zeros(slots, np.int64), np.zeros(slots, np.int64)
+    offs, off, s = np.zeros(e_count, np.int64), 0, 0
+    for e in range(e_count):
+        offs[e] = off
+        if cnt[e] > 0 and s < slots:
+            se[s], so[s], sc[s] = e, off, cnt[e]
+            s += 1
+        off += cnt[e]
+    pl = np.full(len(loc) + 1, -7, np.int64)  # sentinel: must never be read
+    for tid in range(e_count):
+        w = offs[tid]
+        for p in range(len(loc)):
+            if loc[p] == tid:
+                pl[w] = p
+                w += 1
+    return se, so, sc, pl
+
+
+def _gemm_emu(out, aq, asf, w, wsf, owner, se, so, sc, pl, a_row_div, kdim, ndim, nrows_w,
+              col_off, epi):
+    """Shared fc1/fc2 CTA/warp/lane walk (col_off: fc1 gate rows = idim + j).
+    owner[p] = local expert of pair p: a CTA may only write its own pairs
+    (a masked-row slip into the next expert's rows is a race on silicon)."""
+    kh, nkb = kdim // 2, kdim // 16
+    kb_pad, rows_pad = -(-nkb // 4) * 4, -(-nrows_w // 128) * 128
+    sfa_row = 8 * (_LANE & 1) + _LANE // 4
+    for slot, e in enumerate(se):
+        if e < 0:
+            continue
+        off, cnt = so[slot], sc[slot]
+        for bx in range(ndim // 32):
+            for warp in range(4):
+                j0 = (bx * 4 + warp) * 8
+                if j0 >= ndim:
+                    continue
+                rows_b = [j0 + _LG + co for co in col_off]
+                for r0 in range(0, cnt, 16):
+                    ok0, ok1, oks = r0 + _LG < cnt, r0 + _LG + 8 < cnt, r0 + sfa_row < cnt
+                    p0 = np.where(ok0, pl[np.where(ok0, off + r0 + _LG, 0)], 0)
+                    p1 = np.where(ok1, pl[np.where(ok1, off + r0 + _LG + 8, 0)], 0)
+                    ps = np.where(oks, pl[np.where(oks, off + r0 + sfa_row, 0)], 0)
+                    assert (p0[ok0] >= 0).all() and (p1[ok1] >= 0).all() and (ps[oks] >= 0).all()
+
+                    def la(k0):
+                        o = k0 // 2 + 4 * _LT
+                        return np.stack([_ld32(aq, (p0 // a_row_div) * kh + o, ok0),
+                                         _ld32(aq, (p1 // a_row_div) * kh + o, ok1),
+                                         _ld32(aq, (p0 // a_row_div) * kh + o + 16, ok0),
+                                         _ld32(aq, (p1 // a_row_div) * kh + o + 16, ok1),
+                                         _ld32(asf, (ps // a_row_div) * nkb + k0 // 16, oks)], 1)
+
+                    def lb(k0, row):
+                        o = k0 // 2 + 4 * _LT
+                        base = e * nrows_w * kh + row * kh
+                        on = np.ones(32, bool)
+                        sfo = e * rows_pad * kb_pad + ng.sf_offset(row, k0 // 16, kb_pad)
+                        return np.stack([_ld32(w, base + o, on), _ld32(w, base + o + 16, on),
+                                         _ld32(wsf, sfo, on)], 1)
+
+                    steps = kdim // 64
+                    ld = lambda k0: (la(k0), [lb(k0, r) for r in rows_b])
+                    acc = [np.zeros((32, 4), np.float32) for _ in rows_b]
+                    s0 = ld(0)
+                    s1 = ld(64) if steps > 1 else s0
+                    s = 2
+                    while s < steps:
+                        s2 = ld(s * 64)
+                        acc = [_mma(c, s0[0], b) for c, b in zip(acc, s0[1])]
+                        s0, s1 = s1, s2
+                        s += 1
+                    acc = [_mma(c, s0[0], b) for c, b in zip(acc, s0[1])]
+                    if steps > 1:
+                        acc = [_mma(c, s1[0], b) for c, b in zip(acc, s1[1])]
+                    col = j0 + 2 * _LT
+                    for ok, pp, q in ((ok0, p0, 0), (ok1, p1, 2)):
+                        for dc in range(2):
+                            assert (owner[pp[ok]] == e).all(), "wrote another expert's row"
+                            v = epi(e, pp, [c[:, q + dc] for c in acc])
+                            out[pp[ok], col[ok] + dc] = v[ok]
+
+
+def kernel_lane_emu(p, x, ids, tw, base=0):
+    """(ws tuple as nm.workspace, out bf16) from the lane-level emulation."""
+    m, topk = ids.shape
+    e_count, two_i, kh1 = p["w13"].shape
+    hdim, idim = kh1 * 2, two_i // 2
+    pairs = m * topk
+    slots = min(e_count, pairs)
+    ids_flat = ids.reshape(-1).numpy()
+    se, so, sc, pl = _route_emu(ids_flat, base, e_count, slots)
+    aq_t, asf_t = nm.quant_codes(x.float(), p["a1g"])
+    aq, asf = aq_t.reshape(-1).numpy(), asf_t.reshape(-1).numpy()
+    u8 = lambda t: t.reshape(-1).view(torch.uint8).numpy()
+    inter = np.full((pairs, idim), np.nan, np.float32)
+    g1, g2 = p["g1"].numpy(), p["g2"].numpy()
+    twf = tw.reshape(-1).numpy().astype(np.float32)
+
+    def epi1(e, pp, c):  # c = [up, gate]
+        a = np.float32(g1[e])
+        return _act32(a * c[1], p["act"]) * (a * c[0])
+
+    loc = ids_flat.astype(np.int64) - base
+    _gemm_emu(inter, aq, asf, u8(p["w13"]), u8(p["w13_sf"]), loc, se, so, sc, pl, topk,
+              hdim, idim, two_i, (0, idim), epi1)
+    with np.errstate(invalid="ignore"):
+        hq_t, hsf_t = nm.quant_codes(torch.from_numpy(inter), p["a2g"])
+    hq, hsf = hq_t.reshape(-1).numpy(), hsf_t.reshape(-1).numpy()
+    y = np.full((pairs, hdim), np.nan, np.float32)
+
+    def epi2(e, pp, c):
+        return c[0] * (np.float32(g2[e]) * twf[pp])
+
+    _gemm_emu(y, hq, hsf, u8(p["w2"]), u8(p["w2_sf"]), loc, se, so, sc, pl, 1,
+              idim, hdim, hdim, (0,), epi2)
+    acc = np.zeros((m, hdim), np.float32)
+    for k in range(topk):
+        v = (loc[k::topk] >= 0) & (loc[k::topk] < e_count)
+        acc[v] += y[k::topk][v]
+    out = torch.from_numpy(acc).bfloat16()
+    ws = nm.workspace("cpu", m, topk, hdim, idim, e_count)
+    for t, v in zip(ws, (aq, asf, inter, hq, hsf, y)):
+        t[:v.size] = torch.from_numpy(np.ascontiguousarray(v).reshape(-1))
+    return ws, out
+
+
+@pytest.mark.parametrize("act,m,local,e_global,topk,hdim,idim,dead", [
+    ("gelu_tanh", 1, 4, 4, 2, 256, 192, None),   # fc1 4 steps, fc2 3 steps
+    ("gelu_tanh", 17, 2, 2, 2, 256, 64, None),   # 17 rows/expert: 2 chunks, fc2 1 step
+    ("silu", 33, 3, 3, 3, 128, 128, None),       # odd M, odd E, 2-step both
+    ("gelu_tanh", 64, 8, 8, 4, 128, 192, None),  # 32 rows/expert avg, masked tails
+    ("silu", 9, 4, 16, 3, 128, 64, None),        # EP rank 2/4: t%3==1 off-rank
+    ("gelu_tanh", 5, 4, 16, 2, 256, 64, True),   # EP: every token off-rank
+    ("silu", 23, 2, 8, 2, 192, 128, None),       # EP rank 3/4, 3-step fc1
+])
+def test_lane_emulator_matches_f64_spec(act, m, local, e_global, topk, hdim, idim, dead):
+    ep_rank = 2 if e_global == 16 else (3 if e_global == 8 and local == 2 else 0)
+    base = ep_rank * local
+    p = nm.make_problem(local, hdim, idim, act, seed=m)
+    ids, tw = nm.rand_routing(m, e_global, topk, "cpu", seed=m, base=base, local=local,
+                              dead=dead)
+    x = (torch.randn(m, hdim, generator=torch.Generator().manual_seed(m)) * 1.3).bfloat16()
+    ws, out = kernel_lane_emu(p, x, ids, tw, base)
+    lid = nm.to_local(ids, base, local)
+    ok, msg = nm.stages(p, x, lid, tw, ws, out)
+    assert ok, msg
+    ref = nm.moe_ref(p, x, lid, tw)
+    assert torch.isfinite(out.float()).all()
+    dead_rows = (lid < 0).all(1)
+    assert (out[dead_rows] == 0).all()
+    if dead:
+        assert dead_rows.all()
+    else:
+        assert nm._rel(out.float(), ref) <= nm.REF_TOL, nm._rel(out.float(), ref)
+
+
+def test_act_ex2_form_is_finite_and_signed_right_at_extremes():
+    x = np.array([-3e38, -1e13, -200, -60, -11, -5, -1e-30, -0.0, 0.0, 1e-30, 5, 11, 60,
+                  1e13, 3e38], np.float32)
+    for kind in (0, 1):
+        got = _act32(x, kind)
+        ref = nm.act_ref(torch.from_numpy(x).double(), kind).numpy()
+        assert np.isfinite(got).all(), (kind, got)
+        np.testing.assert_allclose(got, ref, rtol=1e-5, atol=1e-30)
+
+
+@pytest.mark.parametrize("m", [1, 2, 3, 5, 7, 8, 15, 16, 17, 31, 32, 47, 63, 64])
+def test_lane_emulator_m_sweep_ep(m):
+    """M sweep on an EP rank (5 local of 15 global, id_base 5, int64 ids):
+    chunk tails at every residue, off-rank rows exact 0, all stages in tol."""
+    local, e_global, base, topk = 5, 15, 5, 3
+    p = nm.make_problem(local, 128, 128, "gelu_tanh" if m % 2 else "silu", seed=100 + m)
+    ids, tw = nm.rand_routing(m, e_global, topk, "cpu", seed=m, base=base, local=local)
+    ids = ids.long()
+    x = torch.randn(m, 128, generator=torch.Generator().manual_seed(m)).bfloat16()
+    ws, out = kernel_lane_emu(p, x, ids, tw, base)
+    lid = nm.to_local(ids, base, local)
+    ok, msg = nm.stages(p, x, lid, tw, ws, out)
+    assert ok, msg
+    assert (out[(lid < 0).all(1)] == 0).all() and torch.isfinite(out.float()).all()
+    assert nm._rel(out.float(), nm.moe_ref(p, x, lid, tw)) <= nm.REF_TOL

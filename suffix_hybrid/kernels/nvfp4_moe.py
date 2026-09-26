@@ -159,9 +159,10 @@ def dequant(packed, sf):
     """(packed uint8 [R, K/2], sf f32 [R, K/16]) -> f32 [R, K] (no 1/g)."""
     import torch
     lut = torch.tensor(_E2M1 + tuple(-v for v in _E2M1), device=packed.device)
-    code = torch.stack([packed & 0xF, packed >> 4], -1).reshape(packed.shape[0], -1)
+    r, k = packed.shape[0], packed.shape[1] * 2  # explicit: R may be 0 (all off-rank)
+    code = torch.stack([packed & 0xF, packed >> 4], -1).reshape(r, k)
     val = lut[code.long()]
-    return (val.reshape(val.shape[0], -1, 16) * sf[..., None]).reshape(val.shape[0], -1)
+    return (val.reshape(r, k // 16, 16) * sf[..., None]).reshape(r, k)
 
 
 def qdq(x, g: float):
