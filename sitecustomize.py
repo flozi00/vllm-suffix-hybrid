@@ -262,6 +262,14 @@ _BOOT_GATES = {
                           "--prompt-len", "4096", "--layers", "2",
                           "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
                          {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}),
+    # Same stack at prod shape: 8 layers with IndexShare followers + draft
+    # top-k reuse, max_num_seqs=4, 256-token chunks mixed with decodes, one
+    # 8-prompt generate(); ref vs patched vs patched+follower-prefetch.
+    "glm_stack_multi_oracle": (["-m", "hisparse_mtp_patch.oracle", "--multi",
+                                "--k", "5", "--layers", "8", "--index-freq", "4",
+                                "--index-offset", "3", "--batched-tokens", "256",
+                                "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
+                               {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 if _boot_gates and not os.environ.get("SUFFIX_BOOT_GATES_DONE"):

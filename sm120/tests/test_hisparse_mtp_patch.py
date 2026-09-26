@@ -654,3 +654,136 @@ def test_prefetch_drift_fails_closed_before_any_rewrite(monkeypatch, tmp_path):
         P.apply(mod)
     assert not hasattr(mod, P.MARKER_ATTR) and rt._get_max_swap_rows(_cfg(3)) == 4
     assert not hasattr(rt, P.PREFETCH_STATS)
+
+
+# --- oracle --multi ---------------------------------------------------------
+
+def test_multi_layout_matches_vllm_rules():
+    # Silicon: 2 layers + MTP (every layer an indexer) -> 8 KV groups.
+    for dt in ("fp8_ds_mla", "nvfp4_ds_mla"):
+        g = oracle.hisparse_hot_groups(2, kv_dtype=dt)
+        assert g == [[0], [1], [2]] and 2 + 2 * len(g) == 8
+    # --multi: freq 4 / offset 3 -> indexers 0,1,2,6 (+MTP 8), followers
+    # 3,4,5,7 (deepseek_v2.py: max(l - offset + 1, 0) % freq != 0 skips).
+    assert oracle.index_leaders(8, 4, 3) == [True, True, True, False, False,
+                                             False, True, False, True]
+    g = oracle.hisparse_hot_groups(8, 4, 3, "nvfp4_ds_mla")
+    assert g == [[0], [1], [2, 3, 4, 5], [6, 7], [8]] and 2 + 2 * len(g) == 12
+    # Packing: a small source page lets whole units share a hot group.
+    oracle.SOURCE_ROW["tiny"] = 8
+    try:
+        assert oracle.hisparse_hot_groups(3, kv_dtype="tiny") == [[0, 1, 2, 3]]
+    finally:
+        del oracle.SOURCE_ROW["tiny"]
+
+
+def test_multi_gpu_blocks_forces_host_reads_but_admits():
+    prompts = oracle.multi_prompts()
+    mml = max(len(p) + n for _, p, n in prompts) + 64
+    r = len(oracle.hisparse_hot_groups(8, 4, 3, "nvfp4_ds_mla"))
+    blocks = oracle.multi_gpu_blocks(5, r, mml)
+    pages = -(-mml // 64)
+    hot = r * (5 + 2) * 2048 // 64
+    one_request = (1 + r) * pages + hot           # indexer + resident + hot
+    watermark = max(hot, blocks // 10)            # coordinator.py:158
+    first_four = sum((1 + r) * -(-len(p) // 64) for _, p, _ in prompts[:4])
+    assert one_request < blocks                   # admission progresses
+    assert first_four > blocks - watermark        # -> reads from host
+
+
+def test_multi_prompts_shape():
+    ps = oracle.multi_prompts()
+    assert len(ps) == 8 and len({n for n, *_ in ps}) == 8
+    d = {n: (p, m) for n, p, m in ps}
+    assert [len(d[n][0]) for n in ("target", "long_3000", "long_2500", "short_700")] \
+        == [4096, 3000, 2500, 700]
+    for name, tail in (("share_tail3", 3), ("share_tail40", 40)):
+        assert d[name][0][:2048] == d["target"][0][:2048]
+        assert len(d[name][0]) == 2048 + tail
+    assert (len(d["prefill_25"][0]), d["prefill_25"][1]) == (25, 1)
+    assert d["target_again"][0] == d["target"][0]
+    assert len({m for _, _, m in ps}) == 8        # staggered finishes
+    assert ps == oracle.multi_prompts()           # deterministic
+
+
+def _mrun(mode, outputs, **kw):
+    r = _run(outputs, mode=mode, patched="r" if mode != "ref" else None,
+             mtp_decode_builds=0 if mode == "ref" else 9,
+             spills=None if mode == "ref" else 4, max_decode_query_len=6,
+             prefetch={"follower_prefetched": 40, "follower_staged": 0}
+             if mode == "prefetch" else None)
+    r.update(kw)
+    return r
+
+
+def test_oracle_verdict_multi():
+    good = {"target": [1, 2, 3], "target_again": [1, 2], "x": [5]}
+    ref, pat, pf = (_mrun(m, good) for m in ("ref", "patched", "prefetch"))
+    assert oracle.verdict_multi(ref, pat, pf) == (0, [])
+    bad = dict(good, x=[6])
+    rc, why = oracle.verdict_multi(ref, pat, _mrun("prefetch", bad))
+    assert rc == 1 and why == ["prefetch != ref at ['x@0']",
+                               "prefetch != patched at ['x@0']"]
+    assert oracle.verdict_multi(ref, pat, dict(pf, prefetch={
+        "follower_prefetched": 0, "follower_staged": 7}))[1] == [
+        "prefetch: leader never prefetched follower rows"]
+    assert oracle.verdict_multi(ref, dict(pat, spills=0), pf)[0] == 1
+    assert oracle.verdict_multi(ref, dict(pat, mtp_decode_builds=0), pf)[0] == 1
+    assert oracle.verdict_multi(ref, _mrun("patched", dict(good, target_again=[1, 9])),
+                                pf)[0] == 1
+    rc, why = oracle.verdict_multi(ref, {"mode": "patched", "error": "exit 1 during "
+                                         "step7(run=4,pf=1,wait=4): boom"}, pf)
+    assert rc == 1 and why == ["patched crashed (exit 1 during step7(run=4,pf=1,wait=4): boom)"]
+    assert oracle.verdict_multi({"mode": "ref", "error": "x"}, pat, pf)[0] == 2
+    assert oracle.verdict_multi({"mode": "ref", "error": "x"}, pat, dict(pf, patched=None))[0] == 1
+
+
+def test_oracle_main_multi_boot_gate_argv(monkeypatch, capsys):
+    src = (REPO / "sitecustomize.py").read_text()
+    ns = {}
+    exec(src[src.index("_BOOT_GATES = {"):src.index("\n}\n") + 3], ns)
+    argv, env = ns["_BOOT_GATES"]["glm_stack_multi_oracle"]
+    assert argv[:2] == ["-m", "hisparse_mtp_patch.oracle"]
+    assert env == {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}
+    good = {"target": [1, 2], "target_again": [1, 2]}
+    calls = []
+
+    def fake(mode, a):
+        calls.append((mode, a))
+        return _mrun(mode, good, steps={"steps": 90, "mixed": 30, "max_running": 4},
+                     peak_reserved_gib=7.5)
+
+    monkeypatch.setattr(oracle, "_run_child", fake)
+    assert oracle.main(argv[2:]) == 0
+    assert [m for m, _ in calls] == ["ref", "patched", "prefetch"]
+    assert all(a[-2:] == ["--k", "5"] and "--multi" in a for _, a in calls)
+    out = capsys.readouterr().out
+    assert "k=5 PASS" in out and '"mixed": 30' in out and "peak_reserved_gib=7.5" in out
+    assert oracle._child_timeout(argv) == 1200 and oracle._child_timeout([]) == 600
+
+
+def test_oracle_child_env_per_mode(monkeypatch):
+    import subprocess as sp
+    seen = {}
+
+    class Proc:
+        pid, returncode = 1, 0
+        stdout = iter([oracle.RESULT + '{"mode": "x"}\n'])
+        stderr = iter([])
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(cmd, env, **kw):
+        seen[cmd[4]] = {k: v for k, v in env.items() if "HISPARSE" in k}
+        return Proc()
+
+    monkeypatch.setattr(sp, "Popen", popen)
+    monkeypatch.setattr(oracle.os, "killpg", lambda *a: None)
+    monkeypatch.setenv("SUFFIX_SM120_HISPARSE_PREFETCH", "1")  # never leaks
+    for m in ("ref", "stock", "patched", "prefetch"):
+        oracle._run_child(m, ["--multi"])
+    assert seen == {"ref": {}, "stock": {},
+                    "patched": {"SUFFIX_SM120_HISPARSE_MTP": "1"},
+                    "prefetch": {"SUFFIX_SM120_HISPARSE_MTP": "1",
+                                 "SUFFIX_SM120_HISPARSE_PREFETCH": "1"}}
