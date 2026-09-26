@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Single-GPU silicon oracle for the SM120 HiSparse+MTP patch (no GLM).
+"""Silicon oracle for the SM120 HiSparse+MTP patch (no GLM); 1 GPU, or
+--tp N GPUs (N>1 = the shared /dev/shm host pool prod's TP=8 uses: every
+rank cudaHostRegisters one mmap; stock crashed there, patched serializes).
 
     python -m hisparse_mtp_patch.oracle [--k 3 5] [--prompt-len 4096] ...
 
@@ -104,19 +106,15 @@ def child(mode: str, a) -> dict:
         speculative_config={"method": "mtp", "num_speculative_tokens": a.k},
         compilation_config={"cudagraph_mode": "FULL_AND_PIECEWISE",
                             "cudagraph_capture_sizes": [1, 2, 4, 8]},
+        tensor_parallel_size=a.tp,
+        # tp>1: "mp" workers = the only executor with the shared HiSparse
+        # host pool (runtime.py use_shared_hisparse_host_pool).
+        distributed_executor_backend="mp" if a.tp > 1 else None,
         **kw)
 
-    import vllm.model_executor.layers.attention.sparse_mla_attention as sma
-
     core = llm.llm_engine.engine_core.engine_core
-    runner = core.model_executor.driver_worker.worker.model_runner
-    cfg = getattr(runner, "vllm_config", None) or llm.llm_engine.vllm_config
-    impls = sorted({type(getattr(layer, "impl", None)).__name__
-                    for layer in cfg.compilation_config
-                    .static_forward_context.values()
-                    if getattr(layer, "impl", None) is not None})
-    stats = getattr(sma, "_SUFFIX_HISPARSE_MTP_STATS", None)
-    base = stats["multi_token_decode_builds"] if stats else 0
+    # Worker-side state via RPC: with tp>1 the workers are other processes.
+    base = llm.collective_rpc(_worker_probe)[0]
 
     sp = SamplingParams(temperature=0.0, max_tokens=a.max_tokens,
                         ignore_eos=True)
@@ -144,13 +142,34 @@ def child(mode: str, a) -> dict:
         from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
         spills = get_hisparse_coordinator(
             core.scheduler.kv_cache_manager).next_spill_id
+    probes = llm.collective_rpc(_worker_probe)
+    end = probes[0]
     return {
-        "mode": mode, "impls": impls, "outputs": out, "spills": spills,
-        "patched": getattr(sma, "__suffix_hisparse_mtp_revision__", None),
-        "mtp_decode_builds": (stats["multi_token_decode_builds"] - base)
-        if stats else 0,
-        "max_decode_query_len": stats["max_decode_query_len"] if stats else 0,
+        "mode": mode, "tp": a.tp, "impls": end["impls"], "outputs": out,
+        "spills": spills, "patched": end["patched"],
+        "mtp_decode_builds": end["builds"] - base["builds"],
+        "max_decode_query_len": end["max_q"],
+        "shared_host_pool": [p["shared_host_pool"] for p in probes],
     }
+
+
+def _worker_probe(worker) -> dict:
+    """Runs inside each worker (collective_rpc); self-contained imports."""
+    import vllm.model_executor.layers.attention.sparse_mla_attention as sma
+
+    runner = worker.model_runner
+    cfg = getattr(runner, "vllm_config", None) or worker.vllm_config
+    impls = sorted({type(getattr(layer, "impl", None)).__name__
+                    for layer in cfg.compilation_config
+                    .static_forward_context.values()
+                    if getattr(layer, "impl", None) is not None})
+    stats = getattr(sma, "_SUFFIX_HISPARSE_MTP_STATS", None) or {}
+    kvc = getattr(runner, "kv_cache_config", None)
+    return {"impls": impls,
+            "patched": getattr(sma, "__suffix_hisparse_mtp_revision__", None),
+            "builds": stats.get("multi_token_decode_builds", 0),
+            "max_q": stats.get("max_decode_query_len", 0),
+            "shared_host_pool": getattr(kvc, "hisparse_shared_host_pool", None)}
 
 
 CHILD_TIMEOUT = int(os.environ.get("SUFFIX_HISPARSE_ORACLE_CHILD_TIMEOUT", "600"))
@@ -239,6 +258,9 @@ def verdict(ref: dict, stock: dict, patched: dict) -> tuple[int, list]:
     stock_ok = "error" not in stock
     if stock_ok and stock["mtp_decode_builds"] != 0:
         fail.append("stock run reports multi-token decode (gate leaked)")
+    if patched.get("tp", 1) > 1 and not all(patched.get("shared_host_pool") or [False]):
+        fail.append(f"tp={patched['tp']} but the shared HiSparse host pool was "
+                    f"not used on every rank: {patched.get('shared_host_pool')}")
     if not patched["spills"]:
         fail.append("no HiSparse spill: host path not exercised "
                     "(lower --gpu-blocks / raise --prompt-len)")
@@ -274,6 +296,9 @@ def main(argv=None) -> int:
     ap.add_argument("--host-gib", type=int, default=4)
     ap.add_argument("--gpu-util", type=float, default=0.5)
     ap.add_argument("--kv-cache-dtype", default="fp8_ds_mla")
+    ap.add_argument("--tp", type=int, default=1,
+                    help="tensor_parallel_size; >1 exercises the shared (mmap) "
+                         "HiSparse host pool, i.e. prod's TP=8 registration path")
     argv = sys.argv[1:] if argv is None else argv
     a = ap.parse_args(argv)
     if a.child:

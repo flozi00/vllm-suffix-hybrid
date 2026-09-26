@@ -260,6 +260,14 @@ _BOOT_GATES = {
                           "--prompt-len", "4096", "--layers", "2",
                           "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
                          {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}),
+    # Same stack at TP=2 (needs 2 GPUs): the shared /dev/shm HiSparse host
+    # pool + per-rank cudaHostRegister that prod's TP=8 takes and TP=1 never
+    # does (prod crash 2026-09-26: "cudaHostRegister failed: cudaError.???").
+    "glm_stack_tp2_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "5",
+                              "--prompt-len", "4096", "--layers", "2",
+                              "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla",
+                              "--tp", "2"],
+                             {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 if _boot_gates and not os.environ.get("SUFFIX_BOOT_GATES_DONE"):

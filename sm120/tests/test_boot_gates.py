@@ -40,3 +40,12 @@ def test_gate_runs_once_with_feature_gates_stripped(tmp_path):
 def test_done_marker_suppresses_rerun(tmp_path):
     r = _boot({"SUFFIX_BOOT_GATES": "nvfp4_dsmla_bench", "SUFFIX_BOOT_GATES_DONE": "1"}, tmp_path)
     assert "boot-gate" not in r.stderr and not (tmp_path / "seen.json").exists()
+
+
+def test_glm_stack_tp2_gate_is_the_tp1_gate_plus_tp2():
+    src = (REPO / "sitecustomize.py").read_text()
+    ns = {}
+    exec(src[src.index("_BOOT_GATES = {"):src.index("\n_boot_gates = ")], ns)
+    argv, env = ns["_BOOT_GATES"]["glm_stack_tp2_oracle"]
+    assert argv == ns["_BOOT_GATES"]["glm_stack_oracle"][0] + ["--tp", "2"]
+    assert env == {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}

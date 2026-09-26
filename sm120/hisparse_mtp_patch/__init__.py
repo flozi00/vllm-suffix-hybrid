@@ -82,7 +82,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-09-26.1"
+PATCH_REVISION = "2026-09-26.3"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
@@ -228,21 +228,138 @@ RUNTIME_NEW = (
     + RUNTIME_OLD.replace("    )\n", "    ) + 1\n")
 )
 
+# Shared (TP>1) host pool registration (rev .3; upstream, not SM120-specific).
+# Stock (runtime.py:360-373) has every local TP rank cudaHostRegister the SAME
+# 25+ GB shmem region at the same moment and reports a failure as
+# "cudaError.???" (torch's cudart enum binds only `success`: EVERY nonzero
+# code prints ???). Driver 580 pins with FOLL_LONGTERM (os-mlock.c), which
+# must migrate any unpinnable page; N ranks pinning the same pages at once
+# race that migration (extra refs -> migrate_pages fails -> -ENOMEM ->
+# NV_ERR_INVALID_ADDRESS). Rewrite: register one TP rank at a time (tp
+# barrier between turns; every rank calls barrier world_size times even after
+# a failure, so nobody hangs), retry each range, log the numeric code plus
+# RLIMIT_MEMLOCK / cgroup memory, and hold no slice of the mmap across a
+# failure (stock's live `tensor` made region.cleanup() hit "BufferError:
+# cannot close exported pointers exist"). Private (TP=1) path unchanged.
+POOL_DEF = "def allocate_hisparse_host_pools(\n"
+POOL_CALL_SITE = "            _, _, self.shared_region = allocate_hisparse_host_pools(\n"
+POOL_OLD = '''\
+    try:
+        for start, end in _hisparse_registration_ranges(
+            tensor_sizes, num_blocks, host_block_stride
+        ):
+            tensor = region.base_tensor[start:end]
+            pin_tensor(tensor)
+            region.pinned_addresses.append(tensor.data_ptr())
+            region.is_pinned = True
+        pools = [
+            region.create_next_canonical_view(size).view(-1) for size in tensor_sizes
+        ]
+    except Exception:
+        region.cleanup()
+        raise
+    return pools, [], region
+'''
+POOL_NEW = '''\
+    group = get_tp_group()
+    failure = None
+    try:
+        ranges = _hisparse_registration_ranges(
+            tensor_sizes, num_blocks, host_block_stride
+        )
+    except Exception as exc:
+        failure, ranges = exc, ()
+    for turn in range(group.world_size):
+        if turn == group.rank_in_group and failure is None:
+            try:
+                for start, end in ranges:
+                    _suffix_pin_range(region, start, end)
+            except Exception as exc:
+                failure = exc
+        group.barrier()
+    try:
+        if failure is not None:
+            raise failure
+        pools = [
+            region.create_next_canonical_view(size).view(-1) for size in tensor_sizes
+        ]
+    except Exception:
+        region.cleanup()
+        raise
+    return pools, [], region
+'''
+POOL_HELPER = f'''
+# --- {HELPER_TAG} (rev {PATCH_REVISION}): serialized shared-pool pinning ---
+_SUFFIX_CUDA_ERRORS = {{1: "cudaErrorInvalidValue", 2: "cudaErrorMemoryAllocation",
+                       712: "cudaErrorHostMemoryAlreadyRegistered",
+                       801: "cudaErrorNotSupported"}}
+
+
+def _suffix_host_mem_facts() -> str:
+    import resource
+
+    facts = [f"RLIMIT_MEMLOCK={{resource.getrlimit(resource.RLIMIT_MEMLOCK)}}"]
+    for name in ("memory.current", "memory.max", "memory.peak"):
+        try:
+            with open(f"/sys/fs/cgroup/{{name}}") as f:
+                facts.append(f"cgroup {{name}}={{f.read().strip()}}")
+        except OSError:
+            pass
+    return ", ".join(facts)
+
+
+def _suffix_pin_range(region, start, end, attempts=3, cudart=None):
+    cudart = torch.cuda.cudart() if cudart is None else cudart
+    tensor = region.base_tensor[start:end]
+    ptr, nbytes = tensor.data_ptr(), tensor.nbytes
+    del tensor  # hold no mmap export across a failure (cleanup closes it)
+    for attempt in range(1, attempts + 1):
+        code = int(cudart.cudaHostRegister(ptr, nbytes, 0).value)
+        if code == 0:
+            region.pinned_addresses.append(ptr)
+            region.is_pinned = True
+            return
+        cudart.cudaGetLastError()  # a failed register leaves the error pending
+        logger.warning(
+            "[suffix {PATCH_NAME}] cudaHostRegister(%#x, %.2f GiB) failed: "
+            "code=%d %s (attempt %d/%d; %s)", ptr, nbytes / 2**30, code,
+            _SUFFIX_CUDA_ERRORS.get(code, "?"), attempt, attempts,
+            _suffix_host_mem_facts())
+        if attempt < attempts:
+            time.sleep(2.0 * attempt)
+    raise RuntimeError(
+        f"cudaHostRegister failed: code={{code}} "
+        f"{{_SUFFIX_CUDA_ERRORS.get(code, '?')}} for the HiSparse shared host "
+        f"pool range [{{start}}, {{end}}) ({{nbytes / 2**30:.2f}} GiB); "
+        + _suffix_host_mem_facts())
+# --- end {HELPER_TAG} ---
+
+'''
+
 
 def patch_runtime_source(src: str) -> str:
-    """Pure check of runtime.py; returns the replacement function source."""
+    """Pure check of runtime.py; returns the replacement functions' source
+    (_get_max_swap_rows, pinning helpers, allocate_hisparse_host_pools)."""
+    anchors = (("swap_rows_def", RUNTIME_OLD), ("swap_rows_call", RUNTIME_CALL_SITE),
+               ("pool_def", POOL_DEF), ("pool_register_loop", POOL_OLD),
+               ("pool_call_site", POOL_CALL_SITE))
     bad = [f"{n}: expected 1, found {src.count(t)}"
-           for n, t in (("swap_rows_def", RUNTIME_OLD),
-                        ("swap_rows_call", RUNTIME_CALL_SITE))
-           if src.count(t) != 1]
+           for n, t in anchors if src.count(t) != 1]
+    if not bad and not (src.index(POOL_DEF) < src.index(POOL_OLD)
+                        and "\ndef " not in src[src.index(POOL_DEF) + 1:
+                                                src.index(POOL_OLD)]):
+        bad.append("pool_register_loop is not the tail of allocate_hisparse_host_pools")
     if HELPER_TAG in src:
         bad.append("already carries the rewrite on disk")
     if bad:
         raise PatchDriftError(
             "hisparse/runtime.py does not match the pinned anchor text "
             f"(expected vLLM {PINNED_VLLM}): " + "; ".join(bad))
-    compile(RUNTIME_NEW, f"<{PATCH_NAME}:runtime>", "exec")
-    return RUNTIME_NEW
+    pool = src[src.index(POOL_DEF):src.index(POOL_OLD) + len(POOL_OLD)]
+    # runtime.py is PEP 563 (lazy annotations); keep the rewrite that way.
+    new = "from __future__ import annotations\n" + RUNTIME_NEW + POOL_HELPER + pool.replace(POOL_OLD, POOL_NEW)
+    compile(new, f"<{PATCH_NAME}:runtime>", "exec")
+    return new
 
 
 def patch_source(src: str) -> tuple[str, list[str]]:
@@ -307,6 +424,7 @@ def apply(module=None) -> bool:
     print(f"[suffix {PATCH_NAME}] ACTIVE on SM120: HiSparse spec-verify tokens "
           f"-> multi-token hot-buffer decode + swap rows = max_rows+1 "
           f"+ prefill staging plan w/o prefill backend "
+          f"+ serialized shared host-pool pinning "
           f"(rev {PATCH_REVISION}; {len(applied) + 1} anchors; vllm {ver}).",
           file=sys.stderr, flush=True)
     return True

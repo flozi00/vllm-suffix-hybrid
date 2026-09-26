@@ -459,3 +459,103 @@ def test_oracle_error_names_the_prompt_being_generated(monkeypatch):
     monkeypatch.setattr(oracle.os, "killpg", lambda *a: None)
     r = oracle._run_child("patched", [])
     assert r["error"] == "exit 1 during target_2: [rank0]: AssertionError"
+
+
+def _pool_ns(codes, rank=1, world=2):
+    """Patched allocate_hisparse_host_pools against fakes: TP group, region,
+    cudart returning `codes` in order (then 0)."""
+    events, codes = [], list(codes)
+
+    class Group:
+        world_size, rank_in_group = world, rank
+
+        def barrier(self):
+            events.append("barrier")
+
+    class Code:
+        def __init__(self, v):
+            self.value = v
+
+    class Cudart:
+        def cudaHostRegister(self, ptr, n, flags):
+            events.append(("register", ptr, n, flags))
+            return Code(codes.pop(0) if codes else 0)
+
+        def cudaGetLastError(self):
+            events.append("drain")
+
+    class Buf:
+        def __getitem__(self, s):
+            return types.SimpleNamespace(data_ptr=lambda: 4096 + s.start,
+                                         nbytes=s.stop - s.start)
+
+    class Region:
+        def __init__(self, **kw):
+            self.base_tensor, self.pinned_addresses, self.is_pinned = Buf(), [], False
+
+        def create_next_canonical_view(self, size):
+            return types.SimpleNamespace(view=lambda *_: size)
+
+        def cleanup(self):
+            events.append("cleanup")
+
+    import math
+    import mmap
+    ns = _defs(RUNTIME_FIXTURE, "_hisparse_registration_ranges",
+               ns={"HOST_REGISTER_CHUNK_BYTES": 256 * 2**30})
+    ns.update(math=math, mmap=mmap,
+              SharedOffloadRegion=Region, get_tp_group=Group,
+              check_hisparse_host_memory=None, allocate_pinned_host_pool=None,
+              torch=types.SimpleNamespace(cuda=types.SimpleNamespace(cudart=Cudart)),
+              time=types.SimpleNamespace(sleep=lambda s: events.append(("sleep", s))),
+              logger=types.SimpleNamespace(warning=lambda *a: events.append("warn")))
+    exec(P.patch_runtime_source(RUNTIME_FIXTURE.read_text()), ns)
+    cfg = types.SimpleNamespace(instance_id="x", parallel_config=types.SimpleNamespace(
+        data_parallel_index=0))
+    # prod geometry scaled down: 352-B rows x 64 tokens, page-rounded stride
+    call = lambda: ns["allocate_hisparse_host_pools"](  # noqa: E731
+        cfg, [22528 * 8, 22528 * 8], 8, 45056, use_shared_host_pool=True)
+    return call, events
+
+
+def test_shared_pool_pins_in_rank_turns():
+    call, events = _pool_ns([])
+    pools, private, region = call()
+    assert pools == [22528 * 8] * 2 and private == []
+    # rank 1 of 2: registers the whole pool (one range) only in ITS turn.
+    assert events == ["barrier", ("register", 4096, 8 * 45056, 0), "barrier"]
+    assert region.pinned_addresses == [4096] and region.is_pinned
+
+
+def test_shared_pool_retries_then_reports_the_numeric_code():
+    call, events = _pool_ns([2, 0], rank=0)
+    call()
+    assert events.count("drain") == 1 and ("sleep", 2.0) in events
+    call, events = _pool_ns([2, 2, 2], rank=0, world=3)
+    with pytest.raises(RuntimeError, match=r"code=2 cudaErrorMemoryAllocation"):
+        call()
+    # every rank still reaches all world_size barriers (no peer hang), then
+    # the region is cleaned up exactly once.
+    assert events.count("barrier") == 3 and events[-1] == "cleanup"
+    assert sum(isinstance(e, tuple) and e[0] == "register" for e in events) == 3
+
+
+def test_pool_anchor_drift():
+    src = RUNTIME_FIXTURE.read_text()
+    with pytest.raises(P.PatchDriftError, match="pool_register_loop: expected 1, found 0"):
+        P.patch_runtime_source(src.replace(P.POOL_OLD, P.POOL_NEW))
+    with pytest.raises(P.PatchDriftError, match="pool_call_site: expected 1, found 0"):
+        P.patch_runtime_source(src.replace(P.POOL_CALL_SITE, ""))
+
+
+def test_oracle_tp2_requires_the_shared_host_pool():
+    outs = {"target_1": [1], "target_2": [1]}
+    ref = {"mode": "ref", "outputs": outs}
+    ok = {"mode": "patched", "tp": 2, "outputs": outs, "patched": "r", "spills": 3,
+          "impls": ["FlashInferMLASparseSM120Impl"], "mtp_decode_builds": 4,
+          "shared_host_pool": [True, True]}
+    stock = {"mode": "stock", "error": "exit 1: RuntimeError: cudaHostRegister failed"}
+    assert oracle.verdict(ref, stock, ok)[0] == 0
+    rc, why = oracle.verdict(ref, stock, dict(ok, shared_host_pool=[True, False]))
+    assert rc == 1 and "shared HiSparse host pool" in why[0]
+    assert oracle.verdict(ref, stock, dict(ok, tp=1, shared_host_pool=[False]))[0] == 0
