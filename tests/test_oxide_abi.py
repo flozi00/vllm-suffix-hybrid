@@ -65,3 +65,48 @@ def test_every_kernel_crate_pins_the_same_cuda_oxide_rev():
         text = c.read_text()
         assert "[workspace]" in text, c
         assert set(re.findall(r'rev = "(\w+)"', text)) == {rev}, c
+
+
+def test_ptx_facts_records_entry_param_counts():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("oxide_build", ROOT / "scripts/oxide_build.py")
+    ob = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ob)
+    ptx = (".version 8.7\n.target sm_120\n"
+           ".visible .entry a(\n\t.param .u64 a_param_0,\n\t.param .u32 a_param_1\n)\n{\n}\n"
+           ".visible .entry b()\n{\n}\n")
+    isa, target, entries, params = ob.ptx_facts(ptx)
+    assert entries == ["a", "b"] and params == {"a": 2, "b": 0}
+
+
+def test_k2_host_param_counts_match_kernel():
+    """own_attn.K2_PARAMS (what prepare() demands of the loaded cubin's
+    manifest) == the #[kernel] parameter counts == the host arg lists."""
+    import sys
+    sys.path.insert(0, str(ROOT / "sm120"))
+    from nvfp4_kv_patch import own_attn
+    dev = (ROOT / "kernels-oxide/k2_nvfp4_attn/src/main.rs").read_text()
+    assert own_attn.K2_PARAMS == {
+        e: len(kernel_params(dev, e)) for e in ("nvfp4_attn_partial", "nvfp4_attn_merge")}
+
+
+def test_stale_cubin_abi_is_refused(tmp_path, monkeypatch):
+    """A cubin whose entry takes a different parameter count than the host
+    passes (or a pre-ABI-record manifest) must fail closed at load: an old
+    cubin would otherwise silently ignore / misread launch arguments."""
+    import json
+    import pytest
+    from suffix_hybrid import oxide_kernels as ok
+    monkeypatch.setattr(ok, "_MANIFEST", None)
+    for params in (None, {"k": 24}):
+        ent = {"name": "fam", "file": "fam.cubin", "sha256": "0", "entries": ["k"]}
+        if params:
+            ent["params"] = params
+        (tmp_path / "manifest.json").write_text(json.dumps({"arch": "sm_120", "kernels": [ent]}))
+        with pytest.raises(RuntimeError, match="params"):
+            ok.ensure_loaded("fam", 0, str(tmp_path), params={"k": 25})
+        # also when probe() already loaded the family (no params there)
+        monkeypatch.setattr(ok, "_LOADED", {("fam", 0)})
+        with pytest.raises(RuntimeError, match="params"):
+            ok.ensure_loaded("fam", 0, str(tmp_path), params={"k": 25})
+        monkeypatch.setattr(ok, "_LOADED", set())

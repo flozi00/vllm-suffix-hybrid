@@ -371,6 +371,13 @@ fn nvfp4_attn_plan(
     ]))
 }
 
+/// K2-NVFP4 device split choice (nvfp4_attn::split_tiles): tiles per split
+/// for a request of `n_t` KV tiles, for the numpy twin's parity test.
+#[pyfunction]
+fn nvfp4_attn_split_tiles(n_t: usize, rows: usize, ns: usize, slots: usize, tn: usize) -> usize {
+    nvfp4_attn::split_tiles(n_t, rows, ns, slots, tn)
+}
+
 /// NVFP4 ds-MLA plan (src/nvfp4_ds_mla.rs) as a dict; ValueError when the
 /// shape is outside the kernel contract (the adapter must refuse, loudly).
 #[pyfunction]
@@ -496,6 +503,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // is the startup kernel-path assertion's probe — an armed pod without it
     // refuses to start, it never silently keeps the FA2 decode route.
     m.add_function(wrap_pyfunction!(nvfp4_attn_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(nvfp4_attn_split_tiles, m)?)?;
     m.add("HAS_NVFP4_ATTN_CUDA", cfg!(feature = "oxide-kernels"))?;
     // cuda-oxide track (ships): shared cubin loader + probe + K2 host op.
     m.add("HAS_OXIDE_KERNELS", cfg!(feature = "oxide-kernels"))?;

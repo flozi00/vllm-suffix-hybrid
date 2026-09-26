@@ -373,6 +373,163 @@ mod tests {
         assert_eq!(n.div_ceil(split_tiles(n, b.rows, b.ns, SMS, b.tn)), b.ns);
     }
 
+    /// The kernel's device `split_tiles`, compiled on the host: `device!`
+    /// both defines it and keeps its tokens, which the test below matches
+    /// against kernels-oxide/k2_nvfp4_attn/src/main.rs (whitespace and
+    /// comments aside), so this IS the device code, in debug-build u32
+    /// arithmetic (an overflow panics).
+    macro_rules! device {
+        ($($t:tt)*) => {
+            const DEVICE_SRC: &str = stringify!($($t)*);
+            $($t)*
+        };
+    }
+    mod dev {
+        pub const MIN_TILES_PER_SPLIT: u32 = 2;
+        pub const SPLIT_COST_TOKENS: u32 = 64;
+        device! {
+            pub fn split_tiles(n_t: u32, rows: u32, ns: u32, slots: u32, tn: u32) -> u32 {
+                let c0 = SPLIT_COST_TOKENS.div_ceil(tn);
+                let mut best = u32::MAX;
+                let mut best_per = MIN_TILES_PER_SPLIT;
+                let mut k = 1u32;
+                while k <= 4 {
+                    let mut s = if k == 4 { ns } else { k * slots / rows };
+                    if s > ns {
+                        s = ns;
+                    }
+                    if s < 1 {
+                        s = 1;
+                    }
+                    let mut per = n_t.div_ceil(s);
+                    if per < MIN_TILES_PER_SPLIT {
+                        per = MIN_TILES_PER_SPLIT;
+                    }
+                    let cost = (rows * n_t.div_ceil(per)).div_ceil(slots) * (per + c0);
+                    if cost < best {
+                        best = cost;
+                        best_per = per;
+                    }
+                    k += 1;
+                }
+                best_per
+            }
+        }
+        pub fn src() -> &'static str {
+            DEVICE_SRC
+        }
+    }
+
+    fn squash(s: &str) -> String {
+        s.lines()
+            .map(|l| l.split("//").next().unwrap())
+            .collect::<String>()
+            .replace("pub ", "")
+            .split_whitespace()
+            .collect()
+    }
+
+    #[test]
+    fn device_split_tiles_copy_is_the_kernel_source() {
+        let k = include_str!("../kernels-oxide/k2_nvfp4_attn/src/main.rs");
+        let start = k.find("fn split_tiles(").expect("kernel split_tiles");
+        let end = start + k[start..].find("\n    }\n").expect("fn end") + 6;
+        assert_eq!(squash(&k[start..end]), squash(dev::src()));
+        for c in [
+            format!(
+                "const MIN_TILES_PER_SPLIT: u32 = {};",
+                dev::MIN_TILES_PER_SPLIT
+            ),
+            format!("const SPLIT_COST_TOKENS: u32 = {};", dev::SPLIT_COST_TOKENS),
+        ] {
+            assert!(k.contains(&c), "kernel lacks {c}");
+        }
+        assert_eq!(dev::MIN_TILES_PER_SPLIT as usize, MIN_TILES_PER_SPLIT);
+        assert_eq!(dev::SPLIT_COST_TOKENS as usize, SPLIT_COST_TOKENS);
+    }
+
+    /// Host == device over plan-realistic and arbitrary (rows, ns, slots)
+    /// grids, plus the kernel's split invariants: every tile of [0, n_t) in
+    /// exactly one non-empty split, all active splits < ns, per >= 2, and a
+    /// chosen 1..3-wave candidate never spills past its wave count.
+    #[test]
+    fn split_tiles_host_matches_device_and_covers_every_tile() {
+        let mut n_ts: Vec<usize> = (0..=300).collect();
+        for kv in [
+            511, 512, 513, 1023, 1024, 1025, 4097, 8191, 32769, 65535, 131073, 262143, 262144,
+            262145,
+        ] {
+            for tn in [16, 32, 64] {
+                n_ts.push(kv / tn);
+                n_ts.push(kv.div_ceil(tn));
+            }
+        }
+        let check = |n_t: usize, rows: usize, ns: usize, slots: usize, tn: usize| {
+            let per = split_tiles(n_t, rows, ns, slots, tn);
+            let dper =
+                dev::split_tiles(n_t as u32, rows as u32, ns as u32, slots as u32, tn as u32);
+            assert_eq!(
+                per, dper as usize,
+                "n_t {n_t} rows {rows} ns {ns} slots {slots} tn {tn}"
+            );
+            assert!(per >= MIN_TILES_PER_SPLIT);
+            // kernel: split s covers [s*per, min(s*per+per, n_t)), s < ns
+            let mut covered = 0;
+            for s in 0..ns {
+                let (t0, t1) = (s * per, (s * per + per).min(n_t));
+                if t0 < t1 {
+                    assert_eq!(t0, covered, "gap/overlap");
+                    covered = t1;
+                }
+            }
+            assert_eq!(covered, n_t, "tiles past split ns-1 dropped");
+            let eff = n_t.div_ceil(per);
+            assert!(eff <= ns && (n_t == 0 || eff >= 1));
+            // a <= 1-wave grid stays one wave
+            if rows * ns <= slots {
+                assert!(rows * eff <= slots);
+            }
+        };
+        let mut plans = 0;
+        for batch in [1, 2, 3, 4, 7, 8, 16, 31, 32, 64] {
+            for q_len in 1..=9 {
+                for &(hq, hkv) in &[(16, 2), (16, 8), (32, 8), (8, 1), (64, 8)] {
+                    for d in [256, 512] {
+                        for page in [16, 64] {
+                            for sms in [1, 2, 7, 94, 170, 188] {
+                                for max_rows in [16, 48] {
+                                    let Ok(p) =
+                                        plan_rows(batch, q_len, hq, hkv, d, page, sms, max_rows)
+                                    else {
+                                        continue;
+                                    };
+                                    plans += 1;
+                                    for &n_t in &n_ts {
+                                        check(n_t, p.rows, p.ns, sms * p.cps, p.tn);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(plans > 1000, "{plans}");
+        // arbitrary (rows, ns, slots): slots 1..376, the MAX_SPLITS cap
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = |m: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % m as u64) as usize
+        };
+        for _ in 0..200_000 {
+            let (rows, ns, slots) = (1 + rnd(4096), 1 + rnd(MAX_SPLITS), 1 + rnd(376));
+            let tn = [16, 32, 64][rnd(3)];
+            check(rnd(262_145 / 16 + 2), rows, ns, slots, tn);
+        }
+    }
+
     #[test]
     fn rejects_out_of_contract() {
         assert!(plan(1, 1, 16, 2, 576, 64, SMS).is_err());

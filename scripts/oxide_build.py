@@ -42,10 +42,12 @@ def run(cmd, **kw):
 def ptx_facts(ptx: str):
     ver = re.search(r"^\.version (\d+)\.(\d+)", ptx, re.M)
     tgt = re.search(r"^\.target (\S+)", ptx, re.M)
-    entries = re.findall(r"^\.visible \.entry (\w+)\(", ptx, re.M)
+    sigs = re.findall(r"^\.visible \.entry (\w+)\(([^)]*)\)", ptx, re.M)
     if not ver or not tgt:
         raise SystemExit("PTX without .version/.target")
-    return (int(ver.group(1)), int(ver.group(2))), tgt.group(1), entries
+    # param counts: the host checks them at load (a stale cubin fails closed)
+    params = {e: body.count(".param") for e, body in sigs}
+    return (int(ver.group(1)), int(ver.group(2))), tgt.group(1), [e for e, _ in sigs], params
 
 
 def build_one(crate, var, nightly, ptxas, cuobjdump, out):
@@ -66,7 +68,7 @@ def build_one(crate, var, nightly, ptxas, cuobjdump, out):
     if not ptx_path.is_file():
         raise SystemExit(f"{name}: cargo-oxide produced no {ptx_path.name}")
     ptx = ptx_path.read_text()
-    isa, target, entries = ptx_facts(ptx)
+    isa, target, entries, params = ptx_facts(ptx)
     if target != arch or isa > MAX_PTX_ISA or not entries:
         raise SystemExit(f"{name}: .target {target} .version {isa} entries {entries} "
                          f"(need {arch}, <= {MAX_PTX_ISA}, >= 1 entry)")
@@ -89,6 +91,7 @@ def build_one(crate, var, nightly, ptxas, cuobjdump, out):
         "ptxas_flags": var["ptxas"],
         "arch": arch,
         "entries": entries,
+        "params": params,
     }
 
 
