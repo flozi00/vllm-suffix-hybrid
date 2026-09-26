@@ -264,6 +264,11 @@ _BOOT_GATES = {
     # ours vs vLLM FlashInfer vs f64 spec + per-stage readback; then us/call.
     "nvfp4_moe_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "oracle"], {}),
     "nvfp4_moe_bench": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "bench"], {}),
+    # NVFP4 lm_head (SUFFIX_NVFP4_LMHEAD) at the qwen / gemma / GLM-TP8 head
+    # shapes: screen vs exact quantized ref + greedy == bf16; then us/call
+    # bf16 head vs NVFP4 screen + rescore (CUDA graphs).
+    "nvfp4_lmhead_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_lm_head", "oracle"], {}),
+    "nvfp4_lmhead_bench": (["-m", "suffix_hybrid.kernels.nvfp4_lm_head", "bench"], {}),
     # --gpu-blocks -1: hot regions + indexer + one request fit, 5 x 4k
     # prompts don't -> host spills while admission still progresses.
     "hisparse_mtp_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "3", "5",
