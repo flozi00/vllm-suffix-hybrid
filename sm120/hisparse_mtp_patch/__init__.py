@@ -82,7 +82,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-09-26.4"
+PATCH_REVISION = "2026-09-26.5"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
@@ -269,15 +269,15 @@ POOL_NEW = '''\
         )
     except Exception as exc:
         failure, ranges = exc, ()
-    for turn in range(group.world_size):
-        if turn == group.rank_in_group and failure is None:
-            try:
-                for start, end in ranges:
-                    _suffix_pin_range(region, start, end)
-            except Exception as exc:
-                failure = exc
-        group.barrier()
     try:
+        for turn in range(group.world_size):
+            if turn == group.rank_in_group and failure is None:
+                try:
+                    for start, end in ranges:
+                        _suffix_pin_range(region, start, end)
+                except Exception as exc:
+                    failure = exc
+            group.barrier()  # a raise here (dead peer) still cleans up below
         if failure is not None:
             raise failure
         pools = [
@@ -335,6 +335,66 @@ def _suffix_pin_range(region, start, end, attempts=3, cudart=None):
 # --- end {HELPER_TAG} ---
 
 '''
+
+
+# Minimal host pool for the profiling KV init (rev .5; upstream, not SM120-
+# specific). profile_cudagraph_memory -> _init_minimal_kv_cache_for_profiling
+# (gpu/cudagraph_utils.py:963-987) shrinks only the GPU pool
+# (num_gpu_blocks_override = min_blocks); the HiSparse host pool is sized from
+# host_pool_gib alone (layout.py:235), so every boot creates, pre-faults and
+# (TP>1: per rank) pins the FULL host pool twice: profiling, teardown, real
+# init. Prod GLM TP=8 died in the profiling one. The wrapper caps
+# host_num_blocks at the profiling min_blocks while that frame is on the stack
+# (no frame = stock sizing: scheduler, real init). The profiling graphs are
+# discarded and address host blocks through fresh zeroed block tables, the
+# same bound the min_blocks GPU pool already relies on.
+LAYOUT_MODULE = "vllm.v1.hisparse.layout"
+LAYOUT_CALL_SITE = (
+    "    hisparse_layout = create_hisparse_layout(vllm_config, kv_cache_groups, "
+    "host_budget)\n")
+PROFILING_FN = "_init_minimal_kv_cache_for_profiling"
+
+
+def _in_profiling_kv_init() -> bool:
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_name == PROFILING_FN:
+            return True
+        frame = frame.f_back
+    return False
+
+
+def install_profiling_host_pool(layout) -> None:
+    """Wrap layout.create_hisparse_layout; get_hisparse_kv_cache_config looks
+    it up in the module globals at call time (LAYOUT_CALL_SITE)."""
+    import dataclasses
+
+    orig = layout.create_hisparse_layout
+    if hasattr(orig, "__wrapped__"):
+        return
+
+    def create_hisparse_layout(vllm_config, groups, host_budget):
+        out = orig(vllm_config, groups, host_budget)
+        blocks = vllm_config.cache_config.num_gpu_blocks_override
+        if blocks and blocks < out.host_num_blocks and _in_profiling_kv_init():
+            print(f"[suffix {PATCH_NAME}] profiling KV init: HiSparse host pool "
+                  f"{blocks} blocks ({blocks * out.host_block_stride / 2**30:.3f} "
+                  f"GiB) instead of {out.host_num_blocks} "
+                  f"({out.host_num_blocks * out.host_block_stride / 2**30:.2f} GiB)",
+                  file=sys.stderr, flush=True)
+            out = dataclasses.replace(out, host_num_blocks=blocks)
+        return out
+
+    create_hisparse_layout.__wrapped__ = orig
+    layout.create_hisparse_layout = create_hisparse_layout
+
+
+def check_layout_source(src: str) -> None:
+    n = src.count(LAYOUT_CALL_SITE)
+    if n != 1:
+        raise PatchDriftError(
+            "hisparse/layout.py does not match the pinned anchor text (expected "
+            f"vLLM {PINNED_VLLM}): layout_call_site: expected 1, found {n}")
 
 
 def patch_runtime_source(src: str) -> str:
@@ -533,20 +593,24 @@ def apply(module=None) -> bool:
     rt_src = rt_path.read_text()
     rt_new = patch_runtime_source(rt_src)
     prefetch = patch_prefetch_source(rt_src) if prefetch_gate_enabled() else None
+    layout = importlib.import_module(LAYOUT_MODULE)
+    check_layout_source(Path(layout.__file__).read_text())
     # Every file verified before any changes (fail closed, all or nothing).
     exec_patched_source(runtime, rt_new, rt_path)
     if prefetch is not None:
         install_prefetch(runtime, prefetch, rt_path)
+    install_profiling_host_pool(layout)
     exec_patched_source(module, new_src, src_path)
     setattr(module, MARKER_ATTR, PATCH_REVISION)
     print(f"[suffix {PATCH_NAME}] ACTIVE on SM120: HiSparse spec-verify tokens "
           f"-> multi-token hot-buffer decode + swap rows = max_rows+1 "
           f"+ prefill staging plan w/o prefill backend "
           f"+ serialized shared host-pool pinning "
+          f"+ minimal profiling host pool "
           + ("+ follower prefetch for multi-token decode "
              if prefetch is not None else "")
           +
-          f"(rev {PATCH_REVISION}; {len(applied) + 5 + (len(prefetch) if prefetch else 0)} anchors; vllm {ver}).",
+          f"(rev {PATCH_REVISION}; {len(applied) + 6 + (len(prefetch) if prefetch else 0)} anchors; vllm {ver}).",
           file=sys.stderr, flush=True)
     return True
 

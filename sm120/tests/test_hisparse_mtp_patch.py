@@ -223,6 +223,7 @@ def _fake_runtime(monkeypatch, tmp_path, src=None):
     _defs(RUNTIME_FIXTURE, "_get_max_decode_query_len", "_get_max_swap_rows",
           ns=rt.__dict__)
     monkeypatch.setitem(sys.modules, P.RUNTIME_MODULE, rt)
+    monkeypatch.setitem(sys.modules, P.LAYOUT_MODULE, _fake_layout()[0])
     return rt
 
 
@@ -462,7 +463,7 @@ def test_oracle_error_names_the_prompt_being_generated(monkeypatch):
     assert r["error"] == "exit 1 during target_2: [rank0]: AssertionError"
 
 
-def _pool_ns(codes, rank=1, world=2):
+def _pool_ns(codes, rank=1, world=2, barrier_error=None):
     """Patched allocate_hisparse_host_pools against fakes: TP group, region,
     cudart returning `codes` in order (then 0)."""
     events, codes = [], list(codes)
@@ -472,6 +473,8 @@ def _pool_ns(codes, rank=1, world=2):
 
         def barrier(self):
             events.append("barrier")
+            if barrier_error is not None:
+                raise barrier_error
 
     class Code:
         def __init__(self, v):
@@ -887,3 +890,109 @@ def test_oracle_child_env_per_mode(monkeypatch):
                     "patched": {"SUFFIX_SM120_HISPARSE_MTP": "1"},
                     "prefetch": {"SUFFIX_SM120_HISPARSE_MTP": "1",
                                  "SUFFIX_SM120_HISPARSE_PREFETCH": "1"}}
+
+
+# --- profiling KV init: minimal host pool (rev .5) --------------------------
+
+LAYOUT_FIXTURE = FIXTURES / "hisparse_layout.py"          # vllm/v1/hisparse/layout.py
+CG_FIXTURE = FIXTURES / "gpu_cudagraph_utils.py"          # vllm/v1/worker/gpu/cudagraph_utils.py
+
+
+def test_new_fixtures_are_pinned_copies():
+    assert hashlib.sha256(LAYOUT_FIXTURE.read_bytes()).hexdigest() == \
+        "7ed13573e57eb9b9dec3a9a8901a080501a6b71dc3d5c25d1be1a73df11a01cd"
+    assert hashlib.sha256(CG_FIXTURE.read_bytes()).hexdigest() == \
+        "6e9c042890603535e300a40df8ee159dbed1058a64a83ae50ff0329e332e05ff"
+
+
+def _fn_src(path, name):
+    import ast
+    src = path.read_text()
+    node = next(n for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.FunctionDef) and n.name == name)
+    return "".join(src.splitlines(keepends=True)[node.lineno - 1:node.end_lineno])
+
+
+def test_stock_profiling_kv_init_sizes_the_full_host_pool():
+    """Pinned sources: the profiling KV init overrides only the GPU block
+    count; the host pool comes from host_pool_gib alone -> the full 24 GiB
+    pool is created + pinned for the profiling pass, then again for real."""
+    prof = _fn_src(CG_FIXTURE, P.PROFILING_FN)
+    assert "runner.cache_config.num_gpu_blocks_override = min_blocks" in prof
+    assert "get_kv_cache_config_from_groups(" in prof
+    assert "runner.initialize_kv_cache(minimal_config, is_profiling=True)" in prof
+    create = _fn_src(LAYOUT_FIXTURE, "create_hisparse_layout")
+    assert "host_num_blocks = host_budget // host_block_stride" in create
+    assert "num_gpu_blocks_override" not in create
+    # The wrapper is reachable: get_hisparse_kv_cache_config looks it up by name.
+    assert _fn_src(LAYOUT_FIXTURE, "get_hisparse_kv_cache_config").count(
+        P.LAYOUT_CALL_SITE) == 1
+    P.check_layout_source(LAYOUT_FIXTURE.read_text())
+    with pytest.raises(P.PatchDriftError, match="layout_call_site: expected 1, found 0"):
+        P.check_layout_source(LAYOUT_FIXTURE.read_text().replace(P.LAYOUT_CALL_SITE, ""))
+
+
+def _fake_layout(stride=4096 * 800, budget_blocks=7866):
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class HiSparseLayout:
+        host_num_blocks: int
+        host_block_stride: int
+
+    layout = types.ModuleType(P.LAYOUT_MODULE)
+    layout.__file__ = str(LAYOUT_FIXTURE)
+    layout.create_hisparse_layout = lambda cfg, groups, budget: HiSparseLayout(
+        budget // stride, stride)
+    # get_hisparse_kv_cache_config's call, resolved in the module globals.
+    exec("def get_hisparse_kv_cache_config(vllm_config, kv_cache_groups, "
+         "host_budget):\n" + P.LAYOUT_CALL_SITE + "    return hisparse_layout\n",
+         layout.__dict__)
+    return layout, stride * budget_blocks
+
+
+def test_profiling_kv_init_gets_a_minimal_host_pool():
+    layout, budget = _fake_layout()
+    P.install_profiling_host_pool(layout)
+    P.install_profiling_host_pool(layout)  # idempotent (no double wrap)
+    assert layout.create_hisparse_layout.__wrapped__.__name__ == "<lambda>"
+    cfg = types.SimpleNamespace(cache_config=types.SimpleNamespace(
+        num_gpu_blocks_override=None))
+    get = layout.get_hisparse_kv_cache_config
+    ns = {"get": get, "cfg": cfg, "budget": budget}
+    exec(f"def {P.PROFILING_FN}(runner=None):\n"
+         "    cfg.cache_config.num_gpu_blocks_override = 4\n"
+         "    try:\n"
+         "        return get(cfg, [], budget)\n"
+         "    finally:\n"
+         "        cfg.cache_config.num_gpu_blocks_override = None\n", ns)
+    assert ns[P.PROFILING_FN]().host_num_blocks == 4
+    assert get(cfg, [], budget).host_num_blocks == 7866           # real init
+    cfg.cache_config.num_gpu_blocks_override = 4                  # user override,
+    assert get(cfg, [], budget).host_num_blocks == 7866           # not profiling
+
+
+def test_apply_wraps_layout_and_layout_drift_fails_closed(monkeypatch, tmp_path):
+    _apply_synthetic(monkeypatch, tmp_path)
+    assert hasattr(sys.modules[P.LAYOUT_MODULE].create_hisparse_layout, "__wrapped__")
+    rt = _fake_runtime(monkeypatch, tmp_path)
+    drifted = tmp_path / "layout.py"
+    drifted.write_text(LAYOUT_FIXTURE.read_text().replace(P.LAYOUT_CALL_SITE, ""))
+    sys.modules[P.LAYOUT_MODULE].__file__ = str(drifted)
+    path = tmp_path / "sparse_mla_attention.py"
+    mod = types.ModuleType(P.TARGET_MODULE)
+    mod.__file__ = str(path)
+    exec(compile(_SYNTH, str(path), "exec"), mod.__dict__)
+    with pytest.raises(P.PatchDriftError, match="layout_call_site"):
+        P.apply(mod)
+    assert not hasattr(mod, P.MARKER_ATTR) and rt._get_max_swap_rows(_cfg(3)) == 4
+    assert not hasattr(sys.modules[P.LAYOUT_MODULE].create_hisparse_layout, "__wrapped__")
+
+
+def test_shared_pool_barrier_failure_unpins_and_unmaps():
+    """A peer died / gloo timed out in a turn barrier after this rank pinned:
+    the region must still be cleaned up (unregister + munmap), not leaked."""
+    call, events = _pool_ns([], rank=0, barrier_error=RuntimeError("gloo timeout"))
+    with pytest.raises(RuntimeError, match="gloo"):
+        call()
+    assert events == [("register", 4096, 8 * 45056, 0), "barrier", "cleanup"]

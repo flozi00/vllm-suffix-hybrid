@@ -17,6 +17,10 @@ that the SM120 NVFP4-KV overlay is a no-op against these exact versions:
   this file; the tests replay the patch over the fixture and byte-verify the
   result.
 
+- `vllm_0.30.0/hisparse_layout.py`, `vllm_0.30.0/gpu_cudagraph_utils.py` —
+  `vllm/v1/hisparse/layout.py`, `vllm/v1/worker/gpu/cudagraph_utils.py` at
+  v0.30.0 (profiling-KV-init host-pool sizing, hisparse_mtp_patch rev .5).
+
 - `vllm_0.30.0/attention_backends_utils.py` — `vllm/v1/attention/backends/utils.py`
   at v0.30.0 (`split_decodes_and_prefills`, for the HiSparse staging-plan replay).
 
