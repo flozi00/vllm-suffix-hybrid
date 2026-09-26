@@ -61,3 +61,36 @@ def test_glm_stack_multi_oracle_gate(tmp_path):
     # The oracle sets the patch gates per child itself; nothing else leaks in.
     assert {k: v for k, v in seen["env"].items() if not k.endswith("_DONE")} == {
         "SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}
+
+
+def test_nvfp4_moe_gates_run_the_kernel_module_cli():
+    src = (REPO / "sitecustomize.py").read_text()
+    ns = {}
+    exec(src[src.index("_BOOT_GATES = {"):src.index("\n_boot_gates = ")], ns)
+    for mode in ("oracle", "bench"):
+        argv, env = ns["_BOOT_GATES"][f"nvfp4_moe_{mode}"]
+        assert argv == ["-m", "suffix_hybrid.kernels.nvfp4_moe", mode] and env == {}
+    # the module's CLI dispatches exactly these modes (no GPU needed to check)
+    mod = (REPO / "suffix_hybrid" / "kernels" / "nvfp4_moe.py").read_text()
+    assert 'if mode in ("oracle", "both")' in mod and 'if mode in ("bench", "both")' in mod
+
+
+def test_nvfp4_moe_gate_runs_once_with_feature_gates_stripped(tmp_path):
+    import json
+    # Shadow the real module with a recorder (same dotted path, earlier on PYTHONPATH).
+    kdir = tmp_path / "suffix_hybrid" / "kernels"
+    kdir.mkdir(parents=True)
+    (tmp_path / "suffix_hybrid" / "__init__.py").write_text("")
+    (kdir / "__init__.py").write_text("")
+    (kdir / "nvfp4_moe.py").write_text(
+        "import json, os, sys\n"
+        f"open({str(tmp_path / 'seen.json')!r}, 'w').write(json.dumps({{'argv': sys.argv[1:], "
+        "'env': {k: v for k, v in os.environ.items() if k.startswith('SUFFIX_')}}))\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SUFFIX_")}
+    env.update({"SUFFIX_BOOT_GATES": "nvfp4_moe_oracle", "SUFFIX_NVFP4_MOE": "1"},
+               PYTHONPATH=f"{tmp_path}{os.pathsep}{REPO}")
+    r = subprocess.run([sys.executable, "-c", "import sitecustomize"], env=env,
+                       capture_output=True, text=True, cwd=tmp_path)
+    assert "[suffix boot-gate] nvfp4_moe_oracle: exit 0" in r.stderr, r.stderr
+    seen = json.loads((tmp_path / "seen.json").read_text())
+    assert seen["argv"] == ["oracle"] and "SUFFIX_NVFP4_MOE" not in seen["env"]

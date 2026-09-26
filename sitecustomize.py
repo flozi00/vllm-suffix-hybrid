@@ -250,6 +250,10 @@ if _nvfp4_gemm in ("oracle", "bench", "both") and not os.environ.get(
 _BOOT_GATES = {
     "nvfp4_dsmla_oracle": (["-m", "nvfp4_ds_mla_patch.oracle"], {}),
     "nvfp4_dsmla_bench": (["-m", "nvfp4_ds_mla_patch.oracle", "--bench", "--json"], {}),
+    # NVFP4 routed-experts MoE (gemma-4 26B + GLM-5.3 EP/TP8 shapes, one GPU):
+    # ours vs vLLM FlashInfer vs f64 spec + per-stage readback; then us/call.
+    "nvfp4_moe_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "oracle"], {}),
+    "nvfp4_moe_bench": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "bench"], {}),
     # --gpu-blocks -1: hot regions + indexer + one request fit, 5 x 4k
     # prompts don't -> host spills while admission still progresses.
     "hisparse_mtp_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "3", "5",
