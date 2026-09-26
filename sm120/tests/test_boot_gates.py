@@ -94,3 +94,15 @@ def test_nvfp4_moe_gate_runs_once_with_feature_gates_stripped(tmp_path):
     assert "[suffix boot-gate] nvfp4_moe_oracle: exit 0" in r.stderr, r.stderr
     seen = json.loads((tmp_path / "seen.json").read_text())
     assert seen["argv"] == ["oracle"] and "SUFFIX_NVFP4_MOE" not in seen["env"]
+
+
+def test_nvfp4_kv_gates(tmp_path):
+    import json
+    r = _boot({"SUFFIX_BOOT_GATES": "nvfp4_kv_oracle_own,nvfp4_kv_bench",
+               "SUFFIX_SM120_NVP4KV_OWN_ATTN": "1"}, tmp_path, "nvfp4_kv_patch")
+    assert "[suffix boot-gate] nvfp4_kv_oracle_own: exit 0" in r.stderr, r.stderr
+    assert "[suffix boot-gate] nvfp4_kv_bench: exit 0" in r.stderr, r.stderr
+    seen = json.loads((tmp_path / "seen.json").read_text())  # last gate run
+    assert seen["argv"][:2] == ["--bench", "--json"] and "SUFFIX_SM120_NVP4KV_OWN_ATTN" not in seen["env"]
+    # argv mirrors the kernel lab's K2 preset (--page 64 --max-gb 8 fixed)
+    assert seen["argv"][-4:] == ["--page", "64", "--max-gb", "8"]

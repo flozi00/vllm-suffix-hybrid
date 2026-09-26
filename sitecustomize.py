@@ -248,6 +248,16 @@ if _nvfp4_gemm in ("oracle", "bench", "both") and not os.environ.get(
 # serving. Children get the pod env minus other SUFFIX_* feature gates, so the
 # pool's own patches never leak into the gate's vLLM instances.
 _BOOT_GATES = {
+    # K2 NVFP4-KV attention (gemma): --own numerics (q_len>1, masked slots,
+    # wide multi-wave verifies) and the lab's K2 microbench preset
+    # (kernel-lab/server.py _nvfp4_kv_bench_args defaults + K2_FIXED).
+    "nvfp4_kv_oracle_own": (["-m", "nvfp4_kv_patch.oracle", "--own"], {}),
+    "nvfp4_kv_bench": (["-m", "nvfp4_kv_patch.oracle", "--bench", "--json",
+                        "--shapes", "512:16:2,256:16:8",
+                        "--batches", "1,2,4,8,16,32",
+                        "--kvs", "1024,4096,16384,65536,131072",
+                        "--q-lens", "1,9", "--iters", "20",
+                        "--page", "64", "--max-gb", "8"], {}),
     "nvfp4_dsmla_oracle": (["-m", "nvfp4_ds_mla_patch.oracle"], {}),
     "nvfp4_dsmla_bench": (["-m", "nvfp4_ds_mla_patch.oracle", "--bench", "--json"], {}),
     # NVFP4 routed-experts MoE (gemma-4 26B + GLM-5.3 EP/TP8 shapes, one GPU):

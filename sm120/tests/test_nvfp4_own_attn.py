@@ -567,3 +567,19 @@ def test_uniform_graph_lens_inert_cases():
 def test_uniform_graph_lens_kill_switch(monkeypatch):
     monkeypatch.setenv("SUFFIX_SM120_NVP4KV_GRAPH_ALL_WIDTHS", "0")
     assert own_attn.install_uniform_graph_lens() is False
+
+
+def test_twin_split_choice_is_wave_aware():
+    """The twin's split rule (mirror of nvfp4_attn::split_tiles and the
+    kernel's device choice) on the Rust plan-test regressions: gemma hd512
+    b8 / b16 MTP verify at 4k and SWA hd256 b8 no longer spill into a
+    partial extra wave."""
+    def waves(b, hkv, d, n_t):
+        p = _native.nvfp4_attn_plan(b, 9, 16, hkv, d, 64, 188)
+        per = ref.split_tiles(n_t, p["rows"], p["ns"], p["slots"], p["tn"],
+                              p["min_tiles"], p["split_cost_tokens"])
+        assert per >= 2 and -(-n_t // per) <= p["ns"]
+        return -(-(p["rows"] * -(-n_t // per)) // p["slots"])
+    assert waves(8, 2, 512, 129) == 1
+    assert waves(16, 2, 512, 129) == 2
+    assert waves(8, 8, 256, 33) == 1

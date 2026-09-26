@@ -142,12 +142,15 @@ def _make_kv(n_tok, hkv, d, pattern, gen):
 
 
 def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
-             page=PAGE, window=-1, mm=None, own=False, graph=False):
+             page=PAGE, window=-1, mm=None, own=False, graph=False,
+             pad=False):
     """window: sliding window in tokens (-1 = full); mm: per-request lists of
     inclusive image ranges (absolute positions), or None for plain causal.
     own: gate OUR kernel (K2-NVFP4) instead of FA2 (FA2 output is kept as
     the cos_vs_fa2 comparison); graph: run ours via CUDA-graph replay with
-    seq_lens changed after capture."""
+    seq_lens changed after capture; pad: masked slots in OUR launch — a
+    q_len-0 request after every real one plus padding tokens past the last
+    request (CUDA-graph batch padding), which must come back zero."""
     import torch
     from vllm.utils.torch_utils import (nvfp4_kv_cache_full_dim,
                                         nvfp4_split_data_scale)
@@ -240,7 +243,7 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
     if own:
         fa2_out, out = out, _run_own(q, (k_data, k_sf, v_data, v_sf), indices,
                                      kv_lens, q_lens, window, sm_scale,
-                                     scales, graph)
+                                     scales, graph, pad)
 
     worst = {"cos_kernel": 1.0, "rel_kernel": 0.0, "cos_e2e": 1.0,
              "cos_decode": 1.0}
@@ -294,9 +297,11 @@ def _block_table(indices, device):
 
 
 def _run_own(q, views, indices, kv_lens, q_lens, window, sm_scale, scales,
-             graph):
+             graph, pad=False):
     """OUR kernel on the production views (own_attn.run = what the patched
-    backend's DecodeWrapper.run calls); q_lens per request (ragged ok)."""
+    backend's DecodeWrapper.run calls, with the builder's row_budget); q_lens
+    per request (ragged ok). pad: interleave q_len-0 requests (same KV) and
+    append padding tokens; their outputs must be exactly zero / untouched."""
     import torch
 
     from . import own_attn
@@ -304,6 +309,12 @@ def _run_own(q, views, indices, kv_lens, q_lens, window, sm_scale, scales,
     k_data, k_sf, v_data, v_sf = views
     d, hq, hkv = q.shape[2], q.shape[1], k_data.shape[1]
     q_max = max(q_lens)
+    real = q.shape[0]
+    if pad:
+        indices = [i for ids in indices for i in (ids, ids)]
+        kv_lens = [n for n in kv_lens for _ in (0, 1)]
+        q_lens = [x for ql in q_lens for x in (ql, 0)]
+        q = torch.cat((q, torch.randn(3, hq, d, device=q.device).to(q.dtype)))
     own_attn.prepare(own_attn.native(), (d, hq, hkv, k_data.shape[2],
                                          window - 1 if window > 0 else -1),
                      (q_max,))
@@ -311,9 +322,10 @@ def _run_own(q, views, indices, kv_lens, q_lens, window, sm_scale, scales,
     sl = torch.tensor(kv_lens, dtype=torch.int32, device=q.device)
     qo = torch.tensor([0] + [sum(q_lens[:i + 1]) for i in range(len(q_lens))],
                       dtype=torch.int32, device=q.device)
-    out = torch.empty_like(q)
+    out = torch.full_like(q, float("nan"))
     args = (q, k_data, k_sf, v_data, v_sf, bt, sl, qo, out, q_max,
-            window - 1 if window > 0 else -1, sm_scale * scales[0], scales[1])
+            window - 1 if window > 0 else -1, sm_scale * scales[0], scales[1],
+            own_attn.row_budget(q_lens))
     if not graph:
         own_attn.run(*args)
     else:
@@ -326,9 +338,15 @@ def _run_own(q, views, indices, kv_lens, q_lens, window, sm_scale, scales,
         with torch.cuda.graph(g):
             own_attn.run(*args)
         sl.copy_(torch.tensor(kv_lens, dtype=torch.int32, device=q.device))
-        out.zero_()
+        out.fill_(float("nan"))
         g.replay()
     torch.cuda.synchronize()
+    if pad:
+        tail = out[real:]
+        if not bool((tail == 0).all()):
+            raise AssertionError("padding tokens past the last request not "
+                                 "zeroed (masked-slot rows leaked)")
+        out = out[:real]
     return out
 
 
@@ -378,6 +396,25 @@ OWN_CASES = (
      dict(own=True, window=128)),
     ("own_graph_ragged", (130, 777, 3001), (2, 9, 1), "prefill",
      dict(own=True, graph=True)),
+    # Masked slots: a q_len-0 request after every real one + 3 padding
+    # tokens past the last request (must come back zero), q_len > 1.
+    ("own_masked_verify", (9, 130, 700, 3001), 9, "prefill",
+     dict(own=True, pad=True)),
+    ("own_masked_ragged_swa", (9, 700, 3001, 300), (9, 1, 4, 2), "prefill",
+     dict(own=True, window=128, pad=True)),
+    ("own_graph_masked", (130, 777, 3001), (2, 9, 1), "prefill",
+     dict(own=True, graph=True, pad=True)),
+    # q_len-1-dominated ragged batch -> row_budget 16 (light w1 tiles), the
+    # plan production picks for suffix-miss steps.
+    ("own_ragged_rows16", (65, 777, 300, 4100, 1, 2049, 130, 3001),
+     (1, 1, 1, 1, 1, 1, 1, 9), "prefill", dict(own=True)),
+    # Wide MTP verify (b32 x q9, kv to 5k): many launch rows -> multi-wave
+    # grid, device split choice over 1..3 waves / the ns cap; SWA at the
+    # gemma-like 1024 window.
+    ("own_wide_verify_b32", tuple(500 + 157 * i for i in range(32)), 9,
+     "prefill", dict(own=True)),
+    ("own_wide_swa_b32", tuple(1100 + 131 * i for i in range(32)), 9,
+     "prefill", dict(own=True, window=1024)),
     # FA2 decode wrapper at q_len 9 (q_len_per_req) vs the torch reference:
     # evidence for a graph-capturable FA2 verify path (no K2 involved).
     ("fa2_decode_verify_k8", (9, 130, 700, 3001), 9, "decode"),
