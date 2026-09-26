@@ -25,6 +25,7 @@ RUNTIME_SHA256 = "84a5305c3aa4a047c8ecb2906f6354b0d8bfe3dcd40e34f5a7422ddc15f563
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     monkeypatch.delenv(P.GATE_ENV, raising=False)
+    monkeypatch.delenv(P.PREFETCH_ENV, raising=False)
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
 
 
@@ -559,3 +560,330 @@ def test_oracle_tp2_requires_the_shared_host_pool():
     rc, why = oracle.verdict(ref, stock, dict(ok, shared_host_pool=[True, False]))
     assert rc == 1 and "shared HiSparse host pool" in why[0]
     assert oracle.verdict(ref, stock, dict(ok, tp=1, shared_host_pool=[False]))[0] == 0
+
+
+# --- follower prefetch under MTP (SUFFIX_SM120_HISPARSE_PREFETCH) ----------
+
+def _runtime_methods(src):
+    import ast
+    cls = next(n for n in ast.parse(src).body
+               if isinstance(n, ast.ClassDef) and n.name == "HiSparseRuntime")
+    import textwrap
+    lines = src.splitlines(keepends=True)
+    return {n.name: textwrap.dedent("".join(lines[n.lineno - 1:n.end_lineno]))
+            for n in cls.body if isinstance(n, ast.FunctionDef)}
+
+
+class _Replay:
+    """HiSparseRuntime methods from runtime.py on fake streams/events. Logs
+    every swap (runtime, rows) and checks at each wait that the awaited event
+    was recorded after this runtime's rows for the current step were copied
+    (copy stream is in-order, so record-after-swap == rows ready)."""
+
+    def __init__(self, methods):
+        import __future__
+        import torch
+        self.log = []
+        self.stats = {"follower_prefetched": 0, "follower_staged": 0}
+        replay = self
+
+        class Event:
+            def record(self, stream):
+                self.covers = {e for e in replay.log if e[0] == "swap"}
+
+        class Stream:
+            def wait_event(self, ev):
+                replay.waited = ev
+
+            def wait_stream(self, s):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        compute = Stream()
+        ns = {"torch": types.SimpleNamespace(Event=Event, Tensor=torch.Tensor),
+              "current_stream": lambda: compute,
+              "in_piecewise_cudagraph": lambda: False,
+              P.PREFETCH_STATS: self.stats}
+        body = {"_suffix_prefetched_through": 0}
+        for name, src in methods.items():
+            if name == "__init__":
+                continue
+            exec(compile(src, "rt", "exec", __future__.annotations.compiler_flag,
+                         dont_inherit=True), ns, body)
+        body["_resolve_residency"] = lambda rt, **kw: None
+        body["_swap_rows"] = lambda rt, rows: replay.log.append(
+            ("swap", rt.name, (rows.start, rows.stop)))
+        RT = type("RT", (), body)
+        group = types.SimpleNamespace(
+            copy_stream=Stream(), logical_topk_ready=None, followers=[],
+            shared_topk=types.SimpleNamespace(
+                physical_topk_indices=torch.zeros(64, 1),
+                valid_topk_counts=torch.zeros(64)))
+        self.layers = []
+        for i, name in enumerate(("leader", "f1", "f2")):
+            rt = RT()
+            rt.name, rt.is_group_leader, rt.index_group = name, i == 0, group
+            rt._swap_step, rt._swap_staged, rt._layer_ready_event = 0, False, None
+            rt.hot = types.SimpleNamespace(block_size=64, attention_block_stride=64)
+            if i:
+                group.followers.append(rt)
+            else:
+                group.leader = rt
+            self.layers.append(rt)
+
+    def forward(self, n, steps, *, decode_batch, num_actual, num_decode):
+        """One forward: every layer (leader first) swaps `steps` x n rows,
+        like index_group.convert_decode_logical_to_physical_topk."""
+        import torch
+        res = types.SimpleNamespace(decode_batch=decode_batch,
+                                    num_actual_tokens=num_actual,
+                                    num_decode_tokens=num_decode)
+        for rt in self.layers:
+            rt.begin_forward()
+        for rt in self.layers:
+            for step in range(steps):
+                rt.swap_in(resident=res, req_id_per_token=None, block_table=None,
+                           logical_topk_indices=torch.zeros(n, 1), block_size=64)
+                rows = (step * n, step * n + n)
+                assert self.waited is rt._layer_ready_event
+                assert ("swap", rt.name, rows) in self.waited.covers
+        return sorted(self.log)
+
+
+def _replays():
+    src = RUNTIME_FIXTURE.read_text()
+    stock = _runtime_methods(src)
+    patched = dict(stock, **P.patch_prefetch_source(src))
+    return _Replay(stock), _Replay(patched)
+
+
+def test_prefetch_pure_multi_token_decode_skips_follower_restage():
+    """k=5, 4 decodes: 6 verify steps x 4 rows. Stock re-stages each follower
+    every step (critical path); patched: the leader prefetches them all, same
+    swaps (runtime, rows) exactly once each."""
+    stock, patched = _replays()
+    kw = dict(decode_batch=False, num_actual=24, num_decode=24)  # max_q_len 6
+    s_log, p_log = stock.forward(4, 6, **kw), patched.forward(4, 6, **kw)
+    assert s_log == p_log and len(p_log) == 3 * 6 == len(set(p_log))
+    assert patched.stats == {"follower_prefetched": 12, "follower_staged": 0}
+    # Next forward resets the mark (no stale coverage across batches).
+    patched.log.clear()
+    patched.forward(4, 6, decode_batch=False, num_actual=30, num_decode=24)
+    assert patched.stats["follower_staged"] == 12
+
+
+@pytest.mark.parametrize("kw,steps", [
+    (dict(decode_batch=False, num_actual=30, num_decode=24), 6),  # mixed batch
+    (dict(decode_batch=False, num_actual=5, num_decode=0), 1),    # pure prefill
+    (dict(decode_batch=True, num_actual=4, num_decode=4), 1),     # q_len=1 (stock prefetch)
+])
+def test_prefetch_other_batches_unchanged(kw, steps):
+    stock, patched = _replays()
+    n = 4 if kw["num_decode"] else 5
+    assert stock.forward(n, steps, **kw) == patched.forward(n, steps, **kw)
+    staged = patched.stats["follower_staged"]
+    assert staged == (0 if kw["decode_batch"] else 2 * steps)
+
+
+def test_prefetch_anchor_drift():
+    src = RUNTIME_FIXTURE.read_text()
+    assert set(P.patch_prefetch_source(src)) == {e[0] for e in P.PREFETCH_EDITS}
+    for name, old, _new in P.PREFETCH_EDITS:
+        with pytest.raises(P.PatchDriftError, match=f"{name}: expected 1, found 0"):
+            P.patch_prefetch_source(src.replace(old, old[:-1] + " \n"))
+        with pytest.raises(P.PatchDriftError, match=f"{name}: expected 1, found 2"):
+            P.patch_prefetch_source(src + "\n" + old)
+    # Hunk moved out of its method (e.g. into HiSparseCacheHandle) = drift.
+    old = P.PREFETCH_EDITS[2][1]
+    moved = src.replace(old, "        pass\n").replace(
+        "class HiSparseCacheHandle:\n", "class HiSparseCacheHandle:\n"
+        "    def _x(self):\n" + old)
+    with pytest.raises(P.PatchDriftError, match="not inside HiSparseRuntime.swap_in"):
+        P.patch_prefetch_source(moved)
+
+
+def _prefetch_runtime(monkeypatch, tmp_path):
+    rt = _fake_runtime(monkeypatch, tmp_path)
+    rt.HiSparseRuntime = type("HiSparseRuntime", (), {
+        n: (lambda self: "stock") for n, *_ in P.PREFETCH_EDITS})
+    return rt
+
+
+def test_apply_installs_prefetch_only_with_its_gate(monkeypatch, tmp_path):
+    mod = _apply_synthetic(monkeypatch, tmp_path)  # prefetch gate unset
+    rt = sys.modules[P.RUNTIME_MODULE]
+    assert not hasattr(rt, P.PREFETCH_STATS)
+    rt = _prefetch_runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv(P.PREFETCH_ENV, "1")
+    delattr(mod, P.MARKER_ATTR)
+    path = Path(mod.__file__)
+    exec(compile(_SYNTH, str(path), "exec"), mod.__dict__)  # fresh stock source
+    assert P.apply(mod) is True
+    cls = rt.HiSparseRuntime
+    assert rt.__dict__[P.PREFETCH_STATS] == {"follower_prefetched": 0,
+                                               "follower_staged": 0}
+    assert cls._suffix_prefetched_through == 0
+    for name, *_ in P.PREFETCH_EDITS:
+        fn = getattr(cls, name)
+        assert fn.__globals__ is rt.__dict__ and P.PATCH_NAME in fn.__code__.co_filename
+    obj = cls()
+    obj._suffix_prefetched_through = 7
+    obj.begin_forward()
+    assert (obj._swap_step, obj._suffix_prefetched_through) == (0, 0)
+
+
+def test_prefetch_drift_fails_closed_before_any_rewrite(monkeypatch, tmp_path):
+    src = RUNTIME_FIXTURE.read_text().replace(P.PREFETCH_EDITS[1][1], "")
+    rt = _fake_runtime(monkeypatch, tmp_path, src=src)
+    rt.HiSparseRuntime = type("HiSparseRuntime", (), {})
+    path = tmp_path / "sparse_mla_attention.py"
+    path.write_text(_SYNTH)
+    mod = types.ModuleType(P.TARGET_MODULE)
+    mod.__file__ = str(path)
+    exec(compile(_SYNTH, str(path), "exec"), mod.__dict__)
+    monkeypatch.setenv(P.GATE_ENV, "1")
+    monkeypatch.setenv(P.PREFETCH_ENV, "1")
+    monkeypatch.setattr(P, "is_sm120", lambda cap=None: True)
+    monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(__version__="0.30.0"))
+    with pytest.raises(P.PatchDriftError, match="_resolve_and_stage_group"):
+        P.apply(mod)
+    assert not hasattr(mod, P.MARKER_ATTR) and rt._get_max_swap_rows(_cfg(3)) == 4
+    assert not hasattr(rt, P.PREFETCH_STATS)
+
+
+# --- oracle --multi ---------------------------------------------------------
+
+def test_multi_layout_matches_vllm_rules():
+    # Silicon: 2 layers + MTP (every layer an indexer) -> 8 KV groups.
+    for dt in ("fp8_ds_mla", "nvfp4_ds_mla"):
+        g = oracle.hisparse_hot_groups(2, kv_dtype=dt)
+        assert g == [[0], [1], [2]] and 2 + 2 * len(g) == 8
+    # --multi: freq 4 / offset 3 -> indexers 0,1,2,6 (+MTP 8), followers
+    # 3,4,5,7 (deepseek_v2.py: max(l - offset + 1, 0) % freq != 0 skips).
+    assert oracle.index_leaders(8, 4, 3) == [True, True, True, False, False,
+                                             False, True, False, True]
+    g = oracle.hisparse_hot_groups(8, 4, 3, "nvfp4_ds_mla")
+    assert g == [[0], [1], [2, 3, 4, 5], [6, 7], [8]] and 2 + 2 * len(g) == 12
+    # Packing: a small source page lets whole units share a hot group.
+    oracle.SOURCE_ROW["tiny"] = 8
+    try:
+        assert oracle.hisparse_hot_groups(3, kv_dtype="tiny") == [[0, 1, 2, 3]]
+    finally:
+        del oracle.SOURCE_ROW["tiny"]
+
+
+def test_multi_gpu_blocks_forces_host_reads_but_admits():
+    prompts = oracle.multi_prompts()
+    mml = max(len(p) + n for _, p, n in prompts) + 64
+    r = len(oracle.hisparse_hot_groups(8, 4, 3, "nvfp4_ds_mla"))
+    blocks = oracle.multi_gpu_blocks(5, r, mml)
+    pages = -(-mml // 64)
+    hot = r * (5 + 2) * 2048 // 64
+    one_request = (1 + r) * pages + hot           # indexer + resident + hot
+    watermark = max(hot, blocks // 10)            # coordinator.py:158
+    first_four = sum((1 + r) * -(-len(p) // 64) for _, p, _ in prompts[:4])
+    assert one_request < blocks                   # admission progresses
+    assert first_four > blocks - watermark        # -> reads from host
+
+
+def test_multi_prompts_shape():
+    ps = oracle.multi_prompts()
+    assert len(ps) == 8 and len({n for n, *_ in ps}) == 8
+    d = {n: (p, m) for n, p, m in ps}
+    assert [len(d[n][0]) for n in ("target", "long_3000", "long_2500", "short_700")] \
+        == [4096, 3000, 2500, 700]
+    for name, tail in (("share_tail3", 3), ("share_tail40", 40)):
+        assert d[name][0][:2048] == d["target"][0][:2048]
+        assert len(d[name][0]) == 2048 + tail
+    assert (len(d["prefill_25"][0]), d["prefill_25"][1]) == (25, 1)
+    assert d["target_again"][0] == d["target"][0]
+    assert len({m for _, _, m in ps}) == 8        # staggered finishes
+    assert ps == oracle.multi_prompts()           # deterministic
+
+
+def _mrun(mode, outputs, **kw):
+    r = _run(outputs, mode=mode, patched="r" if mode != "ref" else None,
+             mtp_decode_builds=0 if mode == "ref" else 9,
+             spills=None if mode == "ref" else 4, max_decode_query_len=6,
+             prefetch={"follower_prefetched": 40, "follower_staged": 0}
+             if mode == "prefetch" else None)
+    r.update(kw)
+    return r
+
+
+def test_oracle_verdict_multi():
+    good = {"target": [1, 2, 3], "target_again": [1, 2], "x": [5]}
+    ref, pat, pf = (_mrun(m, good) for m in ("ref", "patched", "prefetch"))
+    assert oracle.verdict_multi(ref, pat, pf) == (0, [])
+    bad = dict(good, x=[6])
+    rc, why = oracle.verdict_multi(ref, pat, _mrun("prefetch", bad))
+    assert rc == 1 and why == ["prefetch != ref at ['x@0']",
+                               "prefetch != patched at ['x@0']"]
+    assert oracle.verdict_multi(ref, pat, dict(pf, prefetch={
+        "follower_prefetched": 0, "follower_staged": 7}))[1] == [
+        "prefetch: leader never prefetched follower rows"]
+    assert oracle.verdict_multi(ref, dict(pat, spills=0), pf)[0] == 1
+    assert oracle.verdict_multi(ref, dict(pat, mtp_decode_builds=0), pf)[0] == 1
+    assert oracle.verdict_multi(ref, _mrun("patched", dict(good, target_again=[1, 9])),
+                                pf)[0] == 1
+    rc, why = oracle.verdict_multi(ref, {"mode": "patched", "error": "exit 1 during "
+                                         "step7(run=4,pf=1,wait=4): boom"}, pf)
+    assert rc == 1 and why == ["patched crashed (exit 1 during step7(run=4,pf=1,wait=4): boom)"]
+    assert oracle.verdict_multi({"mode": "ref", "error": "x"}, pat, pf)[0] == 2
+    assert oracle.verdict_multi({"mode": "ref", "error": "x"}, pat, dict(pf, patched=None))[0] == 1
+
+
+def test_oracle_main_multi_boot_gate_argv(monkeypatch, capsys):
+    src = (REPO / "sitecustomize.py").read_text()
+    ns = {}
+    exec(src[src.index("_BOOT_GATES = {"):src.index("\n}\n") + 3], ns)
+    argv, env = ns["_BOOT_GATES"]["glm_stack_multi_oracle"]
+    assert argv[:2] == ["-m", "hisparse_mtp_patch.oracle"]
+    assert env == {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}
+    good = {"target": [1, 2], "target_again": [1, 2]}
+    calls = []
+
+    def fake(mode, a):
+        calls.append((mode, a))
+        return _mrun(mode, good, steps={"steps": 90, "mixed": 30, "max_running": 4},
+                     peak_reserved_gib=7.5)
+
+    monkeypatch.setattr(oracle, "_run_child", fake)
+    assert oracle.main(argv[2:]) == 0
+    assert [m for m, _ in calls] == ["ref", "patched", "prefetch"]
+    assert all(a[-2:] == ["--k", "5"] and "--multi" in a for _, a in calls)
+    out = capsys.readouterr().out
+    assert "k=5 PASS" in out and '"mixed": 30' in out and "peak_reserved_gib=7.5" in out
+    assert oracle._child_timeout(argv) == 1200 and oracle._child_timeout([]) == 600
+
+
+def test_oracle_child_env_per_mode(monkeypatch):
+    import subprocess as sp
+    seen = {}
+
+    class Proc:
+        pid, returncode = 1, 0
+        stdout = iter([oracle.RESULT + '{"mode": "x"}\n'])
+        stderr = iter([])
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(cmd, env, **kw):
+        seen[cmd[4]] = {k: v for k, v in env.items() if "HISPARSE" in k}
+        return Proc()
+
+    monkeypatch.setattr(sp, "Popen", popen)
+    monkeypatch.setattr(oracle.os, "killpg", lambda *a: None)
+    monkeypatch.setenv("SUFFIX_SM120_HISPARSE_PREFETCH", "1")  # never leaks
+    for m in ("ref", "stock", "patched", "prefetch"):
+        oracle._run_child(m, ["--multi"])
+    assert seen == {"ref": {}, "stock": {},
+                    "patched": {"SUFFIX_SM120_HISPARSE_MTP": "1"},
+                    "prefetch": {"SUFFIX_SM120_HISPARSE_MTP": "1",
+                                 "SUFFIX_SM120_HISPARSE_PREFETCH": "1"}}

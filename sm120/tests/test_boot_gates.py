@@ -7,9 +7,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 
-def _boot(extra_env, tmp_path):
-    # A fake `nvfp4_ds_mla_patch.oracle` that records the env it was run with.
-    pkg = tmp_path / "nvfp4_ds_mla_patch"
+def _boot(extra_env, tmp_path, package="nvfp4_ds_mla_patch"):
+    # A fake `<package>.oracle` that records the env it was run with.
+    pkg = tmp_path / package
     pkg.mkdir(exist_ok=True)
     (pkg / "__init__.py").write_text("")
     (pkg / "oracle.py").write_text(
@@ -49,3 +49,15 @@ def test_glm_stack_tp2_gate_is_the_tp1_gate_plus_tp2():
     argv, env = ns["_BOOT_GATES"]["glm_stack_tp2_oracle"]
     assert argv == ns["_BOOT_GATES"]["glm_stack_oracle"][0] + ["--tp", "2"]
     assert env == {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}
+
+
+def test_glm_stack_multi_oracle_gate(tmp_path):
+    import json
+    r = _boot({"SUFFIX_BOOT_GATES": "glm_stack_multi_oracle",
+               "SUFFIX_SM120_HISPARSE_PREFETCH": "1"}, tmp_path, "hisparse_mtp_patch")
+    assert "[suffix boot-gate] glm_stack_multi_oracle: exit 0" in r.stderr, r.stderr
+    seen = json.loads((tmp_path / "seen.json").read_text())
+    assert seen["argv"][0] == "--multi" and "nvfp4_ds_mla" in seen["argv"]
+    # The oracle sets the patch gates per child itself; nothing else leaks in.
+    assert {k: v for k, v in seen["env"].items() if not k.endswith("_DONE")} == {
+        "SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}
