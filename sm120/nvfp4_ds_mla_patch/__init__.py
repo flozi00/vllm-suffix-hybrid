@@ -268,15 +268,21 @@ def _suffix_nvfp4_ds_mla_selftest(impl, dev) -> None:
 
     prev = torch.get_default_dtype()
     torch.set_default_dtype(torch.float32)  # vLLM inits models under bf16
+    # vLLM also builds impls under a default-device context: pin every
+    # implicit allocation (here and in the reference helpers) to `dev`.
+    dev_ctx = torch.device(dev)
+    dev_ctx.__enter__()
     try:
-        g = torch.Generator().manual_seed(0)
-        kv_c = torch.randn(128, 512, generator=g)
+        # device="cpu" everywhere: vLLM builds impls under a CUDA default
+        # device, and a CPU generator cannot fill CUDA tensors.
+        g = torch.Generator(device="cpu").manual_seed(0)
+        kv_c = torch.randn(128, 512, generator=g, device="cpu")
         kv_c[:32] = kv_c[:32].sign() * 5000.0  # SF 448, every nibble +-6
-        k_pe = torch.randn(128, 64, generator=g)
-        q = torch.randn(2, 8, 576, generator=g)
+        k_pe = torch.randn(128, 64, generator=g, device="cpu")
+        q = torch.randn(2, 8, 576, generator=g, device="cpu")
         q[0] *= 2.0 ** 15  # |q| > f16 max on every dim (exact rescale:
         # as well-conditioned as q[1]; single-dim outliers live in the oracle)
-        topk = torch.stack([torch.randperm(128, generator=g) for _ in range(2)]).int()
+        topk = torch.stack([torch.randperm(128, generator=g, device="cpu") for _ in range(2)]).int()
         topk[1, 100:] = -1
         kv_c, k_pe, q, topk = (kv_c.bfloat16().to(dev), k_pe.bfloat16().to(dev),
                                q.bfloat16().to(dev), topk.to(dev))
@@ -288,6 +294,7 @@ def _suffix_nvfp4_ds_mla_selftest(impl, dev) -> None:
         ref = attention_ref(q.double(), lat, rope, topk, float(impl.scale))
         err = row_rel_l2(out, ref, torch.ones(2, 8, dtype=torch.bool, device=dev))
     finally:
+        dev_ctx.__exit__(None, None, None)
         torch.set_default_dtype(prev)
     if not (bool(torch.isfinite(out).all()) and err <= 2e-2):
         raise RuntimeError(

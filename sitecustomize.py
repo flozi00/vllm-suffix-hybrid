@@ -254,6 +254,12 @@ _BOOT_GATES = {
                              "--prompt-len", "4096", "--layers", "2",
                              "--gpu-blocks", "-1"],
                             {"SUFFIX_SM120": "1"}),
+    # Full GLM stack inside a real vLLM engine (what prod runs, minus TP=8):
+    # nvfp4_ds_mla KV + HiSparse + MTP k=5, ref vs patched greedy parity.
+    "glm_stack_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "5",
+                          "--prompt-len", "4096", "--layers", "2",
+                          "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
+                         {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 if _boot_gates and not os.environ.get("SUFFIX_BOOT_GATES_DONE"):

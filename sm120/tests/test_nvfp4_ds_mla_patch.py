@@ -652,3 +652,23 @@ def test_hook_fires_on_real_import(tmp_path):
     assert p.returncode == 0, p.stderr
     assert "LOADED True" in p.stdout
     assert "present but inert" in p.stderr, p.stderr  # apply() ran (no GPU)
+
+
+def test_boot_selftest_under_non_cpu_default_device(monkeypatch):
+    """Prod GLM crash 2026-09-26: vLLM builds impls under a CUDA default
+    device, and the self-test's CPU generator filled default-device tensors
+    ("Expected a 'cuda' device type for generator but found 'cpu'"). The
+    meta default device reproduces that class of failure on a CPU runner."""
+    import torch
+
+    emu = _EmuOurs()
+    monkeypatch.setattr(P, "_suffix_nvfp4_ds_mla_write",
+                        lambda kv_c, k_pe, cache, slots: emu.write(kv_c, k_pe, cache, slots))
+    monkeypatch.setattr(P, "_suffix_nvfp4_ds_mla_decode",
+                        lambda impl, q, cache, topk, out: emu.decode(q, cache, topk, out))
+    impl = types.SimpleNamespace(scale=O.SCALE, _nvfp4_num_sms=188)
+    torch.set_default_device("meta")
+    try:
+        P._suffix_nvfp4_ds_mla_selftest(impl, torch.device("cpu"))
+    finally:
+        torch.set_default_device(None)
