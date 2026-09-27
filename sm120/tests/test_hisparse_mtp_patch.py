@@ -26,6 +26,7 @@ RUNTIME_SHA256 = "84a5305c3aa4a047c8ecb2906f6354b0d8bfe3dcd40e34f5a7422ddc15f563
 def _clean(monkeypatch):
     monkeypatch.delenv(P.GATE_ENV, raising=False)
     monkeypatch.delenv(P.PREFETCH_ENV, raising=False)
+    monkeypatch.delenv(P.NOSTAGE_ENV, raising=False)
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
 
 
@@ -1097,3 +1098,136 @@ def test_shared_pool_barrier_failure_unpins_and_unmaps():
     with pytest.raises(RuntimeError, match="gloo"):
         call()
     assert events == [("register", 4096, 8 * 45056, 0), "barrier", "cleanup"]
+
+
+# --- no prefill mirror staging (SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING) ---
+WORKER_FIXTURE = FIXTURES / "hisparse_worker.py"  # .../kv_connector/v1/hisparse/worker.py
+
+
+def test_worker_fixture_is_pinned_copy():
+    assert hashlib.sha256(WORKER_FIXTURE.read_bytes()).hexdigest() == \
+        "251c0d8e57e4739c03ce3e1c899a95ff5b1752eb27676c28ab88c4ebd62c4776"
+
+
+def test_stock_mirror_staging_is_write_only():
+    """The proof the rewrite rests on, on the pinned sources: the staging
+    cache is only handed out by mirror_write_target (whose one caller,
+    MLAAttention.update_kv_cache, writes into it); the worker never names it,
+    DMAs host rows only from the resident caches, and forces
+    mirror_from_resident every step."""
+    rt, wk = RUNTIME_FIXTURE.read_text(), WORKER_FIXTURE.read_text()
+    # attr init + 1 read + 3 in initialize_hisparse_runtime_buffers (incl. the plural)
+    assert rt.count("mirror_staging_cache") == 5
+    assert _fn_src(RUNTIME_FIXTURE, "initialize_hisparse_runtime_buffers").count(
+        "mirror_staging_cache") == 3
+    assert _fn_src(RUNTIME_FIXTURE, "mirror_write_target").count(
+        "self.mirror_staging_cache") == 1
+    assert "mirror_staging" not in wk and "mirror_write_target" not in wk
+    start = _fn_src(WORKER_FIXTURE, "start_step")
+    assert start.count("handle.mirror_from_resident = True\n") == 1
+    for fn in ("_enqueue_row_dma", "_enqueue_transfers"):
+        assert "source = self.resident_caches[layer_index]" in _fn_src(WORKER_FIXTURE, fn)
+
+
+def _buffers_env():
+    import torch
+    ns = _defs(RUNTIME_FIXTURE, "initialize_hisparse_runtime_buffers",
+               ns={"torch": torch})
+    view = types.SimpleNamespace(cache=torch.zeros(3, 64, 352, dtype=torch.uint8),
+                                 block_size=64)
+    handles = [types.SimpleNamespace(view=view, runtime=types.SimpleNamespace())
+               for _ in range(4)]
+    return ns, handles
+
+
+def test_nostage_allocates_nothing_and_keeps_request_state():
+    import __future__
+    import torch
+    ns, stock_h = _buffers_env()
+    ns["initialize_hisparse_runtime_buffers"](stock_h, max_num_reqs=8,
+                                              max_num_batched_tokens=1000)
+    assert stock_h[0].mirror_staging_cache.shape == (16, 64, 352)
+    src = P.patch_nostage_source(RUNTIME_FIXTURE.read_text())
+    pns = {"torch": torch}
+    exec(compile(src, "x", "exec", __future__.annotations.compiler_flag,
+                 dont_inherit=True), pns)
+    _, h = _buffers_env()
+    pns["initialize_hisparse_runtime_buffers"](h, max_num_reqs=8,
+                                               max_num_batched_tokens=1000)
+    rsi = h[0].runtime.request_state_indices
+    assert rsi.tolist() == [-1] * 8
+    assert all(x.runtime.request_state_indices is rsi and x.mirror_staging_cache is None
+               and x.mirror_staging_slots is None for x in h)
+
+
+def test_nostage_mirror_write_target_never_targets_staging():
+    import torch
+    stock = _defs(RUNTIME_FIXTURE, "mirror_write_target", ns={"torch": torch})
+    patched: dict = {}
+    exec(P.NOSTAGE_MIRROR_NEW, {}, patched)
+    cache, slots = torch.zeros(2, 64, 352), torch.arange(128)
+    h = types.SimpleNamespace(host_mirror_required=True, decode_batch=False,
+                              mirror_from_resident=False,
+                              mirror_staging_cache=cache, mirror_staging_slots=slots)
+    assert stock["mirror_write_target"](h, 5)[0] is cache  # pre-start_step forward
+    for fr in (False, True):
+        for db in (False, True):
+            h.mirror_from_resident, h.decode_batch = fr, db
+            assert patched["mirror_write_target"](h, 5) is None
+
+
+def test_nostage_anchor_drift():
+    src = RUNTIME_FIXTURE.read_text()
+    for name, old in (("staging_alloc", P.NOSTAGE_ALLOC_OLD),
+                      ("mirror_write_target", P.NOSTAGE_MIRROR_OLD)):
+        with pytest.raises(P.PatchDriftError, match=f"{name}: expected 1, found 0"):
+            P.patch_nostage_source(src.replace(old, old[:-1] + " \n"))
+        with pytest.raises(P.PatchDriftError, match=f"{name}: expected 1, found 2"):
+            P.patch_nostage_source(src + "\n" + old)
+
+
+def _nostage_runtime(monkeypatch, tmp_path, binding_loaded):
+    rt = _prefetch_runtime(monkeypatch, tmp_path)
+    stock_init = lambda *a, **k: "stock"  # noqa: E731
+    rt.initialize_hisparse_runtime_buffers = stock_init
+    rt.HiSparseCacheHandle = type("HiSparseCacheHandle", (), {
+        "mirror_write_target": lambda self, n: "stock"})
+    if binding_loaded:
+        b = types.ModuleType(P.BINDING_MODULE)
+        b.initialize_hisparse_runtime_buffers = stock_init
+        monkeypatch.setitem(sys.modules, P.BINDING_MODULE, b)
+    else:
+        monkeypatch.delitem(sys.modules, P.BINDING_MODULE, raising=False)
+    return rt
+
+
+@pytest.mark.parametrize("binding_loaded", [False, True])
+def test_apply_installs_nostage_only_with_its_gate(monkeypatch, tmp_path, binding_loaded):
+    monkeypatch.delenv(P.NOSTAGE_ENV, raising=False)
+    mod = _apply_synthetic(monkeypatch, tmp_path)
+    rt = _nostage_runtime(monkeypatch, tmp_path, binding_loaded)
+    delattr(mod, P.MARKER_ATTR)
+    exec(compile(_SYNTH, mod.__file__, "exec"), mod.__dict__)
+    assert P.apply(mod) is True  # gate off: untouched
+    assert rt.initialize_hisparse_runtime_buffers() == "stock"
+    assert rt.HiSparseCacheHandle().mirror_write_target(3) == "stock"
+    monkeypatch.setenv(P.NOSTAGE_ENV, "1")
+    delattr(mod, P.MARKER_ATTR)
+    exec(compile(_SYNTH, mod.__file__, "exec"), mod.__dict__)
+    assert P.apply(mod) is True
+    fn = rt.initialize_hisparse_runtime_buffers
+    assert fn.__globals__ is rt.__dict__ and P.PATCH_NAME in fn.__code__.co_filename
+    assert rt.HiSparseCacheHandle().mirror_write_target(3) is None
+    if binding_loaded:
+        assert sys.modules[P.BINDING_MODULE].initialize_hisparse_runtime_buffers is fn
+
+
+def test_nostage_foreign_binding_function_fails_closed(monkeypatch, tmp_path):
+    mod = _apply_synthetic(monkeypatch, tmp_path)
+    rt = _nostage_runtime(monkeypatch, tmp_path, True)
+    sys.modules[P.BINDING_MODULE].initialize_hisparse_runtime_buffers = lambda: 0
+    monkeypatch.setenv(P.NOSTAGE_ENV, "1")
+    delattr(mod, P.MARKER_ATTR)
+    with pytest.raises(P.PatchDriftError, match="binding"):
+        P.apply(mod)
+    assert rt.HiSparseCacheHandle().mirror_write_target(3) == "stock"

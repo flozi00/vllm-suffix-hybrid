@@ -133,3 +133,13 @@ def test_hybrid_wrap_installs_after_the_sm120_patch_hooks():
     for hook in ("SUFFIX_SM120_NVP4KV\"", "SUFFIX_SM120_HISPARSE_MTP\"", "SUFFIX_SM120_NVP4DSMLA\""):
         i = src.find(f'os.environ.get("{hook[:-1]}"')
         assert i != -1 and i < wrap, hook
+
+
+def test_nostage_gate_is_mixed_plus_its_env():
+    src = (Path(__file__).resolve().parents[2] / "sitecustomize.py").read_text()
+    ns: dict = {}
+    exec(src[src.index("_BOOT_GATES = {"):src.index("\n_boot_gates = ")], ns)
+    argv, env = ns["_BOOT_GATES"]["glm_stack_nostage_oracle"]
+    m_argv, m_env = ns["_BOOT_GATES"]["glm_stack_mixed_oracle"]
+    assert argv == m_argv
+    assert env == dict(m_env, SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING="1")

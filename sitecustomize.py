@@ -13,6 +13,8 @@ PYTHONPATH. Each section is independently gated:
                                builder patch (fail closed on SM120)
     + SUFFIX_SM120_HISPARSE_PREFETCH=1 -> also prefetch IndexShare follower
                                rows for multi-token decode (perf A/B knob)
+    + SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING=1 -> never allocate the
+                               write-only prefill mirror staging buffer
   SUFFIX_SM120_NVP4DSMLA=1  -> arm the deferred SM120 nvfp4_ds_mla sparse-MLA
                                KV patch (our kernels; fail closed on SM120)
   SUFFIX_SM120_NVP4KV_ORACLE=1 -> run the NVFP4-KV on-silicon oracle once per
@@ -311,6 +313,15 @@ _BOOT_GATES = {
                                 "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
                                {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1",
                                 "SUFFIX_SM120_HISPARSE_MIXED": "1"}),
+    # Mixed oracle without the write-only prefill mirror staging buffer
+    # (SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING): patched == ref, same spills.
+    "glm_stack_nostage_oracle": (["-m", "hisparse_mtp_patch.oracle", "--multi",
+                                  "--k", "5", "--layers", "8", "--index-freq", "4",
+                                  "--index-offset", "3", "--batched-tokens", "256",
+                                  "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
+                                 {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1",
+                                  "SUFFIX_SM120_HISPARSE_MIXED": "1",
+                                  "SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING": "1"}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():
