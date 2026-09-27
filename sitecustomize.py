@@ -330,6 +330,15 @@ _BOOT_GATES = {
                                  {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1",
                                   "SUFFIX_SM120_HISPARSE_MIXED": "1",
                                   "SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING": "1"}),
+    # Same as glm_stack_multi_oracle with synchronous launches: the step-55
+    # cudaErrorIllegalAddress (2026-09-27) surfaced asynchronously at the host
+    # mirror sync; blocking launches name the faulting kernel.
+    "glm_stack_multi_debug": (["-m", "hisparse_mtp_patch.oracle", "--multi",
+                               "--k", "5", "--layers", "8", "--index-freq", "4",
+                               "--index-offset", "3", "--batched-tokens", "256",
+                               "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
+                              {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1",
+                               "CUDA_LAUNCH_BLOCKING": "1", "TORCH_SHOW_CPP_STACKTRACES": "1"}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():
