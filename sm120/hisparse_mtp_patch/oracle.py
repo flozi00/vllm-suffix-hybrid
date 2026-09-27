@@ -54,6 +54,7 @@ say how much the decode path could have shown.
 """
 
 import argparse
+import functools
 import json
 import os
 from pathlib import Path
@@ -137,6 +138,20 @@ def multi_prompts() -> list:
             ("prefill_25", toks(25), 1), ("target_again", target, 16)]
 
 
+def _shrink(layers, multi, index_freq, index_offset, config):
+    over = {"num_hidden_layers": layers, "hidden_size": 256,
+            "intermediate_size": 512, "num_attention_heads": 8,
+            "num_key_value_heads": 1, "n_routed_experts": 8,
+            "num_experts_per_tok": 2, "index_topk": 2048}
+    if multi:  # IndexShare followers (deepseek_v2.py:1136-1160)
+        over.update(index_topk_freq=index_freq,
+                    index_skip_topk_offset=index_offset)
+    if any("MTP" in arch for arch in config.architectures):
+        over.pop("num_hidden_layers")
+    config.update(over)
+    return config
+
+
 def child(mode: str, a) -> dict:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
@@ -144,18 +159,11 @@ def child(mode: str, a) -> dict:
     from vllm.config import KVTransferConfig
     from vllm.inputs import TokensPrompt
 
-    def shrink(config):
-        over = {"num_hidden_layers": a.layers, "hidden_size": 256,
-                "intermediate_size": 512, "num_attention_heads": 8,
-                "num_key_value_heads": 1, "n_routed_experts": 8,
-                "num_experts_per_tok": 2, "index_topk": 2048}
-        if a.multi:  # IndexShare followers (deepseek_v2.py:1136-1160)
-            over.update(index_topk_freq=a.index_freq,
-                        index_skip_topk_offset=a.index_offset)
-        if any("MTP" in arch for arch in config.architectures):
-            over.pop("num_hidden_layers")
-        config.update(over)
-        return config
+    # Module-level + partial: tp>1 "mp" workers are spawned, so hf_overrides
+    # is pickled (a local closure is not); imported by its package name so
+    # the workers resolve it without __main__.
+    from hisparse_mtp_patch.oracle import _shrink
+    shrink = functools.partial(_shrink, a.layers, a.multi, a.index_freq, a.index_offset)
 
     hisparse = mode != "ref"
     kw = {}

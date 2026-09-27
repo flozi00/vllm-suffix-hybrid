@@ -17,7 +17,8 @@ def _boot(extra_env, tmp_path, package="nvfp4_ds_mla_patch"):
         f"open({str(tmp_path / 'seen.json')!r}, 'w').write(json.dumps({{'argv': sys.argv[1:], "
         "'env': {k: v for k, v in os.environ.items() if k.startswith('SUFFIX_')}}))\n")
     env = {k: v for k, v in os.environ.items() if not k.startswith("SUFFIX_")}
-    env.update(extra_env, PYTHONPATH=f"{REPO}{os.pathsep}{tmp_path}")
+    env.update(extra_env, PYTHONPATH=f"{REPO}{os.pathsep}{tmp_path}",
+               SUFFIX_BOOT_GATES_MARKER=str(tmp_path / "gates.claimed"))
     return subprocess.run([sys.executable, "-c", "import sitecustomize"], env=env,
                           capture_output=True, text=True, cwd=tmp_path)
 
@@ -39,6 +40,14 @@ def test_gate_runs_once_with_feature_gates_stripped(tmp_path):
 
 def test_done_marker_suppresses_rerun(tmp_path):
     r = _boot({"SUFFIX_BOOT_GATES": "nvfp4_dsmla_bench", "SUFFIX_BOOT_GATES_DONE": "1"}, tmp_path)
+    assert "boot-gate" not in r.stderr and not (tmp_path / "seen.json").exists()
+
+
+def test_marker_file_suppresses_rerun_in_a_second_top_level_process(tmp_path):
+    # `vllm serve` starts >1 top-level Python; the env marker can't reach a sibling.
+    _boot({"SUFFIX_BOOT_GATES": "nvfp4_dsmla_bench"}, tmp_path)
+    (tmp_path / "seen.json").unlink()
+    r = _boot({"SUFFIX_BOOT_GATES": "nvfp4_dsmla_bench"}, tmp_path)
     assert "boot-gate" not in r.stderr and not (tmp_path / "seen.json").exists()
 
 
@@ -88,7 +97,8 @@ def test_nvfp4_moe_gate_runs_once_with_feature_gates_stripped(tmp_path):
         "'env': {k: v for k, v in os.environ.items() if k.startswith('SUFFIX_')}}))\n")
     env = {k: v for k, v in os.environ.items() if not k.startswith("SUFFIX_")}
     env.update({"SUFFIX_BOOT_GATES": "nvfp4_moe_oracle", "SUFFIX_NVFP4_MOE": "1"},
-               PYTHONPATH=f"{tmp_path}{os.pathsep}{REPO}")
+               PYTHONPATH=f"{tmp_path}{os.pathsep}{REPO}",
+               SUFFIX_BOOT_GATES_MARKER=str(tmp_path / "gates.claimed"))
     r = subprocess.run([sys.executable, "-c", "import sitecustomize"], env=env,
                        capture_output=True, text=True, cwd=tmp_path)
     assert "[suffix boot-gate] nvfp4_moe_oracle: exit 0" in r.stderr, r.stderr

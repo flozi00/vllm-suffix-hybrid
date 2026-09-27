@@ -299,7 +299,21 @@ _BOOT_GATES = {
                                {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
-if _boot_gates and not os.environ.get("SUFFIX_BOOT_GATES_DONE"):
+def _boot_gates_claim():
+    # Once per POD: the env marker only reaches children, but `vllm serve`
+    # starts more than one top-level Python (prod glm 2026-09-27 ran every
+    # gate twice) -> an O_EXCL marker file in the pod's /tmp decides.
+    try:
+        os.close(os.open(os.environ.get("SUFFIX_BOOT_GATES_MARKER", "/tmp/suffix_boot_gates.claimed"), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        return True
+    except FileExistsError:
+        return False
+    except OSError:
+        return True
+
+
+if (_boot_gates and not os.environ.get("SUFFIX_BOOT_GATES_DONE")
+        and _boot_gates_claim()):
     import subprocess
     import sys
     os.environ["SUFFIX_BOOT_GATES_DONE"] = "1"
