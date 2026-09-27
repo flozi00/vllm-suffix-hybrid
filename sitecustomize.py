@@ -50,30 +50,6 @@ if os.environ.get("SUFFIX_HYBRID_DEV_ARGS", "").strip() == "1":
     from suffix_hybrid.dev_args import apply_dev_args
     apply_dev_args()
 
-if os.environ.get("SUFFIX_HYBRID_WRAP", "").strip() == "1":
-    import sys
-
-    try:
-        from suffix_hybrid.sched_sync import install_post_import_hook
-        install_post_import_hook()
-        main_gate = True
-    except Exception as exc:
-        print(f"sched_sync hook arm FAILED (async-scheduling force stays "
-              f"-- WATCH ENGINE-CONFIG): {exc}", file=sys.stderr, flush=True)
-        main_gate = False
-    try:
-        # V2 model runner first (the platform default on recent vLLM): the
-        # speculator-path hook. Returns False only when the V2 runner module
-        # does not exist in this vLLM, in which case the V1 class hook below
-        # is the right target.
-        from suffix_hybrid.wrap_v2 import install_v2
-        if not install_v2():
-            from suffix_hybrid.wrap import install
-            install()
-    except Exception as exc:
-        # site.py swallows Exception and continues unpatched. SystemExit is a
-        # BaseException, so an incompatible enabled worker cannot silently run.
-        raise SystemExit(f"suffix hybrid installation failed: {exc}") from exc
 
 # sm120 deep_gemm shim status. The bundle always ships /plugins/deep_gemm/
 # (it shadows site-packages' deep_gemm via PYTHONPATH=/plugins and
@@ -198,6 +174,36 @@ if os.environ.get("SUFFIX_SM120_NVP4DSMLA", "").strip() == "1":
             ) from exc
         print(f"suffix sm120 nvfp4-ds-mla: hook install failed (not SM120, "
               f"ignoring): {exc}", file=sys.stderr, flush=True)
+
+# Hybrid speculator wrap AFTER every sm120 meta_path hook is armed: install_v2
+# imports the V2 model runner, which imports the sparse-MLA backends
+# (index_group ...). Armed first, those imports run through the patch finders;
+# the other way round nvfp4_ds_mla refuses a live module graph (prod glm
+# crash 2026-09-27: "index_group imported before the hook armed").
+if os.environ.get("SUFFIX_HYBRID_WRAP", "").strip() == "1":
+    import sys
+
+    try:
+        from suffix_hybrid.sched_sync import install_post_import_hook
+        install_post_import_hook()
+        main_gate = True
+    except Exception as exc:
+        print(f"sched_sync hook arm FAILED (async-scheduling force stays "
+              f"-- WATCH ENGINE-CONFIG): {exc}", file=sys.stderr, flush=True)
+        main_gate = False
+    try:
+        # V2 model runner first (the platform default on recent vLLM): the
+        # speculator-path hook. Returns False only when the V2 runner module
+        # does not exist in this vLLM, in which case the V1 class hook below
+        # is the right target.
+        from suffix_hybrid.wrap_v2 import install_v2
+        if not install_v2():
+            from suffix_hybrid.wrap import install
+            install()
+    except Exception as exc:
+        # site.py swallows Exception and continues unpatched. SystemExit is a
+        # BaseException, so an incompatible enabled worker cannot silently run.
+        raise SystemExit(f"suffix hybrid installation failed: {exc}") from exc
 
 # In-pod engine-step profiler (suffix_hybrid/step_profiler.py):
 # SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] profiles N EngineCore steps once

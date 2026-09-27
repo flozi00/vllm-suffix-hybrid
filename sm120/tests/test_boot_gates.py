@@ -125,3 +125,11 @@ def test_nvfp4_lmhead_gates_are_allowlisted():
     for mode in ("oracle", "bench"):
         argv, env = ns["_BOOT_GATES"][f"nvfp4_lmhead_{mode}"]
         assert argv == ["-m", "suffix_hybrid.kernels.nvfp4_lm_head", mode] and env == {}
+
+
+def test_hybrid_wrap_installs_after_the_sm120_patch_hooks():
+    src = (REPO / "sitecustomize.py").read_text()
+    wrap = src.index('if os.environ.get("SUFFIX_HYBRID_WRAP"')
+    for hook in ("SUFFIX_SM120_NVP4KV\"", "SUFFIX_SM120_HISPARSE_MTP\"", "SUFFIX_SM120_NVP4DSMLA\""):
+        i = src.find(f'os.environ.get("{hook[:-1]}"')
+        assert i != -1 and i < wrap, hook
