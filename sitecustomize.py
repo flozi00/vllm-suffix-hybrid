@@ -339,6 +339,11 @@ _BOOT_GATES = {
                                "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
                               {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1",
                                "CUDA_LAUNCH_BLOCKING": "1", "TORCH_SHOW_CPP_STACKTRACES": "1"}),
+    # All-reduce latency on this node's GPUs: NCCL vs vLLM custom AR forced
+    # past its NVLink-only gate (prod glm TP=8 PCIe: NCCL all-reduce = 31 % of
+    # a decode step). Second entry: same with NCCL's tree algorithm.
+    "allreduce_bench": (["-m", "suffix_hybrid.tools.ar_bench"], {}),
+    "allreduce_bench_tree": (["-m", "suffix_hybrid.tools.ar_bench"], {"NCCL_ALGO": "Tree"}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():
