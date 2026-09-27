@@ -27,3 +27,6 @@ that the SM120 NVFP4-KV overlay is a no-op against these exact versions:
 Do not edit these files; they are regression fixtures. If upstream drifts
 (newer vLLM/FI in the image), the patch layer must fail closed and a new
 fixture + anchor set is required.
+
+- `vllm_0.30.0/model_loader_utils.py` — `vllm/model_executor/model_loader/utils.py`
+  at v0.30.0 (`process_weights_after_loading`, fp8_dense_patch anchor).

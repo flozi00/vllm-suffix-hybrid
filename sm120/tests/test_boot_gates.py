@@ -143,3 +143,18 @@ def test_nostage_gate_is_mixed_plus_its_env():
     m_argv, m_env = ns["_BOOT_GATES"]["glm_stack_mixed_oracle"]
     assert argv == m_argv
     assert env == dict(m_env, SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING="1")
+
+
+def test_fp8_dense_oracle_gate(tmp_path):
+    import json
+    r = _boot({"SUFFIX_BOOT_GATES": "fp8_dense_oracle", "SUFFIX_FP8_DENSE_LAYERS": "*"},
+              tmp_path, "fp8_dense_patch")
+    assert "[suffix boot-gate] fp8_dense_oracle: exit 0" in r.stderr, r.stderr
+    seen = json.loads((tmp_path / "seen.json").read_text())
+    assert seen["argv"] == [] and "SUFFIX_FP8_DENSE_LAYERS" not in seen["env"]
+
+
+def test_fp8_dense_hook_arms_before_the_hybrid_wrap():
+    src = (REPO / "sitecustomize.py").read_text()
+    i = src.find('os.environ.get("SUFFIX_FP8_DENSE"')
+    assert i != -1 and i < src.index('if os.environ.get("SUFFIX_HYBRID_WRAP"')

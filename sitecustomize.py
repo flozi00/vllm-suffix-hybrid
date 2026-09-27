@@ -17,6 +17,9 @@ PYTHONPATH. Each section is independently gated:
                                write-only prefill mirror staging buffer
   SUFFIX_SM120_NVP4DSMLA=1  -> arm the deferred SM120 nvfp4_ds_mla sparse-MLA
                                KV patch (our kernels; fail closed on SM120)
+  SUFFIX_FP8_DENSE=1        -> arm the deferred FP8 W8A8 dense-linear patch
+                               (fp8_dense_patch/; SUFFIX_FP8_DENSE_LAYERS =
+                               glob allowlist; fail closed when enabled)
   SUFFIX_SM120_NVP4KV_ORACLE=1 -> run the NVFP4-KV on-silicon oracle once per
                                pod before serving (fatal only with NVP4KV=1)
   SUFFIX_FICACHE=seed|dump|both -> FlashInfer autotune cache seed/harvest
@@ -176,6 +179,18 @@ if os.environ.get("SUFFIX_SM120_NVP4DSMLA", "").strip() == "1":
             ) from exc
         print(f"suffix sm120 nvfp4-ds-mla: hook install failed (not SM120, "
               f"ignoring): {exc}", file=sys.stderr, flush=True)
+
+# FP8 dense linears (independent gate, fp8_dense_patch/): BF16 attention /
+# indexer / shared-expert / dense-MLP / MTP eh_proj linears -> FP8 W8A8 at
+# load (per-channel weights, dynamic per-token activations, vLLM's SM120
+# cutlass_scaled_mm). Hook on model_loader.utils; the SM120 check and the
+# per-shape kernel self-test run at conversion on the worker. Unset = inert.
+if os.environ.get("SUFFIX_FP8_DENSE", "").strip() == "1":
+    try:
+        from fp8_dense_patch import install_post_import_hook as _fp8d_hook
+        _fp8d_hook()
+    except Exception as exc:
+        raise SystemExit(f"suffix fp8-dense installation failed: {exc}") from exc
 
 # Hybrid speculator wrap AFTER every sm120 meta_path hook is armed: install_v2
 # imports the V2 model runner, which imports the sparse-MLA backends
@@ -342,6 +357,10 @@ _BOOT_GATES = {
     # All-reduce latency on this node's GPUs: NCCL vs vLLM custom AR forced
     # past its NVLink-only gate (prod glm TP=8 PCIe: NCCL all-reduce = 31 % of
     # a decode step). Second entry: same with NCCL's tree algorithm.
+    # FP8 dense linears (SUFFIX_FP8_DENSE) at GLM-5.3 TP8 per-rank shapes:
+    # FP8 vs BF16 / exact-dequant error per layer type + us/call BF16 vs FP8
+    # at M 6..192 (CUDA graphs, L2-busting weight rotation).
+    "fp8_dense_oracle": (["-m", "fp8_dense_patch.oracle"], {}),
     "allreduce_bench": (["-m", "suffix_hybrid.tools.ar_bench"], {}),
     "allreduce_bench_tree": (["-m", "suffix_hybrid.tools.ar_bench"], {"NCCL_ALGO": "Tree"}),
 }
