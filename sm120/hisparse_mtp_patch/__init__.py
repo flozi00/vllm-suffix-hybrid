@@ -82,7 +82,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-09-27.3"
+PATCH_REVISION = "2026-09-27.4"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
@@ -590,6 +590,132 @@ def install_connector_method(connector, method_src: str, path: Path) -> None:
     connector.HiSparseConnectorScheduler.build_connector_meta = ns["build_connector_meta"]
 
 
+# --- No prefill mirror staging (SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING=1) ---
+# initialize_hisparse_runtime_buffers (runtime.py:1211-1230) allocates
+# [layers, ceil(max_num_batched_tokens/bs), bs, row] of GPU memory (~228 MB/rank
+# on prod GLM) as HiSparseCacheHandle.mirror_staging_cache. In the whole 0.30.0
+# tree that tensor has exactly one consumer, mirror_write_target (runtime.py:
+# 1130), whose one caller (MLAAttention.update_kv_cache, mla_attention.py:785)
+# only WRITES the new KV rows into it (do_kv_cache_update). Nothing ever reads
+# it back: the host mirror DMAs from the resident cache (worker.py
+# _enqueue_row_dma: source = resident_caches), spills too (_enqueue_transfers),
+# restores go host -> resident. And worker.start_step sets
+# mirror_from_resident = True on every handle every step (worker.py:413), so
+# even that write is skipped in steady state. Rewrite: allocate nothing and
+# make mirror_write_target return None (skip the dead write in the few forwards
+# that precede the first start_step). Values unchanged on every path.
+NOSTAGE_ENV = "SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING"
+BINDING_MODULE = "vllm.v1.hisparse.binding"
+NOSTAGE_ALLOC_OLD = (
+    "    staging_blocks = (\n"
+    "        max_num_batched_tokens + resident.block_size - 1\n"
+    "    ) // resident.block_size\n"
+    "    mirror_staging_caches = torch.empty(\n"
+    "        (\n"
+    "            len(cache_handles),\n"
+    "            staging_blocks,\n"
+    "            resident.block_size,\n"
+    "            resident.cache.shape[-1],\n"
+    "        ),\n"
+    "        dtype=resident.cache.dtype,\n"
+    "        device=device,\n"
+    "    )\n"
+    "    mirror_staging_slots = torch.arange(\n"
+    "        max_num_batched_tokens, dtype=torch.int64, device=device\n"
+    "    )\n"
+    "    for layer_index, cache_handle in enumerate(cache_handles):\n"
+    "        cache_handle.runtime.request_state_indices = request_state_indices\n"
+    "        cache_handle.mirror_staging_cache = mirror_staging_caches[layer_index]\n"
+    "        cache_handle.mirror_staging_slots = mirror_staging_slots\n"
+)
+NOSTAGE_ALLOC_NEW = (
+    f"    # {HELPER_TAG}: no prefill mirror staging (write-only buffer)\n"
+    "    for cache_handle in cache_handles:\n"
+    "        cache_handle.runtime.request_state_indices = request_state_indices\n"
+    "        cache_handle.mirror_staging_cache = None\n"
+    "        cache_handle.mirror_staging_slots = None\n"
+)
+NOSTAGE_MIRROR_OLD = (
+    "    def mirror_write_target(\n"
+    "        self, num_rows: int\n"
+    "    ) -> tuple[torch.Tensor, torch.Tensor] | None:\n"
+    "        if (\n"
+    "            not self.host_mirror_required\n"
+    "            or self.decode_batch\n"
+    "            or self.mirror_from_resident\n"
+    "        ):\n"
+    "            return None\n"
+    "        cache = self.mirror_staging_cache\n"
+    "        slots = self.mirror_staging_slots\n"
+)
+NOSTAGE_MIRROR_NEW = (
+    "def mirror_write_target(self, num_rows):\n"
+    f"    # {HELPER_TAG}: the staging copy is never read; the host mirror DMAs\n"
+    "    # from the resident cache.\n"
+    "    return None\n"
+)
+
+
+def nostage_gate_enabled() -> bool:
+    return os.environ.get(NOSTAGE_ENV, "").strip() == "1"
+
+
+def patch_nostage_source(src: str) -> str:
+    """runtime.py: initialize_hisparse_runtime_buffers without the staging
+    allocation (dedented, compilable). Both anchors must sit in their def."""
+    import ast
+    import textwrap
+
+    defs = {n.name: n for n in ast.walk(ast.parse(src))
+            if isinstance(n, ast.FunctionDef)}
+    lines = src.splitlines(keepends=True)
+
+    def body(name):
+        n = defs.get(name)
+        return "".join(lines[n.lineno - 1:n.end_lineno]) if n else ""
+
+    bad = [f"{n}: expected 1, found {src.count(old)}"
+           for n, old in (("staging_alloc", NOSTAGE_ALLOC_OLD),
+                          ("mirror_write_target", NOSTAGE_MIRROR_OLD))
+           if src.count(old) != 1]
+    fn = body("initialize_hisparse_runtime_buffers")
+    if not bad and fn.count(NOSTAGE_ALLOC_OLD) != 1:
+        bad.append("staging_alloc not inside initialize_hisparse_runtime_buffers")
+    if not bad and body("mirror_write_target").count(NOSTAGE_MIRROR_OLD) != 1:
+        bad.append("mirror_write_target moved")
+    if bad:
+        raise PatchDriftError(
+            "hisparse/runtime.py does not match the pinned mirror-staging anchors "
+            f"(expected vLLM {PINNED_VLLM}): " + "; ".join(bad))
+    out = textwrap.dedent(fn.replace(NOSTAGE_ALLOC_OLD, NOSTAGE_ALLOC_NEW))
+    compile(out, f"<{PATCH_NAME}:nostage>", "exec")
+    return out
+
+
+def install_nostage(runtime, fn_src: str, rt_path: Path) -> None:
+    """Replace the function in runtime (and in binding, which imported it by
+    name, if already loaded) and rebind HiSparseCacheHandle.mirror_write_target."""
+    import __future__
+    import linecache
+
+    old = runtime.initialize_hisparse_runtime_buffers
+    binding = sys.modules.get(BINDING_MODULE)
+    if binding is not None and binding.initialize_hisparse_runtime_buffers is not old:
+        raise PatchDriftError(f"{BINDING_MODULE}.initialize_hisparse_runtime_buffers "
+                              "is not runtime's function")
+    ns: dict = {}
+    for tag, src in (("init", fn_src), ("mirror", NOSTAGE_MIRROR_NEW)):
+        fname = f"{rt_path}.{PATCH_NAME}-nostage-{tag}.py"
+        linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)
+        exec(compile(src, fname, "exec", __future__.annotations.compiler_flag,
+                     dont_inherit=True), runtime.__dict__, ns)
+    ns["mirror_write_target"].__qualname__ = "HiSparseCacheHandle.mirror_write_target"
+    runtime.HiSparseCacheHandle.mirror_write_target = ns["mirror_write_target"]
+    runtime.initialize_hisparse_runtime_buffers = ns["initialize_hisparse_runtime_buffers"]
+    if binding is not None:
+        binding.initialize_hisparse_runtime_buffers = ns["initialize_hisparse_runtime_buffers"]
+
+
 STC_MODULE = "vllm.v1.core.single_type_kv_cache_manager"
 # Engine-fatal race (glm_stack_mixed_oracle 2026-09-27, "Cannot get 224 free
 # blocks from the pool"): KVCacheManager.allocate_slots checks free blocks from
@@ -750,6 +876,7 @@ def apply(module=None) -> bool:
     rt_src = rt_path.read_text()
     rt_new = patch_runtime_source(rt_src)
     prefetch = patch_prefetch_source(rt_src) if prefetch_gate_enabled() else None
+    nostage = patch_nostage_source(rt_src) if nostage_gate_enabled() else None
     layout = importlib.import_module(LAYOUT_MODULE)
     check_layout_source(Path(layout.__file__).read_text())
     stc = importlib.import_module(STC_MODULE)
@@ -764,6 +891,8 @@ def apply(module=None) -> bool:
     exec_patched_source(runtime, rt_new, rt_path)
     if prefetch is not None:
         install_prefetch(runtime, prefetch, rt_path)
+    if nostage is not None:
+        install_nostage(runtime, nostage, rt_path)
     install_profiling_host_pool(layout)
     install_hot_methods(stc, hot, Path(stc.__file__))
     install_adopt_method(coord, adopt, Path(coord.__file__))
@@ -781,6 +910,8 @@ def apply(module=None) -> bool:
              if prefetch is not None else "")
           + ("+ prefill-only residency flag (mixed batches) "
              if mixed is not None else "")
+          + ("+ no prefill mirror staging buffer "
+             if nostage is not None else "")
           +
           f"(rev {PATCH_REVISION}; {len(applied) + 6 + (len(prefetch) if prefetch else 0)} anchors; vllm {ver}).",
           file=sys.stderr, flush=True)
