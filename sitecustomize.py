@@ -372,6 +372,10 @@ _BOOT_GATES = {
     # NCCL_ALGO=allreduce:tree, 12 KiB .. 24 MiB (nccl_split crossover).
     "allreduce_split_bench": (["-m", "suffix_hybrid.tools.ar_bench", "--split", "allreduce:tree",
                                "--sizes-kib", "48,192,768,1536"], {}),
+    "allreduce_split_bench_simple": (["-m", "suffix_hybrid.tools.ar_bench", "--split",
+                                      "allreduce:ring/Simple", "--sizes-kib", "48,192,768,1536"], {}),
+    "allreduce_split_bench_tree_simple": (["-m", "suffix_hybrid.tools.ar_bench", "--split",
+                                           "allreduce:tree/Simple", "--sizes-kib", "48,192,768,1536"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():

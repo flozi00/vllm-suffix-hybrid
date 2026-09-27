@@ -20,13 +20,16 @@ import sys
 
 ENV = "SUFFIX_NCCL_SMALL_ALGO"
 BYTES_ENV = "SUFFIX_NCCL_SMALL_BYTES"
+MIN_ENV = "SUFFIX_NCCL_SMALL_MIN_BYTES"
+PROTO_ENV = "SUFFIX_NCCL_SMALL_PROTO"
 TARGET = "vllm.distributed.device_communicators.cuda_communicator"
 TAG = "suffix nccl-split"
 OLD = ("        assert pynccl_comm is not None\n"
        "        out = pynccl_comm.all_reduce(input_)\n")
 NEW = ("        assert pynccl_comm is not None\n"
        f"        _small = getattr(self, '_suffix_small_nccl', None)  # {TAG}\n"
-       "        if _small is not None and (input_.numel() * input_.element_size()\n"
+       "        if _small is not None and (self._suffix_small_min\n"
+       "                                   <= input_.numel() * input_.element_size()\n"
        "                                   <= self._suffix_small_bytes):\n"
        "            pynccl_comm = _small\n"
        "        out = pynccl_comm.all_reduce(input_)\n")
@@ -63,9 +66,14 @@ def apply(module) -> None:
     algo = os.environ.get(ENV, "").strip()
     if not algo:
         return
-    if os.environ.get("NCCL_ALGO"):
-        raise PatchDriftError(f"{ENV} needs NCCL_ALGO unset (it would apply to BOTH communicators)")
-    small_bytes = int(os.environ.get(BYTES_ENV, str(4 << 20)))
+    if os.environ.get("NCCL_ALGO") or os.environ.get("NCCL_PROTO"):
+        raise PatchDriftError(f"{ENV} needs NCCL_ALGO/NCCL_PROTO unset (they would apply to BOTH communicators)")
+    small_bytes = int(os.environ.get(BYTES_ENV, str(2 << 20)))
+    # Measured on worker-06 (allreduce_split_bench 2026-09-27): NCCL's default is
+    # only bad in a band (~384 KiB..2 MiB, 2.3-2.6x slower than tree); below
+    # 256 KiB and above ~3 MiB the default wins -> route the band only.
+    small_min = int(os.environ.get(MIN_ENV, str(256 << 10)))
+    proto = os.environ.get(PROTO_ENV, "").strip()
     import __future__
     import linecache
     from pathlib import Path
@@ -84,22 +92,29 @@ def apply(module) -> None:
         orig_init(self, *a, **kw)
         self._suffix_small_nccl = None
         self._suffix_small_bytes = small_bytes
+        self._suffix_small_min = small_min
         if self.world_size <= 1 or self.pynccl_comm is None or self.pynccl_comm.disabled:
             return
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
         os.environ["NCCL_ALGO"] = algo
+        if proto:
+            os.environ["NCCL_PROTO"] = proto
         try:
             self._suffix_small_nccl = PyNcclCommunicator(group=self.cpu_group, device=self.device)
         finally:
             os.environ.pop("NCCL_ALGO", None)
-        _say(f"second communicator NCCL_ALGO={algo} for all-reduce <= {small_bytes} B "
+            if proto:
+                os.environ.pop("NCCL_PROTO", None)
+        _say(f"second communicator NCCL_ALGO={algo} NCCL_PROTO={proto or 'auto'} for "
+             f"all-reduce in [{small_min}, {small_bytes}] B "
              f"(world {self.world_size}, {self.device})")
 
     ns["all_reduce"].__qualname__ = "CudaCommunicator.all_reduce"
     cls.all_reduce = ns["all_reduce"]
     cls.__init__ = __init__
-    _say(f"ACTIVE: CudaCommunicator.all_reduce routes <= {small_bytes} B to NCCL_ALGO={algo}")
+    _say(f"ACTIVE: CudaCommunicator.all_reduce routes [{small_min}, {small_bytes}] B to "
+         f"NCCL_ALGO={algo} NCCL_PROTO={proto or 'auto'}")
 
 
 def install_post_import_hook() -> None:

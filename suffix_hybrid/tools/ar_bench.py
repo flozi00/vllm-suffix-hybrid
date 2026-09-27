@@ -75,12 +75,16 @@ def _worker(rank: int, world: int, port: int, sizes, iters: int, q, split: str =
 
         dev = torch.device("cuda", rank)
         auto = PyNcclCommunicator(group=cpu, device=dev)
-        os.environ["NCCL_ALGO"] = split
+        algo, _, proto = split.partition("/")  # e.g. "allreduce:ring/Simple"
+        os.environ["NCCL_ALGO"] = algo
+        if proto:
+            os.environ["NCCL_PROTO"] = proto
         try:
             small = PyNcclCommunicator(group=cpu, device=dev)
         finally:
             os.environ.pop("NCCL_ALGO", None)
-        for kib in sizes + [3072, 6144, 12288, 24576]:
+            os.environ.pop("NCCL_PROTO", None)
+        for kib in sizes + [256, 384, 512, 1024, 2048, 3072, 6144, 12288, 24576]:
             x = torch.randn(kib * 512, device="cuda", dtype=torch.bfloat16)
             a_us = timed(lambda t: auto.all_reduce(t), x.clone())
             s_us = timed(lambda t: small.all_reduce(t), x.clone())
@@ -97,7 +101,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sizes-kib", default="12,48,96,192,384,768,1536")
     ap.add_argument("--iters", type=int, default=200)
-    ap.add_argument("--split", default="", help="NCCL_ALGO for a second PyNccl comm, e.g. allreduce:tree")
+    ap.add_argument("--split", default="", help="NCCL_ALGO[/NCCL_PROTO] for a second PyNccl comm, "
+                    "e.g. allreduce:tree or allreduce:ring/Simple")
     a = ap.parse_args()
     import torch
     import torch.multiprocessing as mp
