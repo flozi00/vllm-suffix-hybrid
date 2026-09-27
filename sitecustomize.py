@@ -227,6 +227,11 @@ if os.environ.get("SUFFIX_HYBRID_WRAP", "").strip() == "1":
 # the load bucket (c1/c2-6/c7-12/c13-24/c25+) held <skip> steps, <per>
 # windows per bucket; one "[suffix-prof]" summary block per window.
 # Fail-soft: a profiler error never touches serving.
+# Size-routed NCCL all-reduce (suffix_hybrid/nccl_split.py): unset = inert.
+if os.environ.get("SUFFIX_NCCL_SMALL_ALGO", "").strip():
+    from suffix_hybrid.nccl_split import install_post_import_hook as _ncsplit_hook
+    _ncsplit_hook()
+
 if os.environ.get("SUFFIX_PROFILE_WORKER", "").strip():
     try:
         from suffix_hybrid.step_profiler import install_worker_hook
@@ -363,6 +368,10 @@ _BOOT_GATES = {
     "fp8_dense_oracle": (["-m", "fp8_dense_patch.oracle"], {}),
     "allreduce_bench": (["-m", "suffix_hybrid.tools.ar_bench"], {}),
     "allreduce_bench_tree": (["-m", "suffix_hybrid.tools.ar_bench"], {"NCCL_ALGO": "Tree"}),
+    # Size-routed all-reduce evidence: default comm vs a second comm built under
+    # NCCL_ALGO=allreduce:tree, 12 KiB .. 24 MiB (nccl_split crossover).
+    "allreduce_split_bench": (["-m", "suffix_hybrid.tools.ar_bench", "--split", "allreduce:tree",
+                               "--sizes-kib", "48,192,768,1536"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():

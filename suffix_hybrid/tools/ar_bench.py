@@ -21,7 +21,7 @@ import sys
 MARK = "[suffix ar-bench]"
 
 
-def _worker(rank: int, world: int, port: int, sizes, iters: int, q) -> None:
+def _worker(rank: int, world: int, port: int, sizes, iters: int, q, split: str = "") -> None:
     import torch
     import torch.distributed as dist
 
@@ -68,6 +68,23 @@ def _worker(rank: int, world: int, port: int, sizes, iters: int, q) -> None:
             row["ca_max_abs_err"] = float((got.float() - ref.float()).abs().max())
             row["ca_us"] = timed(lambda t: ca.custom_all_reduce(t), x.clone())
         out["rows"].append(row)
+    if split:
+        # Two vLLM PyNccl communicators, the second built while NCCL_ALGO is set
+        # (suffix_hybrid/nccl_split.py relies on NCCL reading it per comm init).
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+        dev = torch.device("cuda", rank)
+        auto = PyNcclCommunicator(group=cpu, device=dev)
+        os.environ["NCCL_ALGO"] = split
+        try:
+            small = PyNcclCommunicator(group=cpu, device=dev)
+        finally:
+            os.environ.pop("NCCL_ALGO", None)
+        for kib in sizes + [3072, 6144, 12288, 24576]:
+            x = torch.randn(kib * 512, device="cuda", dtype=torch.bfloat16)
+            a_us = timed(lambda t: auto.all_reduce(t), x.clone())
+            s_us = timed(lambda t: small.all_reduce(t), x.clone())
+            out["rows"].append({"kib": kib, "split": True, "auto_us": a_us, "small_us": s_us})
     if rank == 0:
         out["p2p"] = [[int(i == j or torch.cuda.can_device_access_peer(i, j))
                        for j in range(world)] for i in range(world)]
@@ -80,6 +97,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sizes-kib", default="12,48,96,192,384,768,1536")
     ap.add_argument("--iters", type=int, default=200)
+    ap.add_argument("--split", default="", help="NCCL_ALGO for a second PyNccl comm, e.g. allreduce:tree")
     a = ap.parse_args()
     import torch
     import torch.multiprocessing as mp
@@ -92,7 +110,7 @@ def main() -> int:
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = 29500 + os.getpid() % 1000
-    procs = [ctx.Process(target=_worker, args=(r, world, port, sizes, a.iters, q))
+    procs = [ctx.Process(target=_worker, args=(r, world, port, sizes, a.iters, q, a.split))
              for r in range(world)]
     [p.start() for p in procs]
     res = [q.get(timeout=900) for _ in procs]
@@ -103,7 +121,14 @@ def main() -> int:
           f"{sorted({r['ca'] for r in res})}", flush=True)
     if "p2p" in res[0]:
         print(f"{MARK} p2p access matrix rows: {res[0]['p2p']}", flush=True)
-    for i, kib in enumerate(sizes):
+    for i in range(len(res[0]["rows"])):
+        if res[0]["rows"][i].get("split"):
+            rows = [r["rows"][i] for r in res]
+            au, sm = max(r["auto_us"] for r in rows), max(r["small_us"] for r in rows)
+            print(f"{MARK} split {rows[0]['kib']:6d} KiB: default-comm {au:8.1f} us | "
+                  f"NCCL_ALGO={a.split} comm {sm:8.1f} us ({au / sm:4.2f}x)", flush=True)
+            continue
+        kib = sizes[i]
         rows = [r["rows"][i] for r in res]
         nccl = max(r["nccl_us"] for r in rows)
         line = f"{MARK} {kib:5d} KiB bf16: nccl {nccl:8.1f} us"
