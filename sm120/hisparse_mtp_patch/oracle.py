@@ -149,10 +149,11 @@ def _shrink(layers, multi, index_freq, index_offset, config):
     if any("MTP" in arch for arch in config.architectures):
         over.pop("num_hidden_layers")
     config.update(over)
-    if multi and hasattr(config, "quantization_config"):
+    if hasattr(config, "quantization_config"):
         # bf16 dummy weights: stock FP8 block cutlass_scaled_mm rejects the
-        # shrunk fused_qkv_a shapes on SM120 ("Invalid status", ref crashed
-        # too on prod 2026-09-27) -- this gate is about attention, not GEMMs.
+        # shrunk fused_qkv_a shapes on SM120 ("Invalid status" in --multi and
+        # at --tp 2, ref crashed too on prod 2026-09-27) -- these gates are
+        # about attention/HiSparse, not GEMMs.
         delattr(config, "quantization_config")
     return config
 

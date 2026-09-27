@@ -82,7 +82,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-09-27.1"
+PATCH_REVISION = "2026-09-27.2"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
@@ -590,6 +590,61 @@ def install_connector_method(connector, method_src: str, path: Path) -> None:
     connector.HiSparseConnectorScheduler.build_connector_meta = ns["build_connector_meta"]
 
 
+STC_MODULE = "vllm.v1.core.single_type_kv_cache_manager"
+# Engine-fatal race (glm_stack_mixed_oracle 2026-09-27, "Cannot get 224 free
+# blocks from the pool"): KVCacheManager.allocate_slots checks free blocks from
+# get_num_blocks_to_allocate, THEN allocate_new_computed_blocks may call
+# require_hot (any local prefix hit), and allocate_new_blocks takes a whole hot
+# region the check never counted (it only counted never-seen requests). Count
+# it in the check instead: worst case a request waits a pass for admission.
+HOT_EDITS = [
+    ("get_num_blocks_to_allocate",
+     "        resumes_host_prefix = (\n"
+     "            num_local_computed_tokens > 0 and request_id not in self.num_cached_block\n"
+     "        )\n",
+     "        # " + HELPER_TAG + ": add_local_computed_blocks require_hot()s on ANY\n"
+     "        # local prefix hit (also a resumed/preempted request already in\n"
+     "        # num_cached_block) -- count exactly what the allocation will take.\n"
+     "        resumes_host_prefix = num_local_computed_tokens > 0\n"),
+]
+
+def patch_hot_methods(src: str) -> dict:
+    """HiSparseHotManager methods with the counted-allocation guard."""
+    import ast
+    import textwrap
+
+    cls = next((n for n in ast.parse(src).body if isinstance(n, ast.ClassDef)
+                and n.name == "HiSparseHotManager"), None)
+    if cls is None:
+        raise PatchDriftError("HiSparseHotManager missing (expected vLLM " + PINNED_VLLM + ")")
+    lines = src.splitlines(keepends=True)
+    methods = {n.name: "".join(lines[n.lineno - 1:n.end_lineno])
+               for n in cls.body if isinstance(n, ast.FunctionDef)}
+    out = {}
+    for name, old, new in HOT_EDITS:
+        body = methods.get(name) or ""
+        if body.count(old) != 1:
+            raise PatchDriftError(f"hot-manager anchor {name}: expected 1, found {body.count(old)}")
+        out[name] = textwrap.dedent(body.replace(old, new))
+        compile(out[name], f"<{PATCH_NAME}:hot>", "exec")
+    return out
+
+
+def install_hot_methods(stc, methods: dict, path: Path) -> None:
+    import __future__
+    import linecache
+
+    cls = stc.HiSparseHotManager
+    for name, src in methods.items():
+        fname = f"{path}.{PATCH_NAME}-hot-{name}.py"
+        linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)
+        ns: dict = {}
+        exec(compile(src, fname, "exec", __future__.annotations.compiler_flag,
+                     dont_inherit=True), stc.__dict__, ns)
+        ns[name].__qualname__ = f"HiSparseHotManager.{name}"
+        setattr(cls, name, ns[name])
+
+
 def patch_source(src: str) -> tuple[str, list[str]]:
     """Pure transform of sparse_mla_attention.py. Every anchor is
     count-verified BEFORE any replacement (all failures reported at once)."""
@@ -649,6 +704,8 @@ def apply(module=None) -> bool:
     prefetch = patch_prefetch_source(rt_src) if prefetch_gate_enabled() else None
     layout = importlib.import_module(LAYOUT_MODULE)
     check_layout_source(Path(layout.__file__).read_text())
+    stc = importlib.import_module(STC_MODULE)
+    hot = patch_hot_methods(Path(stc.__file__).read_text())
     mixed = None
     if mixed_gate_enabled():
         connector = importlib.import_module(CONNECTOR_MODULE)
@@ -658,6 +715,7 @@ def apply(module=None) -> bool:
     if prefetch is not None:
         install_prefetch(runtime, prefetch, rt_path)
     install_profiling_host_pool(layout)
+    install_hot_methods(stc, hot, Path(stc.__file__))
     if mixed is not None:
         install_connector_method(connector, mixed, Path(connector.__file__))
     exec_patched_source(module, new_src, src_path)
@@ -667,6 +725,7 @@ def apply(module=None) -> bool:
           f"+ prefill staging plan w/o prefill backend "
           f"+ serialized shared host-pool pinning "
           f"+ minimal profiling host pool "
+          f"+ counted hot-region allocation "
           + ("+ follower prefetch for multi-token decode "
              if prefetch is not None else "")
           + ("+ prefill-only residency flag (mixed batches) "

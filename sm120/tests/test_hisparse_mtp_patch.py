@@ -224,7 +224,54 @@ def _fake_runtime(monkeypatch, tmp_path, src=None):
           ns=rt.__dict__)
     monkeypatch.setitem(sys.modules, P.RUNTIME_MODULE, rt)
     monkeypatch.setitem(sys.modules, P.LAYOUT_MODULE, _fake_layout()[0])
+    monkeypatch.setitem(sys.modules, P.STC_MODULE, _fake_stc(tmp_path))
     return rt
+
+
+# Minimal HiSparseHotManager carrying the pinned vLLM 0.30.0 method text the
+# counted-allocation fix anchors on (single_type_kv_cache_manager.py:2406+).
+STC_FIXTURE = (
+    "class HiSparseHotManager:\n"
+    "    def __init__(self, blocks_per_request):\n"
+    "        self.blocks_per_request = blocks_per_request\n"
+    "        self.hot_required = set()\n"
+    "        self.req_to_blocks = {}\n"
+    "        self.num_cached_block = {}\n"
+    "    def get_num_required_blocks(self, request_id):\n"
+    "        return max(self.blocks_per_request - len(self.req_to_blocks.get(request_id, ())), 0)\n"
+    "    def get_num_blocks_to_allocate(self, request_id, num_tokens, new_computed_blocks,\n"
+    "                                   total_computed_tokens, num_local_computed_tokens,\n"
+    "                                   num_tokens_main_model, apply_admission_cap=False):\n"
+    "        host_import = total_computed_tokens > num_local_computed_tokens\n"
+    "        resumes_host_prefix = (\n"
+    "            num_local_computed_tokens > 0 and request_id not in self.num_cached_block\n"
+    "        )\n"
+    "        if host_import or resumes_host_prefix or request_id in self.hot_required:\n"
+    "            return self.get_num_required_blocks(request_id)\n"
+    "        return 0\n"
+)
+
+
+def _fake_stc(tmp_path):
+    path = tmp_path / "single_type_kv_cache_manager.py"
+    path.write_text(STC_FIXTURE)
+    stc = types.ModuleType(P.STC_MODULE)
+    stc.__file__ = str(path)
+    exec(STC_FIXTURE, stc.__dict__)
+    return stc
+
+
+def test_hot_region_counted_for_resumed_prefix_hit(monkeypatch, tmp_path):
+    """Engine-fatal race: a preempted request (already in num_cached_block) with
+    a local prefix hit is require_hot()ed by add_local_computed_blocks AFTER the
+    free-block check; the check must count its hot region."""
+    stc = _fake_stc(tmp_path)
+    m = stc.HiSparseHotManager(224)
+    m.num_cached_block["r"] = 0
+    assert m.get_num_blocks_to_allocate("r", 64, [], 128, 128, 64) == 0  # stock: uncounted
+    P.install_hot_methods(stc, P.patch_hot_methods(STC_FIXTURE), tmp_path / "x.py")
+    assert m.get_num_blocks_to_allocate("r", 64, [], 128, 128, 64) == 224
+    assert m.get_num_blocks_to_allocate("q", 64, [], 0, 0, 64) == 0  # cold: still free
 
 
 def _apply_synthetic(monkeypatch, tmp_path):
