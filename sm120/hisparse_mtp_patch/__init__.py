@@ -82,7 +82,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-09-27.2"
+PATCH_REVISION = "2026-09-27.3"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
@@ -608,6 +608,54 @@ HOT_EDITS = [
      "        resumes_host_prefix = num_local_computed_tokens > 0\n"),
 ]
 
+COORD_MODULE = "vllm.v1.hisparse.coordinator"
+# Second uncounted consumer (same "Cannot get 224 free blocks" crash, still on
+# rev .2): HiSparseCoordinator._adopt_copies block_pool.touch()es cached GPU
+# copies of a host prefix during allocate_new_computed_blocks -- AFTER the
+# free-block check. A FREE (ref_cnt == 0) copy leaves the free queue uncounted.
+# Adopt only copies already in use; a free one stays in the pool and that page
+# is read from host through the (counted) hot region.
+ADOPT_OLD = (
+    "                if manager.adopt_resident_page(request_id, host_idx, block):\n"
+    "                    manager.block_pool.touch([block])\n")
+ADOPT_NEW = (
+    "                if block.ref_cnt == 0:  # " + HELPER_TAG + ": uncounted by admission\n"
+    "                    continue\n"
+    "                if manager.adopt_resident_page(request_id, host_idx, block):\n"
+    "                    manager.block_pool.touch([block])\n")
+
+
+def patch_adopt_method(src: str) -> str:
+    import ast
+    import textwrap
+
+    cls = next((n for n in ast.parse(src).body if isinstance(n, ast.ClassDef)
+                and n.name == "HiSparseCoordinator"), None)
+    fn = next((n for n in (cls.body if cls else []) if isinstance(n, ast.FunctionDef)
+               and n.name == "_adopt_copies"), None)
+    if fn is None:
+        raise PatchDriftError("HiSparseCoordinator._adopt_copies missing (expected vLLM " + PINNED_VLLM + ")")
+    body = "".join(src.splitlines(keepends=True)[fn.lineno - 1:fn.end_lineno])
+    if body.count(ADOPT_OLD) != 1:
+        raise PatchDriftError(f"_adopt_copies anchor: expected 1, found {body.count(ADOPT_OLD)}")
+    out = textwrap.dedent(body.replace(ADOPT_OLD, ADOPT_NEW))
+    compile(out, f"<{PATCH_NAME}:adopt>", "exec")
+    return out
+
+
+def install_adopt_method(coord, method_src: str, path: Path) -> None:
+    import __future__
+    import linecache
+
+    fname = f"{path}.{PATCH_NAME}-adopt.py"
+    linecache.cache[fname] = (len(method_src), None, method_src.splitlines(True), fname)
+    ns: dict = {}
+    exec(compile(method_src, fname, "exec", __future__.annotations.compiler_flag,
+                 dont_inherit=True), coord.__dict__, ns)
+    ns["_adopt_copies"].__qualname__ = "HiSparseCoordinator._adopt_copies"
+    coord.HiSparseCoordinator._adopt_copies = ns["_adopt_copies"]
+
+
 def patch_hot_methods(src: str) -> dict:
     """HiSparseHotManager methods with the counted-allocation guard."""
     import ast
@@ -706,6 +754,8 @@ def apply(module=None) -> bool:
     check_layout_source(Path(layout.__file__).read_text())
     stc = importlib.import_module(STC_MODULE)
     hot = patch_hot_methods(Path(stc.__file__).read_text())
+    coord = importlib.import_module(COORD_MODULE)
+    adopt = patch_adopt_method(Path(coord.__file__).read_text())
     mixed = None
     if mixed_gate_enabled():
         connector = importlib.import_module(CONNECTOR_MODULE)
@@ -716,6 +766,7 @@ def apply(module=None) -> bool:
         install_prefetch(runtime, prefetch, rt_path)
     install_profiling_host_pool(layout)
     install_hot_methods(stc, hot, Path(stc.__file__))
+    install_adopt_method(coord, adopt, Path(coord.__file__))
     if mixed is not None:
         install_connector_method(connector, mixed, Path(connector.__file__))
     exec_patched_source(module, new_src, src_path)
@@ -725,7 +776,7 @@ def apply(module=None) -> bool:
           f"+ prefill staging plan w/o prefill backend "
           f"+ serialized shared host-pool pinning "
           f"+ minimal profiling host pool "
-          f"+ counted hot-region allocation "
+          f"+ counted hot-region allocation + in-use-only copy adoption "
           + ("+ follower prefetch for multi-token decode "
              if prefetch is not None else "")
           + ("+ prefill-only residency flag (mixed batches) "

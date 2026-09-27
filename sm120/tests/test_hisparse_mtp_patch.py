@@ -225,7 +225,61 @@ def _fake_runtime(monkeypatch, tmp_path, src=None):
     monkeypatch.setitem(sys.modules, P.RUNTIME_MODULE, rt)
     monkeypatch.setitem(sys.modules, P.LAYOUT_MODULE, _fake_layout()[0])
     monkeypatch.setitem(sys.modules, P.STC_MODULE, _fake_stc(tmp_path))
+    monkeypatch.setitem(sys.modules, P.COORD_MODULE, _fake_coord(tmp_path))
     return rt
+
+
+COORD_FIXTURE = (
+    "class HiSparseCoordinator:\n"
+    "    def __init__(self, managers):\n"
+    "        self.resident_managers = managers\n"
+    "        self.copies = {}\n"
+    "    def _adopt_copies(\n"
+    "        self,\n"
+    "        request_id,\n"
+    "        state,\n"
+    "        host_blocks,\n"
+    "    ):\n"
+    "        if not self.copies:\n"
+    "            return\n"
+    "        for host_idx, host_block in enumerate(host_blocks):\n"
+    "            if host_block.is_null or host_block.block_hash is None:\n"
+    "                continue\n"
+    "            blocks = self.copies.get(host_block.block_hash)\n"
+    "            if blocks is None:\n"
+    "                continue\n"
+    "            for manager, block in zip(self.resident_managers, blocks):\n"
+    "                if manager.adopt_resident_page(request_id, host_idx, block):\n"
+    "                    manager.block_pool.touch([block])\n"
+    "                    state.pinned_clean.add(host_idx)\n"
+)
+
+
+def _fake_coord(tmp_path):
+    path = tmp_path / "coordinator.py"
+    path.write_text(COORD_FIXTURE)
+    coord = types.ModuleType(P.COORD_MODULE)
+    coord.__file__ = str(path)
+    exec(COORD_FIXTURE, coord.__dict__)
+    return coord
+
+
+def test_adopt_copies_never_takes_a_free_block(tmp_path):
+    """_adopt_copies runs after the admission check: touching a FREE cached copy
+    removes it from the free queue uncounted (-> 'Cannot get N free blocks')."""
+    coord = _fake_coord(tmp_path)
+    touched = []
+    B = types.SimpleNamespace
+    pool = B(touch=lambda bs: touched.extend(bs))
+    mgr = B(block_pool=pool, adopt_resident_page=lambda r, i, b: True)
+    c = coord.HiSparseCoordinator([mgr])
+    free, used = B(ref_cnt=0), B(ref_cnt=2)
+    c.copies = {"h0": (free,), "h1": (used,)}
+    host = [B(is_null=False, block_hash="h0"), B(is_null=False, block_hash="h1")]
+    state = B(pinned_clean=set())
+    P.install_adopt_method(coord, P.patch_adopt_method(COORD_FIXTURE), tmp_path / "x.py")
+    c._adopt_copies("r", state, host)
+    assert touched == [used] and state.pinned_clean == {1}
 
 
 # Minimal HiSparseHotManager carrying the pinned vLLM 0.30.0 method text the
