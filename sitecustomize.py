@@ -210,6 +210,14 @@ if os.environ.get("SUFFIX_HYBRID_WRAP", "").strip() == "1":
 # the load bucket (c1/c2-6/c7-12/c13-24/c25+) held <skip> steps, <per>
 # windows per bucket; one "[suffix-prof]" summary block per window.
 # Fail-soft: a profiler error never touches serving.
+if os.environ.get("SUFFIX_PROFILE_WORKER", "").strip():
+    try:
+        from suffix_hybrid.step_profiler import install_worker_hook
+        install_worker_hook()
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        import sys
+        print(f"[suffix-prof] worker hook failed: {exc!r}", file=sys.stderr, flush=True)
+
 if os.environ.get("SUFFIX_PROFILE_STEPS", "").strip():
     try:
         from suffix_hybrid.step_profiler import (

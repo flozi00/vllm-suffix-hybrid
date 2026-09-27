@@ -144,3 +144,21 @@ def test_patch_is_idempotent(monkeypatch):
     sp._patch(mod)
     assert EngineCoreProc._process_engine_step is first
     assert first.__wrapped__ is not None
+
+
+def test_worker_profiler_wraps_execute_model_and_passes_results(monkeypatch):
+    import types
+    from suffix_hybrid import step_profiler as sp
+
+    monkeypatch.setenv(sp.WORKER_ENV, "2:1")
+    mod = types.ModuleType(sp._WORKER_MODULE)
+
+    class Worker:
+        def execute_model(self, x):
+            return x * 2
+
+    mod.Worker = Worker
+    sp._patch_worker(mod)
+    assert Worker._suffix_worker_prof and Worker().execute_model(21) == 42
+    sp._patch_worker(mod)  # idempotent
+    assert Worker().execute_model(1) == 2  # not rank 0 here (no vllm): never profiles

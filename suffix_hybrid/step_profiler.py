@@ -579,6 +579,119 @@ def install_post_import_hook() -> None:
     sys.meta_path.insert(0, finder)
 
 
+
+# --------------------------------------------------------------------------
+# Worker-side profiler: SUFFIX_PROFILE_WORKER=<N>:<skip>[:<windows>]. The
+# EngineCore window above sees no GPU work at TP>1 (the kernels run in the
+# worker processes). This wraps Worker.execute_model on TP rank 0 only: after
+# <skip> calls it profiles the next <N> (CPU+CUDA, everything in between incl.
+# sample_tokens and collectives), prints the same summary, repeats <windows>
+# times (default 1) with <skip> calls between windows. Fail-soft, never alters
+# a result.
+WORKER_ENV = "SUFFIX_PROFILE_WORKER"
+_WORKER_MODULE = "vllm.v1.worker.gpu_worker"
+
+
+def _patch_worker(module) -> None:
+    cfg = parse_env(os.environ.get(WORKER_ENV))
+    cls = getattr(module, "Worker", None)
+    if cfg is None or cls is None or getattr(cls, "_suffix_worker_prof", False):
+        return
+    n, skip, windows = cfg
+    orig = cls.execute_model
+    st = {"calls": 0, "prof": None, "left": windows, "t0": 0.0, "k": 0}
+
+    def rank0() -> bool:
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+            return get_tensor_model_parallel_rank() == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    def finish() -> None:
+        import torch
+        prof, st["prof"] = st["prof"], None
+        wall = time.perf_counter() - st["t0"]
+        torch.cuda.synchronize()
+        prof.__exit__(None, None, None)
+        st["k"] += 1
+        path = f"/tmp/suffix-wprof-{os.getpid()}-{st['k']}.json"
+        prof.export_chrome_trace(path)
+        _say(f"worker window {st['k']}: {n} execute_model calls in "
+             f"{wall * 1e3:.0f} ms ({wall * 1e3 / n:.2f} ms/call); trace {path}")
+
+        def work():
+            try:
+                with open(path) as fh:
+                    lines = summarize(json.load(fh))
+                print("\n".join(f"{MARK} worker {ln}" for ln in lines),
+                      file=sys.stderr, flush=True)
+            except Exception as exc:  # noqa: BLE001
+                _say(f"worker summary FAILED (trace kept at {path}): {exc!r}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @functools.wraps(orig)
+    def execute_model(self, *a, **kw):
+        if st["left"] <= 0:
+            return orig(self, *a, **kw)
+        try:
+            if st["prof"] is None and rank0():
+                st["calls"] += 1
+                if st["calls"] > skip:
+                    from torch.profiler import ProfilerActivity, profile
+                    st["prof"] = profile(activities=[ProfilerActivity.CPU,
+                                                     ProfilerActivity.CUDA])
+                    st["prof"].__enter__()
+                    st["t0"], st["calls"] = time.perf_counter(), 0
+                    _say(f"worker window START on rank 0 (pid {os.getpid()})")
+            elif st["prof"] is not None:
+                st["calls"] += 1
+                if st["calls"] >= n:
+                    st["left"] -= 1
+                    st["calls"] = 0
+                    finish()
+        except Exception as exc:  # noqa: BLE001
+            st["left"] = 0
+            _say(f"worker profiler abandoned (serving unaffected): {exc!r}")
+        return orig(self, *a, **kw)
+
+    cls.execute_model = execute_model
+    cls._suffix_worker_prof = True
+    _say(f"worker profiler armed on Worker.execute_model (rank 0): {n} calls "
+         f"per window after {skip}, {windows} window(s)")
+
+
+def install_worker_hook() -> None:
+    """Patch vllm.v1.worker.gpu_worker right after it executes. Never raises."""
+    if parse_env(os.environ.get(WORKER_ENV)) is None:
+        return
+    if _WORKER_MODULE in sys.modules:
+        _patch_worker(sys.modules[_WORKER_MODULE])
+        return
+
+    class _WFinder:
+        def find_spec(self, fullname, path, target=None):  # noqa: ARG002
+            if fullname != _WORKER_MODULE:
+                return None
+            sys.meta_path[:] = [f for f in sys.meta_path if f is not self]
+            spec = importlib.util.find_spec(fullname)
+            if spec is None or spec.loader is None:
+                return None
+            real_exec = spec.loader.exec_module
+
+            def exec_module(module, *a, **kw):
+                real_exec(module, *a, **kw)
+                try:
+                    _patch_worker(module)
+                except Exception as exc:  # noqa: BLE001
+                    _say(f"worker patch failed, profiler off: {exc!r}")
+
+            spec.loader.exec_module = exec_module  # type: ignore[method-assign]
+            return spec
+
+    sys.meta_path.insert(0, _WFinder())
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit("usage: python -m suffix_hybrid.step_profiler <trace.json>")
