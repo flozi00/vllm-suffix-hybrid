@@ -44,7 +44,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-ds-mla"
-PATCH_REVISION = "2026-09-26.3"
+PATCH_REVISION = "2026-09-27.1"
 PINNED_VLLM = "0.30.0"
 GATE_ENV = "SUFFIX_SM120_NVP4DSMLA"
 MARKER_ATTR = "__suffix_nvfp4_ds_mla_revision__"
@@ -172,6 +172,36 @@ IMPL_EDITS = [
         1,
     ),
 ]
+
+# HiSparse mixed batches (SUFFIX_SM120_HISPARSE_MIXED=1): stock only takes the
+# direct resident read for the prefill slice when the batch has NO decodes, so
+# every mixed step re-staged the prefill's whole context in every layer (the
+# 2026-09-27 prod decode freeze under a 90k prefill). With the connector flag
+# narrowed to prefill requests (hisparse_mtp_patch), a resident prefill slice
+# is converted straight through the leader's resident block table. Fresh
+# triton conversion, never _convert_once: followers reuse the leader's cached
+# result in the decode workspace, which the decode slice already owns.
+IMPL_EDITS.append((
+    "hisparse_mixed_resident_prefill",
+    "                if num_decode_tokens == 0 and cache.all_context_pages_resident:\n",
+    "                if (_SUFFIX_HISPARSE_MIXED and num_decode_tokens\n"
+    "                        and cache.all_context_pages_resident):\n"
+    + "    " + _TAG
+    + "                    _leader = index_group.cache(0)\n"
+    "                    topk_indices_physical = triton_convert_req_index_to_global_index(\n"
+    "                        attn_metadata.req_id_per_token[num_decode_tokens:num_actual_toks],\n"
+    "                        _leader.block_table,\n"
+    "                        topk_indices[num_decode_tokens:],\n"
+    "                        BLOCK_SIZE=_leader.view.block_size,\n"
+    "                        BLOCK_STRIDE_ROWS=_leader.view.attention_block_stride,\n"
+    "                        NUM_TOPK_TOKENS=topk_indices.shape[1],\n"
+    "                    )\n"
+    "                    prefill_cache = index_group.physical_kv_cache(\n"
+    "                        self.index_group_index\n"
+    "                    )\n"
+    "                elif num_decode_tokens == 0 and cache.all_context_pages_resident:\n",
+    1,
+))
 
 INDEX_GROUP_EDITS = [
     (
@@ -337,6 +367,7 @@ def _suffix_nvfp4_ds_mla_write(kv_c, k_pe, kv_cache, slot_mapping) -> None:
 
 
 _HELPERS = {
+    "_SUFFIX_HISPARSE_MIXED": os.environ.get("SUFFIX_SM120_HISPARSE_MIXED", "").strip() == "1",
     "_suffix_nvfp4_ds_mla_init": _suffix_nvfp4_ds_mla_init,
     "_suffix_nvfp4_ds_mla_decode": _suffix_nvfp4_ds_mla_decode,
     "_suffix_nvfp4_ds_mla_write": _suffix_nvfp4_ds_mla_write,

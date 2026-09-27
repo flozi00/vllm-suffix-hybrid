@@ -297,6 +297,14 @@ _BOOT_GATES = {
                                 "--index-offset", "3", "--batched-tokens", "256",
                                 "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
                                {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}),
+    # Multi oracle with the mixed-batch fix on (SUFFIX_SM120_HISPARSE_MIXED):
+    # resident prefill slices next to decodes skip the full-context staging.
+    "glm_stack_mixed_oracle": (["-m", "hisparse_mtp_patch.oracle", "--multi",
+                                "--k", "5", "--layers", "8", "--index-freq", "4",
+                                "--index-offset", "3", "--batched-tokens", "256",
+                                "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
+                               {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1",
+                                "SUFFIX_SM120_HISPARSE_MIXED": "1"}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():

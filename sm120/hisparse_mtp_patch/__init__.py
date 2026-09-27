@@ -82,7 +82,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-09-26.5"
+PATCH_REVISION = "2026-09-27.1"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
@@ -536,6 +536,60 @@ def install_prefetch(runtime, methods: dict, rt_path: Path) -> None:
         setattr(cls, name, ns[name])
 
 
+MIXED_ENV = "SUFFIX_SM120_HISPARSE_MIXED"
+CONNECTOR_MODULE = "vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector"
+# all_context_pages_resident is only read for the prefill slice; stock computes
+# it over EVERY scheduled request, so one decode with an evicted page forced the
+# prefill onto the host-staging path. Narrow it to the requests the backend will
+# treat as prefills (query > 1 + spec lookahead = the decode threshold).
+MIXED_OLD = "            self.coordinator.all_context_pages_resident(scheduled_requests),\n"
+MIXED_NEW = (
+    "            self.coordinator.all_context_pages_resident(tuple(  # " + HELPER_TAG + "\n"
+    "                r for r in scheduled_requests\n"
+    "                if r[2] > 1 + self.draft_kv_lookahead)),\n")
+
+
+def mixed_gate_enabled() -> bool:
+    return os.environ.get(MIXED_ENV, "").strip() == "1"
+
+
+def patch_connector_method(src: str) -> str:
+    """HiSparseConnectorScheduler.build_connector_meta with the narrowed
+    residency flag (dedented, compilable)."""
+    import ast
+    import textwrap
+
+    if src.count(MIXED_OLD) != 1:
+        raise PatchDriftError(
+            f"hisparse/connector.py residency anchor: expected 1, found "
+            f"{src.count(MIXED_OLD)} (expected vLLM {PINNED_VLLM})")
+    cls = next((n for n in ast.parse(src).body if isinstance(n, ast.ClassDef)
+                and n.name == "HiSparseConnectorScheduler"), None)
+    fn = next((n for n in (cls.body if cls else []) if isinstance(n, ast.FunctionDef)
+               and n.name == "build_connector_meta"), None)
+    if fn is None:
+        raise PatchDriftError("HiSparseConnectorScheduler.build_connector_meta missing")
+    body = "".join(src.splitlines(keepends=True)[fn.lineno - 1:fn.end_lineno])
+    if body.count(MIXED_OLD) != 1:
+        raise PatchDriftError("residency anchor not inside build_connector_meta")
+    out = textwrap.dedent(body.replace(MIXED_OLD, MIXED_NEW))
+    compile(out, f"<{PATCH_NAME}:mixed>", "exec")
+    return out
+
+
+def install_connector_method(connector, method_src: str, path: Path) -> None:
+    import __future__
+    import linecache
+
+    fname = f"{path}.{PATCH_NAME}-mixed-build_connector_meta.py"
+    linecache.cache[fname] = (len(method_src), None, method_src.splitlines(True), fname)
+    ns: dict = {}
+    exec(compile(method_src, fname, "exec", __future__.annotations.compiler_flag,
+                 dont_inherit=True), connector.__dict__, ns)
+    ns["build_connector_meta"].__qualname__ = "HiSparseConnectorScheduler.build_connector_meta"
+    connector.HiSparseConnectorScheduler.build_connector_meta = ns["build_connector_meta"]
+
+
 def patch_source(src: str) -> tuple[str, list[str]]:
     """Pure transform of sparse_mla_attention.py. Every anchor is
     count-verified BEFORE any replacement (all failures reported at once)."""
@@ -595,11 +649,17 @@ def apply(module=None) -> bool:
     prefetch = patch_prefetch_source(rt_src) if prefetch_gate_enabled() else None
     layout = importlib.import_module(LAYOUT_MODULE)
     check_layout_source(Path(layout.__file__).read_text())
+    mixed = None
+    if mixed_gate_enabled():
+        connector = importlib.import_module(CONNECTOR_MODULE)
+        mixed = patch_connector_method(Path(connector.__file__).read_text())
     # Every file verified before any changes (fail closed, all or nothing).
     exec_patched_source(runtime, rt_new, rt_path)
     if prefetch is not None:
         install_prefetch(runtime, prefetch, rt_path)
     install_profiling_host_pool(layout)
+    if mixed is not None:
+        install_connector_method(connector, mixed, Path(connector.__file__))
     exec_patched_source(module, new_src, src_path)
     setattr(module, MARKER_ATTR, PATCH_REVISION)
     print(f"[suffix {PATCH_NAME}] ACTIVE on SM120: HiSparse spec-verify tokens "
@@ -609,6 +669,8 @@ def apply(module=None) -> bool:
           f"+ minimal profiling host pool "
           + ("+ follower prefetch for multi-token decode "
              if prefetch is not None else "")
+          + ("+ prefill-only residency flag (mixed batches) "
+             if mixed is not None else "")
           +
           f"(rev {PATCH_REVISION}; {len(applied) + 6 + (len(prefetch) if prefetch else 0)} anchors; vllm {ver}).",
           file=sys.stderr, flush=True)
