@@ -211,8 +211,9 @@ def child(mode: str, a) -> dict:
         max_num_seqs=4 if a.multi else 1, max_num_batched_tokens=a.batched_tokens,
         enable_prefix_caching=True, enable_chunked_prefill=True,
         gpu_memory_utilization=a.gpu_util, speculative_config=spec,
-        compilation_config={"cudagraph_mode": "FULL_AND_PIECEWISE",
-                            "cudagraph_capture_sizes": [1, 2, 4, 8]},
+        compilation_config=({"cudagraph_mode": "NONE"} if a.eager else
+                            {"cudagraph_mode": "FULL_AND_PIECEWISE",
+                             "cudagraph_capture_sizes": [1, 2, 4, 8]}),
         tensor_parallel_size=a.tp,
         # tp>1: "mp" workers = the only executor with the shared HiSparse
         # host pool (runtime.py use_shared_hisparse_host_pool).
@@ -529,6 +530,8 @@ def main(argv=None) -> int:
     ap.add_argument("--tp", type=int, default=1,
                     help="tensor_parallel_size; >1 exercises the shared (mmap) "
                          "HiSparse host pool, i.e. prod's TP=8 registration path")
+    ap.add_argument("--eager", action="store_true",
+                    help="no CUDA graphs: CUDA_LAUNCH_BLOCKING cannot see into graph replays")
     ap.add_argument("--multi", action="store_true",
                     help="max_num_seqs=4 IndexShare stress (see module doc)")
     ap.add_argument("--index-freq", type=int, default=4)

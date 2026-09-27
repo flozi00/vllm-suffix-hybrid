@@ -348,7 +348,7 @@ _BOOT_GATES = {
     # Same as glm_stack_multi_oracle with synchronous launches: the step-55
     # cudaErrorIllegalAddress (2026-09-27) surfaced asynchronously at the host
     # mirror sync; blocking launches name the faulting kernel.
-    "glm_stack_multi_debug": (["-m", "hisparse_mtp_patch.oracle", "--multi",
+    "glm_stack_multi_debug": (["-m", "hisparse_mtp_patch.oracle", "--multi", "--eager",
                                "--k", "5", "--layers", "8", "--index-freq", "4",
                                "--index-offset", "3", "--batched-tokens", "256",
                                "--gpu-blocks", "-1", "--kv-cache-dtype", "nvfp4_ds_mla"],
