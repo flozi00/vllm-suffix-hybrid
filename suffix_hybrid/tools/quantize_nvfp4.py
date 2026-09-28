@@ -39,6 +39,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import sys
@@ -55,7 +56,7 @@ TOOL_VERSION = "1"
 # vision tower, MTP head, conv1d, in_proj_b / in_proj_a gates, A_log,
 # dt_bias, all norms) is copied bf16/fp32 byte-identical.
 QUANT_RE = re.compile(
-    r"^(?:model\.language_model\.|language_model\.model\.|model\.)layers\.(\d+)\."
+    r"^(?:model\.language_model\.|language_model\.model\.|model\.)?layers\.(\d+)\."
     r"(self_attn\.(?:q_proj|k_proj|v_proj|o_proj)"
     r"|mlp\.(?:gate_proj|up_proj|down_proj)"
     r"|linear_attn\.(?:in_proj_qkv|in_proj_z|out_proj))\.weight$"
@@ -256,10 +257,96 @@ def build_manifest(src: Path, source_hashes: dict, args, stats: dict) -> dict:
 # ---------------------------------------------------------------------------
 # calibration (GPU; transformers; offline)
 # ---------------------------------------------------------------------------
+def is_embedding_model(src: Path) -> bool:
+    """sentence-transformers layout, a bidirectional config, or a bare *Model
+    architecture (no LM head): these cannot generate -> calibrate by encoding."""
+    cfg = json.loads((src / "config.json").read_text())
+    archs = cfg.get("architectures") or []
+    return ((src / "modules.json").is_file() or cfg.get("is_causal") is False
+            or (bool(archs) and all(a.endswith("Model") for a in archs)))
+
+
+def calibrate_embed(src: Path, args) -> dict[str, float]:
+    """Embedding models: AutoModel forward passes over plain calibration texts
+    (queries, passages, and long concatenated documents up to 4k tokens) with
+    the same per-linear input |x| max hooks as calibrate()."""
+    import torch
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
+
+    from suffix_hybrid.tools.calib_prompts import PROMPTS
+
+    torch.manual_seed(args.seed)
+    cfg = AutoConfig.from_pretrained(src)
+    tok = AutoTokenizer.from_pretrained(src)
+    with torch.device("cuda"):
+        model = AutoModel.from_config(cfg, dtype=torch.bfloat16)
+    model.eval()
+    _load_checkpoint_into(model, src)
+    amax, hooks = _amax_hooks(model)
+    rng = random.Random(args.seed)
+    texts = [f"query: {p}" for p in PROMPTS] + [f"passage: {p} " * 8 for p in PROMPTS]
+    while len(texts) < args.samples:  # long documents: 16-64 prompts glued together
+        texts.append(" ".join(rng.choice(PROMPTS) for _ in range(rng.randint(16, 64))))
+    texts = texts[: max(args.samples, 1)]
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    bs = max(1, args.batch // 4)
+    with torch.inference_mode():
+        for i in range(0, len(texts), bs):
+            enc = tok(texts[i:i + bs], return_tensors="pt", padding=True, truncation=True,
+                      max_length=4096).to("cuda")
+            model(**enc)
+            print(f"[quantize-nvfp4] embed calib {min(i + bs, len(texts))}/{len(texts)} "
+                  f"({len(amax)} linears seen)", flush=True)
+    for h in hooks:
+        h.remove()
+    del model
+    torch.cuda.empty_cache()
+    return amax
+
+
+def _load_checkpoint_into(model, src: Path) -> None:
+    import torch
+    from safetensors import safe_open
+    params = dict(model.named_parameters())
+    shards = sorted(src.glob("*.safetensors"))
+    ckpt_shapes = {}
+    for f in shards:
+        with safe_open(str(f), framework="pt", device="cpu") as st:
+            for key in st.keys():
+                ckpt_shapes[key] = st.get_slice(key).get_shape()
+    mapping, missing = match_checkpoint(
+        ckpt_shapes, {n: tuple(p.shape) for n, p in params.items()})
+    if missing:
+        raise RuntimeError(f"calibration model ({type(model).__name__}) has {len(missing)} "
+                           f"params not in the checkpoint, e.g. {missing[:3]}")
+    for f in shards:
+        with safe_open(str(f), framework="pt", device="cuda") as st:
+            for key in st.keys():
+                if key in mapping:
+                    with torch.no_grad():
+                        params[mapping[key]].copy_(st.get_tensor(key))
+    print(f"[quantize-nvfp4] calibration model {type(model).__name__}: "
+          f"{len(mapping)} checkpoint tensors loaded", flush=True)
+
+
+def _amax_hooks(model):
+    import torch
+    amax: dict[str, float] = {}
+    hooks = []
+    for name, mod in model.named_modules():
+        if isinstance(mod, torch.nn.Linear) and classify(name + ".weight"):
+            def hook(m, inp, _n=canonical(name)):
+                v = float(inp[0].detach().abs().amax())
+                if v > amax.get(_n, 0.0):
+                    amax[_n] = v
+            hooks.append(mod.register_forward_pre_hook(hook))
+    return amax, hooks
+
+
 def calibrate(src: Path, args) -> dict[str, float]:
     """-> {canonical(module name): input |x| max} for every allowlisted linear."""
     import torch
-    from safetensors import safe_open
     from transformers import AutoConfig, AutoModelForImageTextToText, AutoTokenizer
 
     from suffix_hybrid.tools.calib_prompts import PROMPTS
@@ -278,37 +365,8 @@ def calibrate(src: Path, args) -> dict[str, float]:
     with torch.device("cuda"):
         model = AutoModelForImageTextToText.from_config(cfg, dtype=torch.bfloat16)
     model.eval()
-    params = dict(model.named_parameters())  # tied lm_head appears once
-    shards = sorted(src.glob("*.safetensors"))
-    ckpt_shapes, where = {}, {}
-    for f in shards:
-        with safe_open(str(f), framework="pt", device="cpu") as st:
-            for key in st.keys():
-                ckpt_shapes[key] = st.get_slice(key).get_shape()
-                where[key] = f
-    mapping, missing = match_checkpoint(
-        ckpt_shapes, {n: tuple(p.shape) for n, p in params.items()})
-    if missing:
-        raise RuntimeError(f"calibration model ({type(model).__name__}) has {len(missing)} "
-                           f"params not in the checkpoint, e.g. {missing[:3]}")
-    for f in shards:
-        with safe_open(str(f), framework="pt", device="cuda") as st:
-            for key in st.keys():
-                if key in mapping:
-                    with torch.no_grad():
-                        params[mapping[key]].copy_(st.get_tensor(key))
-    print(f"[quantize-nvfp4] calibration model {type(model).__name__}: "
-          f"{len(mapping)} checkpoint tensors loaded", flush=True)
-
-    amax: dict[str, float] = {}
-    hooks = []
-    for name, mod in model.named_modules():
-        if isinstance(mod, torch.nn.Linear) and classify(name + ".weight"):
-            def hook(m, inp, _n=canonical(name)):
-                v = float(inp[0].detach().abs().amax())
-                if v > amax.get(_n, 0.0):
-                    amax[_n] = v
-            hooks.append(mod.register_forward_pre_hook(hook))
+    _load_checkpoint_into(model, src)
+    amax, hooks = _amax_hooks(model)
     n_prompts = len(PROMPTS)
     per = max(1, -(-args.samples // n_prompts))
     texts = []
@@ -405,10 +463,19 @@ def write_checkpoint(src: Path, out: Path, w_amax, key_group, a_amax, device: st
 
 
 def copy_side_files(src: Path, out: Path):
-    for f in src.iterdir():
-        if f.is_file() and not f.name.startswith(".") and f.suffix in COPY_FILES and f.name not in (
-                "model.safetensors.index.json", "config.json"):
-            shutil.copy2(f, out / f.name)
+    # Recursive: sentence-transformers checkpoints keep their pooling config in
+    # 1_Pooling/config.json (vLLM's pooler reads it -- dropped, a mean-pooling
+    # embedder silently falls back to another pooling mode) and 2_Normalize/.
+    for f in src.rglob("*"):
+        rel = f.relative_to(src)
+        if (f.is_file() and not any(part.startswith(".") for part in rel.parts)
+                and f.suffix in COPY_FILES
+                and str(rel) not in ("model.safetensors.index.json", "config.json")):
+            (out / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, out / rel)
+    for d in src.rglob("*"):  # empty module dirs (2_Normalize) are part of modules.json
+        if d.is_dir() and not any(part.startswith(".") for part in d.relative_to(src).parts):
+            (out / d.relative_to(src)).mkdir(parents=True, exist_ok=True)
     cfg = json.loads((src / "config.json").read_text())
     cfg["quantization_config"] = quant_config()
     (out / "config.json").write_text(json.dumps(cfg, indent=1))
@@ -419,8 +486,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--src", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--calib", choices=["selfgen", "none"], default="selfgen",
-                    help="none = input_scale from weights only (TEST ONLY; not servable)")
+    ap.add_argument("--calib", choices=["auto", "selfgen", "embed", "none"], default="auto",
+                    help="auto = embed for embedding models (is_embedding_model), else "
+                         "selfgen; none = input_scale from weights only (TEST ONLY)")
     ap.add_argument("--samples", type=int, default=256)
     ap.add_argument("--gen-tokens", type=int, default=192)
     ap.add_argument("--batch", type=int, default=16)
@@ -439,8 +507,13 @@ def main(argv=None) -> int:
     w_amax, key_group = group_amax(src)
     print(f"[quantize-nvfp4] {len(key_group)} linears in {len(w_amax)} fused groups",
           flush=True)
+    if args.calib == "auto":
+        args.calib = "embed" if is_embedding_model(src) else "selfgen"
+        print(f"[quantize-nvfp4] calibration mode: {args.calib}", flush=True)
     if args.calib == "selfgen":
         act = calibrate(src, args)
+    elif args.calib == "embed":
+        act = calibrate_embed(src, args)
     else:
         act = {canonical(module_name(k)): 1.0 for k in key_group}
     a_amax = act_group_amax(act, key_group)

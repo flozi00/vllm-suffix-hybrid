@@ -212,3 +212,38 @@ def test_names_from_the_real_transformers_class():
     assert missing == []
     assert {q.canonical(q.module_name(k)) for k in ckpt if q.classify(k)} == \
         {q.canonical(n) for n in hooked}
+
+
+def test_embedding_checkpoint_layout(tmp_path):
+    """Nemotron-3-Embed-8B (Ministral3Model, sentence-transformers): bare
+    `layers.N.` names quantize, embeddings/norms stay bf16, the model is
+    calibrated by encoding (it cannot generate), and the pooling config in
+    1_Pooling/ survives the copy (vLLM's pooler reads it)."""
+    import json as _json
+    from suffix_hybrid.tools import quantize_nvfp4 as q
+
+    assert q.classify("layers.0.self_attn.q_proj.weight")[2] == "layers.0.self_attn.qkv"
+    assert q.classify("layers.3.mlp.down_proj.weight") is not None
+    assert q.classify("embed_tokens.weight") is None
+    assert q.classify("layers.0.input_layernorm.weight") is None
+    src, out = tmp_path / "src", tmp_path / "out"
+    (src / "1_Pooling").mkdir(parents=True)
+    (src / "2_Normalize").mkdir()
+    (src / "config.json").write_text(_json.dumps({"architectures": ["Ministral3Model"],
+                                                  "is_causal": False}))
+    (src / "modules.json").write_text("[]")
+    (src / "1_Pooling" / "config.json").write_text('{"pooling_mode_mean_tokens": true}')
+    assert q.is_embedding_model(src)
+    out.mkdir()
+    q.copy_side_files(src, out)
+    assert (out / "1_Pooling" / "config.json").read_text() == '{"pooling_mode_mean_tokens": true}'
+    assert (out / "2_Normalize").is_dir() and (out / "modules.json").is_file()
+    assert "quantization_config" in _json.loads((out / "config.json").read_text())
+
+
+def test_causal_lm_is_not_an_embedding_model(tmp_path):
+    import json as _json
+    from suffix_hybrid.tools import quantize_nvfp4 as q
+    (tmp_path / "config.json").write_text(_json.dumps(
+        {"architectures": ["Qwen3_5ForConditionalGeneration"]}))
+    assert not q.is_embedding_model(tmp_path)
