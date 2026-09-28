@@ -113,3 +113,22 @@ def test_greedy_ok_tolerates_only_bf16_ties():
     ref = torch.tensor([[10.0, 9.99, 0.0], [1.0, 3.0, 2.0]])
     assert lh.greedy_ok(ref, torch.tensor([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]))  # tie
     assert not lh.greedy_ok(ref, torch.tensor([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]))
+
+
+def test_load_oracle_runs_for_every_m(monkeypatch):
+    """load_oracle checks M in (1, 4, MAX_M); its screen-only mask must be per
+    input row (a [1, R] mask crashed both gemma dev pods at M=4, 2026-09-28)."""
+    n, k = 1024, 256
+    w, _x, g_w, (quant, gemm) = _lm_problem(n=n, k=k, m=1)
+    wq, bits, _ = ng.quantize(w.float().numpy(), g_w)
+    st = {"n": n, "k": k, "g_w": g_w, "wq": torch.from_numpy(wq),
+          "wsf": torch.from_numpy(ng.swizzle_sf(bits))}
+
+    def run(_st, x):
+        return lh.logits_nvfp4(x, w, g_w, quant, gemm)
+
+    # the CPU gemm twin rounds its output to bf16 (the device kernel does not):
+    # this test is about per-row mask shapes, not the plumbing tolerance
+    monkeypatch.setattr(lh, "PLUMB_REL", 5e-2)
+    res = lh.load_oracle(st, run, quant, lambda x: x @ w.t(), n_rows=128)
+    assert {"m1", "m4", f"m{lh.MAX_M}"} <= set(res) and res["plumb_rel"] <= lh.PLUMB_REL

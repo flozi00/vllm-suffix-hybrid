@@ -204,7 +204,9 @@ def load_oracle(st, run, quant, stock, n_rows=256, seed=0) -> dict:
                                           g_x, st["g_w"]))
         sub = got.float()[:, torch.from_numpy(rows).to(dev)].cpu()
         top = got.float().topk(min(RESCORE, n), dim=-1).indices.cpu().numpy()
-        keep = torch.from_numpy(~np.isin(rows[None, :], top))  # screen-only cells
+        # screen-only cells, per input row (a [1, R] mask broke M > 1: gemma
+        # dev pods 2026-09-28 "mask [1, 256] ... indexed tensor [4, 256]")
+        keep = torch.from_numpy(np.stack([~np.isin(rows, top[i]) for i in range(m)]))
         rel = float((sub - ref)[keep].norm() / ref[keep].norm().clamp_min(1e-30))
         want = stock(x)
         if not rel <= PLUMB_REL or not torch.isfinite(got).all():
