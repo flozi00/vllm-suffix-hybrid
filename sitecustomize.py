@@ -20,6 +20,9 @@ PYTHONPATH. Each section is independently gated:
   SUFFIX_FP8_DENSE=1        -> arm the deferred FP8 W8A8 dense-linear patch
                                (fp8_dense_patch/; SUFFIX_FP8_DENSE_LAYERS =
                                glob allowlist; fail closed when enabled)
+  SUFFIX_NVFP4_DENSE=1       -> same patch, NVFP4 W4A4 mode (vLLM ModelOpt
+                               method; SUFFIX_NVFP4_DENSE_LAYERS allowlist,
+                               SUFFIX_NVFP4_DENSE_ACT_AMAX overrides)
   SUFFIX_SM120_NVP4KV_ORACLE=1 -> run the NVFP4-KV on-silicon oracle once per
                                pod before serving (fatal only with NVP4KV=1)
   SUFFIX_FICACHE=seed|dump|both -> FlashInfer autotune cache seed/harvest
@@ -185,7 +188,10 @@ if os.environ.get("SUFFIX_SM120_NVP4DSMLA", "").strip() == "1":
 # load (per-channel weights, dynamic per-token activations, vLLM's SM120
 # cutlass_scaled_mm). Hook on model_loader.utils; the SM120 check and the
 # per-shape kernel self-test run at conversion on the worker. Unset = inert.
-if os.environ.get("SUFFIX_FP8_DENSE", "").strip() == "1":
+# SUFFIX_NVFP4_DENSE=1 (same hook): allowlisted BF16 linears -> vLLM ModelOpt
+# NVFP4 W4A4 layers (static activation global scale from proven input bounds).
+if (os.environ.get("SUFFIX_FP8_DENSE", "").strip() == "1"
+        or os.environ.get("SUFFIX_NVFP4_DENSE", "").strip() == "1"):
     try:
         from fp8_dense_patch import install_post_import_hook as _fp8d_hook
         _fp8d_hook()
@@ -366,6 +372,10 @@ _BOOT_GATES = {
     # FP8 vs BF16 / exact-dequant error per layer type + us/call BF16 vs FP8
     # at M 6..192 (CUDA graphs, L2-busting weight rotation).
     "fp8_dense_oracle": (["-m", "fp8_dense_patch.oracle"], {}),
+    # NVFP4 dense linears (SUFFIX_NVFP4_DENSE) at Gemma-4-26B-A4B (TP1) and
+    # Gemma-4-31B (TP2) per-rank shapes: NVFP4 vs BF16 / exact-dequant error,
+    # activation-headroom sweep, us/call BF16 vs NVFP4 vs FP8 at M 1..64.
+    "nvfp4_dense_oracle": (["-m", "fp8_dense_patch.nvfp4_oracle"], {}),
     "allreduce_bench": (["-m", "suffix_hybrid.tools.ar_bench"], {}),
     "allreduce_bench_tree": (["-m", "suffix_hybrid.tools.ar_bench"], {"NCCL_ALGO": "Tree"}),
     # Size-routed all-reduce evidence: default comm vs a second comm built under

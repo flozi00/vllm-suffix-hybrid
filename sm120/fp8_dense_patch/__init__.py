@@ -29,6 +29,13 @@ serving).
 
 Not supported: weight reload / RL refit / sleep-mode level 2 on converted
 layers (the loaders' BF16 parameters are gone).
+
+NVFP4 mode (nvfp4.py): ``SUFFIX_NVFP4_DENSE=1`` (default off), allowlist
+``SUFFIX_NVFP4_DENSE_LAYERS`` (unset = NVFP4_DEFAULT_LAYERS, Gemma 4 language
+model), same anchor and DENY_LAYERS. Allowlisted LinearBase layers become
+vLLM ModelOpt NVFP4 W4A4 layers (vLLM's own method + kernel selection, so
+SUFFIX_NVFP4_GEMM serves them too). It runs BEFORE the FP8 mode, which then
+only sees what is still UnquantizedLinearMethod; both gates may be on.
 """
 
 import fnmatch
@@ -37,10 +44,12 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "fp8-dense"
-PATCH_REVISION = "2026-09-27.1"
+PATCH_REVISION = "2026-09-28.1"
 PINNED_VLLM = "0.30.0"
 GATE_ENV = "SUFFIX_FP8_DENSE"
 LAYERS_ENV = "SUFFIX_FP8_DENSE_LAYERS"
+NVFP4_GATE_ENV = "SUFFIX_NVFP4_DENSE"
+NVFP4_LAYERS_ENV = "SUFFIX_NVFP4_DENSE_LAYERS"
 MARKER_ATTR = "__suffix_fp8_dense_revision__"
 HELPER_TAG = "suffix fp8-dense patch"
 TARGET_MODULE = "vllm.model_executor.model_loader.utils"
@@ -67,6 +76,21 @@ DENY_LAYERS = (
     "*kv_b_proj*",        # MLA absorb reads the BF16 weight post-load
     "*lm_head*",
     "*shared_head*",      # MTP's lm_head
+    "*router*",           # Gemma 4 MoE router (router.proj)
+    "*vision_tower*",     # multimodal towers / embedders stay BF16
+    "*embed_vision*",
+    "*audio_tower*",
+    "*embed_audio*",
+)
+# Gemma 4 (gemma4.py / gemma4_mm.py: language_model.model.layers.N...):
+# attention (q_proj = KV-shared layers) and the dense MLP; the routed experts
+# are NVFP4 in the checkpoint already.
+NVFP4_DEFAULT_LAYERS = (
+    "*language_model*self_attn.qkv_proj",
+    "*language_model*self_attn.q_proj",
+    "*language_model*self_attn.o_proj",
+    "*language_model*.mlp.gate_up_proj",
+    "*language_model*.mlp.down_proj",
 )
 
 
@@ -74,15 +98,32 @@ class PatchDriftError(RuntimeError):
     """Installed sources do not match the pinned anchor text: refuse to patch."""
 
 
-def gate_enabled() -> bool:
+def fp8_enabled() -> bool:
     return os.environ.get(GATE_ENV, "").strip() == "1"
 
 
-def layer_patterns() -> tuple:
-    raw = os.environ.get(LAYERS_ENV, "").strip()
+def nvfp4_enabled() -> bool:
+    return os.environ.get(NVFP4_GATE_ENV, "").strip() == "1"
+
+
+def gate_enabled() -> bool:
+    """Either mode arms the (shared) anchor."""
+    return fp8_enabled() or nvfp4_enabled()
+
+
+def _patterns(env, default) -> tuple:
+    raw = os.environ.get(env, "").strip()
     if not raw:
-        return DEFAULT_LAYERS
+        return default
     return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
+def layer_patterns() -> tuple:
+    return _patterns(LAYERS_ENV, DEFAULT_LAYERS)
+
+
+def nvfp4_layer_patterns() -> tuple:
+    return _patterns(NVFP4_LAYERS_ENV, NVFP4_DEFAULT_LAYERS)
 
 
 def selected(name: str, patterns=None) -> bool:
@@ -130,9 +171,14 @@ def patch_source(src: str) -> tuple[str, list[str]]:
 
 
 def _suffix_fp8_dense_convert(model) -> None:
-    from . import runtime  # torch/vllm: worker side only
+    if nvfp4_enabled():  # first: FP8 then skips what became NVFP4
+        from . import nvfp4  # torch/vllm: worker side only
 
-    runtime.convert_model(model)
+        nvfp4.convert_model(model)
+    if fp8_enabled():
+        from . import runtime
+
+        runtime.convert_model(model)
 
 
 def apply(module) -> bool:
@@ -164,8 +210,10 @@ def apply(module) -> bool:
     exec(compile(new_src, fname, "exec"), module.__dict__)
     setattr(module, MARKER_ATTR, PATCH_REVISION)
     print(f"[suffix {PATCH_NAME}] ACTIVE: {TARGET_MODULE} rewritten "
-          f"({', '.join(applied)}; rev {PATCH_REVISION}; vllm {ver}; layers "
-          f"{','.join(layer_patterns())}).", file=sys.stderr, flush=True)
+          f"({', '.join(applied)}; rev {PATCH_REVISION}; vllm {ver}; fp8 layers "
+          f"{','.join(layer_patterns()) if fp8_enabled() else 'off'}; nvfp4 layers "
+          f"{','.join(nvfp4_layer_patterns()) if nvfp4_enabled() else 'off'}).",
+          file=sys.stderr, flush=True)
     return True
 
 

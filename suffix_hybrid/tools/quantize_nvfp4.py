@@ -181,7 +181,8 @@ def quantize_weight(w, amax: float):
 def dequantize_weight(packed, sf, ws2):
     """Inverse (for tests / sanity): -> float32 [N, K]."""
     import torch
-    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32)
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32,
+                       device=packed.device)
     lo, hi = packed & 0xF, packed >> 4
     code = torch.stack([lo, hi], -1).reshape(packed.shape[0], -1).long()
     val = lut[code & 7] * torch.where(code & 8 > 0, -1.0, 1.0)

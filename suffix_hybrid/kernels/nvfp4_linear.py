@@ -171,8 +171,12 @@ def _make_kernel_cls():
             dev = layer.weight.device
             gen = torch.Generator(device=dev).manual_seed(n * 7 + k)
             worst = 0.0
+            # activations at the layer's design point (amax ~ A/4 with A =
+            # 2688 / g): a static global far above N(0,1) (SUFFIX_NVFP4_DENSE's
+            # proven bounds) would otherwise zero most blocks on both paths.
+            amp = max(1.0, 448.0 * 6.0 / cfg["g"] / 20.0)
             for m in (1, 4, MAX_M):
-                x = torch.randn(m, k, generator=gen, device=dev, dtype=torch.bfloat16)
+                x = (torch.randn(m, k, generator=gen, device=dev) * amp).bfloat16()
                 ref = super().apply_weights(layer, x).float()
                 ours = self._ours(layer, cfg, x).float()
                 xq, xsf = scaled_fp4_quant(x, layer.input_global_scale_inv,
