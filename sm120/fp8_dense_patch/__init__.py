@@ -90,7 +90,12 @@ NVFP4_DEFAULT_LAYERS = (
     "*language_model*self_attn.q_proj",
     "*language_model*self_attn.o_proj",
     "*language_model*.mlp.gate_up_proj",
-    "*language_model*.mlp.down_proj",
+    # NOT *.mlp.down_proj by default: its static activation scale comes from a
+    # loose analytic bound; on gemma-4-26B-A4B (dev pool 2026-09-28) the extra
+    # headroom underflowed real activations below the e4m3 block-scale floor ->
+    # multilingual garbage to the length cap (GSM8K), while attention +
+    # gate_up alone answered correctly. Opt in via SUFFIX_NVFP4_DENSE_LAYERS
+    # only together with a calibrated SUFFIX_NVFP4_DENSE_ACT_AMAX override.
 )
 
 

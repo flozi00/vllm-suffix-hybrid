@@ -287,7 +287,7 @@ GEMMA_NAMES = {
     f"{L1}.self_attn.q_proj": True,
     f"{L0}.self_attn.o_proj": True,
     f"{L0}.mlp.gate_up_proj": True,
-    f"{L0}.mlp.down_proj": True,
+    f"{L0}.mlp.down_proj": False,  # opt-in only (loose bound -> garbage on 26B)
     f"{L0}.router.proj": False,
     f"{L0}.moe.experts": False,
     "language_model.model.layers.0.per_layer_input_gate": False,
@@ -313,7 +313,8 @@ def test_env_allowlist_is_separate_from_fp8_and_deny_wins(monkeypatch):
     monkeypatch.setenv(P.NVFP4_LAYERS_ENV, "*")
     assert not any(P.selected(n, P.nvfp4_layer_patterns())
                    for n, v in GEMMA_NAMES.items()
-                   if not v and "per_layer" not in n and "moe" not in n)
+                   if not v and "per_layer" not in n and "moe" not in n
+                   and n != f"{L0}.mlp.down_proj")  # default-off, not denied
 
 
 # --- activation bounds -----------------------------------------------------------------
@@ -375,7 +376,8 @@ def test_env_override_wins_and_is_validated(monkeypatch):
 
 
 # --- conversion over fake vLLM ------------------------------------------------------------
-def test_convert_model_builds_modelopt_checkpoint_layers(fake_vllm, capsys):
+def test_convert_model_builds_modelopt_checkpoint_layers(fake_vllm, capsys, monkeypatch):
+    monkeypatch.setenv(P.NVFP4_LAYERS_ENV, ",".join(P.NVFP4_DEFAULT_LAYERS + ("*language_model*.mlp.down_proj",)))  # down_proj is opt-in
     root = _gemma_like()
     mods = dict(root.named_modules())
     bf16 = {n: m.weight.data.clone() for n, m in mods.items() if isinstance(m, LinearBase)}
@@ -413,6 +415,7 @@ def test_convert_model_builds_modelopt_checkpoint_layers(fake_vllm, capsys):
 
 
 def test_selftest_once_per_shape_and_fails_closed(fake_vllm, monkeypatch):
+    monkeypatch.setenv(P.NVFP4_LAYERS_ENV, ",".join(P.NVFP4_DEFAULT_LAYERS + ("*language_model*.mlp.down_proj",)))  # down_proj is opt-in
     calls = []
     real = N._selftest
     monkeypatch.setattr(N, "_selftest", lambda *a: (calls.append(a[0]), real(*a)))
