@@ -158,3 +158,14 @@ def test_fp8_dense_hook_arms_before_the_hybrid_wrap():
     src = (REPO / "sitecustomize.py").read_text()
     i = src.find('os.environ.get("SUFFIX_FP8_DENSE"')
     assert i != -1 and i < src.index('if os.environ.get("SUFFIX_HYBRID_WRAP"')
+
+
+def test_nvfp4_dense_oracle_gate_and_hook():
+    src = (REPO / "sitecustomize.py").read_text()
+    ns: dict = {}
+    exec(src[src.index("_BOOT_GATES = {"):src.index("\n_boot_gates = ")], ns)
+    argv, env = ns["_BOOT_GATES"]["nvfp4_dense_oracle"]
+    assert argv == ["-m", "fp8_dense_patch.nvfp4_oracle"] and env == {}
+    assert (REPO / "sm120/fp8_dense_patch/nvfp4_oracle.py").is_file()
+    i = src.find('os.environ.get("SUFFIX_NVFP4_DENSE"')
+    assert i != -1 and i < src.index('if os.environ.get("SUFFIX_HYBRID_WRAP"')
