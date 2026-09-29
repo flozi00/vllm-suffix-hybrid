@@ -2,6 +2,8 @@
 """SUFFIX_NVFP4_GEMM vLLM wiring: gate, eligibility routing, workspace,
 VLLM_DISABLED_KERNELS union, entry point. (vLLM itself is not importable on
 the CPU test host; the kernel class is exercised by the in-pod layer oracle.)"""
+import os
+os.environ["SUFFIX_NVFP4_GEMM_FUSED_MAX_M"] = "64"  # these tests exercise fusion at every M
 import configparser
 import pathlib
 import sys

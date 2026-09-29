@@ -119,6 +119,15 @@ FUSED_ENV = "SUFFIX_NVFP4_GEMM_FUSED"  # "0" = old 3-launch path, "reduce"
 FUSE_QUANT, FUSE_REDUCE = 1, 2
 STAGE_FLOATS = 4096  # split-K fixup staging (ch + 1) * M * 32 f32 <= 16 KB
 FUSED_QUANT_MAX_M = 64  # ponytail: static; bench old-vs-fused rows retune it
+# Silicon (qwen TP2, 2026-09-29): single launch wins only at M=1 (~2 us per
+# linear); from M=5 the last-CTA split-K fixup is a serial tail (HC down
+# 336x10240 S=54: 10 -> 22 us at M=5, 60 us at M=16). Fuse only up to this M.
+FUSED_MAX_M_ENV = "SUFFIX_NVFP4_GEMM_FUSED_MAX_M"
+
+
+def fused_max_m() -> int:
+    import os
+    return int(os.environ.get(FUSED_MAX_M_ENV, "1") or 1)
 QUANT_SMEM_MAX = 20 * 1024  # prologue A+scales: keeps >= 4 CTAs/SM (TARGET_CTAS)
 
 
@@ -179,6 +188,8 @@ def plan(n: int, k: int, m: int, splits: int | None = None, fused: str | bool | 
     s = -(-steps // kps)
     grid = (-(-n // 32), s)
     mode = fused_mode() if fused is None else {True: "all", False: "off"}.get(fused, fused)
+    if fused is None and m > fused_max_m():
+        mode = "off"
     fq = (mode == "all" and not prequant and m <= FUSED_QUANT_MAX_M
           and quant_smem(m, kps) <= QUANT_SMEM_MAX)
     fr = mode != "off" and s > 1

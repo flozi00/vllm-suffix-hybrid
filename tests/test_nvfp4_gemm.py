@@ -2,6 +2,8 @@
 """NVFP4 decode-GEMM spike: CPU contract tests (reference quant/dequant, vLLM
 swizzle vs the kernel's sf_offset, and the CPU twin of the kernel's fragment
 addressing vs the exact reference). GPU oracle/bench run in-pod only."""
+import os
+os.environ["SUFFIX_NVFP4_GEMM_FUSED_MAX_M"] = "64"  # these tests exercise fusion at every M
 import pathlib
 import re
 
@@ -270,3 +272,9 @@ def test_oracle_ok_triangle_when_vllm_quant_deviates():
     assert oracle_ok(0.0, 2.30e-2, 2.30e-2)
     # ours off the spec while vLLM is exact -> fail
     assert not oracle_ok(2.0e-2, 2.0e-2, 0.0)
+
+
+def test_fused_default_only_m1(monkeypatch):
+    monkeypatch.delenv("SUFFIX_NVFP4_GEMM_FUSED_MAX_M", raising=False)
+    assert ng.plan(336, 10240, 1)["flags"]          # M=1: single launch
+    assert not ng.plan(336, 10240, 5)["flags"]      # M>=5: old path (serial fixup tail on silicon)
