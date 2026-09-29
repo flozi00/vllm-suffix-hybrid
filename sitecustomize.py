@@ -307,6 +307,11 @@ _BOOT_GATES = {
     # ours vs vLLM FlashInfer vs f64 spec + per-stage readback; then us/call.
     "nvfp4_moe_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "oracle"], {}),
     "nvfp4_moe_bench": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "bench"], {}),
+    # FP8 128x128-block routed experts (SUFFIX_FP8_MOE, qwen3.8 MTP draft
+    # shape E 512 / EP2 ranks 0+1, H 2560, I 640, top-10; one GPU = one rank):
+    # ours vs vLLM Triton vs f64 spec + per-stage readback; then us/call.
+    "fp8_moe_oracle": (["-m", "suffix_hybrid.kernels.fp8_moe", "oracle"], {}),
+    "fp8_moe_bench": (["-m", "suffix_hybrid.kernels.fp8_moe", "bench"], {}),
     # NVFP4 lm_head (SUFFIX_NVFP4_LMHEAD) at the qwen / gemma / GLM-TP8 head
     # shapes: screen vs exact quantized ref + greedy == bf16; then us/call
     # bf16 head vs NVFP4 screen + rescore (CUDA graphs).

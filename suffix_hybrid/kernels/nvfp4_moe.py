@@ -38,7 +38,8 @@ Parallel contract (= vLLM's stock FLASHINFER_CUTLASS path, vLLM 0.30):
 Serving (gate ``SUFFIX_NVFP4_MOE=1``, default OFF; entry point
 ``suffix_nvfp4_moe``): ``RoutedExperts`` is a vLLM PluggableLayer
 (fused_moe/routed_experts.py:45) -> ``RoutedExperts.register_oot`` swaps in
-``SuffixNvFp4RoutedExperts``. After vLLM's own weight processing (FlashInfer
+``SuffixRoutedExperts`` (shared with fp8_moe / SUFFIX_FP8_MOE: one
+register_oot for both gates, see ``arm``). After vLLM's own weight processing (FlashInfer
 CUTLASS layout) each eligible layer runs a LAYER ORACLE on its real weights:
 ours vs the parent ``forward_modular`` (= vLLM's FlashInfer
 cutlass_fused_moe path) vs the f64 spec reference + per-stage readback of our
@@ -74,7 +75,10 @@ HBM_BPS = 1.79e12  # RTX PRO 6000 Max-Q
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _MID = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 _state = {"armed": False, "instances": 0, "layers_ours": 0, "stock": {},
-          "ws": {}, "checked": False, "hook": None, "oracle": [], "active_logged": False}
+          "ws": {}, "checked": False, "hook": None, "oracle": [], "active_logged": False,
+          # FP8 block layers (suffix_hybrid/kernels/fp8_moe.py, SUFFIX_FP8_MOE)
+          # share this module's single OOT class; their own counters:
+          "fp8": {"seen": 0, "ours": 0, "stock": {}, "oracle": []}}
 
 
 def _log(msg: str) -> None:
@@ -501,8 +505,10 @@ def _make_layer_cls():
 
     native = oxide_kernels.native()
 
-    class SuffixNvFp4RoutedExperts(RoutedExperts):
-        """vLLM RoutedExperts + our sm_120a NVFP4 decode MoE for M <= max_m."""
+    class SuffixRoutedExperts(RoutedExperts):
+        """vLLM RoutedExperts + our sm_120a decode MoE for M <= max_m: NVFP4
+        layers (SUFFIX_NVFP4_MOE) and FP8 128x128-block layers
+        (SUFFIX_FP8_MOE, fp8_moe.py) — ONE OOT class for both gates."""
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -514,9 +520,13 @@ def _make_layer_cls():
             # Instance-level wrap (not a vLLM class patch): run our prepare +
             # layer oracle right after vLLM's own FI weight processing.
             def _after_load(layer, _orig=orig):
+                # FP8 block scales before vLLM's processing: the DEEPGEMM
+                # backend may re-layout / pack them (fp8_moe.resolve_scale)
+                pre = {k: getattr(layer, f"{k}_weight_scale_inv").data for k in ("w13", "w2")
+                       if getattr(layer, f"{k}_weight_scale_inv", None) is not None}
                 _orig(layer)
                 if layer is self:
-                    self._sfx_prepare()
+                    self._sfx_prepare(pre)
 
             qm.process_weights_after_loading = _after_load
 
@@ -558,7 +568,18 @@ def _make_layer_cls():
                 gscale_shared=bool((a1 == a1[0]).all() and (a2 == a2[0]).all()))
             return info, qc
 
-        def _sfx_prepare(self):
+        def _sfx_prepare(self, pre=None):
+            from suffix_hybrid.kernels import fp8_moe
+            if fp8_moe.gate_on() and fp8_moe.is_fp8(self):
+                self._sfx_moe = fp8_moe.prepare(
+                    self, pre or {},
+                    lambda x, w, i: RoutedExperts.forward_modular(self, x, w, i), _state["fp8"])
+                if gate_on():  # decided for the NVFP4 verdict too (not an NVFP4 layer)
+                    why = "FP8 block layer (SUFFIX_FP8_MOE path)"
+                    _state["stock"][why] = _state["stock"].get(why, 0) + 1
+                return
+            if not gate_on():
+                return
             info, qc = self._sfx_info()
             why = eligibility(info)
             if why is not None:
@@ -582,6 +603,9 @@ def _make_layer_cls():
             _state["layers_ours"] += 1
 
         def _sfx_run(self, cfg, x, topk_weights, topk_ids):
+            if cfg.get("kind") == "fp8":
+                from suffix_hybrid.kernels import fp8_moe
+                return fp8_moe.run(native, cfg, x, topk_weights, topk_ids)
             dev = x.device
             tw = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
             return run_ours(native, cfg, x.contiguous(), topk_ids.contiguous(),
@@ -651,12 +675,12 @@ def _make_layer_cls():
                     or x.shape[1] != cfg["H"]):
                 return super().forward_modular(x, topk_weights, topk_ids,
                                                shared_experts, shared_experts_input)
-            if not _state["active_logged"]:
+            if cfg.get("kind") != "fp8" and not _state["active_logged"]:
                 _state["active_logged"] = True
                 _log(summary())
             return self._sfx_run(cfg, x, topk_weights, topk_ids)
 
-    return SuffixNvFp4RoutedExperts
+    return SuffixRoutedExperts
 
 
 def verdict(instances: int, ours: int, stock: dict) -> str | None:
@@ -676,50 +700,80 @@ def verdict(instances: int, ours: int, stock: dict) -> str | None:
 
 def _first_forward_check(module, args):
     """Global forward pre-hook (PyTorch API): at the first module call after
-    weight processing, fail startup if no layer engaged."""
+    weight processing, fail startup if a gated family engaged no layer."""
+    from suffix_hybrid.kernels import fp8_moe
     if _state["checked"]:
         return
-    err = verdict(_state["instances"], _state["layers_ours"], _state["stock"])
-    if err == "":
+    errs = []
+    if gate_on():
+        errs.append(verdict(_state["instances"], _state["layers_ours"], _state["stock"]))
+    if fp8_moe.gate_on():
+        f = _state["fp8"]
+        errs.append(fp8_moe.verdict(f["seen"], f["ours"], f["stock"]))
+    if "" in errs:
         return  # weights not processed yet: decide at a later call
     _state["checked"] = True
     h = _state.pop("hook", None)
     if h is not None:
         h.remove()
-    if err is not None:
-        _log(err)
-        raise RuntimeError(err)
-    stock = "; ".join(f"{k} x{v}" for k, v in sorted(_state["stock"].items())) or "-"
-    _log(f"NVFP4-MOE SELECTION: {_state['layers_ours']} RoutedExperts layers on our "
-         f"decode kernel (M<={max_m()}), stock: {stock}")
+    errs = [e for e in errs if e]
+    for e in errs:
+        _log(e)
+    if errs:
+        raise RuntimeError(" | ".join(errs))
+    for on, name, ours, stk, mm in (
+            (gate_on(), "NVFP4-MOE", _state["layers_ours"], _state["stock"], max_m),
+            (fp8_moe.gate_on(), "FP8-MOE", _state["fp8"]["ours"], _state["fp8"]["stock"],
+             fp8_moe.max_m)):
+        if on:
+            stock = "; ".join(f"{k} x{v}" for k, v in sorted(stk.items())) or "-"
+            _log(f"{name} SELECTION: {ours} RoutedExperts layers on our decode kernel "
+                 f"(M<={mm()}), stock: {stock}")
 
 
 def register():
     """vllm.general_plugins entry point. No-op unless SUFFIX_NVFP4_MOE=1."""
     if not gate_on():
         return None
+    return arm()
+
+
+def arm():
+    """Register the shared OOT class ONCE for every MoE gate that is on
+    (SUFFIX_NVFP4_MOE here, SUFFIX_FP8_MOE via fp8_moe.register); the
+    second caller gets the armed state back. Checks each on-gate's host op
+    and cubin before touching vLLM."""
     if _state["armed"]:
         return _state
     import torch
     from suffix_hybrid import oxide_kernels
+    from suffix_hybrid.kernels import fp8_moe
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
     native = oxide_kernels.native()
-    if not hasattr(native, "nvfp4_moe_cuda"):
-        raise RuntimeError(f"{GATE}=1 but _native lacks nvfp4_moe_cuda (oxide-kernels build)")
+    fams = [(g, fn, fam, knob) for on, g, fn, fam, knob in (
+        (gate_on(), GATE, "nvfp4_moe_cuda", FAMILY, max_m),
+        (fp8_moe.gate_on(), fp8_moe.GATE, fp8_moe.NATIVE_FN, fp8_moe.FAMILY, fp8_moe.max_m))
+        if on]
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
-        raise RuntimeError(f"{GATE}=1: the NVFP4 MoE cubin is sm_120a SASS (cc 12.x only)")
-    ent = [k for k in oxide_kernels.manifest()["kernels"] if k["name"] == FAMILY]
-    if not ent:
-        raise RuntimeError(f"{GATE}=1 but the oxide manifest has no {FAMILY!r} cubin")
-    max_m()  # validate the knob now, not at load
+        raise RuntimeError(f"{'/'.join(f[0] for f in fams)}=1: our MoE cubins are "
+                           "sm_120a SASS (cc 12.x only)")
+    shas = []
+    for g, fn, fam, knob in fams:
+        if not hasattr(native, fn):
+            raise RuntimeError(f"{g}=1 but _native lacks {fn} (oxide-kernels build)")
+        ent = [k for k in oxide_kernels.manifest()["kernels"] if k["name"] == fam]
+        if not ent:
+            raise RuntimeError(f"{g}=1 but the oxide manifest has no {fam!r} cubin")
+        knob()  # validate the knob now, not at load
+        shas.append(f"{fam} M<={knob()} sha256 {ent[0]['sha256'][:12]}")
     cls = _make_layer_cls()
     RoutedExperts.register_oot(cls, name="RoutedExperts")
     _state["hook"] = torch.nn.modules.module.register_module_forward_pre_hook(
         _first_forward_check)
     _state["armed"] = True
-    _log(f"NVFP4-MOE armed: RoutedExperts -> SuffixNvFp4RoutedExperts (M<={max_m()} -> "
-         f"sm_120a mxf4nvf4 SASS, sha256 {ent[0]['sha256'][:12]}; else vLLM FlashInfer)")
+    _log(f"MOE armed ({', '.join(f[0] for f in fams)}): RoutedExperts -> SuffixRoutedExperts "
+         f"({'; '.join(shas)}; else vLLM's MoE path)")
     return _state
 
 

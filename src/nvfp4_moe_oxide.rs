@@ -12,15 +12,15 @@ use pyo3::types::PyAny;
 
 pub const FAMILY: &str = "nvfp4_moe";
 
-struct T {
-    ptr: u64,
-    shape: Vec<usize>,
-    stride: Vec<usize>,
-    dtype: String,
-    device: usize,
+pub(crate) struct T {
+    pub(crate) ptr: u64,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) stride: Vec<usize>,
+    pub(crate) dtype: String,
+    pub(crate) device: usize,
 }
 
-fn info(name: &str, o: &Bound<'_, PyAny>) -> PyResult<T> {
+pub(crate) fn info(name: &str, o: &Bound<'_, PyAny>) -> PyResult<T> {
     let dev = o.getattr("device")?;
     let typ: String = dev.getattr("type")?.extract()?;
     if typ != "cuda" {
@@ -44,7 +44,7 @@ fn info(name: &str, o: &Bound<'_, PyAny>) -> PyResult<T> {
     })
 }
 
-fn contiguous(t: &T) -> bool {
+pub(crate) fn contiguous(t: &T) -> bool {
     let mut want = 1;
     for (d, s) in t.shape.iter().zip(&t.stride).rev() {
         if *d > 1 && *s != want {
@@ -55,7 +55,7 @@ fn contiguous(t: &T) -> bool {
     true
 }
 
-fn need(
+pub(crate) fn need(
     name: &str,
     t: &T,
     dtypes: &[&str],
