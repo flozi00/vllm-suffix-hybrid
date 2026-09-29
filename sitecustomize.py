@@ -330,6 +330,12 @@ _BOOT_GATES = {
     # ours vs vLLM Triton vs f64 spec + per-stage readback; then us/call.
     "fp8_moe_oracle": (["-m", "suffix_hybrid.kernels.fp8_moe", "oracle"], {}),
     "fp8_moe_bench": (["-m", "suffix_hybrid.kernels.fp8_moe", "bench"], {}),
+    # DSA indexer logits (SUFFIX_SM120_DSA_INDEXER, GLM-5.3 H=32 / DeepSeek
+    # H=64 decode native + flattened MTP rows, prefill): ours vs the Triton
+    # shim fallback vs f64, top-2048 sets, vLLM persistent_topk on a
+    # NaN-poisoned output; then us/call vs Triton + GB/s vs HBM roofline.
+    "dsa_indexer_oracle": (["-m", "suffix_hybrid.kernels.dsa_indexer", "oracle"], {}),
+    "dsa_indexer_bench": (["-m", "suffix_hybrid.kernels.dsa_indexer", "bench"], {}),
     # NVFP4 W4A4 dense decode GEMM (SUFFIX_NVFP4_GEMM), M <= 64 at the qwen
     # 27b / gemma / qwen-flash TP2 shapes: ours vs exact ref + vLLM FlashInfer
     # (both input routes); bench us/call vs FlashInfer + suggested
