@@ -46,8 +46,11 @@ import sys
 import numpy as np
 
 from suffix_hybrid.kernels.nvfp4_gemm import (
+    PARAMS,
     dequant,
     e4m3_bits_to_f32,
+    partial_elems,
+    plan,
     sf_offset,
 )
 
@@ -154,10 +157,10 @@ def _device_ops(native):
         wq, wsf = scaled_fp4_quant(
             w, torch.tensor(g_w, dtype=torch.float32, device=w.device),
             is_sf_swizzled_layout=True)
-        splits = native.nvfp4_gemm_splits(n, k)
-        return dict(n=n, k=k, w=w, wq=wq, wsf=wsf, g_w=g_w, splits=splits,
-                    partial=torch.empty(splits * 16 * n, dtype=torch.float32,
-                                        device=w.device))
+        return dict(n=n, k=k, w=w, wq=wq, wsf=wsf, g_w=g_w,
+                    splits=plan(n, k, MAX_M)["splits"],  # M <= 16: one tile bucket
+                    partial=torch.empty(max(1, partial_elems(n, k, MAX_M)),
+                                        dtype=torch.float32, device=w.device))
 
     def quant(x2, g):
         return scaled_fp4_quant(x2, g, is_sf_swizzled_layout=True)
@@ -251,7 +254,7 @@ def _make_head_cls(native):
                 _state["stock"] += 1
                 _log(f"lm_head N={n} K={k} stays bf16: {why}")
                 return
-            oxide_kernels.ensure_loaded(FAMILY, w.device.index)
+            oxide_kernels.ensure_loaded(FAMILY, w.device.index, params=PARAMS)
             st = prepare(w)
             key = (n, k, st["g_w"])
             if key not in _state["oracle"]:
@@ -317,7 +320,7 @@ def register():
     from vllm.model_executor.custom_op import PluggableLayer, op_registry_oot
 
     native = oxide_kernels.native()
-    for fn in ("nvfp4_gemm_q_cuda", "nvfp4_gemm_splits"):
+    for fn in ("nvfp4_gemm_q_cuda",):
         if not hasattr(native, fn):
             raise RuntimeError(f"{GATE}=1 but _native lacks {fn} (oxide-kernels build)")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
@@ -358,7 +361,7 @@ def main(argv=None) -> int:
         native = oxide_kernels.native()
         if torch.cuda.get_device_capability()[0] != 12:
             raise RuntimeError("sm_120a SASS needs cc 12.x")
-        oxide_kernels.ensure_loaded(FAMILY)
+        oxide_kernels.ensure_loaded(FAMILY, params=PARAMS)
         prepare, quant, run = _device_ops(native)
         dev = torch.device("cuda", torch.cuda.current_device())
         for name, (n, k) in SHAPES.items():

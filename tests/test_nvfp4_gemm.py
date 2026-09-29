@@ -59,9 +59,61 @@ def test_kernel_twin_matches_reference(m, mode, splits):
     np.testing.assert_allclose(twin, ref, rtol=1e-5, atol=1e-5)
 
 
-def test_gemma_and_qwen_shapes_are_kernel_eligible():
-    for name, (n, k) in ng.ALL_SHAPES.items():
-        assert n % 32 == 0 and k % 64 == 0, name
+@pytest.mark.parametrize("m,n,mode,splits", [(17, 32, 0, 1), (17, 48, 1, 2), (40, 16, 0, 3),
+                                             (40, 48, 1, 1), (63, 32, 1, 3), (64, 16, 0, 2),
+                                             (63, 48, 0, None)])
+def test_kernel_twin_multi_tile_and_n_tail(m, n, mode, splits):
+    # tiles 2..4 sharing each weight fragment; M not a multiple of 16 (rows
+    # past M: zero rows in mode 0, predicated loads in mode 1); N = 16 / 48
+    # leave a CTA's trailing warps without columns (N % 32 != 0)
+    p = ng.make_problem(m, n, 192, seed=m + n)
+    twin = ng.kernel_twin(p, mode=mode, splits=splits)
+    np.testing.assert_allclose(twin, ng.gemm_ref(p), rtol=1e-5, atol=1e-5)
+
+
+def test_plan_tiles_and_split_ranges():
+    assert [ng.plan(8192, 2560, m)["entry"] for m in (1, 16, 17, 32, 33, 48, 49, 64)] == \
+        ["nvfp4_gemm_t1"] * 2 + ["nvfp4_gemm_t2"] * 2 + ["nvfp4_gemm_t3"] * 2 + \
+        ["nvfp4_gemm_t4"] * 2
+    for (n, k) in ng.ALL_SHAPES.values():
+        for m in range(1, ng.MAX_M + 1):
+            pl = ng.plan(n, k, m)
+            steps = k // 64
+            assert 1 <= pl["splits"] <= min(ng.MAX_SPLITS, steps)
+            assert pl["kps"] * (pl["splits"] - 1) < steps <= pl["kps"] * pl["splits"]
+            assert pl["splits"] == 1 or pl["kps"] >= ng.MIN_KPS
+            assert pl["grid"] == (-(-n // 32), pl["splits"])
+            # graph safety: the plan is a function of the M bucket only
+            assert pl == dict(ng.plan(n, k, 16 * pl["tiles"]), partial=pl["partial"])
+            assert pl["partial"] <= ng.partial_elems(n, k)
+
+
+def test_split_policy():
+    s = lambda n, k, m=16: ng.plan(n, k, m)["splits"]
+    # qwen3.8-27b / gemma (M <= 16): the silicon-validated policy (gemma down 7 -> 9)
+    assert s(34816, 5120) == 1 and s(16384, 5120) == 2
+    assert s(5120, 17408) == 5 and s(5120, 6144) == 5
+    assert s(2816, 2112) == 9  # 88 CTAs -> 792
+    # qwen-flash TP2: narrow-N / deep-K HC projections split deep ...
+    assert s(336, 10240, 1) == 54 and s(320, 10240, 5) == 54  # 11/10 CTAs -> ~560
+    assert s(336, 10240, 64) == 20  # partial budget K / (128 * 4 tiles)
+    assert s(2560, 3072, 5) == 10 and s(2560, 3072, 64) == 6
+    assert s(2560, 320, 5) == 2 and s(10240, 320, 40) == 1
+    # ... wide-N ones stay (almost) whole
+    assert s(8192, 2560) == 3 and s(12800, 2560) == 2 and s(6656, 2560) == 4
+    assert s(48, 2560, 1) == 20 and s(48, 2560, 64) == 5  # GDN in_proj_ba: 2 CTAs
+
+
+def test_unswizzle_and_torch_exact_ref_match_numpy():
+    p = ng.make_problem(40, 48, 256, seed=2)
+    xq, xsf_bits, _ = ng.quantize(p["x"].float().numpy(), p["g_x"])
+    xsf = torch.from_numpy(ng.swizzle_sf(xsf_bits))
+    assert torch.equal(ng.unswizzle_sf(xsf, 40, 16), torch.from_numpy(xsf_bits))
+    # FlashInfer-padded weight rows (48 -> 64) are ignored past N
+    w = torch.from_numpy(np.pad(p["w_packed"], ((0, 16), (0, 0)), constant_values=0x77))
+    ref = ng.exact_ref(torch.from_numpy(xq), xsf, w, torch.from_numpy(p["w_sf_swz"]),
+                       float(p["alpha"]), 48, chunk_elems=256 * 20)
+    np.testing.assert_allclose(ref.numpy(), ng.gemm_ref(p), rtol=1e-5, atol=1e-5)
 
 
 def test_reference_tracks_bf16_matmul():
@@ -81,7 +133,11 @@ def test_kernel_source_uses_nvf4_block_scale_mma_and_sm120a():
     var = (ROOT / "kernels-oxide" / "nvfp4_gemm" / "oxide-variants.json").read_text()
     assert '"arch": "sm_120a"' in var
     entries = re.findall(r"pub unsafe fn (\w+)\(", src)
-    assert entries == ["nvfp4_quant_act", "nvfp4_gemm_m16", "nvfp4_splitk_reduce"]
+    assert entries == ["nvfp4_quant_act", "nvfp4_gemm_t1", "nvfp4_gemm_t2", "nvfp4_gemm_t3",
+                       "nvfp4_gemm_t4", "nvfp4_splitk_reduce"]
+    assert sorted(entries) == sorted(ng.PARAMS)
+    host = (ROOT / "src" / "nvfp4_gemm_oxide.rs").read_text()
+    assert all(f'"{e}"' in host for e in entries)
 
 
 def test_oracle_gate_is_relative_to_vllm():

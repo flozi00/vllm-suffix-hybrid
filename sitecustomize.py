@@ -270,12 +270,12 @@ if (os.environ.get("SUFFIX_OXIDE_PROBE", "").strip() == "1"
     subprocess.run([sys.executable, "-m", "suffix_hybrid.oxide_kernels"])
 
 # NVFP4 W4A4 decode-GEMM spike (qwen38-27b-kernels.md §7): SUFFIX_NVFP4_GEMM_
-# SPIKE=oracle|bench|both runs `python -m suffix_hybrid.kernels.nvfp4_gemm`
+# SPIKE=oracle|bench|both|sweep runs `python -m suffix_hybrid.kernels.nvfp4_gemm`
 # once per pod in a CHILD process (its CUDA context is gone before vLLM sizes
 # memory). Evidence only: markers "[suffix nvfp4-gemm] NVFP4-GEMM ORACLE
 # PASS|FAIL" and "bench ..." lines; never gates serving.
 _nvfp4_gemm = os.environ.get("SUFFIX_NVFP4_GEMM_SPIKE", "").strip().lower()
-if _nvfp4_gemm in ("oracle", "bench", "both") and not os.environ.get(
+if _nvfp4_gemm in ("oracle", "bench", "both", "sweep") and not os.environ.get(
         "SUFFIX_NVFP4_GEMM_SPIKE_DONE"):
     import subprocess
     import sys
@@ -312,6 +312,13 @@ _BOOT_GATES = {
     # ours vs vLLM Triton vs f64 spec + per-stage readback; then us/call.
     "fp8_moe_oracle": (["-m", "suffix_hybrid.kernels.fp8_moe", "oracle"], {}),
     "fp8_moe_bench": (["-m", "suffix_hybrid.kernels.fp8_moe", "bench"], {}),
+    # NVFP4 W4A4 dense decode GEMM (SUFFIX_NVFP4_GEMM), M <= 64 at the qwen
+    # 27b / gemma / qwen-flash TP2 shapes: ours vs exact ref + vLLM FlashInfer
+    # (both input routes); bench us/call vs FlashInfer + suggested
+    # SUFFIX_NVFP4_GEMM_ROUTE; sweep adds the measured best split per case.
+    "nvfp4_gemm_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "oracle"], {}),
+    "nvfp4_gemm_bench": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "bench"], {}),
+    "nvfp4_gemm_sweep": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "sweep"], {}),
     # NVFP4 lm_head (SUFFIX_NVFP4_LMHEAD) at the qwen / gemma / GLM-TP8 head
     # shapes: screen vs exact quantized ref + greedy == bf16; then us/call
     # bf16 head vs NVFP4 screen + rescore (CUDA graphs).

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NVFP4 W4A4 decode-GEMM capability spike (qwen3.8-27b) — reference, CPU
-twin, on-silicon oracle + bench.
+"""NVFP4 W4A4 decode GEMM (M <= 64) — launch plan (M tiling + split-K
+policy), reference, CPU twin, on-silicon oracle + bench.
 
 Kernel: kernels-oxide/nvfp4_gemm (cuda-oxide -> PTX 8.7 .target sm_120a ->
 ptxas 13.0 -> sm_120a SASS), block-scaled FP4 tensor-core mma
@@ -14,13 +14,24 @@ vLLM conventions reproduced here (dossier qwen38-27b-kernels.md §7):
          swizzled 128x4 (nvfp4_utils.py:13-53, `swizzle_sf` below)
   gemm   y = alpha * sum(q_a sf_a q_b sf_b),  alpha = 1 / (g_x * g_w)
 
+Launch plan (`plan`, mirrored by the host op src/nvfp4_gemm_oxide.rs):
+  M tiling  tiles = ceil(M/16) in 1..4 -> entry nvfp4_gemm_t{tiles}; each
+            warp loads a k64 weight fragment + scales once and runs `tiles`
+            mmas on it (register accumulators), so weight bytes stay at the
+            roofline for every M <= 64.
+  split-K   see `splits_for`; partials f32 [splits, M, N] reduced in fixed
+            split order by nvfp4_splitk_reduce (deterministic, graph-safe:
+            the grid depends on (N, K, M) only, workspace preallocated).
+
 CLI (in-pod, SM120 + oxide bundle):
   python -m suffix_hybrid.kernels.nvfp4_gemm oracle   # numerics vs torch ref + vLLM op
   python -m suffix_hybrid.kernels.nvfp4_gemm bench    # us: ours vs vLLM (quant+gemm, CUDA graphs)
-Boot: SUFFIX_NVFP4_GEMM_SPIKE=oracle|bench|both (sitecustomize, child process).
+  python -m suffix_hybrid.kernels.nvfp4_gemm sweep    # bench + best split count per case
+Boot: SUFFIX_NVFP4_GEMM_SPIKE=oracle|bench|both|sweep (sitecustomize, child process).
 """
 from __future__ import annotations
 
+import functools
 import sys
 
 import numpy as np
@@ -50,7 +61,86 @@ GEMMA_SHAPES = {
     "gemma_mlp_gate_up": (4224, 2816),
     "gemma_mlp_down": (2816, 2112),
 }
-ALL_SHAPES = {**SHAPES, **GEMMA_SHAPES}
+# qwen3.8-flash-next-nvfp4 per-rank dense linears at TP=2 (hidden 2560; GDN
+# 16 k / 48 v heads x 128; QSA 24 q (+24 gate) / 2 kv heads x 256; shared
+# expert 640; PLE ple_embed_dim 2560, hc_count 4; HC lora rank 320) from
+# vLLM v0.30.0 vllm/models/qwen4_exp/nvidia/{model,qsa,ple_layer,mtp,
+# hyperconnection}.py + the HF config. QSA qkv = (24 q + 24 gate + 1 k +
+# 1 v) x 256 = 6656 per rank (2 kv heads / TP2 -> 1). GDN out_proj and QSA
+# o_proj share (2560, 3072). HyperConnection projections are replicated
+# (disable_tp / ReplicatedLinear): inject = 320 lora + 4 hc + 12 pad rows.
+QWEN_FLASH_SHAPES = {
+    "flash_gdn_in_proj_qkvz": (8192, 2560),
+    "flash_gdn_in_proj_ba": (48, 2560),
+    "flash_o_proj": (2560, 3072),  # GDN out_proj + QSA o_proj
+    "flash_qsa_qkv": (6656, 2560),
+    "flash_shared_gate_up": (640, 2560),
+    "flash_shared_down": (2560, 320),
+    "flash_ple_kv_proj": (12800, 2560),
+    "flash_mtp_fc": (1280, 2560),  # fc_embedding / fc_hidden (gather_output)
+    "flash_hc_down_inject": (336, 10240),
+    "flash_hc_down": (320, 10240),
+    "flash_hc_up": (10240, 320),
+}
+ALL_SHAPES = {**SHAPES, **GEMMA_SHAPES, **QWEN_FLASH_SHAPES}
+
+# ---------------------------------------------------------------------------
+# launch plan: M tiling + split-K policy (host op validates, never re-derives)
+# ---------------------------------------------------------------------------
+MAX_M = 64
+MAX_SPLITS = 64  # host op limit (src/nvfp4_gemm_oxide.rs MAX_SPLITS)
+SMS = 188  # RTX PRO 6000 Blackwell (Server / Max-Q): 188 SMs
+TARGET_CTAS = 4 * SMS  # ~4 resident 128-thread CTAs per SM
+MIN_KPS = 2  # >= 2 k64 steps per split: the 2-stage load pipeline has depth
+PARTIAL_DIV = 128  # splits <= K / (128 * tiles): f32 partial traffic
+# (write + reduce read = 8 B x 16*tiles x N per split) <= N*K bytes ~ 1.8x
+# the weight bytes, and it is L2-resident
+# Host-op ABI (.param counts), checked against the cubin manifest at load.
+PARAMS = {"nvfp4_quant_act": 7, "nvfp4_splitk_reduce": 7,
+          **{f"nvfp4_gemm_t{t}": 15 for t in (1, 2, 3, 4)}}
+
+
+def tiles_for(m: int) -> int:
+    return -(-m // 16)
+
+
+def splits_for(n: int, k: int, m: int) -> int:
+    """Split-K factor for an (N, K) GEMM at M rows (depends on the M bucket
+    tiles = ceil(M/16) only). Enough CTAs for ~4 per SM (ceil(N/32) CTAs
+    per split), capped by: MAX_SPLITS, >= MIN_KPS k64 steps per split, and
+    the partial-traffic budget K / (PARTIAL_DIV * tiles). Wide-N projections
+    stay at 1 (no reduce kernel); narrow-N / deep-K ones (HC down 336 x
+    10240: 11 CTAs) split deep. ponytail: static heuristic; the in-pod
+    `sweep` prints the measured best split per case to retune it."""
+    ctas = -(-n // 32)
+    want = -(-TARGET_CTAS // ctas)
+    cap = min(MAX_SPLITS, (k // 64) // MIN_KPS, k // (PARTIAL_DIV * tiles_for(m)))
+    return max(1, min(want, cap))
+
+
+def plan(n: int, k: int, m: int, splits: int | None = None) -> dict:
+    """What the host op launches for (N, K, M): GEMM entry, grid, k64 steps
+    per split, launched splits (no empty trailing split)."""
+    tiles = tiles_for(m)
+    steps = k // 64
+    s = splits_for(n, k, m) if splits is None else splits
+    kps = -(-steps // s)
+    s = -(-steps // kps)
+    grid = (-(-n // 32), s)
+    return dict(tiles=tiles, splits=s, kps=kps, grid=grid, ctas=grid[0] * grid[1],
+                entry=f"nvfp4_gemm_t{tiles}", partial=(s * m * n if s > 1 else 0))
+
+
+def plan_str(p: dict) -> str:
+    return (f"tiles={p['tiles']} splits={p['splits']} kps={p['kps']} "
+            f"ctas={p['ctas']}")
+
+
+def partial_elems(n: int, k: int, max_m: int = MAX_M) -> int:
+    """f32 split-K workspace for every M <= max_m (worst case at each M
+    bucket's top row count)."""
+    ms = {min(16 * t, max_m) for t in range(1, tiles_for(max_m) + 1)}
+    return max(plan(n, k, m)["partial"] for m in ms)
 
 
 # ---------------------------------------------------------------------------
@@ -112,51 +202,71 @@ def sf_offset(row, kb, kb_pad):
     return atom * 512 + (row % 32) * 16 + ((row // 32) % 4) * 4 + kb % 4
 
 
-def make_problem(m, n, k, seed=0):
-    """Random bf16-representable x [m,k], quantized weight in vLLM layout."""
-    rng = np.random.default_rng(seed)
+@functools.lru_cache(maxsize=1)
+def _weights(n, k, seed=0):
+    """Quantized random weight in vLLM layout (cached: the oracle / bench
+    walk M for one shape at a time)."""
     import torch
-    x = torch.from_numpy(rng.standard_normal((m, k)).astype(np.float32)).bfloat16()
+    rng = np.random.default_rng(seed)
     w = torch.from_numpy((rng.standard_normal((n, k)) * 0.05).astype(np.float32)).bfloat16()
-    xf, wf = x.float().numpy(), w.float().numpy()
-    g_x = np.float32(448.0 * 6.0 / np.abs(xf).max())
+    wf = w.float().numpy()
     g_w = np.float32(448.0 * 6.0 / np.abs(wf).max())
     w_packed, w_sf_bits, w_sf = quantize(wf, g_w)
-    return dict(x=x, w_bf16=w, g_x=g_x, g_w=g_w, alpha=np.float32(1.0 / (g_x * g_w)),
-                w_packed=w_packed, w_sf_bits=w_sf_bits, w_sf=w_sf,
-                w_sf_swz=swizzle_sf(w_sf_bits))
+    return dict(w_bf16=w, g_w=g_w, w_packed=w_packed, w_sf_bits=w_sf_bits, w_sf=w_sf,
+                w_sf_swz=swizzle_sf(w_sf_bits), w_deq=(w_packed, dequant(w_packed, w_sf)))
+
+
+def make_problem(m, n, k, seed=0):
+    """Random bf16-representable x [m,k] (seeded by `seed`), quantized weight
+    in vLLM layout (seeded per shape)."""
+    rng = np.random.default_rng(1000 + seed)
+    import torch
+    x = torch.from_numpy(rng.standard_normal((m, k)).astype(np.float32)).bfloat16()
+    p = dict(_weights(n, k))
+    g_x = np.float32(448.0 * 6.0 / np.abs(x.float().numpy()).max())
+    p.update(x=x, g_x=g_x, alpha=np.float32(1.0 / (g_x * p["g_w"])))
+    return p
 
 
 def gemm_ref(p):
     """Exact fp32 result of the quantized problem (what the mma computes)."""
     xq, _, xsf = quantize(p["x"].float().numpy(), p["g_x"])
     a = dequant(xq, xsf)
-    b = dequant(p["w_packed"], p["w_sf"])
+    src, b = p.get("w_deq", (None, None))
+    if src is not p["w_packed"]:  # caller swapped the weight: recompute
+        b = dequant(p["w_packed"], p["w_sf"])
     return (a @ b.T * p["alpha"]).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# CPU twin of nvfp4_gemm_m16's addressing + the mma fragment layouts
+# CPU twin of nvfp4_gemm_t{tiles}'s addressing + the mma fragment layouts
 # ---------------------------------------------------------------------------
 def kernel_twin(p, mode=0, splits=1):
-    """Replays nvfp4_gemm_m16's per-lane u32 loads from flat buffers with the
-    mxf4nvf4 m16n8k64 fragment/scale layouts (cute MMA_Traits
-    SM120_16x8x64_TN_VS), its split-K ranges and nvfp4_splitk_reduce's sum,
-    returning the fp32 [M, N] result. mode 0: our quant buffers ([16, K/2],
-    row-major scales, a_rows=16); mode 1: vLLM's pre-quantized activation
-    ([M, K/2], 128x4-swizzled scales, a_rows=M). Any addressing bug
-    (fragment rows/k, scale bytes, swizzles, split ranges) shows up here."""
+    """Replays nvfp4_gemm_t{tiles}'s per-lane u32 loads from flat buffers with
+    the mxf4nvf4 m16n8k64 fragment/scale layouts (cute MMA_Traits
+    SM120_16x8x64_TN_VS): CTA/warp column ownership (warps past N exit),
+    one weight fragment per k64 step shared by `tiles` m16 A tiles, its
+    split-K ranges, the [splits, M, N] partial layout and
+    nvfp4_splitk_reduce's fixed-order sum; returns the fp32 [M, N] result.
+    mode 0: our quant buffers ([16*tiles, K/2], row-major scales, a_rows =
+    16*tiles, zero rows past M); mode 1: vLLM's pre-quantized activation
+    ([M, K/2], 128x4-swizzled scales, a_rows = M). Any addressing bug
+    (fragment rows/k, tile offsets, scale bytes, swizzles, split ranges,
+    N tails) shows up here."""
     xf = p["x"].float().numpy()
     m, k = xf.shape
     n = p["w_packed"].shape[0]
+    pl = plan(n, k, m, splits)
+    tiles, kps, splits = pl["tiles"], pl["kps"], pl["splits"]
     xq, xsf_bits, _ = quantize(xf, p["g_x"])
     kh, nkb = k // 2, k // 16
     kb_pad = -(-nkb // 4) * 4
     if mode == 0:
-        aq = np.zeros((16, kh), np.uint8)
-        asf_bits = np.zeros((16, nkb), np.uint8)
+        rows = 16 * tiles
+        aq = np.zeros((rows, kh), np.uint8)
+        asf_bits = np.zeros((rows, nkb), np.uint8)
         aq[:m], asf_bits[:m] = xq, xsf_bits
-        a_rows, a_stride = 16, kh
+        a_rows, a_stride = rows, kh
         aq, asf = aq.reshape(-1), asf_bits.reshape(-1)
         sfa_off = lambda row, kb: row * nkb + kb
     else:
@@ -165,10 +275,7 @@ def kernel_twin(p, mode=0, splits=1):
         sfa_off = lambda row, kb: sf_offset(row, kb, kb_pad)
     w, wsf = p["w_packed"].reshape(-1), p["w_sf_swz"]
     f8 = lambda b: e4m3_bits_to_f32(np.asarray(b, np.uint8))
-    steps = k // 64
-    kps = -(-steps // splits)
-    splits = -(-steps // kps)
-    partial = np.zeros((splits, 16, n), np.float32)
+    partial = np.full((splits, m, n), np.nan, np.float32)
 
     def u32(buf, off, ok=True):
         return buf[off:off + 4] if ok else np.zeros(4, np.uint8)
@@ -178,41 +285,57 @@ def kernel_twin(p, mode=0, splits=1):
         c = (byte >> 4) if j % 2 else (byte & 0xF)
         return E2M1[c & 7] * (-1.0 if c & 8 else 1.0)
 
+    warps = [(cta * 4 + wp) * 8 for cta in range(pl["grid"][0]) for wp in range(4)]
     for sp in range(splits):
         ks = range(sp * kps * 64, min(k, (sp + 1) * kps * 64), 64)
-        for n0 in range(0, n, 8):
-            acc = np.zeros((16, 8), np.float64)
+        for n0 in warps:
+            if n0 >= n:
+                continue  # warp-uniform exit (N tail)
+            acc = np.zeros((tiles, 16, 8), np.float64)
             for k0 in ks:
-                A = np.full((16, 64), np.nan)
+                off = k0 // 2
                 B = np.full((8, 64), np.nan)
-                SA = np.full((16, 4), np.nan)
                 SB = np.full((8, 4), np.nan)
-                for lane in range(32):
+                for lane in range(32):  # weight fragment: once per step
                     g, t = lane // 4, lane % 4
-                    off = k0 // 2 + 4 * t
-                    ok0, ok1 = g < a_rows, g + 8 < a_rows
-                    regs_a = [u32(aq, g * a_stride + off, ok0),
-                              u32(aq, (g + 8) * a_stride + off, ok1),
-                              u32(aq, g * a_stride + off + 16, ok0),
-                              u32(aq, (g + 8) * a_stride + off + 16, ok1)]
-                    for r, reg in enumerate(regs_a):
-                        for j in range(8):
-                            _put(A, g + 8 * (r & 1), 8 * t + j + 32 * (r >> 1), nib(reg, j))
-                    regs_b = [u32(w, (n0 + g) * kh + off), u32(w, (n0 + g) * kh + off + 16)]
-                    for r, reg in enumerate(regs_b):
+                    o = off + 4 * t
+                    for r, reg in enumerate([u32(w, (n0 + g) * kh + o),
+                                             u32(w, (n0 + g) * kh + o + 16)]):
                         for j in range(8):
                             _put(B, g, 8 * t + j + 32 * r, nib(reg, j))
-                    sfa_row = 8 * (lane & 1) + lane // 4
-                    sfa = u32(asf, sfa_off(sfa_row, k0 // 16), sfa_row < a_rows)
                     sfb = u32(wsf, sf_offset(n0 + g, k0 // 16, kb_pad))
                     for b in range(4):
-                        _put(SA, sfa_row, b, f8(sfa[b]))
-                        _put(SB, lane // 4, b, f8(sfb[b]))
-                assert not np.isnan(A).any() and not np.isnan(B).any()
-                assert not np.isnan(SA).any() and not np.isnan(SB).any()
-                acc += (A * np.repeat(SA, 16, axis=1)) @ (B * np.repeat(SB, 16, axis=1)).T
-            partial[sp, :, n0:n0 + 8] = acc.astype(np.float32)
-    return (partial.sum(0)[:m] * p["alpha"]).astype(np.float32)
+                        _put(SB, g, b, f8(sfb[b]))
+                assert not np.isnan(B).any() and not np.isnan(SB).any()
+                Bs = B * np.repeat(SB, 16, axis=1)
+                for i in range(tiles):  # the tiles' A fragments
+                    A = np.full((16, 64), np.nan)
+                    SA = np.full((16, 4), np.nan)
+                    for lane in range(32):
+                        g, t = lane // 4, lane % 4
+                        o = off + 4 * t
+                        r0, r1 = 16 * i + g, 16 * i + g + 8
+                        regs_a = [u32(aq, r0 * a_stride + o, r0 < a_rows),
+                                  u32(aq, r1 * a_stride + o, r1 < a_rows),
+                                  u32(aq, r0 * a_stride + o + 16, r0 < a_rows),
+                                  u32(aq, r1 * a_stride + o + 16, r1 < a_rows)]
+                        for r, reg in enumerate(regs_a):
+                            for j in range(8):
+                                _put(A, g + 8 * (r & 1), 8 * t + j + 32 * (r >> 1), nib(reg, j))
+                        sr = 16 * i + 8 * (lane & 1) + g
+                        sfa = u32(asf, sfa_off(sr, k0 // 16), sr < a_rows)
+                        for b in range(4):
+                            _put(SA, sr - 16 * i, b, f8(sfa[b]))
+                    assert not np.isnan(A).any() and not np.isnan(SA).any()
+                    acc[i] += (A * np.repeat(SA, 16, axis=1)) @ Bs.T
+            for i in range(tiles):
+                for row in range(16 * i, min(m, 16 * i + 16)):
+                    partial[sp, row, n0:n0 + 8] = acc[i, row - 16 * i].astype(np.float32)
+    out = np.zeros((m, n), np.float32)
+    for sp in range(splits):  # nvfp4_splitk_reduce: fixed split order
+        out += partial[sp]
+    assert not np.isnan(out).any(), "output column/row never written"
+    return (out * p["alpha"]).astype(np.float32)
 
 
 def _put(arr, i, j, v):
@@ -227,38 +350,82 @@ def e4m3_bits_to_f32(b):
         torch.float8_e4m3fn).float().numpy().reshape(np.shape(b))
 
 
+def unswizzle_sf(sf_swz, rows: int, nkb: int):
+    """torch: vLLM 128x4-swizzled scale buffer (any shape / e4m3 or uint8)
+    -> uint8 [rows, nkb] row-major (inverse of `swizzle_sf`)."""
+    import torch
+    rp, cp = -(-rows // 128) * 128, -(-nkb // 4) * 4
+    flat = sf_swz.reshape(-1).view(torch.uint8)[:rp * cp]
+    return (flat.reshape(rp // 128, cp // 4, 32, 4, 4).permute(0, 3, 2, 1, 4)
+            .reshape(rp, cp)[:rows, :nkb])
+
+
+def dequant_torch(packed, sf_u8):
+    """torch f64 exact dequant: packed uint8 [R, K/2] (low nibble = even k),
+    row-major e4m3 scale bits uint8 [R, K/16] -> [R, K] (without 1/g)."""
+    import torch
+    lut = torch.tensor(np.concatenate([E2M1, -E2M1]), dtype=torch.float64,
+                       device=packed.device)
+    r = packed.shape[0]
+    code = torch.stack([packed & 15, packed >> 4], -1).reshape(r, -1).long()
+    sf = sf_u8.contiguous().view(torch.float8_e4m3fn).double()
+    return (lut[code].reshape(r, sf.shape[1], 16) * sf[..., None]).reshape(r, -1)
+
+
+def exact_ref(xq, xsf, w, wsf, alpha: float, n: int, chunk_elems: int = 1 << 24):
+    """torch f64 alpha * deq(xq) @ deq(w[:n]).T from vLLM-layout tensors
+    (xq [M, K/2], w [>=N, K/2], both scale buffers 128x4-swizzled); weight
+    rows dequantized in chunks (load-time memory bound)."""
+    import torch
+    m, k = xq.shape[0], xq.shape[1] * 2
+    a = dequant_torch(xq.contiguous(), unswizzle_sf(xsf, m, k // 16))
+    wsf_u8 = unswizzle_sf(wsf, n, k // 16)
+    out = torch.empty(m, n, dtype=torch.float64, device=xq.device)
+    step = max(1, chunk_elems // k)
+    for r0 in range(0, n, step):
+        r1 = min(n, r0 + step)
+        out[:, r0:r1] = a @ dequant_torch(w[r0:r1], wsf_u8[r0:r1]).T
+    return out * alpha
+
+
 # ---------------------------------------------------------------------------
 # on-silicon oracle + bench
 # ---------------------------------------------------------------------------
-def _dev_problem(m, n, k, dev, seed=0):
+def _dev_problem(m, n, k, dev, seed=0, max_splits=None):
     import torch
     p = make_problem(m, n, k, seed)
+    rows = 16 * tiles_for(m)
+    s = plan(n, k, m)["splits"] if max_splits is None else max_splits
     t = dict(
         x=p["x"].to(dev),
         w=torch.from_numpy(p["w_packed"]).to(dev),
         w_sf=torch.from_numpy(p["w_sf_swz"]).to(dev).view(torch.float8_e4m3fn),
-        aq=torch.empty(16, k // 2, dtype=torch.uint8, device=dev),
-        asf=torch.empty(16, k // 16, dtype=torch.uint8, device=dev),
-        partial=torch.empty(8 * 16 * n, dtype=torch.float32, device=dev),
+        aq=torch.empty(rows, k // 2, dtype=torch.uint8, device=dev),
+        asf=torch.empty(rows, k // 16, dtype=torch.uint8, device=dev),
+        partial=torch.empty(max(1, s * m * n), dtype=torch.float32, device=dev),
         out=torch.empty(m, n, dtype=torch.bfloat16, device=dev),
         g=torch.tensor([p["g_x"]], dtype=torch.float32, device=dev),
         alpha=torch.tensor([p["alpha"]], dtype=torch.float32, device=dev),
+        g_f=float(p["g_x"]), alpha_f=float(p["alpha"]),
     )
     t["w_sf_2d"] = t["w_sf"].view(-(-n // 128) * 128, -1)
+    # FlashInfer CUTLASS needs N % 32: pad rows like vLLM's
+    # pad_nvfp4_weight_for_cutlass (the swizzled scales already are).
+    t["w_fi"] = torch.nn.functional.pad(t["w"], (0, 0, 0, -n % 32)).contiguous()
     return p, t
 
 
 def _ours(native, t, stream, splits=None):
-    n, k = t["w"].shape[0], t["x"].shape[1]
-    s = native.nvfp4_gemm_splits(n, k) if splits is None else splits
+    n, k, m = t["w"].shape[0], t["x"].shape[1], t["x"].shape[0]
+    s = plan(n, k, m)["splits"] if splits is None else splits
     native.nvfp4_gemm_cuda(t["x"], t["w"], t["w_sf"], t["aq"], t["asf"], t["partial"],
                            t["out"], t["g_f"], t["alpha_f"], s, stream)
     return t["out"]
 
 
 def _ours_q(native, t, xq, xsf, stream, splits=None):
-    n, k = t["w"].shape[0], t["x"].shape[1]
-    s = native.nvfp4_gemm_splits(n, k) if splits is None else splits
+    n, k, m = t["w"].shape[0], t["x"].shape[1], t["x"].shape[0]
+    s = plan(n, k, m)["splits"] if splits is None else splits
     native.nvfp4_gemm_q_cuda(xq, xsf, t["w"], t["w_sf"], t["partial"], t["out"],
                              t["alpha_f"], s, stream)
     return t["out"]
@@ -273,10 +440,10 @@ def _vllm(t, n):
     xq, xsf = ops.scaled_fp4_quant(t["x"], t["g"])
     try:
         from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm
-        y = flashinfer_scaled_fp4_mm(xq, t["w"], xsf, t["w_sf_2d"], t["alpha"],
+        y = flashinfer_scaled_fp4_mm(xq, t["w_fi"], xsf, t["w_sf_2d"], t["alpha"],
                                      torch.bfloat16, backend="cutlass")
     except Exception:  # FlashInfer absent: vLLM's own CUTLASS kernel
-        y = ops.cutlass_scaled_fp4_mm(xq, t["w"], xsf, t["w_sf_2d"], t["alpha"],
+        y = ops.cutlass_scaled_fp4_mm(xq, t["w_fi"], xsf, t["w_sf_2d"], t["alpha"],
                                       torch.bfloat16)
     return y[:, :n]
 
@@ -286,8 +453,8 @@ def _native_ready():
     from suffix_hybrid import oxide_kernels
     native = oxide_kernels.native()
     if torch.cuda.get_device_capability()[0] != 12:
-        raise RuntimeError("NVFP4 spike cubin is sm_120a SASS (cc 12.x only)")
-    oxide_kernels.ensure_loaded(FAMILY)  # sha256 + cuModuleLoadData
+        raise RuntimeError("NVFP4 GEMM cubin is sm_120a SASS (cc 12.x only)")
+    oxide_kernels.ensure_loaded(FAMILY, params=PARAMS)  # ABI + sha256 + cuModuleLoadData
     return native
 
 
@@ -301,11 +468,16 @@ def oracle_ok(rel_vs_ref: float, rel_vs_vllm: float, vllm_rel_vs_ref: float) -> 
             and rel_vs_ref <= max(1e-2, 1.1 * vllm_rel_vs_ref))
 
 
-def oracle(ms=(1, 4, 16), shapes=("mlp_gate_up", "mlp_down", "gdn_in_proj_qkvz",
-                                  "attn_o", "gemma_mlp_down")):
+ORACLE_MS = (1, 5, 16, 17, 40, 64)
+BENCH_MS = (1, 5, 8, 16, 24, 40, 64)
+
+
+def oracle(ms=ORACLE_MS, shapes=("mlp_gate_up", "mlp_down", "gdn_in_proj_qkvz", "attn_o",
+                                 "gemma_mlp_down", *QWEN_FLASH_SHAPES)):
     """Both entry paths (bf16 x -> our quant; vLLM-prequantized x with
     swizzled scales, i.e. the fused SiLU*mul / RMSNorm quant route) with the
-    production split-K policy, vs the exact reference and vs vLLM's op."""
+    production M tiling + split-K plan, vs the exact reference and vs vLLM's
+    op."""
     import torch
     from vllm import _custom_ops as ops
     native = _native_ready()
@@ -316,7 +488,6 @@ def oracle(ms=(1, 4, 16), shapes=("mlp_gate_up", "mlp_down", "gdn_in_proj_qkvz",
         n, k = ALL_SHAPES[name]
         for m in ms:
             p, t = _dev_problem(m, n, k, dev, seed=m)
-            t["g_f"], t["alpha_f"] = float(p["g_x"]), float(p["alpha"])
             ref = torch.from_numpy(gemm_ref(p)).to(dev)
             ref16 = ref.bfloat16().float()
             vl = _vllm(t, n).float()
@@ -331,10 +502,9 @@ def oracle(ms=(1, 4, 16), shapes=("mlp_gate_up", "mlp_down", "gdn_in_proj_qkvz",
                 rel_v = float((ours - vl).norm() / vl.norm())
                 ok = oracle_ok(rel, rel_v, vl_rel)
                 lines.append(
-                    f"{name} {path} M={m} N={n} K={k} splits="
-                    f"{native.nvfp4_gemm_splits(n, k)}: rel_vs_ref={rel:.2e} "
-                    f"cos={cos_v:.6f} rel_vs_vllm={rel_v:.2e} vllm_rel_vs_ref={vl_rel:.2e} "
-                    f"{'OK' if ok else 'FAIL'}")
+                    f"{name} {path} M={m} N={n} K={k} {plan_str(plan(n, k, m))}: "
+                    f"rel_vs_ref={rel:.2e} cos={cos_v:.6f} rel_vs_vllm={rel_v:.2e} "
+                    f"vllm_rel_vs_ref={vl_rel:.2e} {'OK' if ok else 'FAIL'}")
                 if not ok:
                     raise RuntimeError(f"{MARKER} NVFP4-GEMM ORACLE FAIL: {lines[-1]}")
     for ln in lines:
@@ -342,45 +512,84 @@ def oracle(ms=(1, 4, 16), shapes=("mlp_gate_up", "mlp_down", "gdn_in_proj_qkvz",
     return f"{MARKER} NVFP4-GEMM ORACLE PASS ({len(lines)} cases, sm_120a mxf4nvf4 mma)"
 
 
-def bench(ms=(1, 4, 8, 16), shapes=tuple(ALL_SHAPES), iters=200):
-    """us per call (quant + gemm), each path captured in one CUDA graph."""
+def _graph_us(fn, dev, iters):
     import torch
+    s = torch.cuda.Stream(dev)
+    s.wait_stream(torch.cuda.current_stream(dev))
+    with torch.cuda.stream(s):
+        fn(s)  # warm (FlashInfer tactic selection happens here)
+        torch.cuda.synchronize(dev)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            fn(s)
+    torch.cuda.current_stream(dev).wait_stream(s)
+    g.replay()
+    torch.cuda.synchronize(dev)
+    e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
+    e0.record()
+    for _ in range(iters):
+        g.replay()
+    e1.record()
+    torch.cuda.synchronize(dev)
+    return e0.elapsed_time(e1) * 1000.0 / iters
+
+
+def route_from_bench(res: dict, ms=BENCH_MS) -> dict:
+    """{(N, K): largest benched M such that ours won at every benched M' <=
+    it} from bench results {(N, K, M): (vllm_us, ours_us)}; 0 = never."""
+    out = {}
+    for (n, k) in dict.fromkeys((n, k) for n, k, _ in res):
+        best = 0
+        for m in sorted(ms):
+            if (n, k, m) not in res:
+                continue
+            v, o = res[(n, k, m)]
+            if o > v:
+                break
+            best = m
+        out[(n, k)] = best
+    return out
+
+
+def bench(ms=BENCH_MS, shapes=tuple(ALL_SHAPES), iters=200, sweep=False):
+    """us per call (quant + gemm), each path captured in one CUDA graph, vs
+    vLLM's FlashInfer CUTLASS (quant + gemm). sweep: also time split counts
+    {1, 2, 4, ..., 64} and print the best (heuristic retuning). Ends with the
+    SUFFIX_NVFP4_GEMM_ROUTE string that keeps every losing (shape, M) on
+    FlashInfer."""
     native = _native_ready()
+    import torch
     dev = torch.device("cuda", torch.cuda.current_device())
     res = {}
     for name in shapes:
         n, k = ALL_SHAPES[name]
+        if any((n, k) == key[:2] for key in res):
+            continue  # same (N, K) under another name
         for m in ms:
-            p, t = _dev_problem(m, n, k, dev, seed=1)
-            t["g_f"], t["alpha_f"] = float(p["g_x"]), float(p["alpha"])
-            times = []
-            for which in ("vllm", "ours"):
-                s = torch.cuda.Stream(dev)
-                s.wait_stream(torch.cuda.current_stream(dev))
-                with torch.cuda.stream(s):
-                    fn = (lambda: _vllm(t, n)) if which == "vllm" else \
-                        (lambda: _ours(native, t, s.cuda_stream))
-                    fn()  # warm (FlashInfer tactic selection happens here)
-                    torch.cuda.synchronize(dev)
-                    g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g, stream=s):
-                        fn()
-                torch.cuda.current_stream(dev).wait_stream(s)
-                g.replay()
-                torch.cuda.synchronize(dev)
-                e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
-                e0.record()
-                for _ in range(iters):
-                    g.replay()
-                e1.record()
-                torch.cuda.synchronize(dev)
-                times.append(e0.elapsed_time(e1) * 1000.0 / iters)
-            bytes_w = n * k // 2 + n * k // 16
-            roof = bytes_w / 1.79e12 * 1e6
-            res[(name, m)] = tuple(times)
-            print(f"{MARKER} bench {name} M={m} N={n} K={k} splits={native.nvfp4_gemm_splits(n, k)}: vllm {times[0]:.1f} us, "
-                  f"ours {times[1]:.1f} us (x{times[1] / times[0]:.2f}), "
-                  f"weight-roofline {roof:.1f} us", file=sys.stderr, flush=True)
+            pl = plan(n, k, m)
+            cands = sorted({pl["splits"], *(s for s in (1, 2, 4, 8, 16, 32, 64)
+                                             if s <= k // 64)}) if sweep else [pl["splits"]]
+            p, t = _dev_problem(m, n, k, dev, seed=1, max_splits=max(cands))
+            t_v = _graph_us(lambda s: _vllm(t, n), dev, iters)
+            t_o = {c: _graph_us(lambda s, c=c: _ours(native, t, s.cuda_stream, c), dev, iters)
+                   for c in cands}
+            ours = t_o[pl["splits"]]
+            res[(n, k, m)] = (t_v, ours)
+            roof = (n * k // 2 + n * k // 16) / 1.79e12 * 1e6
+            best = min(t_o, key=t_o.get)
+            extra = (f"; sweep best splits={plan(n, k, m, best)['splits']} "
+                     f"{t_o[best]:.1f} us" if sweep else "")
+            print(f"{MARKER} bench {name} M={m} N={n} K={k} {plan_str(pl)}: vllm "
+                  f"{t_v:.1f} us, ours {ours:.1f} us (x{ours / t_v:.2f} "
+                  f"{'WIN' if ours <= t_v else 'LOSE'}), weight-roofline {roof:.1f} us"
+                  f"{extra}", file=sys.stderr, flush=True)
+    route = route_from_bench(res, ms)
+    lose = ",".join(f"{n}x{k}:{mm}" for (n, k), mm in route.items() if mm < max(ms))
+    print(f"{MARKER} bench route: ours wins up to M per (N x K): "
+          + " ".join(f"{n}x{k}<={mm}" for (n, k), mm in route.items()),
+          file=sys.stderr, flush=True)
+    print(f"{MARKER} bench suggested SUFFIX_NVFP4_GEMM_ROUTE={lose or '(none: ours wins all)'}",
+          file=sys.stderr, flush=True)
     return res
 
 
@@ -389,8 +598,8 @@ def main(argv=None):
     try:
         if mode in ("oracle", "both"):
             print(oracle(), file=sys.stderr, flush=True)
-        if mode in ("bench", "both"):
-            bench()
+        if mode in ("bench", "both", "sweep"):
+            bench(sweep=mode == "sweep")
         return 0
     except Exception as exc:
         print(f"{MARKER} NVFP4-GEMM {mode.upper()} FAIL: {type(exc).__name__}: {exc}",

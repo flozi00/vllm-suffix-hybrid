@@ -453,8 +453,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "oxide-kernels")]
     m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_q_cuda, m)?)?;
     #[cfg(feature = "oxide-kernels")]
-    m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_splits, m)?)?;
-    #[cfg(feature = "oxide-kernels")]
     m.add_function(wrap_pyfunction!(nvfp4_moe_oxide::nvfp4_moe_cuda, m)?)?;
     #[cfg(feature = "oxide-kernels")]
     m.add_function(wrap_pyfunction!(fp8_moe_oxide::fp8_moe_cuda, m)?)?;

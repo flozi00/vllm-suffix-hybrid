@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! NVFP4 W4A4 decode GEMM — capability spike (qwen3.8-27b, M <= 16).
+//! NVFP4 W4A4 decode GEMM (M <= 64: decode rows x MTP verify tokens).
 //!
 //! Proves the cuda-oxide -> PTX 8.7 (.target sm_120a) -> ptxas 13.0 chain can
 //! drive SM120's block-scaled FP4 tensor cores:
@@ -22,15 +22,21 @@
 //!   alpha = 1 / (x_global_scale * w_global_scale)
 //!
 //! Entries (interface.json):
-//!   nvfp4_quant_act  grid (K/16/128 rounded up, 16), block 128: one thread
-//!                    per (row, 16-block): amax -> e4m3 scale -> e2m1 codes;
-//!                    rows >= M are written as zeros (the mma always runs
-//!                    m16). Output: aq [16, K/2] u8, asf [16, K/16] u8 (row
-//!                    major, NOT swizzled — our own layout).
-//!   nvfp4_gemm_m16   grid (N / 32), block 128 (4 warps x n8 tiles): each
-//!                    warp owns 8 output columns and streams K in k64 steps,
-//!                    one mma per step, fp32 accumulate, bf16 store.
-//! Fragment maps (cute MMA_Traits<SM120_16x8x64_TN_VS>, g = lane/4, t = lane%4):
+//!   nvfp4_quant_act  grid (K/16/128 rounded up, 16*MT), block 128: one
+//!                    thread per (row, 16-block): amax -> e4m3 scale -> e2m1
+//!                    codes; rows >= M are written as zeros (the mma always
+//!                    runs m16 tiles). Output: aq [16*MT, K/2] u8, asf
+//!                    [16*MT, K/16] u8 (row major, NOT swizzled — our layout).
+//!   nvfp4_gemm_t{MT} MT = ceil(M/16) in 1..4; grid (ceil(N/32), splits),
+//!                    block 128 (4 warps x n8 tiles): each warp owns 8 output
+//!                    columns and streams its K range in k64 steps; the
+//!                    weight fragment + scales of a step are loaded ONCE and
+//!                    feed MT mmas (one per m16 activation tile), so weight
+//!                    bytes stay at the roofline independent of M.
+//!   nvfp4_splitk_reduce  fixed-order sum over the split partials (fp32
+//!                    workspace [splits, M, N]) -> bf16: deterministic.
+//! Fragment maps (cute MMA_Traits<SM120_16x8x64_TN_VS>, g = lane/4, t = lane%4;
+//! A/SFA rows of m16 tile i are offset by 16*i):
 //!   A reg r: row g + 8*(r&1), k = 8t..8t+7 (+32 for r>=2)   -> u32 of aq row
 //!   B reg r: col g,           k = 8t..8t+7 (+32 for r=1)    -> u32 of w row
 //!   SFA:     row 8*(lane&1) + lane/4, 4 bytes = k-blocks 0..3 of the k64 step
@@ -44,6 +50,18 @@ pub mod kernels {
     use cuda_device::{kernel, launch_bounds, ptx_asm, thread};
 
     const WARPS: u32 = 4;
+
+    /// `for $i in 0..$mt` fully unrolled (MT <= 4): every tile index is a
+    /// constant, so the per-tile arrays stay in registers (a rolled loop
+    /// over the accumulators spilled them to .local for MT >= 3).
+    macro_rules! unroll_mt {
+        ($mt:expr, $i:ident, $body:block) => {{
+            { const $i: usize = 0; if $i < $mt $body }
+            { const $i: usize = 1; if $i < $mt $body }
+            { const $i: usize = 2; if $i < $mt $body }
+            { const $i: usize = 3; if $i < $mt $body }
+        }};
+    }
 
     #[inline(always)]
     fn bf16_to_f32(x: u16) -> f32 {
@@ -173,58 +191,69 @@ pub mod kernels {
         unsafe { *(p.add(off) as *const u32) }
     }
 
-    /// One k64 step's operands for this lane.
+    /// One k64 step's operands for this lane: the weight (B) fragment and
+    /// its scales are loaded ONCE and shared by the MT m16 activation tiles.
     #[derive(Clone, Copy)]
-    struct Step {
-        a: [u32; 4],
+    struct Step<const MT: usize> {
+        a: [[u32; 4]; MT],
+        sfa: [u32; MT],
         b: [u32; 2],
-        sfa: u32,
         sfb: u32,
     }
 
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    fn load_step(
+    fn load_step<const MT: usize>(
         k0: u32,
-        t: u32,
-        g: u32,
-        a_row0: *const u8,
-        a_row1: *const u8,
-        a0_ok: bool,
-        a1_ok: bool,
+        lane: u32,
+        aq: *const u8,
+        a_stride: u32,
+        a_rows: u32,
         w_row: *const u8,
         asf: *const u8,
         wsf: *const u8,
-        sfa_row: u32,
-        sfa_ok: bool,
         asf_mode: u32,
         nkb: u32,
         kb_pad: u32,
         n0: u32,
-    ) -> Step {
+    ) -> Step<MT> {
+        let g = lane / 4;
+        let t = lane % 4;
         let off = (k0 / 2 + 4 * t) as usize;
         let kb = k0 / 16;
-        let a0 = if a0_ok { ld32(a_row0, off) } else { 0 };
-        let a1 = if a1_ok { ld32(a_row1, off) } else { 0 };
-        let a2 = if a0_ok { ld32(a_row0, off + 16) } else { 0 };
-        let a3 = if a1_ok { ld32(a_row1, off + 16) } else { 0 };
-        let sfa = if !sfa_ok {
-            0
-        } else if asf_mode == 0 {
-            ld32(asf, (sfa_row * nkb + kb) as usize)
-        } else {
-            ld32(asf, sf_offset(sfa_row, kb, kb_pad))
-        };
-        Step {
-            a: [a0, a1, a2, a3],
+        let mut s = Step {
+            a: [[0u32; 4]; MT],
+            sfa: [0u32; MT],
             b: [ld32(w_row, off), ld32(w_row, off + 16)],
-            sfa,
             sfb: ld32(wsf, sf_offset(n0 + g, kb, kb_pad)),
-        }
+        };
+        unroll_mt!(MT, I, {
+            let r0 = 16 * I as u32 + g;
+            let r1 = r0 + 8;
+            if r0 < a_rows {
+                let p = (r0 * a_stride) as usize + off;
+                s.a[I][0] = ld32(aq, p);
+                s.a[I][2] = ld32(aq, p + 16);
+            }
+            if r1 < a_rows {
+                let p = (r1 * a_stride) as usize + off;
+                s.a[I][1] = ld32(aq, p);
+                s.a[I][3] = ld32(aq, p + 16);
+            }
+            let sr = 16 * I as u32 + 8 * (lane & 1) + g;
+            if sr < a_rows {
+                s.sfa[I] = if asf_mode == 0 {
+                    ld32(asf, (sr * nkb + kb) as usize)
+                } else {
+                    ld32(asf, sf_offset(sr, kb, kb_pad))
+                };
+            }
+        });
+        s
     }
 
     #[inline(always)]
-    fn mma(c: [f32; 4], s: Step) -> [f32; 4] {
+    fn mma(c: [f32; 4], a: [u32; 4], b: [u32; 2], sfa: u32, sfb: u32) -> [f32; 4] {
         let zero: u16 = 0;
         let (d0, d1, d2, d3): (f32, f32, f32, f32);
         unsafe {
@@ -234,20 +263,20 @@ pub mod kernels {
                 out("=f") d1,
                 out("=f") d2,
                 out("=f") d3,
-                in("r") s.a[0],
-                in("r") s.a[1],
-                in("r") s.a[2],
-                in("r") s.a[3],
-                in("r") s.b[0],
-                in("r") s.b[1],
+                in("r") a[0],
+                in("r") a[1],
+                in("r") a[2],
+                in("r") a[3],
+                in("r") b[0],
+                in("r") b[1],
                 in("f") c[0],
                 in("f") c[1],
                 in("f") c[2],
                 in("f") c[3],
-                in("r") s.sfa,
+                in("r") sfa,
                 in("h") zero,
                 in("h") zero,
-                in("r") s.sfb,
+                in("r") sfb,
                 in("h") zero,
                 in("h") zero,
                 options(register_only),
@@ -256,16 +285,27 @@ pub mod kernels {
         [d0, d1, d2, d3]
     }
 
-    /// y[m, n] = alpha * (A_q x W_q^T), M <= 16, one warp per 8 columns,
-    /// split-K over blockIdx.y (`kps` k64 steps per split). partial == null:
-    /// write bf16 `out` (alpha applied); else write fp32 partials
-    /// partial[(split*16 + row) * n + col] for nvfp4_splitk_reduce.
-    /// A: `a_rows` rows of `a_stride` bytes (rows >= a_rows read as 0);
-    /// asf_mode 0 = row-major [a_rows, K/16] (our quant), 1 = vLLM's
-    /// 128x4-swizzled activation scales (fused SiLU*mul / RMSNorm quant).
-    #[kernel]
-    #[launch_bounds(128)]
-    pub unsafe fn nvfp4_gemm_m16(
+    #[inline(always)]
+    fn mma_all<const MT: usize>(mut c: [[f32; 4]; MT], s: Step<MT>) -> [[f32; 4]; MT] {
+        unroll_mt!(MT, I, {
+            c[I] = mma(c[I], s.a[I], s.b, s.sfa[I], s.sfb);
+        });
+        c
+    }
+
+    /// y[m, n] = alpha * (A_q x W_q^T) for M <= 16*MT: one warp per 8
+    /// columns (CTA = 4 warps = 32 columns, grid.x = ceil(N/32); warps past
+    /// N exit, so N % 8 == 0 suffices), MT m16 tiles per warp sharing each
+    /// k64 weight fragment (register-resident accumulators), split-K over
+    /// blockIdx.y (`kps` k64 steps per split). partial == null: write bf16
+    /// `out` (alpha applied); else fp32 partials partial[(split*m + row) * n
+    /// + col] for nvfp4_splitk_reduce. A: `a_rows` rows of `a_stride` bytes
+    /// (rows >= a_rows read as 0); asf_mode 0 = row-major [a_rows, K/16]
+    /// (our quant), 1 = vLLM's 128x4-swizzled activation scales (fused
+    /// SiLU*mul / RMSNorm quant).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemm_body<const MT: usize>(
         out: *mut u16,
         partial: *mut f32,
         aq: *const u8,
@@ -297,64 +337,109 @@ pub mod kernels {
         if k_end > k {
             k_end = k;
         }
-        let kh = k / 2;
         let nkb = k / 16;
         let kb_pad = (nkb + 3) / 4 * 4;
-        let a_row0 = unsafe { aq.add((g * a_stride) as usize) };
-        let a_row1 = unsafe { aq.add(((g + 8) * a_stride) as usize) };
-        let sfa_row = 8 * (lane & 1) + lane / 4;
-        let w_row = unsafe { w.add(((n0 + g) * kh) as usize) };
-        let (a0_ok, a1_ok, sfa_ok) = (g < a_rows, g + 8 < a_rows, sfa_row < a_rows);
-        let mut c = [0.0f32; 4];
+        let w_row = unsafe { w.add(((n0 + g) * (k / 2)) as usize) };
+        let mut c = [[0.0f32; 4]; MT];
         if k_begin < k_end {
             // 2-stage software pipeline: next step's loads are in flight
-            // while the current mma issues.
-            let mut cur = load_step(
-                k_begin, t, g, a_row0, a_row1, a0_ok, a1_ok, w_row, asf, wsf, sfa_row,
-                sfa_ok, asf_mode, nkb, kb_pad, n0,
+            // while the current step's MT mmas issue.
+            let mut cur = load_step::<MT>(
+                k_begin, lane, aq, a_stride, a_rows, w_row, asf, wsf, asf_mode, nkb, kb_pad, n0,
             );
             let mut k0 = k_begin + 64;
             while k0 < k_end {
-                let nxt = load_step(
-                    k0, t, g, a_row0, a_row1, a0_ok, a1_ok, w_row, asf, wsf, sfa_row,
-                    sfa_ok, asf_mode, nkb, kb_pad, n0,
+                let nxt = load_step::<MT>(
+                    k0, lane, aq, a_stride, a_rows, w_row, asf, wsf, asf_mode, nkb, kb_pad, n0,
                 );
-                c = mma(c, cur);
+                c = mma_all(c, cur);
                 cur = nxt;
                 k0 += 64;
             }
-            c = mma(c, cur);
+            c = mma_all(c, cur);
         }
         let col = n0 + 2 * t;
-        if partial.is_null() {
-            if g < m {
-                let v = f32_to_bf16(c[0] * alpha) | (f32_to_bf16(c[1] * alpha) << 16);
-                unsafe { *(out.add((g * out_stride + col) as usize) as *mut u32) = v };
-            }
-            if g + 8 < m {
-                let v = f32_to_bf16(c[2] * alpha) | (f32_to_bf16(c[3] * alpha) << 16);
-                unsafe { *(out.add(((g + 8) * out_stride + col) as usize) as *mut u32) = v };
-            }
-        } else {
-            let base = split * 16;
-            if g < m {
-                let p = unsafe { partial.add(((base + g) * n + col) as usize) };
-                unsafe {
-                    *p = c[0];
-                    *p.add(1) = c[1];
+        let bf16 = partial.is_null();
+        let store = |row: u32, v0: f32, v1: f32| {
+            if row < m {
+                if bf16 {
+                    let v = f32_to_bf16(v0 * alpha) | (f32_to_bf16(v1 * alpha) << 16);
+                    unsafe { *(out.add((row * out_stride + col) as usize) as *mut u32) = v };
+                } else {
+                    let p = unsafe { partial.add(((split * m + row) * n + col) as usize) };
+                    unsafe {
+                        *p = v0;
+                        *p.add(1) = v1;
+                    }
                 }
             }
-            if g + 8 < m {
-                let p = unsafe { partial.add(((base + g + 8) * n + col) as usize) };
-                unsafe {
-                    *p = c[2];
-                    *p.add(1) = c[3];
-                }
-            }
+        };
+        unroll_mt!(MT, I, {
+            let row = 16 * I as u32 + g;
+            store(row, c[I][0], c[I][1]);
+            store(row + 8, c[I][2], c[I][3]);
+        });
+    }
+
+    // One entry per m16-tile count (M <= 16, 32, 48, 64); the host picks it
+    // from M, so the launch shape is a function of M only (graph-safe).
+    #[kernel]
+    #[launch_bounds(128)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn nvfp4_gemm_t1(
+        out: *mut u16, partial: *mut f32, aq: *const u8, asf: *const u8, w: *const u8,
+        wsf: *const u8, m: u32, n: u32, k: u32, out_stride: u32, a_stride: u32, a_rows: u32,
+        asf_mode: u32, kps: u32, alpha: f32,
+    ) {
+        unsafe {
+            gemm_body::<1>(out, partial, aq, asf, w, wsf, m, n, k, out_stride, a_stride, a_rows,
+                           asf_mode, kps, alpha)
         }
     }
 
-    /// out[row, col] = bf16(alpha * sum_s partial[(s*16 + row) * n + col]),
+    #[kernel]
+    #[launch_bounds(128)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn nvfp4_gemm_t2(
+        out: *mut u16, partial: *mut f32, aq: *const u8, asf: *const u8, w: *const u8,
+        wsf: *const u8, m: u32, n: u32, k: u32, out_stride: u32, a_stride: u32, a_rows: u32,
+        asf_mode: u32, kps: u32, alpha: f32,
+    ) {
+        unsafe {
+            gemm_body::<2>(out, partial, aq, asf, w, wsf, m, n, k, out_stride, a_stride, a_rows,
+                           asf_mode, kps, alpha)
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(128)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn nvfp4_gemm_t3(
+        out: *mut u16, partial: *mut f32, aq: *const u8, asf: *const u8, w: *const u8,
+        wsf: *const u8, m: u32, n: u32, k: u32, out_stride: u32, a_stride: u32, a_rows: u32,
+        asf_mode: u32, kps: u32, alpha: f32,
+    ) {
+        unsafe {
+            gemm_body::<3>(out, partial, aq, asf, w, wsf, m, n, k, out_stride, a_stride, a_rows,
+                           asf_mode, kps, alpha)
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(128)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn nvfp4_gemm_t4(
+        out: *mut u16, partial: *mut f32, aq: *const u8, asf: *const u8, w: *const u8,
+        wsf: *const u8, m: u32, n: u32, k: u32, out_stride: u32, a_stride: u32, a_rows: u32,
+        asf_mode: u32, kps: u32, alpha: f32,
+    ) {
+        unsafe {
+            gemm_body::<4>(out, partial, aq, asf, w, wsf, m, n, k, out_stride, a_stride, a_rows,
+                           asf_mode, kps, alpha)
+        }
+    }
+
+    /// out[row, col] = bf16(alpha * sum_s partial[(s*m + row) * n + col]),
     /// one thread per (row < m, col); fixed summation order (deterministic).
     #[kernel]
     #[launch_bounds(256)]
@@ -376,7 +461,7 @@ pub mod kernels {
         let mut acc = 0.0f32;
         let mut s = 0;
         while s < splits {
-            acc += unsafe { *partial.add(((s * 16 + row) * n + col) as usize) };
+            acc += unsafe { *partial.add(((s * m + row) * n + col) as usize) };
             s += 1;
         }
         unsafe { *out.add((row * out_stride + col) as usize) = f32_to_bf16(acc * alpha) as u16 };
