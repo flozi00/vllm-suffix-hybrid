@@ -395,7 +395,9 @@ def stages(p, x, ids, tw, ws, out):
     f8 = lambda b: b.view(torch.float8_e4m3fn).float()
     frac = lambda a, b: float((a != b).float().mean()) if a.numel() else 0.0
     xq = dequant(aq[:m * hdim // 2].view(m, -1), f8(asf[:m * hdim // 16].view(m, -1)))
-    got = {"xq": frac(xq, qdq(x.float(), p["a1g"]))}
+    xr = qdq(x.float(), p["a1g"])
+    got = {"xq": frac(xq, xr)}
+    bad_rows = [(r, int((xq[r] != xr[r]).sum())) for r in range(m) if (xq[r] != xr[r]).any()]
     vp = torch.nonzero(ids.reshape(-1) >= 0).reshape(-1)
     h = inter[:pairs * idim].view(pairs, idim)[vp]
     h_ref = torch.zeros(pairs, idim, dtype=torch.float64, device=x.device)
@@ -419,7 +421,8 @@ def stages(p, x, ids, tw, ws, out):
         acc = torch.where(valid[:, k, None], acc + yk[:, k], acc)
     got["comb"] = frac(out.float(), acc.bfloat16().float())
     ok = all(got[k] <= STAGE_TOL[k] for k in got)
-    return ok, "stages " + " ".join(f"{k}={v:.1e}" for k, v in got.items())
+    return ok, ("stages " + " ".join(f"{k}={v:.1e}" for k, v in got.items())
+                + (f" xq_bad_rows={bad_rows[:8]}" if bad_rows else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -605,15 +608,22 @@ def _make_layer_cls():
                     dev, torch.bfloat16)
                 ids, tw = rand_routing(m, cfg["E_global"], cfg["topk"], dev, seed,
                                        base, local, dead)
-                fi = super().forward_modular(x, tw, ids).float()
-                out = self._sfx_run(cfg, x, tw, ids)
+                x0 = x.clone()
+                # each path gets its own copy: an in-place writer (either
+                # kernel) must not change what the spec and the other see
+                fi = super().forward_modular(x.clone(), tw.clone(), ids.clone()).float()
+                x_fi = _rel(x, x0)
+                xo = x.clone()
+                out = self._sfx_run(cfg, xo, tw, ids)
+                x_ours = _rel(xo, x0)
                 lid = to_local(ids, base, local)
                 st_ok, st = stages(cfg, x, lid, tw, _state["ws"][dev], out)
                 ours = out.float()
                 ref = moe_ref(cfg, x, lid, tw)
                 emu = moe_ref(cfg, x, lid, tw, fi=True).bfloat16()
                 ok, msg = judge(ours, fi, ref, lid, emu)
-                ok, msg = ok and st_ok, f"{msg} {st}"
+                ok, msg = ok and st_ok, (f"{msg} {st} a1g={cfg['a1g']:.4g} a2g={cfg['a2g']:.4g} "
+                                         f"x_mutated_by_fi={x_fi:.1e} x_mutated_by_ours={x_ours:.1e}")
                 if fi.norm() > 0:
                     worst = max(worst, _rel(ours, fi))
                     worst_ref = max(worst_ref, _rel(ours, ref))
