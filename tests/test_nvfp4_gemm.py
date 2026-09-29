@@ -146,3 +146,11 @@ def test_oracle_gate_is_relative_to_vllm():
     assert ng.oracle_ok(9e-3, 1e-3, 1e-3)          # floor 1e-2
     assert not ng.oracle_ok(1.5e-2, 1e-3, 1.27e-2)  # > 1.1 x vLLM's error
     assert not ng.oracle_ok(5e-3, 3e-2, 5e-3)       # disagrees with vLLM
+
+
+def test_oracle_ok_triangle_when_vllm_quant_deviates():
+    from suffix_hybrid.kernels.nvfp4_gemm import oracle_ok
+    # silicon 2026-09-29 qwen gate_up M=16: ours == spec, vLLM 2.3e-2 off -> pass
+    assert oracle_ok(0.0, 2.30e-2, 2.30e-2)
+    # ours off the spec while vLLM is exact -> fail
+    assert not oracle_ok(2.0e-2, 2.0e-2, 0.0)

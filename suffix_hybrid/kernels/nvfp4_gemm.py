@@ -464,8 +464,10 @@ def oracle_ok(rel_vs_ref: float, rel_vs_vllm: float, vllm_rel_vs_ref: float) -> 
     the fp32 reference is stricter than vLLM itself meets (bf16 output
     rounding at large K*|x| — silicon 87fdbc80: gate_up prequant M=16
     rel_vs_ref 1.27e-2 with rel_vs_vllm 0)."""
-    return (rel_vs_vllm <= 2e-2
-            and rel_vs_ref <= max(1e-2, 1.1 * vllm_rel_vs_ref))
+    # Triangle bound vs vLLM (silicon 2026-09-29, qwen gate_up M=16: ours ==
+    # spec exactly, vLLM 2.3e-2 away: its scaled_fp4_quant uses rcp.approx).
+    return (rel_vs_ref <= max(1e-2, 1.1 * vllm_rel_vs_ref)
+            and rel_vs_vllm <= max(2e-2, 1.1 * (rel_vs_ref + vllm_rel_vs_ref)))
 
 
 ORACLE_MS = (1, 5, 16, 17, 40, 64)

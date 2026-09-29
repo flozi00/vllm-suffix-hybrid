@@ -150,12 +150,17 @@ def _make_kernel_cls():
         nvfp4_weight_padding_bytes,
     )
     from suffix_hybrid import oxide_kernels
+    import numpy as np
+
     from suffix_hybrid.kernels.nvfp4_gemm import (
         PARAMS,
+        dequant_torch,
         exact_ref,
         oracle_ok,
         plan,
         plan_str,
+        quantize,
+        unswizzle_sf,
     )
 
     native = oxide_kernels.native()
@@ -253,16 +258,49 @@ def _make_kernel_cls():
                                   cfg["alpha"], n).bfloat16().float()
                 enorm = exact.norm().clamp_min(1e-30)
                 ref_rel = float((ref - exact).norm() / enorm)  # FlashInfer's own error
-                for route, got in (("bf16", ours), ("prequant", ours_q)):
-                    rel = float((got - ref).norm() / ref.norm().clamp_min(1e-30))
-                    rel_x = float((got - exact).norm() / enorm)
-                    worst, worst_ref = max(worst, rel), max(worst_ref, rel_x)
-                    if not oracle_ok(rel_x, rel, ref_rel) or not torch.isfinite(got).all():
-                        raise RuntimeError(
-                            f"{MARKER} LAYER ORACLE FAIL N={n} K={k} M={m} {route} "
-                            f"{plan_str(plan(n, k, m))}: rel_vs_flashinfer={rel:.3e} "
-                            f"(<= {ORACLE_REL}) rel_vs_exact={rel_x:.3e} (flashinfer "
-                            f"{ref_rel:.3e}) — refusing to serve with {GATE}=1")
+                # prequant route: vLLM's own quantized x -> must agree with the
+                # FlashInfer parent and the exact product (standalone tolerances).
+                rel = float((ours_q - ref).norm() / ref.norm().clamp_min(1e-30))
+                rel_x = float((ours_q - exact).norm() / enorm)
+                worst, worst_ref = max(worst, rel), max(worst_ref, rel_x)
+                bad = (not oracle_ok(rel_x, rel, ref_rel) or not torch.isfinite(ours_q).all())
+                why = (f"prequant rel_vs_flashinfer={rel:.3e} rel_vs_exact={rel_x:.3e} "
+                       f"(flashinfer {ref_rel:.3e})")
+                if not bad:
+                    # bf16 route: OUR in-kernel quant is the NVFP4 spec with IEEE
+                    # math (sf = e4m3(amax*g/6), q = e2m1(x*g/sf)); vLLM's
+                    # scaled_fp4_quant uses rcp.approx.ftz and flips some block
+                    # scales for some g (silicon 2026-09-29: 2e-2 at o_proj g=93).
+                    # So: kernel quant == spec bit-for-bit, GEMM == exact product
+                    # of that quant, and vs FlashInfer only the triangle bound.
+                    aq, asf, _ = _state["ws"][dev]
+                    q_own = aq[: m * k // 2].view(m, k // 2)
+                    sf_own = asf[: m * k // 16].view(m, k // 16)
+                    q_spec, sfb_spec, _ = quantize(x.float().cpu().numpy(), cfg["g"])
+                    qmis = float(np.mean(q_own.cpu().numpy() != q_spec)
+                                 + np.mean(sf_own.cpu().numpy() != sfb_spec))
+                    a_own = dequant_torch(q_own, sf_own)
+                    w_u = unswizzle_sf(layer.weight_scale, n, k // 16)
+                    own = torch.empty(m, n, dtype=torch.float64, device=dev)
+                    step = max(1, (1 << 24) // k)
+                    for r0 in range(0, n, step):
+                        r1 = min(n, r0 + step)
+                        own[:, r0:r1] = a_own @ dequant_torch(layer.weight[r0:r1], w_u[r0:r1]).T
+                    own = (own * cfg["alpha"]).bfloat16().float()
+                    onorm = own.norm().clamp_min(1e-30)
+                    rel_b = float((ours - ref).norm() / ref.norm().clamp_min(1e-30))
+                    rel_bx = float((ours - own).norm() / onorm)
+                    fi_own = float((ref - own).norm() / onorm)  # FlashInfer vs the spec product
+                    worst, worst_ref = max(worst, rel_b), max(worst_ref, rel_bx)
+                    bad = (qmis > 1e-3 or rel_bx > max(1e-2, 1.1 * ref_rel)
+                           or rel_b > max(ORACLE_REL, 1.1 * (rel_bx + fi_own))
+                           or not torch.isfinite(ours).all())
+                    why = (f"bf16 quant_mismatch_vs_spec={qmis:.1e} rel_vs_own_exact={rel_bx:.3e} "
+                           f"rel_vs_flashinfer={rel_b:.3e} (flashinfer_vs_spec={fi_own:.3e})")
+                if bad:
+                    raise RuntimeError(
+                        f"{MARKER} LAYER ORACLE FAIL N={n} K={k} M={m} "
+                        f"{plan_str(plan(n, k, m))}: {why} — refusing to serve with {GATE}=1")
             torch.cuda.synchronize(dev)
             plans = " ".join(f"M{m}:{plan(n, k, m)['tiles']}t/{plan(n, k, m)['splits']}s"
                              for m in ms)
