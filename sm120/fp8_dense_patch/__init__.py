@@ -111,9 +111,13 @@ def nvfp4_enabled() -> bool:
     return os.environ.get(NVFP4_GATE_ENV, "").strip() == "1"
 
 
+def amax_record_enabled() -> bool:
+    return bool(os.environ.get("SUFFIX_ACT_AMAX_RECORD", "").strip())
+
+
 def gate_enabled() -> bool:
-    """Either mode arms the (shared) anchor."""
-    return fp8_enabled() or nvfp4_enabled()
+    """Any mode arms the (shared) anchor."""
+    return fp8_enabled() or nvfp4_enabled() or amax_record_enabled()
 
 
 def _patterns(env, default) -> tuple:
@@ -184,6 +188,10 @@ def _suffix_fp8_dense_convert(model) -> None:
         from . import runtime
 
         runtime.convert_model(model)
+    if amax_record_enabled():  # last: records what stayed BF16
+        from . import amax_record
+
+        amax_record.attach(model)
 
 
 def apply(module) -> bool:

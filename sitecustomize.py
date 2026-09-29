@@ -191,7 +191,8 @@ if os.environ.get("SUFFIX_SM120_NVP4DSMLA", "").strip() == "1":
 # SUFFIX_NVFP4_DENSE=1 (same hook): allowlisted BF16 linears -> vLLM ModelOpt
 # NVFP4 W4A4 layers (static activation global scale from proven input bounds).
 if (os.environ.get("SUFFIX_FP8_DENSE", "").strip() == "1"
-        or os.environ.get("SUFFIX_NVFP4_DENSE", "").strip() == "1"):
+        or os.environ.get("SUFFIX_NVFP4_DENSE", "").strip() == "1"
+        or os.environ.get("SUFFIX_ACT_AMAX_RECORD", "").strip()):
     try:
         from fp8_dense_patch import install_post_import_hook as _fp8d_hook
         _fp8d_hook()
