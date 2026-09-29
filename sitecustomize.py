@@ -307,6 +307,9 @@ _BOOT_GATES = {
     # ours vs vLLM FlashInfer vs f64 spec + per-stage readback; then us/call.
     "nvfp4_moe_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "oracle"], {}),
     "nvfp4_moe_bench": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "bench"], {}),
+    # cold-L2 us of every tune candidate per M (qwen EP0, gemma, GLM EP/TP8)
+    # vs FlashInfer -> paste-able SUFFIX_NVFP4_MOE_TUNE + recommended MAX_M.
+    "nvfp4_moe_sweep": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "sweep"], {}),
     # FP8 128x128-block routed experts (SUFFIX_FP8_MOE, qwen3.8 MTP draft
     # shape E 512 / EP2 ranks 0+1, H 2560, I 640, top-10; one GPU = one rank):
     # ours vs vLLM Triton vs f64 spec + per-stage readback; then us/call.

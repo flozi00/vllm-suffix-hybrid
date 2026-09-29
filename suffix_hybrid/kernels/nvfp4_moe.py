@@ -30,7 +30,9 @@ launches is the win; all plans are bit-identical, same f32 ops per element):
   2 fused   3: front + TOKEN-MAJOR fc2+combine (one CTA per (token, 8 H
             cols), one warp per top-k slot, y summed over k ascending in
             smem, bf16 stored once: no y workspace, no combine launch)
-M <= FUSED_MAX_M runs plan 2, larger M plan 1. Token-major re-reads an
+M <= FUSED_MAX_M runs plan 2, larger M plan 1 (fp8_moe's `launch_mode`;
+this family picks plan + tunables per M bucket from the TUNE table below).
+Token-major re-reads an
 expert's w2 once per token routed to it (expert-major reads it once per
 chunk of 16 of its rows): extra fc2 traffic = (local pairs - distinct local
 experts) * w2 bytes/expert, mostly L2 hits inside one launch. qwen3.8-flash
@@ -38,6 +40,38 @@ EP2 (256 local of 512, top-10, ~5 local pairs/token): M=8 -> ~40 pairs over
 ~37 experts (+8 % fc2 bytes), M=16 -> ~80 over ~69 (+16 %); gemma (128,
 top-8, no EP) M=8 -> 64 pairs over ~50 experts (+27 %). The bench prints all
 three plans per M so FUSED_MAX_M is set from silicon, not assumed.
+
+Mid-M (M ~ 10..64, 2026-09-29): silicon showed ours near the weight
+roofline up to M=8 but x1.3 SLOWER than FlashInfer at M=16/32 (qwen EP0).
+Diagnosis from the code + those numbers:
+  * the bench replays one layer back to back: its routed-expert weights
+    (2.77 MB/expert at qwen) stay in the 128 MB L2 while they fit — M=8
+    hits 37 experts = 102 MB, M=10 hits 50 = 138 MB. The M<=8 "roofline"
+    rows are L2 reads; serving (every layer's experts cold) looks like the
+    M>=10 rows. There our time is linear in weight bytes at ~47 % of the
+    DRAM peak (M=16: 196 MB in ~233 us + ~20 us fixed; M=32: 318 MB in
+    ~373 us), FlashInfer ~58 %.
+  * cause: each warp streams 8 (fc2) / 16 (fc1) weight rows 32 B per row
+    per k64 step, rows 320 / 1280 B apart, ~3 steps in flight: DRAM gets
+    scattered 32 B sector misses, not whole lines / pages.
+  * route: one CTA, two O(P) walks over GLOBAL topk ids per thread plus a
+    256-step serial tid-0 scan: ~10 us at M=10 growing to ~30 us at M=64,
+    serialized in front of fc1.
+  (Row-chunk weight reuse is moot: qwen/gemma/GLM-EP decode has 1-2 rows
+  per active expert up to M=64, one 16-row mma chunk.)
+Fixes (all bit-identical to tune 0 / the legacy plan — they move bytes
+earlier, never change which bytes or which f32 ops):
+  la1 / la2  L2 prefetch lookahead of fc1 / fc2 weight rows + scale lines
+             (k64 steps; 255 = whole row at CTA start): `prefetch.global.L2`
+             per 128 B line, issued right after the expert id is known
+  pf2        fc1 CTAs prefetch their share of the expert's w2 for fc2
+  route_par  moe_route_quant (plans 1, 2): ids staged once in smem as u16,
+             8 ids per 4 smem loads, warp-shuffle prefix sums (same outputs)
+TUNE table (SUFFIX_NVFP4_MOE_TUNE overrides DEFAULT_TUNE): comma list of
+"M:plan/la1/la2/pf2" buckets, a bucket serving every M <= its key (the last
+also above), plan = legacy6|front4|fused3. `sweep` measures every candidate
+per M with a COLD L2 (serving's regime) and prints the table to paste plus
+the largest M where ours still beats FlashInfer (SUFFIX_NVFP4_MOE_MAX_M).
 
 Parallel contract (= vLLM's stock FLASHINFER_CUTLASS path, vLLM 0.30):
   EP (TP=N + --enable-expert-parallel, DP=1): moe tp=1, ep=N, linear
@@ -72,6 +106,7 @@ startup error naming why.
 CLI (in-pod, SM120 + oxide bundle):
   python -m suffix_hybrid.kernels.nvfp4_moe oracle   # ours vs FlashInfer vs f64 ref, per stage
   python -m suffix_hybrid.kernels.nvfp4_moe bench    # us: ours vs FlashInfer (CUDA graphs)
+  python -m suffix_hybrid.kernels.nvfp4_moe sweep    # cold-L2 us of every tune candidate per M
   (gemma + GLM-5.3 EP rank + GLM-5.3 TP=8 shard, synthetic weights, one GPU)
 """
 from __future__ import annotations
@@ -85,6 +120,15 @@ MAX_M_ENV = "SUFFIX_NVFP4_MOE_MAX_M"
 FUSED_ENV = "SUFFIX_MOE_FUSED"  # "0" -> legacy 6-launch plan (both families)
 FUSED_MAX_M = 8  # token-major fc2+combine up to here (module doc), plan 1 above
 PLANS = {0: "legacy6", 1: "front4", 2: "fused3"}
+TUNE_ENV = "SUFFIX_NVFP4_MOE_TUNE"
+LA_FULL = 255  # lookahead >= K/64: the whole weight row prefetched at CTA start
+# unmeasured defaults (whole rows while few experts are hit, a bounded fc1
+# window above); `sweep` prints the measured table to paste into TUNE_ENV
+DEFAULT_TUNE = "8:fused3/255/255/0,256:front4/16/255/0"
+# kernel parameter counts the host op passes (a stale cubin fails closed)
+PARAMS = {"moe_route": 10, "moe_quant_rows": 8, "moe_fc1": 18, "moe_fc2": 14,
+          "moe_combine": 10, "moe_route_quant": 17, "moe_fc1_quant": 20,
+          "moe_fc2_combine": 16}
 MARKER = "[suffix nvfp4-moe]"
 FAMILY = "nvfp4_moe"
 ACT_CODE = {"silu": 0, "gelu_tanh": 1}
@@ -133,6 +177,56 @@ def launch_mode(m: int, fused: bool = True) -> int:
     """Launch plan for M tokens (module doc): a function of M only, so a
     CUDA graph captured at a given M replays the same plan."""
     return 0 if not fused else (2 if m <= FUSED_MAX_M else 1)
+
+
+def tune_word(la1: int = 0, la2: int = 0, pf2: int = 0, skip: int = 0) -> int:
+    """Host op `tune` (src/nvfp4_moe_oxide.rs): la1 | la2 << 8 | pf2 << 16 |
+    skip << 24 (skip: per-launch mask, sweep timing only)."""
+    return la1 | la2 << 8 | pf2 << 16 | skip << 24
+
+
+def parse_tune(text: str) -> list:
+    """"M:plan/la1/la2/pf2,..." -> [(m_max, mode, la1, la2, pf2)] ascending."""
+    names = {v: k for k, v in PLANS.items()}
+    out = []
+    for item in (t.strip() for t in text.split(",")):
+        if not item:
+            continue
+        try:
+            m, rest = item.split(":")
+            plan, la1, la2, pf2 = rest.split("/")
+            row = (int(m), names[plan] if plan in names else int(plan), int(la1), int(la2),
+                   int(pf2))
+        except (ValueError, KeyError) as exc:
+            raise ValueError(f"{TUNE_ENV}: bad bucket {item!r} (want M:plan/la1/la2/pf2, "
+                             f"plan in {sorted(names)})") from exc
+        if (not 1 <= row[0] <= 256 or row[1] not in PLANS or not 0 <= row[2] <= LA_FULL
+                or not 0 <= row[3] <= LA_FULL or row[4] not in (0, 1)
+                or (out and row[0] <= out[-1][0])):
+            raise ValueError(f"{TUNE_ENV}: bucket {item!r} out of range / not ascending")
+        out.append(row)
+    if not out:
+        raise ValueError(f"{TUNE_ENV}: empty table")
+    return out
+
+
+def format_tune(table) -> str:
+    return ",".join(f"{m}:{PLANS[md]}/{a}/{b}/{c}" for m, md, a, b, c in table)
+
+
+def tune_table() -> list:
+    return parse_tune(os.environ.get(TUNE_ENV, DEFAULT_TUNE))
+
+
+def tune_for(m: int, table=None, fused: bool = True) -> tuple:
+    """(mode, tune word) for M tokens: the first bucket with M <= its key,
+    else the last. fused=False (SUFFIX_MOE_FUSED=0): the verbatim legacy
+    plan, (0, 0). A function of M only (CUDA-graph safe)."""
+    if not fused:
+        return 0, 0
+    table = tune_table() if table is None else table
+    row = next((r for r in table if m <= r[0]), table[-1])
+    return row[1], tune_word(*row[2:])
 
 
 def _r(v: int, a: int) -> int:
@@ -501,27 +595,34 @@ def workspace(dev, m: int, topk: int, hdim: int, idim: int, e_count: int, ws=Non
                  for n, d, o in zip(need, dts, old))
 
 
-def run_ours(native, p, x, ids, tw, ws, stream, out=None, mode=None):
-    """mode None: launch_mode(M) (p["fused"] when prepared, else the env)."""
+def run_ours(native, p, x, ids, tw, ws, stream, out=None, mode=None, tune=0):
+    """mode None: plan AND tune from tune_for(M) (p["tune"] / p["fused"]
+    when prepared, else the env); an explicit mode runs with `tune`."""
     import torch
     if out is None:
         out = torch.empty(x.shape[0], p["w2"].shape[1], dtype=torch.bfloat16, device=x.device)
     if mode is None:
-        mode = launch_mode(x.shape[0], p.get("fused", fused_on()))
+        mode, tune = tune_for(x.shape[0], p.get("tune"), p.get("fused", fused_on()))
     native.nvfp4_moe_cuda(x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"],
                           p["g2"], *ws, out, float(p["a1g"]), float(p["a2g"]),
-                          int(p["act"]), int(p.get("id_base", 0)), int(mode), stream)
+                          int(p["act"]), int(p.get("id_base", 0)), int(mode), int(tune), stream)
     return out
 
 
-def run_plans(run, ws, lid, xq_len, hq_len):
+def _vname(v) -> str:
+    return PLANS[v] if isinstance(v, int) else f"{PLANS[v[0]]}+tune{v[1]:#x}"
+
+
+def run_plans(run, ws, lid, xq_len, hq_len, variants=(1, 2)):
     """Runs every launch plan, legacy first, via run(mode) -> out, and
-    checks plans 1 and 2 against the legacy plan BIT FOR BIT: out, the x
+    checks `variants` (plans 1 and 2; nvfp4 adds (plan, tune) pairs) against
+    the legacy plan BIT FOR BIT: out, the x
     quant (ws[0]/ws[1], xq_len = per-token lengths) and the h quant rows of
     every LOCAL pair (ws[3]/ws[4], hq_len = per-pair lengths; off-rank rows
     are never written by the fused fc1). Order 0, 1, 2 leaves ws as
-    `stages` expects. Family-agnostic (fp8_moe uses it too).
-    Returns (plan 2's out, ok, msg)."""
+    `stages` expects (every variant rewrites the same bytes when ok).
+    Family-agnostic (fp8_moe uses it too). Returns (the last variant's out,
+    ok, msg)."""
     import torch
     m, topk = lid.shape
     vp = torch.nonzero(lid.reshape(-1) >= 0).reshape(-1)
@@ -534,22 +635,31 @@ def run_plans(run, ws, lid, xq_len, hq_len):
 
     ref = snap(run(0))
     bad = []
-    for mode in (1, 2):
-        out = run(mode)
+    for v in variants:
+        out = run(v)
         for name, a, b in zip(("out", "xq", "xsf", "hq", "hsf"), ref, snap(out)):
             if not torch.equal(a, b):
-                bad.append(f"{PLANS[mode]}.{name}:{int((a != b).sum())}B")
+                bad.append(f"{_vname(v)}.{name}:{int((a != b).sum())}B")
     ok = not bad
-    return out, ok, ("plans " + "=".join(PLANS.values()) + " bitwise" if ok
-                     else f"plans DIFFER vs legacy6: {' '.join(bad)}")
+    return out, ok, ("plans " + "=".join([PLANS[0]] + [_vname(v) for v in variants]) + " bitwise"
+                     if ok else f"plans DIFFER vs legacy6: {' '.join(bad)}")
+
+
+ORACLE_TUNE = tune_word(LA_FULL, LA_FULL, 1)  # every prefetch on
 
 
 def plans_nvfp4(native, p, x, ids, tw, ws, stream):
-    """run_plans for an NVFP4 layer (ids GLOBAL; x/ids/tw not mutated)."""
+    """run_plans for an NVFP4 layer (ids GLOBAL; x/ids/tw not mutated):
+    plans 1, 2 at tune 0, then every plan at this M's table tune and at
+    ORACLE_TUNE (all prefetches on), plus the table's own pick."""
     hdim, idim = p["w2"].shape[1], p["w2"].shape[2] * 2
     lid = to_local(ids, int(p.get("id_base", 0)), p["w2"].shape[0])
-    return run_plans(lambda mode: run_ours(native, p, x, ids, tw, ws, stream, mode=mode), ws, lid,
-                     (hdim // 2, hdim // 16), (idim // 2, idim // 16))
+    pick = tune_for(x.shape[0], p.get("tune"))
+    tuned = sorted({(md, t) for md in PLANS for t in (pick[1], ORACLE_TUNE)} | {pick})
+    run = lambda v: run_ours(native, p, x, ids, tw, ws, stream, mode=v if isinstance(v, int)
+                             else v[0], tune=0 if isinstance(v, int) else v[1])
+    return run_plans(run, ws, lid, (hdim // 2, hdim // 16), (idim // 2, idim // 16),
+                     variants=[1, 2] + tuned)
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +791,7 @@ def _make_layer_cls():
                 _log(f"layer {self.layer_name} stays on vLLM's MoE path: {why}")
                 return
             dev = self.w13_weight.device
-            oxide_kernels.ensure_loaded(FAMILY, dev.index)
+            oxide_kernels.ensure_loaded(FAMILY, dev.index, params=PARAMS)
             cfg = dict(w13=self.w13_weight, w13_sf=qc.w1_scale, w2=self.w2_weight,
                        w2_sf=qc.w2_scale, g1=qc.g1_alphas.float().contiguous(),
                        g2=qc.g2_alphas.float().contiguous(),
@@ -689,7 +799,7 @@ def _make_layer_cls():
                        a2g=float(qc.a2_gscale.reshape(-1)[0]),
                        act=ACT_CODE[info["act"]], H=info["H"], topk=self.top_k,
                        max_m=max_m(), id_base=info["ep_base"],
-                       E_global=self.global_num_experts, fused=fused_on())
+                       E_global=self.global_num_experts, fused=fused_on(), tune=tune_table())
             _state["ws"][dev] = workspace(dev, cfg["max_m"], cfg["topk"], info["H"],
                                           info["I"], info["E"], _state["ws"].get(dev))
             self._sfx_moe = cfg
@@ -862,7 +972,8 @@ def arm():
         if not ent:
             raise RuntimeError(f"{g}=1 but the oxide manifest has no {fam!r} cubin")
         knob()  # validate the knob now, not at load
-        shas.append(f"{fam} M<={knob()} sha256 {ent[0]['sha256'][:12]}")
+        shas.append(f"{fam} M<={knob()} sha256 {ent[0]['sha256'][:12]}"
+                    + (f" tune {format_tune(tune_table())}" if fam == FAMILY else ""))
     cls = _make_layer_cls()
     RoutedExperts.register_oot(cls, name="RoutedExperts")
     _state["hook"] = torch.nn.modules.module.register_module_forward_pre_hook(
@@ -889,7 +1000,7 @@ def _native_ready():
     native = oxide_kernels.native()
     if torch.cuda.get_device_capability()[0] != 12:
         raise RuntimeError("NVFP4 MoE cubin is sm_120a SASS (cc 12.x only)")
-    oxide_kernels.ensure_loaded(FAMILY)
+    oxide_kernels.ensure_loaded(FAMILY, params=PARAMS)
     return native
 
 
@@ -996,7 +1107,11 @@ def oracle(cases=ORACLE_CASES):
     return f"{MARKER} NVFP4-MOE ORACLE PASS ({len(lines)} cases, sm_120a mxf4nvf4 mma)"
 
 
-def _graph_us(fn, dev, iters):
+def _graph_us(fn, dev, iters, flush=None):
+    """us per call of fn(stream) replayed from a CUDA graph. flush (a
+    callable) runs before EVERY replay, outside the timed window: a cold
+    L2 per call, like serving, where a layer's experts were last touched a
+    whole forward pass ago. Without it replays run back to back (warm)."""
     import torch
     s = torch.cuda.Stream(dev)
     s.wait_stream(torch.cuda.current_stream(dev))
@@ -1009,6 +1124,15 @@ def _graph_us(fn, dev, iters):
     torch.cuda.current_stream(dev).wait_stream(s)
     g.replay()
     torch.cuda.synchronize(dev)
+    if flush is not None:
+        ev = [(torch.cuda.Event(True), torch.cuda.Event(True)) for _ in range(iters)]
+        for a, b in ev:
+            flush()
+            a.record()
+            g.replay()
+            b.record()
+        torch.cuda.synchronize(dev)
+        return sum(a.elapsed_time(b) for a, b in ev) * 1000.0 / iters
     e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
     e0.record()
     for _ in range(iters):
@@ -1020,7 +1144,8 @@ def _graph_us(fn, dev, iters):
 
 def bench(cases=BENCH_CASES, iters=200):
     """us per MoE layer call on one rank (x quant + experts + combine), CUDA
-    graphs, every launch plan (legacy6 / front4 / fused3) vs FlashInfer. The
+    graphs replayed back to back (L2-WARM: see `sweep` for serving's cold
+    regime), every launch plan at the table's tune vs FlashInfer. The
     crossover M where FlashInfer wins sets SUFFIX_NVFP4_MOE_MAX_M (above it
     the layer delegates to vLLM); fused3 vs front4 sets FUSED_MAX_M."""
     import torch
@@ -1038,23 +1163,129 @@ def bench(cases=BENCH_CASES, iters=200):
             x = torch.randn(m, hdim, device=dev).bfloat16()
             out = torch.empty(m, hdim, dtype=torch.bfloat16, device=dev)
             t_fi = _graph_us(lambda s: _fi_call(p, x, ids, tw, out), dev, iters)
+            auto, tune = tune_for(m)
             t = {mode: _graph_us(lambda s, mode=mode: run_ours(
-                native, p, x, ids, tw, ws, s.cuda_stream, out, mode), dev, iters)
+                native, p, x, ids, tw, ws, s.cuda_stream, out, mode, tune), dev, iters)
                 for mode in PLANS}
             lid = to_local(ids, base, local)
             distinct = int(torch.unique(lid[lid >= 0]).numel())
             roof = distinct * per_expert / HBM_BPS * 1e6
-            auto = launch_mode(m)
             res[(case, m)] = (t_fi, t[auto], roof, t)
             print(f"{MARKER} bench {_case_name(case)} M={m} routed_rows={m * topk} "
                   f"local_experts_hit={distinct}: flashinfer {t_fi:.1f} us, ours "
                   + ", ".join(f"{PLANS[k]} {v:.1f} us" for k, v in t.items())
-                  + f" (auto {PLANS[auto]} x{t[auto] / t_fi:.2f} vs flashinfer, "
+                  + f" (tune {tune:#x}; auto {PLANS[auto]} x{t[auto] / t_fi:.2f} vs flashinfer, "
                   f"x{t[auto] / t[0]:.2f} vs legacy6), weight-roofline {roof:.1f} us",
                   file=sys.stderr, flush=True)
         del p, ws
         torch.cuda.empty_cache()
     return res
+
+
+SWEEP_MS = (1, 2, 5, 8, 10, 16, 24, 32, 48, 64)
+SWEEP_CASES = ((QWEN_EP0, SWEEP_MS), (GEMMA_MOE, SWEEP_MS), (GLM_EP, SWEEP_MS),
+               (GLM_TP8, SWEEP_MS))
+
+
+def sweep_candidates() -> list:
+    """(mode, la1, la2, pf2) grid the sweep times; (0, 0, 0, 0) = baseline."""
+    return [(md, a, b, c) for md in PLANS for a in (0, 8, 16, 32, LA_FULL)
+            for b in (0, LA_FULL) for c in (0, 1)]
+
+
+def sweep_verdict(rows) -> tuple:
+    """rows [(m, best candidate, best us, flashinfer us)] ascending M ->
+    (TUNE table string, recommended MAX_M or None, losing Ms). Buckets merge
+    runs of equal choices; MAX_M = the largest M where ours wins (losses
+    below it are listed so a non-monotone crossover is visible)."""
+    table = []
+    for m, cand, _, _ in rows:
+        if table and table[-1][1:] == tuple(cand):
+            table[-1] = (m, *cand)
+        else:
+            table.append((m, *cand))
+    wins = [m for m, _, t, fi in rows if t < fi]
+    lose = [m for m, _, t, fi in rows if wins and t >= fi and m < max(wins)]
+    return format_tune(table), (max(wins) if wins else None), lose
+
+
+def sweep(cases=SWEEP_CASES, iters=30):
+    """Per case and M: every sweep_candidates() variant vs FlashInfer, both
+    timed with a COLD L2 (flush before each replay) — serving's regime —
+    plus FlashInfer warm for reference. Every variant's output must equal
+    the baseline's BIT FOR BIT (else FAIL). Prints per M the best variant,
+    its per-launch us (plan prefixes via the tune skip mask), then per case
+    the paste-able SUFFIX_NVFP4_MOE_TUNE, the recommended
+    SUFFIX_NVFP4_MOE_MAX_M, and the kernels' regs / occupancy."""
+    import torch
+    native = _native_ready()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(dev)
+    l2 = int(getattr(props, "L2_cache_size", 128 << 20)) or (128 << 20)
+    buf = torch.zeros(2 * l2 // 4, dtype=torch.float32, device=dev)
+    flush = lambda: buf.sum()
+    cands = sweep_candidates()
+    bad = []
+    _log(f"sweep: {len(cands)} variants x M, cold L2 (flush {2 * l2 >> 20} MB before each "
+         f"replay), {props.multi_processor_count} SMs")
+    for case, ms in cases:
+        e_global, hdim, idim, topk, act, ep_size, _ = case[:7]
+        p = _dev_problem(dev, case, seed=1)
+        base, local = p["id_base"], e_global // ep_size
+        ws = workspace(dev, max(ms), topk, hdim, idim, local)
+        per_expert = 3 * idim * hdim * (1 / 2 + 1 / 16)
+        rows = []
+        for m in ms:
+            ids, tw = rand_routing(m, e_global, topk, dev, seed=100 + m, dead=False)
+            x = torch.randn(m, hdim, device=dev).bfloat16()
+            out = torch.empty(m, hdim, dtype=torch.bfloat16, device=dev)
+            call = lambda md, t: (lambda s: run_ours(native, p, x, ids, tw, ws, s.cuda_stream,
+                                                     out, md, t))
+            ref = run_ours(native, p, x, ids, tw, ws, torch.cuda.current_stream(dev).cuda_stream,
+                           None, 0, 0).clone()
+            t_fi = _graph_us(lambda s: _fi_call(p, x, ids, tw, out), dev, iters, flush)
+            t_fi_warm = _graph_us(lambda s: _fi_call(p, x, ids, tw, out), dev, iters)
+            t = {}
+            for c in cands:
+                t[c] = _graph_us(call(c[0], tune_word(*c[1:])), dev, iters, flush)
+                if not torch.equal(out.view(torch.int16), ref.view(torch.int16)):
+                    bad.append(f"{_case_name(case)} M={m} {c}")
+            best = min(t, key=t.get)
+            nl = 6 if best[0] == 0 else (4 if best[0] == 1 else 3)
+            pre = [_graph_us(call(best[0], tune_word(*best[1:], skip=(0x3F << k) & 0x3F)), dev,
+                             iters, flush) for k in range(1, nl + 1)]
+            stage = [pre[0]] + [b - a for a, b in zip(pre, pre[1:])]
+            lid = to_local(ids, base, local)
+            distinct = int(torch.unique(lid[lid >= 0]).numel())
+            roof = distinct * per_expert / HBM_BPS * 1e6
+            top = sorted(t, key=t.get)[:3]
+            rows.append((m, best, t[best], t_fi))
+            _log(f"sweep {_case_name(case)} M={m} rows={m * topk} experts_hit={distinct}: "
+                 f"flashinfer {t_fi:.1f} us cold ({t_fi_warm:.1f} warm), best "
+                 f"{PLANS[best[0]]}/{best[1]}/{best[2]}/{best[3]} {t[best]:.1f} us "
+                 f"(x{t[best] / t_fi:.2f} vs flashinfer; baseline legacy6/0/0/0 "
+                 f"{t[(0, 0, 0, 0)]:.1f}, fused3/0/0/0 {t[(2, 0, 0, 0)]:.1f}, "
+                 f"front4/0/0/0 {t[(1, 0, 0, 0)]:.1f}); weight-roofline {roof:.1f} us; "
+                 f"per-launch us {' '.join(f'{v:.1f}' for v in stage)}; next "
+                 + ", ".join(f"{PLANS[c[0]]}/{c[1]}/{c[2]}/{c[3]} {t[c]:.1f}" for c in top[1:]))
+        table, mx, lose = sweep_verdict(rows)
+        _log(f"sweep {_case_name(case)} SUFFIX_NVFP4_MOE_TUNE={table}")
+        _log(f"sweep {_case_name(case)} SUFFIX_NVFP4_MOE_MAX_M={mx if mx else '(ours never wins)'}"
+             + (f" (ours LOSES below it at M={lose})" if lose else "")
+             + (" (wins at the largest swept M: extend the sweep)" if mx == max(ms) else ""))
+        slots = min(local, max(ms) * topk)
+        occ = native.nvfp4_moe_attrs(
+            [("moe_route_quant", 256, 64 + 2 * _r(max(ms) * topk, 8)), ("moe_fc1_quant", 128, 2048),
+             ("moe_fc1", 128, 0), ("moe_fc2", 128, 0),
+             ("moe_fc2_combine", 32 * min(topk, 16), topk * 32), ("moe_route", 256, 8 * local)],
+            dev.index)
+        _log(f"sweep {_case_name(case)} slots<={slots} regs/local/max-CTAs-per-SM: "
+             + ", ".join(f"{e} {r}/{lb}/{c}" for e, r, lb, c in occ))
+        del p, ws
+        torch.cuda.empty_cache()
+    if bad:
+        raise RuntimeError(f"sweep variants NOT bit-identical to legacy6/tune 0: {bad[:8]}")
+    return "sweep done: every variant bit-identical to legacy6 tune 0"
 
 
 def main(argv=None):
@@ -1064,6 +1295,8 @@ def main(argv=None):
             print(oracle(), file=sys.stderr, flush=True)
         if mode in ("bench", "both"):
             bench()
+        if mode in ("sweep",):
+            _log(sweep())
         return 0
     except Exception as exc:
         print(f"{MARKER} NVFP4-MOE {mode.upper()} FAIL: {type(exc).__name__}: {exc}",

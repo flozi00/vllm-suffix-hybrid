@@ -6,8 +6,14 @@
 //!     combine
 //!   1 fused front, 4: route+quant(x), fc1+act_and_mul+quant(h), fc2, combine
 //!   2 fused, 3: route+quant(x), fc1+act_and_mul+quant(h), token-major
-//!     fc2+combine (decode M; Python picks it for M <= FUSED_MAX_M)
+//!     fc2+combine (decode M; Python picks the plan per M bucket, TUNE table)
 //! All three are bit-identical (same f32 ops per output element).
+//! `tune` (Python packs it per M bucket, nvfp4_moe.py tune_for): bits 0-7
+//! la1, 8-15 la2 (L2 prefetch lookahead of the fc1 / fc2 weight rows in k64
+//! steps, 0 = off), bit 16 pf2 (fc1 prefetches w2 for fc2), bits 24-29 skip
+//! mask (launch i of the plan is skipped when bit 24+i is set: the sweep's
+//! per-launch timing only; serving never sets it). Every tune value is
+//! bit-identical to tune 0: prefetches are hints, the loads are unchanged.
 //! Oracle/bench + vLLM wiring: suffix_hybrid/kernels/nvfp4_moe.py.
 
 use crate::oxide::{function, launch, Arg};
@@ -103,9 +109,9 @@ pub(crate) fn need(
 /// topk_ids are GLOBAL ids, pairs outside [id_base, id_base + E) contribute
 /// nothing on this rank (vLLM all-reduces the partial outputs afterwards).
 /// mode: launch plan (module doc); ws_inter is written only by mode 0,
-/// ws_y only by modes 0 and 1.
+/// ws_y only by modes 0 and 1. tune: module doc.
 #[pyfunction]
-#[pyo3(signature = (x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter, ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, id_base, mode, stream_ptr))]
+#[pyo3(signature = (x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter, ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, id_base, mode, tune, stream_ptr))]
 #[allow(clippy::too_many_arguments)]
 pub fn nvfp4_moe_cuda<'py>(
     py: Python<'py>,
@@ -131,11 +137,16 @@ pub fn nvfp4_moe_cuda<'py>(
     act: u32,
     id_base: u32,
     mode: u32,
+    tune: u32,
     stream_ptr: usize,
 ) -> PyResult<()> {
     if mode > 2 {
         return Err(PyValueError::new_err(format!("mode {mode} not in 0..=2")));
     }
+    if tune & 0xC0FE_0000 != 0 {
+        return Err(PyValueError::new_err(format!("tune {tune:#x}: unknown bits")));
+    }
+    let (la1, la2, pf2, skip) = (tune & 0xFF, (tune >> 8) & 0xFF, (tune >> 16) & 1, tune >> 24);
     let x = info("x", x)?;
     let ids = info("topk_ids", topk_ids)?;
     let tw = info("topk_w", topk_w)?;
@@ -237,6 +248,11 @@ pub fn nvfp4_moe_cuda<'py>(
         }
     }
     let ids_i64 = u32::from(ids.dtype == "torch.int64");
+    // route_par smem: 16 warp totals + u16 ids padded to 8 pairs
+    let route_par_smem = 64 + 2 * p.div_ceil(8) * 8;
+    if route_par_smem > crate::oxide::MAX_DYN_SMEM as usize {
+        return Err(PyValueError::new_err(format!("M*topk={p} pairs exceed the route smem")));
+    }
     let slots = e.min(p);
     let r = route.ptr;
     let (slot_expert, slot_off, slot_cnt, pair_list) =
@@ -279,6 +295,10 @@ pub fn nvfp4_moe_cuda<'py>(
         u(h),
         u(i),
         Arg::U32(act),
+        Arg::U32(la1),
+        Arg::U32(pf2),
+        Arg::Ptr(w2.ptr),
+        Arg::Ptr(w2s.ptr),
     ];
     let qh_args = [
         Arg::Ptr(inter.ptr),
@@ -304,6 +324,7 @@ pub fn nvfp4_moe_cuda<'py>(
         Arg::Ptr(pair_list),
         u(h),
         u(i),
+        Arg::U32(la2),
     ];
     let comb_args = [
         Arg::Ptr(out.ptr),
@@ -354,6 +375,10 @@ pub fn nvfp4_moe_cuda<'py>(
         u(i),
         Arg::U32(act),
         Arg::F32(a2_gscale),
+        Arg::U32(la1),
+        Arg::U32(pf2),
+        Arg::Ptr(w2.ptr),
+        Arg::Ptr(w2s.ptr),
     ];
     let fc_args = [
         Arg::Ptr(out.ptr),
@@ -371,6 +396,7 @@ pub fn nvfp4_moe_cuda<'py>(
         u(i),
         u(e),
         u(out.stride[0]),
+        Arg::U32(la2),
     ];
     let route_smem = (2 * e * 4) as u32;
     let mm = m as u32;
@@ -384,7 +410,7 @@ pub fn nvfp4_moe_cuda<'py>(
         ("moe_combine", ((m * h).div_ceil(256) as u32, 1), 256, 0, &comb_args),
     ];
     let front: [(&str, (u32, u32), u32, u32, &[Arg]); 2] = [
-        ("moe_route_quant", (1 + (m * h / 16).div_ceil(256) as u32, 1), 256, route_smem, &rq_args),
+        ("moe_route_quant", (1 + (m * h / 16).div_ceil(256) as u32, 1), 256, route_par_smem as u32, &rq_args),
         ("moe_fc1_quant", ((i / 32) as u32, slots as u32), 128, 16 * 32 * 4, &fq_args),
     ];
     let tail: Vec<(&str, (u32, u32), u32, u32, &[Arg])> = if mode == 2 {
@@ -395,6 +421,12 @@ pub fn nvfp4_moe_cuda<'py>(
     };
     let plan: Vec<(&str, (u32, u32), u32, u32, &[Arg])> =
         if mode == 0 { legacy.to_vec() } else { front.iter().cloned().chain(tail).collect() };
+    let plan: Vec<_> = plan
+        .into_iter()
+        .enumerate()
+        .filter(|(n, _)| skip >> n & 1 == 0)
+        .map(|(_, l)| l)
+        .collect();
     let ordinal = x.device;
     py.detach(move || {
         crate::guard_py("nvfp4_moe_cuda", move || {
@@ -406,4 +438,34 @@ pub fn nvfp4_moe_cuda<'py>(
             Ok(())
         })
     })
+}
+
+/// Per-entry resource facts of the loaded nvfp4_moe cubin, for the sweep's
+/// occupancy report: [(entry, regs/thread, local bytes/thread, max resident
+/// CTAs per SM at `threads` threads + `smem` dynamic bytes)] for each
+/// (entry, threads, smem) asked.
+#[pyfunction]
+pub fn nvfp4_moe_attrs(
+    entries: Vec<(String, u32, u32)>,
+    device_ordinal: usize,
+) -> PyResult<Vec<(String, i32, i32, i32)>> {
+    use cuda_core::sys;
+    let mut out = Vec::new();
+    for (entry, threads, smem) in entries {
+        let f = function(FAMILY, &entry, device_ordinal).map_err(PyRuntimeError::new_err)?
+            as sys::CUfunction;
+        let (mut regs, mut local, mut ctas) = (0i32, 0i32, 0i32);
+        // SAFETY: `f` is a live CUfunction of a loaded module.
+        unsafe {
+            sys::cuFuncGetAttribute(&mut regs, sys::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS, f);
+            sys::cuFuncGetAttribute(
+                &mut local,
+                sys::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                f,
+            );
+            sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut ctas, f, threads as i32, smem as usize);
+        }
+        out.push((entry, regs, local, ctas));
+    }
+    Ok(out)
 }
