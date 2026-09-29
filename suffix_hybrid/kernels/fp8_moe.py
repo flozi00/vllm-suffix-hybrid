@@ -7,9 +7,14 @@ rank, top-10, hidden 2560, expert intermediate 640, silu; e4m3 weights with
 
 Kernel: kernels-oxide/fp8_moe (cuda-oxide -> PTX .target sm_120a -> ptxas
 13.0 SASS, ``mma.sync.m16n8k32.row.col.f32.e4m3.e4m3.f32``). Host op
-``_native.fp8_moe_cuda``; same six-launch skeleton as nvfp4_moe (route,
-quant x, fc1+silu_and_mul, quant h, fc2 * topk_w, combine), grids a function
-of M only, torch's current stream, no host sync.
+``_native.fp8_moe_cuda``; same stages as nvfp4_moe (route, quant x,
+fc1+silu_and_mul, quant h, fc2 * topk_w, combine), grids a function of M
+only, torch's current stream, no host sync, and the same three bit-identical
+launch plans (nvfp4_moe.launch_mode: legacy6 / front4 / fused3, M <=
+nvfp4_moe.FUSED_MAX_M -> fused3, SUFFIX_MOE_FUSED=0 -> legacy6). FP8
+specifics: the h quant group is 128 columns, so the fused fc1+quant CTA owns
+a whole 128-col tile of I (16 warps x 8 cols, the legacy per-warp code, 4x
+larger CTAs, same warp count) and quantizes it in-CTA from an 8 KB smem tile.
 
 Numerical contract (the f64 spec ``moe_ref`` below; the kernel matches it up
 to f32 accumulation):
@@ -249,9 +254,10 @@ def judge(ours, stock, ref, local_ids, emu=None):
 
 
 def stages(p, x, ids, tw, ws, out):
-    """Per-stage drift of OUR kernel read back from its workspace (`ids`
-    LOCAL), each stage vs the f64 spec fed with the kernel's own previous
-    stage (see nvfp4_moe.stages): xq / hq / comb = fraction of values
+    """Per-stage drift of OUR kernel read back from its workspace after
+    `plans_fp8` (`ids` LOCAL; `inter` = legacy plan, `y` = plan 1, the rest
+    = fused plan, see nvfp4_moe.stages), each stage vs the f64 spec fed with
+    the kernel's own previous stage: xq / hq / comb = fraction of values
     differing (same f32 ops, bit-exact expected), fc1 / fc2 = rel error."""
     import torch
     aq, a_s, inter, hq, h_s, y, _ = ws
@@ -303,13 +309,26 @@ def workspace(dev, m: int, topk: int, hdim: int, idim: int, e_count: int, ws=Non
                  for n, d, o in zip(need, dts, old))
 
 
-def run_ours(native, p, x, ids, tw, ws, stream, out=None):
+def run_ours(native, p, x, ids, tw, ws, stream, out=None, mode=None):
+    """mode None: nvfp4_moe.launch_mode(M) (p["fused"] when prepared, else
+    the env)."""
     import torch
     if out is None:
         out = torch.empty(x.shape[0], p["w2"].shape[1], dtype=torch.bfloat16, device=x.device)
+    if mode is None:
+        mode = nm.launch_mode(x.shape[0], p.get("fused", nm.fused_on()))
     native.fp8_moe_cuda(x, ids, tw, p["w13"], p["w13_s"], p["w2"], p["w2_s"], *ws, out,
-                        bool(p["ue8m0"]), int(p.get("id_base", 0)), stream)
+                        bool(p["ue8m0"]), int(p.get("id_base", 0)), int(mode), stream)
     return out
+
+
+def plans_fp8(native, p, x, ids, tw, ws, stream):
+    """nvfp4_moe.run_plans for an FP8 layer (ids GLOBAL): all three launch
+    plans bit-identical; returns (fused3 out, ok, msg)."""
+    hdim, idim = p["w2"].shape[1], p["w2"].shape[2]
+    lid = nm.to_local(ids, int(p.get("id_base", 0)), p["w2"].shape[0])
+    return nm.run_plans(lambda mode: run_ours(native, p, x, ids, tw, ws, stream, mode=mode), ws,
+                        lid, (hdim, hdim // 128), (idim, idim // 128))
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +454,8 @@ def prepare(layer, pre, parent_forward, state):
     oxide_kernels.ensure_loaded(FAMILY, dev.index)
     cfg = dict(kind="fp8", w13=layer.w13_weight, w13_s=sc[0], w2=layer.w2_weight, w2_s=sc[1],
                ue8m0=e8m0_used(), H=info["H"], I=info["I"], E=info["E"], topk=layer.top_k,
-               max_m=max_m(), id_base=info["ep_base"], E_global=layer.global_num_experts)
+               max_m=max_m(), id_base=info["ep_base"], E_global=layer.global_num_experts,
+               fused=nm.fused_on())
     _ws[dev] = workspace(dev, cfg["max_m"], cfg["topk"], info["H"], info["I"], info["E"],
                          _ws.get(dev))
     state["oracle"].append(layer_oracle(layer.layer_name, cfg, parent_forward))
@@ -481,9 +501,11 @@ def layer_oracle(name, cfg, parent_forward):
         ids, tw = nm.rand_routing(m, cfg["E_global"], cfg["topk"], dev, seed, base, local, dead)
         x0 = x.clone()
         stock = parent_forward(x.clone(), tw.clone(), ids.clone()).float()
-        out = _launch(native, cfg, x.clone(), tw.clone(), ids.clone())
+        out, pl_ok, pl = plans_fp8(native, cfg, x.clone(), ids.clone(), tw.clone(), _ws[dev],
+                                   torch.cuda.current_stream(dev).cuda_stream)
         lid = nm.to_local(ids, base, local)
         st_ok, st = stages(cfg, x0, lid, tw, _ws[dev], out)
+        st_ok, st = st_ok and pl_ok, f"{st} {pl}"
         ours, ref = out.float(), moe_ref(cfg, x0, lid, tw)
         ok, msg = judge(ours, stock, ref, lid, moe_ref(cfg, x0, lid, tw, vllm=True).bfloat16())
         if stock.norm() > 0:
@@ -569,7 +591,8 @@ BENCH_CASES = ((QWEN_DRAFT_EP0, (1, 2, 4, 8, 16, 32, 64)),)
 
 def oracle(cases=ORACLE_CASES):
     """Per case: ours vs vLLM Triton (same EP rank) vs the f64 reference,
-    vLLM vs our emulation of its numerics, per-stage readback, determinism;
+    vLLM vs our emulation of its numerics, all three launch plans
+    bit-identical (plans_fp8), per-stage readback, determinism;
     EP cases add rows routed only off-rank plus an all-off-rank batch. The
     first case also runs in the other activation-scale mode (UE8M0 flipped)
     against the reference only. Fatal on mismatch."""
@@ -592,9 +615,10 @@ def oracle(cases=ORACLE_CASES):
             x = torch.randn(m, hdim, device=dev).bfloat16()
             lid = nm.to_local(ids, base, local)
             ref = moe_ref(p, x, lid, tw)
-            again = run_ours(native, p, x, ids, tw, ws, stream).float()
-            out = run_ours(native, p, x, ids, tw, ws, stream)
+            again = run_ours(native, p, x, ids, tw, ws, stream, mode=2).float()
+            out, pl_ok, pl = plans_fp8(native, p, x, ids, tw, ws, stream)
             st_ok, st = stages(p, x, lid, tw, ws, out)
+            st_ok, st = st_ok and pl_ok, f"{st} {pl}"
             ours = out.float()
             det = bool(torch.equal(ours, again))
             if ue == mode:
@@ -618,8 +642,9 @@ def oracle(cases=ORACLE_CASES):
 
 def bench(cases=BENCH_CASES, iters=200):
     """us per MoE layer call on one rank (x quant + experts + combine), CUDA
-    graphs, ours vs vLLM fused_experts (Triton). The crossover M sets
-    SUFFIX_FP8_MOE_MAX_M."""
+    graphs, every launch plan (legacy6 / front4 / fused3) vs vLLM
+    fused_experts (Triton). The crossover M sets SUFFIX_FP8_MOE_MAX_M;
+    fused3 vs front4 sets nvfp4_moe.FUSED_MAX_M."""
     import torch
     native = _native_ready()
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -636,15 +661,19 @@ def bench(cases=BENCH_CASES, iters=200):
             x = torch.randn(m, hdim, device=dev).bfloat16()
             out = torch.empty(m, hdim, dtype=torch.bfloat16, device=dev)
             t_v = nm._graph_us(lambda s: _vllm_call(p, x, ids, tw), dev, iters)
-            t_o = nm._graph_us(lambda s: run_ours(native, p, x, ids, tw, ws, s.cuda_stream, out),
-                               dev, iters)
+            t = {pl: nm._graph_us(lambda s, pl=pl: run_ours(
+                native, p, x, ids, tw, ws, s.cuda_stream, out, pl), dev, iters)
+                for pl in nm.PLANS}
             lid = nm.to_local(ids, base, local)
             distinct = int(torch.unique(lid[lid >= 0]).numel())
             roof = distinct * per_expert / nm.HBM_BPS * 1e6
-            res[(case, m)] = (t_v, t_o, roof)
+            auto = nm.launch_mode(m)
+            res[(case, m)] = (t_v, t[auto], roof, t)
             _log(f"bench {_case_name(case, mode)} M={m} routed_rows={m * topk} "
-                 f"local_experts_hit={distinct}: vllm {t_v:.1f} us, ours {t_o:.1f} us "
-                 f"(x{t_o / t_v:.2f}), weight-roofline {roof:.1f} us")
+                 f"local_experts_hit={distinct}: vllm {t_v:.1f} us, ours "
+                 + ", ".join(f"{nm.PLANS[k]} {v:.1f} us" for k, v in t.items())
+                 + f" (auto {nm.PLANS[auto]} x{t[auto] / t_v:.2f} vs vllm, "
+                 f"x{t[auto] / t[0]:.2f} vs legacy6), weight-roofline {roof:.1f} us")
         del p, ws
         torch.cuda.empty_cache()
     return res

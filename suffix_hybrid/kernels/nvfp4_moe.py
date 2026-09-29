@@ -7,7 +7,7 @@ experts, top-8, hidden 6144, intermediate 2048, TP=8 + expert parallel ->
 Kernel: kernels-oxide/nvfp4_moe (cuda-oxide -> PTX .target sm_120a -> ptxas
 13.0 SASS, block-scaled mxf4nvf4 m16n8k64 mma). Host op
 ``_native.nvfp4_moe_cuda`` launches, on torch's stream, with grids that are a
-function of M only (CUDA-graph safe, no host sync):
+function of M only (CUDA-graph safe, no host sync). Stages:
   route    one CTA: local id = topk_id - id_base (EP), active local experts
            ascending, pairs (p = token*topk + k) ascending per expert ->
            deterministic; pairs routed to other ranks' experts are skipped
@@ -20,6 +20,24 @@ function of M only (CUDA-graph safe, no host sync):
   fc2      y[p, :] = g2[e] * (h_p @ w2[e]^T) * topk_w[p]
   combine  out[t] = sum_k y[t*topk + k] in ascending k (fixed order) over
            local experts only; a token with no local expert gets exactly 0
+Launch plans (``launch_mode``; decode is launch/latency bound, so fewer
+launches is the win; all plans are bit-identical, same f32 ops per element):
+  0 legacy  6 launches, one per stage (SUFFIX_MOE_FUSED=0 forces it)
+  1 front   4: route+quant x in one launch (block 0 routes, the rest
+            quantize x), fc1+act+quant h in one launch (each CTA's 32 I
+            columns are two whole 16-col NVFP4 blocks: quantized in-CTA from
+            an smem tile, no f32 `inter` round trip), then fc2, combine
+  2 fused   3: front + TOKEN-MAJOR fc2+combine (one CTA per (token, 8 H
+            cols), one warp per top-k slot, y summed over k ascending in
+            smem, bf16 stored once: no y workspace, no combine launch)
+M <= FUSED_MAX_M runs plan 2, larger M plan 1. Token-major re-reads an
+expert's w2 once per token routed to it (expert-major reads it once per
+chunk of 16 of its rows): extra fc2 traffic = (local pairs - distinct local
+experts) * w2 bytes/expert, mostly L2 hits inside one launch. qwen3.8-flash
+EP2 (256 local of 512, top-10, ~5 local pairs/token): M=8 -> ~40 pairs over
+~37 experts (+8 % fc2 bytes), M=16 -> ~80 over ~69 (+16 %); gemma (128,
+top-8, no EP) M=8 -> 64 pairs over ~50 experts (+27 %). The bench prints all
+three plans per M so FUSED_MAX_M is set from silicon, not assumed.
 
 Parallel contract (= vLLM's stock FLASHINFER_CUTLASS path, vLLM 0.30):
   EP (TP=N + --enable-expert-parallel, DP=1): moe tp=1, ep=N, linear
@@ -64,6 +82,9 @@ import zlib
 
 GATE = "SUFFIX_NVFP4_MOE"
 MAX_M_ENV = "SUFFIX_NVFP4_MOE_MAX_M"
+FUSED_ENV = "SUFFIX_MOE_FUSED"  # "0" -> legacy 6-launch plan (both families)
+FUSED_MAX_M = 8  # token-major fc2+combine up to here (module doc), plan 1 above
+PLANS = {0: "legacy6", 1: "front4", 2: "fused3"}
 MARKER = "[suffix nvfp4-moe]"
 FAMILY = "nvfp4_moe"
 ACT_CODE = {"silu": 0, "gelu_tanh": 1}
@@ -102,6 +123,16 @@ def max_m() -> int:
     if not 1 <= v <= 256:
         raise ValueError(f"{MAX_M_ENV}={v} outside [1, 256]")
     return v
+
+
+def fused_on() -> bool:
+    return os.environ.get(FUSED_ENV, "1").strip() != "0"
+
+
+def launch_mode(m: int, fused: bool = True) -> int:
+    """Launch plan for M tokens (module doc): a function of M only, so a
+    CUDA graph captured at a given M replays the same plan."""
+    return 0 if not fused else (2 if m <= FUSED_MAX_M else 1)
 
 
 def _r(v: int, a: int) -> int:
@@ -386,10 +417,13 @@ def judge(ours, fi, ref, local_ids, fi_emu=None):
 
 
 def stages(p, x, ids, tw, ws, out):
-    """Per-stage drift of OUR kernel, read back from its workspace right
-    after a run (`ids` LOCAL, -1 = off-rank). Each stage is checked against
-    the f64 spec fed with the kernel's own previous-stage output, so a drift
-    is pinned to the stage that made it:
+    """Per-stage drift of OUR kernel, read back from its workspace after
+    `run_plans` (`ids` LOCAL, -1 = off-rank): `inter` is the legacy plan's
+    f32 fc1 output and `y` plan 1's f32 fc2 output (the fused plans keep
+    them on chip), xq/hq and `out` come from the fused 3-launch plan, which
+    run_plans has already proven bit-identical to the legacy plan. Each
+    stage is checked against the f64 spec fed with the kernel's own
+    previous-stage output, so a drift is pinned to the stage that made it:
       xq    x -> NVFP4 (a1 gscale)        frac of dequantized values differing
       fc1   act(g1*gate) * g1*up           rel vs f64 from the kernel's xq
       hq    inter -> NVFP4 (a2 gscale)    frac differing vs quant of its inter
@@ -467,14 +501,55 @@ def workspace(dev, m: int, topk: int, hdim: int, idim: int, e_count: int, ws=Non
                  for n, d, o in zip(need, dts, old))
 
 
-def run_ours(native, p, x, ids, tw, ws, stream, out=None):
+def run_ours(native, p, x, ids, tw, ws, stream, out=None, mode=None):
+    """mode None: launch_mode(M) (p["fused"] when prepared, else the env)."""
     import torch
     if out is None:
         out = torch.empty(x.shape[0], p["w2"].shape[1], dtype=torch.bfloat16, device=x.device)
+    if mode is None:
+        mode = launch_mode(x.shape[0], p.get("fused", fused_on()))
     native.nvfp4_moe_cuda(x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"],
                           p["g2"], *ws, out, float(p["a1g"]), float(p["a2g"]),
-                          int(p["act"]), int(p.get("id_base", 0)), stream)
+                          int(p["act"]), int(p.get("id_base", 0)), int(mode), stream)
     return out
+
+
+def run_plans(run, ws, lid, xq_len, hq_len):
+    """Runs every launch plan, legacy first, via run(mode) -> out, and
+    checks plans 1 and 2 against the legacy plan BIT FOR BIT: out, the x
+    quant (ws[0]/ws[1], xq_len = per-token lengths) and the h quant rows of
+    every LOCAL pair (ws[3]/ws[4], hq_len = per-pair lengths; off-rank rows
+    are never written by the fused fc1). Order 0, 1, 2 leaves ws as
+    `stages` expects. Family-agnostic (fp8_moe uses it too).
+    Returns (plan 2's out, ok, msg)."""
+    import torch
+    m, topk = lid.shape
+    vp = torch.nonzero(lid.reshape(-1) >= 0).reshape(-1)
+    u8 = lambda t: t.contiguous().reshape(-1).view(torch.uint8)
+
+    def snap(out):
+        xs = [u8(ws[i][:m * n]).clone() for i, n in zip((0, 1), xq_len)]
+        hs = [u8(ws[i][:m * topk * n].view(m * topk, n)[vp]).clone() for i, n in zip((3, 4), hq_len)]
+        return [u8(out).clone()] + xs + hs
+
+    ref = snap(run(0))
+    bad = []
+    for mode in (1, 2):
+        out = run(mode)
+        for name, a, b in zip(("out", "xq", "xsf", "hq", "hsf"), ref, snap(out)):
+            if not torch.equal(a, b):
+                bad.append(f"{PLANS[mode]}.{name}:{int((a != b).sum())}B")
+    ok = not bad
+    return out, ok, ("plans " + "=".join(PLANS.values()) + " bitwise" if ok
+                     else f"plans DIFFER vs legacy6: {' '.join(bad)}")
+
+
+def plans_nvfp4(native, p, x, ids, tw, ws, stream):
+    """run_plans for an NVFP4 layer (ids GLOBAL; x/ids/tw not mutated)."""
+    hdim, idim = p["w2"].shape[1], p["w2"].shape[2] * 2
+    lid = to_local(ids, int(p.get("id_base", 0)), p["w2"].shape[0])
+    return run_plans(lambda mode: run_ours(native, p, x, ids, tw, ws, stream, mode=mode), ws, lid,
+                     (hdim // 2, hdim // 16), (idim // 2, idim // 16))
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +689,7 @@ def _make_layer_cls():
                        a2g=float(qc.a2_gscale.reshape(-1)[0]),
                        act=ACT_CODE[info["act"]], H=info["H"], topk=self.top_k,
                        max_m=max_m(), id_base=info["ep_base"],
-                       E_global=self.global_num_experts)
+                       E_global=self.global_num_experts, fused=fused_on())
             _state["ws"][dev] = workspace(dev, cfg["max_m"], cfg["topk"], info["H"],
                                           info["I"], info["E"], _state["ws"].get(dev))
             self._sfx_moe = cfg
@@ -657,10 +732,12 @@ def _make_layer_cls():
                 fi = super().forward_modular(x.clone(), tw.clone(), ids.clone()).float()
                 x_fi = _rel(x, x0)
                 xo = x.clone()
-                out = self._sfx_run(cfg, xo, tw, ids)
+                out, pl_ok, pl = plans_nvfp4(native, cfg, xo, ids, tw, _state["ws"][dev],
+                                             torch.cuda.current_stream(dev).cuda_stream)
                 x_ours = _rel(xo, x0)
                 lid = to_local(ids, base, local)
                 st_ok, st = stages(cfg, x, lid, tw, _state["ws"][dev], out)
+                st_ok, st = st_ok and pl_ok, f"{st} {pl}"
                 ours = out.float()
                 ref = moe_ref(cfg, x, lid, tw)
                 emu = moe_ref(cfg, x, lid, tw, fi=True).bfloat16()
@@ -867,15 +944,18 @@ GLM_MS = (1, 6, 32, 64)  # MTP k=5: one seq verifies 6 tokens per step
 ORACLE_CASES = ((GEMMA_MOE, CONCURRENCY), ((64, 2048, 768, 8, "silu", 1, 0), CONCURRENCY),
                 (GLM_EP, GLM_MS), (GLM_TP8, GLM_MS),
                 (QWEN_EP0, (1, 5, 8, 40)), (QWEN_EP1, (1, 5, 8, 40)), (QWEN_EP1R1, (1, 5, 8, 40)))
-BENCH_CASES = ((GEMMA_MOE, CONCURRENCY), (GLM_EP, (1, 6, 12, 24, 48, 64, 96, 192)),
+BENCH_CASES = ((QWEN_EP0, (1, 2, 5, 8, 10, 16, 32)), (GEMMA_MOE, (1, 2, 4, 8, 16, 32)),
+               (GLM_EP, (1, 6, 12, 24, 48, 64, 96, 192)),
                (GLM_TP8, (1, 6, 12, 24, 48, 64, 96, 192)))
 
 
 def oracle(cases=ORACLE_CASES):
     """Per case: ours vs vLLM's FlashInfer (same EP rank) vs the f64
-    reference, FlashInfer vs our emulation of its numerics, and our kernel's
-    per-stage drift read back from its workspace (`stages`); EP cases add rows routed only off-rank plus one batch whose
-    tokens ALL route off-rank (exact-zero contract). Fatal on mismatch."""
+    reference, FlashInfer vs our emulation of its numerics, all three launch
+    plans bit-identical (`run_plans`), and our kernel's per-stage drift read
+    back from its workspace (`stages`); EP cases add rows routed only
+    off-rank plus one batch whose tokens ALL route off-rank (exact-zero
+    contract). Fatal on mismatch."""
     import torch
     native = _native_ready()
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -896,13 +976,14 @@ def oracle(cases=ORACLE_CASES):
             emu = moe_ref(p, x, lid, tw, fi=True).bfloat16()
             fi = _fi_call(p, x, ids, tw, torch.full((m, hdim), float("nan"),
                                                     dtype=torch.bfloat16, device=dev)).float()
-            again = run_ours(native, p, x, ids, tw, ws, stream).float()
-            out = run_ours(native, p, x, ids, tw, ws, stream)
+            again = run_ours(native, p, x, ids, tw, ws, stream, mode=2).float()
+            out, pl_ok, pl = plans_nvfp4(native, p, x, ids, tw, ws, stream)
             st_ok, st = stages(p, x, lid, tw, ws, out)
             ours = out.float()
             det = bool(torch.equal(ours, again))
             ok, msg = judge(ours, fi, ref, lid, emu)
-            ok = ok and det and st_ok
+            ok = ok and det and st_ok and pl_ok
+            st = f"{st} {pl}"
             lines.append(f"{_case_name(case)} M={m}{' all-nonlocal' if dead else ''} "
                          f"P={m * topk}: {msg} {st} deterministic={det} "
                          f"{'OK' if ok else 'FAIL'}")
@@ -939,8 +1020,9 @@ def _graph_us(fn, dev, iters):
 
 def bench(cases=BENCH_CASES, iters=200):
     """us per MoE layer call on one rank (x quant + experts + combine), CUDA
-    graphs. The crossover M where FlashInfer wins sets SUFFIX_NVFP4_MOE_MAX_M
-    (above it the layer delegates to vLLM)."""
+    graphs, every launch plan (legacy6 / front4 / fused3) vs FlashInfer. The
+    crossover M where FlashInfer wins sets SUFFIX_NVFP4_MOE_MAX_M (above it
+    the layer delegates to vLLM); fused3 vs front4 sets FUSED_MAX_M."""
     import torch
     native = _native_ready()
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -956,15 +1038,19 @@ def bench(cases=BENCH_CASES, iters=200):
             x = torch.randn(m, hdim, device=dev).bfloat16()
             out = torch.empty(m, hdim, dtype=torch.bfloat16, device=dev)
             t_fi = _graph_us(lambda s: _fi_call(p, x, ids, tw, out), dev, iters)
-            t_ours = _graph_us(lambda s: run_ours(native, p, x, ids, tw, ws, s.cuda_stream,
-                                                  out), dev, iters)
+            t = {mode: _graph_us(lambda s, mode=mode: run_ours(
+                native, p, x, ids, tw, ws, s.cuda_stream, out, mode), dev, iters)
+                for mode in PLANS}
             lid = to_local(ids, base, local)
             distinct = int(torch.unique(lid[lid >= 0]).numel())
             roof = distinct * per_expert / HBM_BPS * 1e6
-            res[(case, m)] = (t_fi, t_ours, roof)
+            auto = launch_mode(m)
+            res[(case, m)] = (t_fi, t[auto], roof, t)
             print(f"{MARKER} bench {_case_name(case)} M={m} routed_rows={m * topk} "
                   f"local_experts_hit={distinct}: flashinfer {t_fi:.1f} us, ours "
-                  f"{t_ours:.1f} us (x{t_ours / t_fi:.2f}), weight-roofline {roof:.1f} us",
+                  + ", ".join(f"{PLANS[k]} {v:.1f} us" for k, v in t.items())
+                  + f" (auto {PLANS[auto]} x{t[auto] / t_fi:.2f} vs flashinfer, "
+                  f"x{t[auto] / t[0]:.2f} vs legacy6), weight-roofline {roof:.1f} us",
                   file=sys.stderr, flush=True)
         del p, ws
         torch.cuda.empty_cache()

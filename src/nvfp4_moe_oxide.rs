@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! NVFP4 MoE decode host op (feature `oxide-kernels`): launches
 //! kernels-oxide/nvfp4_moe (sm_120a SASS, ptxas 13.0) on torch's stream.
-//! Six launches, all grids a function of M only (no device->host reads):
-//! route, quant(x), fc1+act_and_mul, quant(h), fc2, combine.
+//! All grids a function of M only (no device->host reads). `mode`:
+//!   0 legacy, 6 launches: route, quant(x), fc1+act_and_mul, quant(h), fc2,
+//!     combine
+//!   1 fused front, 4: route+quant(x), fc1+act_and_mul+quant(h), fc2, combine
+//!   2 fused, 3: route+quant(x), fc1+act_and_mul+quant(h), token-major
+//!     fc2+combine (decode M; Python picks it for M <= FUSED_MAX_M)
+//! All three are bit-identical (same f32 ops per output element).
 //! Oracle/bench + vLLM wiring: suffix_hybrid/kernels/nvfp4_moe.py.
 
 use crate::oxide::{function, launch, Arg};
@@ -97,8 +102,10 @@ pub(crate) fn need(
 /// id_base: expert parallel offset (vLLM linear expert_map: ep_rank * E);
 /// topk_ids are GLOBAL ids, pairs outside [id_base, id_base + E) contribute
 /// nothing on this rank (vLLM all-reduces the partial outputs afterwards).
+/// mode: launch plan (module doc); ws_inter is written only by mode 0,
+/// ws_y only by modes 0 and 1.
 #[pyfunction]
-#[pyo3(signature = (x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter, ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, id_base, stream_ptr))]
+#[pyo3(signature = (x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter, ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, id_base, mode, stream_ptr))]
 #[allow(clippy::too_many_arguments)]
 pub fn nvfp4_moe_cuda<'py>(
     py: Python<'py>,
@@ -123,8 +130,12 @@ pub fn nvfp4_moe_cuda<'py>(
     a2_gscale: f32,
     act: u32,
     id_base: u32,
+    mode: u32,
     stream_ptr: usize,
 ) -> PyResult<()> {
+    if mode > 2 {
+        return Err(PyValueError::new_err(format!("mode {mode} not in 0..=2")));
+    }
     let x = info("x", x)?;
     let ids = info("topk_ids", topk_ids)?;
     let tw = info("topk_w", topk_w)?;
@@ -153,9 +164,10 @@ pub fn nvfp4_moe_cuda<'py>(
     if m == 0 {
         return Ok(());
     }
-    if e > 256 || h % 64 != 0 || i % 64 != 0 || h % 32 != 0 || i % 32 != 0 {
+    // I % 32: moe_fc1_quant's CTA = 32 cols of I = two whole NVFP4 blocks
+    if e > 256 || h % 64 != 0 || i % 64 != 0 || k == 0 {
         return Err(PyValueError::new_err(format!(
-            "unsupported MoE shape E={e} H={h} I={i} (E<=256, H,I % 64 == 0)"
+            "unsupported MoE shape E={e} H={h} I={i} topk={k} (E<=256, H,I % 64 == 0, topk >= 1)"
         )));
     }
     need("x", &x, &["torch.bfloat16"], Some(&[m, h]), 0)?;
@@ -305,74 +317,92 @@ pub fn nvfp4_moe_cuda<'py>(
         u(e),
         u(out.stride[0]),
     ];
-    let grids = [
-        (1u32, 1u32),
-        ((h / 16).div_ceil(128) as u32, m as u32),
-        ((i / 32) as u32, slots as u32),
-        ((i / 16).div_ceil(128) as u32, p as u32),
-        ((h / 32) as u32, slots as u32),
-        ((m * h).div_ceil(256) as u32, 1),
+    // fused launch plan (modes 1, 2)
+    let rq_args = [
+        Arg::Ptr(ids.ptr),
+        Arg::U32(ids_i64),
+        Arg::U32(id_base),
+        u(p),
+        u(e),
+        u(slots),
+        Arg::Ptr(slot_expert),
+        Arg::Ptr(slot_off),
+        Arg::Ptr(slot_cnt),
+        Arg::Ptr(pair_list),
+        Arg::Ptr(x.ptr),
+        Arg::Ptr(aq.ptr),
+        Arg::Ptr(asf.ptr),
+        u(m),
+        u(h),
+        u(x.stride[0]),
+        Arg::F32(a1_gscale),
     ];
-    let ordinal = x.device;
+    let fq_args = [
+        Arg::Ptr(hq.ptr),
+        Arg::Ptr(hsf.ptr),
+        Arg::Ptr(aq.ptr),
+        Arg::Ptr(asf.ptr),
+        Arg::Ptr(w13.ptr),
+        Arg::Ptr(w13s.ptr),
+        Arg::Ptr(g1.ptr),
+        Arg::Ptr(slot_expert),
+        Arg::Ptr(slot_off),
+        Arg::Ptr(slot_cnt),
+        Arg::Ptr(pair_list),
+        u(k),
+        u(h),
+        u(i),
+        Arg::U32(act),
+        Arg::F32(a2_gscale),
+    ];
+    let fc_args = [
+        Arg::Ptr(out.ptr),
+        Arg::Ptr(hq.ptr),
+        Arg::Ptr(hsf.ptr),
+        Arg::Ptr(w2.ptr),
+        Arg::Ptr(w2s.ptr),
+        Arg::Ptr(g2.ptr),
+        Arg::Ptr(tw.ptr),
+        Arg::Ptr(ids.ptr),
+        Arg::U32(ids_i64),
+        Arg::U32(id_base),
+        u(k),
+        u(h),
+        u(i),
+        u(e),
+        u(out.stride[0]),
+    ];
     let route_smem = (2 * e * 4) as u32;
+    let mm = m as u32;
+    // (entry, grid, threads, dynamic smem, args)
+    let legacy: [(&str, (u32, u32), u32, u32, &[Arg]); 6] = [
+        ("moe_route", (1, 1), 256, route_smem, &route_args),
+        ("moe_quant_rows", ((h / 16).div_ceil(128) as u32, mm), 128, 0, &qx_args),
+        ("moe_fc1", ((i / 32) as u32, slots as u32), 128, 0, &fc1_args),
+        ("moe_quant_rows", ((i / 16).div_ceil(128) as u32, p as u32), 128, 0, &qh_args),
+        ("moe_fc2", ((h / 32) as u32, slots as u32), 128, 0, &fc2_args),
+        ("moe_combine", ((m * h).div_ceil(256) as u32, 1), 256, 0, &comb_args),
+    ];
+    let front: [(&str, (u32, u32), u32, u32, &[Arg]); 2] = [
+        ("moe_route_quant", (1 + (m * h / 16).div_ceil(256) as u32, 1), 256, route_smem, &rq_args),
+        ("moe_fc1_quant", ((i / 32) as u32, slots as u32), 128, 16 * 32 * 4, &fq_args),
+    ];
+    let tail: Vec<(&str, (u32, u32), u32, u32, &[Arg])> = if mode == 2 {
+        let nw = k.min(16) as u32;
+        vec![("moe_fc2_combine", ((h / 8) as u32, mm), 32 * nw, (k * 8 * 4) as u32, &fc_args)]
+    } else {
+        legacy[4..].to_vec()
+    };
+    let plan: Vec<(&str, (u32, u32), u32, u32, &[Arg])> =
+        if mode == 0 { legacy.to_vec() } else { front.iter().cloned().chain(tail).collect() };
+    let ordinal = x.device;
     py.detach(move || {
         crate::guard_py("nvfp4_moe_cuda", move || {
-            let f = |entry: &str| function(FAMILY, entry, ordinal).map_err(PyRuntimeError::new_err);
             let e_ = |e: String| PyRuntimeError::new_err(format!("nvfp4 moe launch: {e}"));
-            launch(
-                f("moe_route")?,
-                (grids[0].0, grids[0].1, 1),
-                (256, 1, 1),
-                route_smem,
-                stream_ptr,
-                &route_args,
-            )
-            .map_err(e_)?;
-            launch(
-                f("moe_quant_rows")?,
-                (grids[1].0, grids[1].1, 1),
-                (128, 1, 1),
-                0,
-                stream_ptr,
-                &qx_args,
-            )
-            .map_err(e_)?;
-            launch(
-                f("moe_fc1")?,
-                (grids[2].0, grids[2].1, 1),
-                (128, 1, 1),
-                0,
-                stream_ptr,
-                &fc1_args,
-            )
-            .map_err(e_)?;
-            launch(
-                f("moe_quant_rows")?,
-                (grids[3].0, grids[3].1, 1),
-                (128, 1, 1),
-                0,
-                stream_ptr,
-                &qh_args,
-            )
-            .map_err(e_)?;
-            launch(
-                f("moe_fc2")?,
-                (grids[4].0, grids[4].1, 1),
-                (128, 1, 1),
-                0,
-                stream_ptr,
-                &fc2_args,
-            )
-            .map_err(e_)?;
-            launch(
-                f("moe_combine")?,
-                (grids[5].0, grids[5].1, 1),
-                (256, 1, 1),
-                0,
-                stream_ptr,
-                &comb_args,
-            )
-            .map_err(e_)?;
+            for (entry, grid, threads, smem, args) in plan {
+                let f = function(FAMILY, entry, ordinal).map_err(PyRuntimeError::new_err)?;
+                launch(f, (grid.0, grid.1, 1), (threads, 1, 1), smem, stream_ptr, args).map_err(e_)?;
+            }
             Ok(())
         })
     })

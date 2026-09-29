@@ -214,45 +214,64 @@ def _block_dot(x0, x1, b):
     return c
 
 
-def _gemm_emu(out, aq, a_s, w, w_s, owner, se, so, sc, pl, a_row_div, kdim, ndim, nrows_w,
-              col_offs, epi):
-    """fc1 (col_offs (0, I): gate, up) / fc2 (col_offs (0,)) CTA/warp/lane walk."""
+def _warp_dot(aq, a_s, w, w_s, e, col_offs, j0, t0, t1, ok0, ok1, kdim, nrows_w):
+    """One warp's fc1_dot / fc2_dot: A rows t0/t1 (rows g / g+8, masked by
+    ok0/ok1), per 128-K block rescale acc += dot * a_s * w_s, weight rows
+    co + j0 + g of expert e for each co in col_offs -> one (32, 4) f32
+    accumulator per co."""
     nkb = kdim // 128
     s_rows = nrows_w // 128
+    accs = [np.zeros((32, 4), np.float32) for _ in col_offs]
+    for kb in range(nkb):
+        lo = kb * 128 + 32 * _LT
+        x0 = _words(aq, t0 * kdim + lo, ok0)
+        x1 = _words(aq, t1 * kdim + lo, ok1)
+        sa0 = np.where(ok0, a_s[np.where(ok0, t0 * nkb + kb, 0)], 0).astype(np.float32)
+        sa1 = np.where(ok1, a_s[np.where(ok1, t1 * nkb + kb, 0)], 0).astype(np.float32)
+        for ci, co in enumerate(col_offs):
+            row = co + j0 + _LG
+            b = _words(w, e * nrows_w * kdim + row * kdim + lo, np.ones(32, bool))
+            sw = np.float32(w_s[e * s_rows * nkb + ((co + j0) // 128) * nkb + kb])
+            blk = _block_dot(x0, x1, b)
+            sa = np.stack([sa0, sa0, sa1, sa1], 1)
+            accs[ci] = (accs[ci] + blk * sa * sw).astype(np.float32)
+    return accs
+
+
+def _gemm_emu(out, aq, a_s, w, w_s, owner, se, so, sc, pl, a_row_div, kdim, ndim, nrows_w,
+              col_offs, epi, warps=4, sink=None):
+    """fc1 (col_offs (0, I): gate, up) / fc2 (col_offs (0,)) CTA/warp/lane
+    walk, CTA = `warps` x 8 columns. sink (moe_fc1_quant, warps=16): the
+    warps' epilogue values of each 16-row chunk land in a 16 x (8*warps)
+    tile (row g / g+8, col warp*8 + 2t + dc) handed to sink(e, off, cnt,
+    r0, bx, tile) after the chunk (the kernel's barrier)."""
     for slot, e in enumerate(se):
         if e < 0:
             continue
         off, cnt = so[slot], sc[slot]
-        for bx in range(ndim // 32):
-            for warp in range(4):
-                j0 = (bx * 4 + warp) * 8
-                if j0 >= ndim:
-                    continue
-                for r0 in range(0, cnt, 16):
+        for bx in range(ndim // (8 * warps)):
+            for r0 in range(0, cnt, 16):
+                tile = np.full((16, 8 * warps), np.nan, np.float32)
+                for warp in range(warps):
+                    j0 = (bx * warps + warp) * 8
+                    if j0 >= ndim:
+                        continue
                     ok0, ok1 = r0 + _LG < cnt, r0 + _LG + 8 < cnt
                     p0 = np.where(ok0, pl[np.where(ok0, off + r0 + _LG, 0)], 0)
                     p1 = np.where(ok1, pl[np.where(ok1, off + r0 + _LG + 8, 0)], 0)
-                    t0, t1 = p0 // a_row_div, p1 // a_row_div
-                    accs = [np.zeros((32, 4), np.float32) for _ in col_offs]
-                    for kb in range(nkb):
-                        lo = kb * 128 + 32 * _LT
-                        x0 = _words(aq, t0 * kdim + lo, ok0)
-                        x1 = _words(aq, t1 * kdim + lo, ok1)
-                        sa0 = np.where(ok0, a_s[np.where(ok0, t0 * nkb + kb, 0)], 0).astype(np.float32)
-                        sa1 = np.where(ok1, a_s[np.where(ok1, t1 * nkb + kb, 0)], 0).astype(np.float32)
-                        for ci, co in enumerate(col_offs):
-                            row = co + j0 + _LG
-                            b = _words(w, e * nrows_w * kdim + row * kdim + lo, np.ones(32, bool))
-                            sw = np.float32(w_s[e * s_rows * nkb + ((co + j0) // 128) * nkb + kb])
-                            blk = _block_dot(x0, x1, b)
-                            sa = np.stack([sa0, sa0, sa1, sa1], 1)
-                            accs[ci] = (accs[ci] + blk * sa * sw).astype(np.float32)
+                    accs = _warp_dot(aq, a_s, w, w_s, e, col_offs, j0, p0 // a_row_div,
+                                     p1 // a_row_div, ok0, ok1, kdim, nrows_w)
                     col = j0 + 2 * _LT
-                    for ok, pp, q in ((ok0, p0, 0), (ok1, p1, 2)):
+                    for ok, pp, q, rr in ((ok0, p0, 0, _LG), (ok1, p1, 2, _LG + 8)):
                         for dc in range(2):
-                            assert (owner[pp[ok]] == e).all(), "wrote another expert's row"
                             v = epi(pp, [a[:, q + dc] for a in accs])
+                            if sink is not None:
+                                tile[rr, warp * 8 + 2 * _LT + dc] = v
+                                continue
+                            assert (owner[pp[ok]] == e).all(), "wrote another expert's row"
                             out[pp[ok], col[ok] + dc] = v[ok]
+                if sink is not None:
+                    sink(e, off, cnt, r0, bx, tile)
 
 
 def _silu32(x):
@@ -290,7 +309,65 @@ def kernel_lane_emu(p, x, ids, tw, base=0):
     for t, v in zip(ws, (u8(aq_t), as_t, inter, u8(hq_t), hs_t, y)):
         v = torch.as_tensor(np.ascontiguousarray(v)).reshape(-1)
         t[:v.numel()] = v
+    kernel_lane_emu.acc = acc  # f32 sum before the bf16 store (fused-order test)
     return ws, torch.from_numpy(acc).bfloat16()
+
+
+def kernel_lane_emu_fused(p, x, ids, tw, base=0):
+    """The fused 3-launch plan: moe_route_quant (route + quant_group of x:
+    moe_quant_rows' code), moe_fc1_quant (CTA = 128 cols of I = 16 warps;
+    warp w quantizes chunk row w of the 16x128 smem tile, quant_group ==
+    fm.quant_fp8 "h"), moe_fc2_combine (token-major, pair alone in mma row
+    0, k-ascending f32 sum). -> (hq [P, I], h_s [P, I/128], out f32)."""
+    m, topk = ids.shape
+    e_count, two_i, hdim = p["w13"].shape
+    idim, pairs = two_i // 2, m * topk
+    ids_flat = ids.reshape(-1).numpy()
+    se, so, sc, pl = nm.route_twin(ids, e_count, base)
+    pl = np.asarray(pl + [-7], np.int64)
+    loc = ids_flat.astype(np.int64) - base
+    u8 = lambda t: t.reshape(-1).contiguous().view(torch.uint8).numpy()
+    aq_t, as_t = fm.quant_fp8(x.float(), p["ue8m0"])
+    hq = np.full((pairs, idim), 0xAB, np.uint8)
+    hs = np.full((pairs, idim // 128), np.nan, np.float32)
+
+    def sink(e, off, cnt, r0, bx, tile):
+        for w in range(16):
+            if r0 + w < cnt:
+                pp = pl[off + r0 + w]
+                assert loc[pp] == e, "quantized another expert's row"
+                q, s_ = fm.quant_fp8(torch.from_numpy(tile[w:w + 1].copy()), p["ue8m0"], "h")
+                hq[pp, bx * 128:(bx + 1) * 128] = q.numpy()[0]
+                hs[pp, bx] = s_.numpy()[0, 0]
+
+    _gemm_emu(None, u8(aq_t), as_t.reshape(-1).numpy(), u8(p["w13"]), p["w13_s"].reshape(-1).numpy(),
+              loc, se, so, sc, pl, topk, hdim, idim, two_i, (0, idim),
+              lambda pp, c: _silu32(c[0]) * c[1], warps=16, sink=sink)
+    w2, w2_s = u8(p["w2"]), p["w2_s"].reshape(-1).numpy()
+    twf = tw.reshape(-1).numpy().astype(np.float32)
+    ok0, ok1 = _LG < 1, np.zeros(32, bool)
+    local = lambda pp: 0 <= loc[pp] < e_count
+    out = np.zeros((m, hdim), np.float32)
+    for tok in range(m):
+        for bx in range(hdim // 8):
+            h0 = bx * 8
+            ys = np.full((topk, 8), np.nan, np.float32)
+            for k in range(topk):
+                pp = tok * topk + k
+                if not local(pp):
+                    continue
+                rows = np.full(32, pp)
+                c = _warp_dot(hq.reshape(-1), hs.reshape(-1), w2, w2_s, loc[pp], (0,), h0, rows, rows,
+                              ok0, ok1, idim, hdim)[0]
+                for dc in range(2):
+                    ys[k, 2 * _LT[ok0] + dc] = c[ok0, dc] * twf[pp]
+            for j in range(8):
+                acc = np.float32(0.0)
+                for k in range(topk):
+                    if local(tok * topk + k):
+                        acc = np.float32(acc + ys[k, j])
+                out[tok, h0 + j] = acc
+    return hq, hs, out
 
 
 @pytest.mark.parametrize("m,local,e_global,topk,hdim,idim,ue8m0,dead", [
@@ -334,6 +411,41 @@ def test_stages_pin_drift_to_the_stage_that_made_it():
         bump(bad[idx])
         ok, msg = fm.stages(p, x, ids, tw, bad, out)
         assert not ok and msg.split(f" {stage}=")[1].split()[0] != "0.0e+00", msg
+
+
+@pytest.mark.parametrize("m", [1, 2, 5, 8, 16, 32])
+def test_fused_plan_is_bit_identical_to_legacy(m):
+    """Fused 3-launch plan == legacy 6-launch plan BIT FOR BIT (f32 sum,
+    bf16 out, every local pair's hq / h_s row) on an EP rank (4 local of 8
+    global, top-4, rows t % 3 == 1 off-rank, 2-block fc1, 2-block fc2,
+    UE8M0 on odd M); `stages` on run_plans' mixed workspace passes."""
+    local, e_global, base, topk, hdim, idim = 4, 8, 4, 4, 256, 256
+    p = fm.make_problem(local, hdim, idim, seed=500 + m, ue8m0=bool(m % 2))
+    ids, tw = nm.rand_routing(m, e_global, topk, "cpu", seed=10 + m, base=base, local=local)
+    x = torch.randn(m, hdim, generator=torch.Generator().manual_seed(m)).bfloat16()
+    ws, out = kernel_lane_emu(p, x, ids, tw, base)
+    acc = kernel_lane_emu.acc
+    hq, hs, facc = kernel_lane_emu_fused(p, x, ids, tw, base)
+    lid = nm.to_local(ids, base, local)
+    vp = (lid.reshape(-1) >= 0).numpy()
+    assert vp.any() and (~vp).any()
+    if m >= 8:
+        assert ((lid >= 0).sum(1) >= 3).any()  # k order observable
+    pairs = m * topk
+    assert np.array_equal(facc.view(np.uint32), acc.view(np.uint32))
+    assert torch.equal(torch.from_numpy(facc).bfloat16().view(torch.int16), out.view(torch.int16))
+    assert (out[(lid < 0).all(1)] == 0).all()
+    leg_hq = ws[3][:pairs * idim].view(pairs, -1).numpy()
+    leg_hs = ws[4][:pairs * idim // 128].view(pairs, -1).numpy()
+    assert np.array_equal(hq[vp], leg_hq[vp])
+    assert np.array_equal(hs[vp].view(np.uint32), leg_hs[vp].view(np.uint32))
+    assert (hq[~vp] == 0xAB).all()  # off-rank rows never written
+    mixed = list(ws)
+    mixed[3], mixed[4] = ws[3].clone(), ws[4].clone()
+    mixed[3][:hq.size] = torch.from_numpy(hq.reshape(-1))
+    mixed[4][:hs.size] = torch.from_numpy(hs.reshape(-1))
+    ok, msg = fm.stages(p, x, lid, tw, mixed, torch.from_numpy(facc).bfloat16())
+    assert ok, msg
 
 
 def test_k_permutation_is_a_bijection_per_block():
@@ -500,25 +612,38 @@ def test_host_launch_args_match_kernel_abi():
     params = {}
     for name, sig in re.findall(r"pub unsafe fn (moe_\w+)\((.*?)\)\s*\{", KSRC, re.S):
         params[name] = len([a for a in sig.split(",") if a.strip()])
-    assert set(params) == {"moe_route", "moe_quant_rows", "moe_fc1", "moe_fc2", "moe_combine"}
+    assert set(params) == {"moe_route", "moe_quant_rows", "moe_fc1", "moe_fc2", "moe_combine",
+                           "moe_route_quant", "moe_fc1_quant", "moe_fc2_combine"}
     for arr, kern in [("route_args", "moe_route"), ("qx_args", "moe_quant_rows"),
                       ("qh_args", "moe_quant_rows"), ("fc1_args", "moe_fc1"),
-                      ("fc2_args", "moe_fc2"), ("comb_args", "moe_combine")]:
+                      ("fc2_args", "moe_fc2"), ("comb_args", "moe_combine"),
+                      ("rq_args", "moe_route_quant"), ("fq_args", "moe_fc1_quant"),
+                      ("fc_args", "moe_fc2_combine")]:
         body = re.search(rf"let {arr} = \[(.*?)\];", HOST, re.S).group(1)
         n = len([a for a in re.split(r",\s*\n", body) if a.strip()])
         assert n == params[kern], (arr, n, params[kern])
         assert f'("{kern}", ' in HOST and f"&{arr})" in HOST
     assert '"arch": "sm_120a"' in (ROOT / "kernels-oxide" / "fp8_moe" / "oxide-variants.json").read_text()
     assert 'name = "fp8_moe"' in (ROOT / "kernels-oxide" / "fp8_moe" / "Cargo.toml").read_text()
+    # fused fc1: 16 warps (whole 128-col h quant group), 16x128 f32 smem tile
+    assert '"moe_fc1_quant", ((i / 128) as u32, slots as u32), 512, 16 * 128 * 4,' in HOST
+    assert "#[launch_bounds(512)]\n    pub unsafe fn moe_fc1_quant(" in KSRC
+    assert "32 * nw, (k * 8 * 4) as u32" in HOST
 
 
 def test_route_and_combine_are_nvfp4s_verified_kernels():
-    """moe_route / moe_combine are byte-identical to nvfp4_moe's (silicon-
-    verified there), so nm.route_twin is their spec here too."""
+    """moe_route / moe_combine / moe_fc2_combine's k-ascending sum and the
+    route_cta macro are byte-identical to nvfp4_moe's (silicon-verified
+    there), so nm.route_twin is their spec here too."""
     nv = (ROOT / "kernels-oxide" / "nvfp4_moe" / "src" / "main.rs").read_text()
     body = lambda s, n: re.search(rf"pub unsafe fn {n}\(.*?\n    \}}\n", s, re.S).group(0)
     for n in ("moe_route", "moe_combine"):
         assert body(KSRC, n) == body(nv, n), n
+    macro = lambda s: re.search(r"macro_rules! route_cta \{.*?\n\}\n", s, re.S).group(0)
+    assert macro(KSRC) == macro(nv)
+    tail = lambda s: re.search(r"        thread::sync_threads\(\);\n        if tid < 8 \{.*?\n    \}\n",
+                               s[s.index("pub unsafe fn moe_fc2_combine("):], re.S).group(0)
+    assert tail(KSRC) == tail(nv)
 
 
 def test_first_forward_hook_decides_each_gated_family(monkeypatch):

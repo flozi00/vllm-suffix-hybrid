@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! FP8 block-scaled MoE decode host op (feature `oxide-kernels`): launches
 //! kernels-oxide/fp8_moe (sm_120a SASS, ptxas 13.0) on torch's stream.
-//! Six launches, all grids a function of M only (no device->host reads):
-//! route, quant(x), fc1+silu_and_mul, quant(h), fc2, combine.
+//! All grids a function of M only (no device->host reads). `mode` (same
+//! plans as nvfp4_moe_oxide, all bit-identical):
+//!   0 legacy, 6 launches: route, quant(x), fc1+silu_and_mul, quant(h),
+//!     fc2, combine
+//!   1 fused front, 4: route+quant(x), fc1+silu_and_mul+quant(h), fc2,
+//!     combine
+//!   2 fused, 3: route+quant(x), fc1+silu_and_mul+quant(h), token-major
+//!     fc2+combine
 //! Oracle/bench + vLLM wiring: suffix_hybrid/kernels/fp8_moe.py.
 
 use crate::nvfp4_moe_oxide::{info, need};
@@ -29,9 +35,10 @@ const MIN_SCALE: f32 = 1.0 / (448.0 * 512.0);
 /// ue8m0: activation scales rounded up to powers of two (vLLM with DeepGEMM
 /// E8M0 on). id_base: expert parallel offset (vLLM linear expert_map:
 /// ep_rank * E); topk_ids are GLOBAL ids, pairs outside [id_base,
-/// id_base + E) contribute nothing on this rank.
+/// id_base + E) contribute nothing on this rank. mode: launch plan (module
+/// doc); ws_inter is written only by mode 0, ws_y only by modes 0 and 1.
 #[pyfunction]
-#[pyo3(signature = (x, topk_ids, topk_w, w13, w13_s, w2, w2_s, ws_aq, ws_as, ws_inter, ws_hq, ws_hs, ws_y, ws_route, out, ue8m0, id_base, stream_ptr))]
+#[pyo3(signature = (x, topk_ids, topk_w, w13, w13_s, w2, w2_s, ws_aq, ws_as, ws_inter, ws_hq, ws_hs, ws_y, ws_route, out, ue8m0, id_base, mode, stream_ptr))]
 #[allow(clippy::too_many_arguments)]
 pub fn fp8_moe_cuda<'py>(
     py: Python<'py>,
@@ -52,8 +59,12 @@ pub fn fp8_moe_cuda<'py>(
     out: &Bound<'py, PyAny>,
     ue8m0: bool,
     id_base: u32,
+    mode: u32,
     stream_ptr: usize,
 ) -> PyResult<()> {
+    if mode > 2 {
+        return Err(PyValueError::new_err(format!("mode {mode} not in 0..=2")));
+    }
     let x = info("x", x)?;
     let ids = info("topk_ids", topk_ids)?;
     let tw = info("topk_w", topk_w)?;
@@ -80,9 +91,9 @@ pub fn fp8_moe_cuda<'py>(
     if m == 0 {
         return Ok(());
     }
-    if e == 0 || e > 256 || h % 128 != 0 || i % 128 != 0 || two_i != 2 * i {
+    if e == 0 || e > 256 || h % 128 != 0 || i % 128 != 0 || two_i != 2 * i || k == 0 {
         return Err(PyValueError::new_err(format!(
-            "unsupported MoE shape E={e} H={h} I={i} (E<=256, H,I % 128 == 0)"
+            "unsupported MoE shape E={e} H={h} I={i} topk={k} (E<=256, H,I % 128 == 0, topk >= 1)"
         )));
     }
     let f8 = ["torch.float8_e4m3fn", "torch.uint8"];
@@ -210,39 +221,93 @@ pub fn fp8_moe_cuda<'py>(
         u(e),
         u(out.stride[0]),
     ];
-    // quant: one warp per 128-col group, 4 groups per 128-thread CTA
-    let grids = [
-        (1u32, 1u32),
-        ((h / 128).div_ceil(4) as u32, m as u32),
-        ((i / 32) as u32, slots as u32),
-        ((i / 128).div_ceil(4) as u32, p as u32),
-        ((h / 32) as u32, slots as u32),
-        ((m * h).div_ceil(256) as u32, 1),
+    // fused launch plan (modes 1, 2)
+    let rq_args = [
+        Arg::Ptr(ids.ptr),
+        Arg::U32(ids_i64),
+        Arg::U32(id_base),
+        u(p),
+        u(e),
+        u(slots),
+        Arg::Ptr(slot_expert),
+        Arg::Ptr(slot_off),
+        Arg::Ptr(slot_cnt),
+        Arg::Ptr(pair_list),
+        Arg::Ptr(x.ptr),
+        Arg::Ptr(aq.ptr),
+        Arg::Ptr(a_s.ptr),
+        u(m),
+        u(h),
+        u(x.stride[0]),
+        Arg::F32(EPS),
+        Arg::F32(0.0),
+        Arg::U32(u32::from(ue8m0)),
     ];
-    let ordinal = x.device;
+    let fq_args = [
+        Arg::Ptr(hq.ptr),
+        Arg::Ptr(hs.ptr),
+        Arg::Ptr(aq.ptr),
+        Arg::Ptr(a_s.ptr),
+        Arg::Ptr(w13.ptr),
+        Arg::Ptr(w13s.ptr),
+        Arg::Ptr(slot_expert),
+        Arg::Ptr(slot_off),
+        Arg::Ptr(slot_cnt),
+        Arg::Ptr(pair_list),
+        u(k),
+        u(h),
+        u(i),
+        Arg::F32(h_eps),
+        Arg::F32(h_min),
+        Arg::U32(u32::from(ue8m0)),
+    ];
+    let fc_args = [
+        Arg::Ptr(out.ptr),
+        Arg::Ptr(hq.ptr),
+        Arg::Ptr(hs.ptr),
+        Arg::Ptr(w2.ptr),
+        Arg::Ptr(w2s.ptr),
+        Arg::Ptr(tw.ptr),
+        Arg::Ptr(ids.ptr),
+        Arg::U32(ids_i64),
+        Arg::U32(id_base),
+        u(k),
+        u(h),
+        u(i),
+        u(e),
+        u(out.stride[0]),
+    ];
     let route_smem = (2 * e * 4) as u32;
+    let mm = m as u32;
+    // (entry, grid, threads, dynamic smem, args); quant: one warp per
+    // 128-col group, 4 groups per 128-thread CTA (8 per fused 256-thread CTA)
+    let legacy: [(&str, (u32, u32), u32, u32, &[Arg]); 6] = [
+        ("moe_route", (1, 1), 256, route_smem, &route_args),
+        ("moe_quant_rows", ((h / 128).div_ceil(4) as u32, mm), 128, 0, &qx_args),
+        ("moe_fc1", ((i / 32) as u32, slots as u32), 128, 0, &fc1_args),
+        ("moe_quant_rows", ((i / 128).div_ceil(4) as u32, p as u32), 128, 0, &qh_args),
+        ("moe_fc2", ((h / 32) as u32, slots as u32), 128, 0, &fc2_args),
+        ("moe_combine", ((m * h).div_ceil(256) as u32, 1), 256, 0, &comb_args),
+    ];
+    let front: [(&str, (u32, u32), u32, u32, &[Arg]); 2] = [
+        ("moe_route_quant", (1 + (m * h / 128).div_ceil(8) as u32, 1), 256, route_smem, &rq_args),
+        ("moe_fc1_quant", ((i / 128) as u32, slots as u32), 512, 16 * 128 * 4, &fq_args),
+    ];
+    let tail: Vec<(&str, (u32, u32), u32, u32, &[Arg])> = if mode == 2 {
+        let nw = k.min(16) as u32;
+        vec![("moe_fc2_combine", ((h / 8) as u32, mm), 32 * nw, (k * 8 * 4) as u32, &fc_args)]
+    } else {
+        legacy[4..].to_vec()
+    };
+    let plan: Vec<(&str, (u32, u32), u32, u32, &[Arg])> =
+        if mode == 0 { legacy.to_vec() } else { front.iter().cloned().chain(tail).collect() };
+    let ordinal = x.device;
     py.detach(move || {
         crate::guard_py("fp8_moe_cuda", move || {
-            let f = |entry: &str| function(FAMILY, entry, ordinal).map_err(PyRuntimeError::new_err);
             let e_ = |e: String| PyRuntimeError::new_err(format!("fp8 moe launch: {e}"));
-            let steps: [(&str, usize, u32, u32, &[Arg]); 6] = [
-                ("moe_route", 0, 256, route_smem, &route_args),
-                ("moe_quant_rows", 1, 128, 0, &qx_args),
-                ("moe_fc1", 2, 128, 0, &fc1_args),
-                ("moe_quant_rows", 3, 128, 0, &qh_args),
-                ("moe_fc2", 4, 128, 0, &fc2_args),
-                ("moe_combine", 5, 256, 0, &comb_args),
-            ];
-            for (entry, gi, threads, smem, args) in steps {
-                launch(
-                    f(entry)?,
-                    (grids[gi].0, grids[gi].1, 1),
-                    (threads, 1, 1),
-                    smem,
-                    stream_ptr,
-                    args,
-                )
-                .map_err(e_)?;
+            for (entry, grid, threads, smem, args) in plan {
+                let f = function(FAMILY, entry, ordinal).map_err(PyRuntimeError::new_err)?;
+                launch(f, (grid.0, grid.1, 1), (threads, 1, 1), smem, stream_ptr, args).map_err(e_)?;
             }
             Ok(())
         })
