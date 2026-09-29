@@ -174,8 +174,9 @@ def fused_on() -> bool:
 
 
 def launch_mode(m: int, fused: bool = True) -> int:
-    """Launch plan for M tokens (module doc): a function of M only, so a
-    CUDA graph captured at a given M replays the same plan."""
+    """Launch plan for M tokens (fp8_moe's choice; this family uses
+    tune_for): a function of M only, so a CUDA graph captured at a given M
+    replays the same plan."""
     return 0 if not fused else (2 if m <= FUSED_MAX_M else 1)
 
 

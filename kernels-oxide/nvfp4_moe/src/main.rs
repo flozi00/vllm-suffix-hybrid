@@ -113,9 +113,8 @@ macro_rules! route_cta {
 /// warp totals, then every pair's local id as u16 (0xFFFF = not on this
 /// rank), padded to a multiple of 8 pairs (host: 64 + 2 * round8(P) B).
 /// Thread e counts / walks expert e 8 ids (4 independent u32 smem loads)
-/// per iteration; the offset and
-/// slot prefix sums are warp shuffle scans + 8 warp totals (integer adds:
-/// exact in any order, so deterministic).
+/// per iteration; the offset and slot prefix sums are warp shuffle scans +
+/// 8 warp totals (integer adds: exact in any order, so deterministic).
 macro_rules! route_par {
     ($tid:expr, $sh:expr, $topk_ids:expr, $ids_i64:expr, $id_base:expr, $pairs:expr,
      $num_experts:expr, $max_slots:expr, $slot_expert:expr, $slot_off:expr, $slot_cnt:expr,
