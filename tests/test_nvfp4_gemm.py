@@ -72,9 +72,11 @@ def test_kernel_twin_multi_tile_and_n_tail(m, n, mode, splits):
 
 
 def test_plan_tiles_and_split_ranges():
-    assert [ng.plan(8192, 2560, m)["entry"] for m in (1, 16, 17, 32, 33, 48, 49, 64)] == \
+    ms = (1, 16, 17, 32, 33, 48, 49, 64)
+    assert [ng.plan(8192, 2560, m, fused=False)["entry"] for m in ms] == \
         ["nvfp4_gemm_t1"] * 2 + ["nvfp4_gemm_t2"] * 2 + ["nvfp4_gemm_t3"] * 2 + \
         ["nvfp4_gemm_t4"] * 2
+    shape = ("tiles", "splits", "kps", "grid", "ctas")
     for (n, k) in ng.ALL_SHAPES.values():
         for m in range(1, ng.MAX_M + 1):
             pl = ng.plan(n, k, m)
@@ -83,9 +85,119 @@ def test_plan_tiles_and_split_ranges():
             assert pl["kps"] * (pl["splits"] - 1) < steps <= pl["kps"] * pl["splits"]
             assert pl["splits"] == 1 or pl["kps"] >= ng.MIN_KPS
             assert pl["grid"] == (-(-n // 32), pl["splits"])
-            # graph safety: the plan is a function of the M bucket only
-            assert pl == dict(ng.plan(n, k, 16 * pl["tiles"]), partial=pl["partial"])
+            # graph safety: the launch grid is a function of the M bucket only
+            top = ng.plan(n, k, 16 * pl["tiles"])
+            assert all(pl[f] == top[f] for f in shape)
             assert pl["partial"] <= ng.partial_elems(n, k)
+            # the host op re-derives kps from the launched splits: fixed point
+            assert ng.plan(n, k, m, pl["splits"])["kps"] == pl["kps"]
+            # fused defaults: one launch whenever the quant prologue fits
+            assert pl["fused_reduce"] == (pl["splits"] > 1)
+            assert pl["launches"] == 1 + (not pl["fused_quant"])
+            assert pl["smem"] <= 16 + max(ng.QUANT_SMEM_MAX, ng.STAGE_FLOATS * 4)
+            old = ng.plan(n, k, m, fused=False)
+            assert old["flags"] == 0 and old["entry"] == f"nvfp4_gemm_t{pl['tiles']}"
+            assert old["launches"] == 2 + (pl["splits"] > 1)
+            q = ng.plan(n, k, m, prequant=True)
+            assert not q["fused_quant"] and q["launches"] == 1
+
+
+def test_fused_env(monkeypatch):
+    monkeypatch.delenv(ng.FUSED_ENV, raising=False)
+    assert ng.plan(336, 10240, 1)["flags"] == ng.FUSE_QUANT | ng.FUSE_REDUCE
+    monkeypatch.setenv(ng.FUSED_ENV, "0")  # the old 3-launch path, exactly
+    pl = ng.plan(336, 10240, 1)
+    assert pl["flags"] == 0 and pl["entry"] == "nvfp4_gemm_t1" and pl["launches"] == 3
+    monkeypatch.setenv(ng.FUSED_ENV, "reduce")
+    pl = ng.plan(336, 10240, 1)
+    assert pl["flags"] == ng.FUSE_REDUCE and pl["launches"] == 2
+    monkeypatch.setenv(ng.FUSED_ENV, "yes")
+    with pytest.raises(ValueError, match=ng.FUSED_ENV):
+        ng.plan(336, 10240, 1)
+
+
+def test_fused_layout():
+    # same numbers as src/nvfp4_gemm_oxide.rs fused_layout_matches_python_plan
+    both = ng.FUSE_QUANT | ng.FUSE_REDUCE
+    assert ng.fused_layout(1, 3, 54, ng.FUSE_REDUCE) == (16 + 55 * 32 * 4, 54)
+    assert ng.fused_layout(1, 3, 54, both) == (16 + 55 * 32 * 4, 54)
+    assert ng.fused_layout(16, 14, 3, both) == (16 + 16 * (14 * 32 + 16) + 16 * 4 * 15, 3)
+    assert ng.fused_layout(64, 8, 6, ng.FUSE_REDUCE) == (16 + 2 * 64 * 32 * 4, 1)
+    assert ng.fused_layout(5, 40, 1, ng.FUSE_QUANT) == (16 + 5 * (40 * 32 + 16) + 5 * 4 * 41, 1)
+    assert ng.fused_layout(17, 5, 2, 0) == (16, 2)
+    # qwen-flash decode: quant fused at M <= 16 everywhere; the widest
+    # (ple_kv 12800 x 2560, 2 splits) falls back above the smem budget
+    for (n, k) in ng.QWEN_FLASH_SHAPES.values():
+        assert all(ng.plan(n, k, m)["fused_quant"] for m in (1, 5, 16))
+    assert not ng.plan(12800, 2560, 64)["fused_quant"]
+    assert not ng.plan(34816, 5120, 64)["fused_quant"]  # 27b gate_up: 185 KB
+
+
+def test_smem_rows_are_bank_conflict_free():
+    # the 8 fragment rows g of a warp (4 lanes t each) hit 32 distinct banks;
+    # the 16 scale rows of one k64 step hit 16 distinct banks
+    for kps in range(1, 90):
+        astr, sw = kps * 32 + 16, kps | 1
+        banks = {((g * astr + 4 * t) // 4) % 32 for g in range(8) for t in range(4)}
+        assert len(banks) == 32
+        assert len({(sr * sw) % 32 for sr in range(16)}) == 16
+
+
+FUSED_MS = (1, 5, 16, 17, 40, 64)
+FUSED_SPLITS = (1, 2, 3, 10, 54)
+
+
+@pytest.mark.parametrize("mode", [0, 1])
+@pytest.mark.parametrize("splits", FUSED_SPLITS)
+@pytest.mark.parametrize("m", FUSED_MS)
+def test_fused_twin_bit_identical_to_old_path(m, splits, mode):
+    # K = 2 k64 steps per split (exactly `splits` launched), N = 48: the last
+    # column tile has 16 valid columns and two warps without columns
+    n, k = 48, 128 * splits
+    p = ng.make_problem(m, n, k, seed=m * 7 + splits)
+    out, pl, _ = ng.fused_twin(p, mode=mode, splits=splits, seed=m + splits)
+    assert pl["splits"] == splits and pl["fused_reduce"] == (splits > 1)
+    assert pl["fused_quant"] == (mode == 0)  # every case fits the smem budget
+    assert pl["launches"] == 1
+    as_f32 = lambda b: (b.astype(np.uint32) << 16).view(np.float32)
+    np.testing.assert_allclose(as_f32(out), ng.gemm_ref(p), rtol=1e-2, atol=1e-3)  # sanity
+
+
+def test_fused_counters_survive_graph_replay():
+    # replays reuse the SAME counters with different arrival orders: each
+    # launch leaves them at 0 and produces identical bits
+    p = ng.make_problem(17, 80, 128 * 10, seed=4)
+    counters = np.zeros(3, np.int64)
+    outs = []
+    for replay in range(4):
+        out, pl, counters = ng.fused_twin(p, splits=10, seed=replay, counters=counters)
+        assert pl["fused_reduce"] and not counters.any()
+        outs.append(out)
+    assert all(np.array_equal(o, outs[0]) for o in outs)
+
+
+def test_fixup_twin_detects_stale_counter():
+    # a counter left non-zero (no wrap) makes some CTA fix up early: caught
+    rng = np.random.default_rng(0)
+    partial = rng.standard_normal((5, 3, 32)).astype(np.float32)
+    order = [(0, s) for s in range(5)]
+    with pytest.raises(AssertionError, match="fixup before"):
+        ng.fixup_twin(partial, 1.0, 32, 2, order, np.array([1]), np.zeros((3, 32), np.uint16))
+    c = np.zeros(1, np.int64)
+    out = ng.fixup_twin(partial, 1.0, 32, 2, order[::-1], c, np.zeros((3, 32), np.uint16))
+    assert not c.any()
+    np.testing.assert_array_equal(out, ng.splitk_reduce_twin(partial, 1.0))
+
+
+def test_fixup_order_matters_so_bit_identity_is_meaningful():
+    # partials where a different summation order changes the f32 result
+    partial = np.array([[[1e8]], [[1.0]], [[-1e8]], [[1.0]]], np.float32).repeat(32, 2)
+    fixed = ng.splitk_reduce_twin(partial, 1.0)
+    swapped = ng.splitk_reduce_twin(partial[[0, 2, 1, 3]], 1.0)
+    assert not np.array_equal(fixed, swapped)
+    out = ng.fixup_twin(partial, 1.0, 32, 3, [(0, s) for s in (3, 1, 0, 2)],
+                        np.zeros(1, np.int64), np.zeros((1, 32), np.uint16))
+    np.testing.assert_array_equal(out, fixed)
 
 
 def test_split_policy():
@@ -134,7 +246,11 @@ def test_kernel_source_uses_nvf4_block_scale_mma_and_sm120a():
     assert '"arch": "sm_120a"' in var
     entries = re.findall(r"pub unsafe fn (\w+)\(", src)
     assert entries == ["nvfp4_quant_act", "nvfp4_gemm_t1", "nvfp4_gemm_t2", "nvfp4_gemm_t3",
-                       "nvfp4_gemm_t4", "nvfp4_splitk_reduce"]
+                       "nvfp4_gemm_t4", "nvfp4_gemm_f1", "nvfp4_gemm_f2", "nvfp4_gemm_f3",
+                       "nvfp4_gemm_f4", "nvfp4_splitk_reduce"]
+    # one quant function for the separate kernel and the fused prologue
+    assert src.count("quant_block(") == 3  # definition + 2 call sites
+    assert "atom.acq_rel.gpu.global.inc.u32" in src and "fence.acq_rel.gpu" in src
     assert sorted(entries) == sorted(ng.PARAMS)
     host = (ROOT / "src" / "nvfp4_gemm_oxide.rs").read_text()
     assert all(f'"{e}"' in host for e in entries)

@@ -157,10 +157,12 @@ def _device_ops(native):
         wq, wsf = scaled_fp4_quant(
             w, torch.tensor(g_w, dtype=torch.float32, device=w.device),
             is_sf_swizzled_layout=True)
+        pl = plan(n, k, MAX_M, prequant=True)  # M <= 16: one tile bucket
         return dict(n=n, k=k, w=w, wq=wq, wsf=wsf, g_w=g_w,
-                    splits=plan(n, k, MAX_M)["splits"],  # M <= 16: one tile bucket
+                    splits=pl["splits"], flags=pl["flags"],  # fused split-K reduce
                     partial=torch.empty(max(1, partial_elems(n, k, MAX_M)),
-                                        dtype=torch.float32, device=w.device))
+                                        dtype=torch.float32, device=w.device),
+                    counters=torch.zeros(-(-n // 32), dtype=torch.int32, device=w.device))
 
     def quant(x2, g):
         return scaled_fp4_quant(x2, g, is_sf_swizzled_layout=True)
@@ -172,7 +174,8 @@ def _device_ops(native):
             out = torch.empty(xq.shape[0], st["n"], dtype=torch.bfloat16, device=dev)
             native.nvfp4_gemm_q_cuda(xq, xsf, st["wq"], st["wsf"], st["partial"], out,
                                      alpha, st["splits"],
-                                     torch.cuda.current_stream(dev).cuda_stream)
+                                     torch.cuda.current_stream(dev).cuda_stream,
+                                     st["flags"], st["counters"])
             return out
         return logits_nvfp4(x2, st["w"], st["g_w"], quant, gemm)
 

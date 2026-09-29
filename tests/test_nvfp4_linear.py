@@ -83,6 +83,9 @@ def test_workspace_grows_at_load_only(monkeypatch):
         assert ng.plan(336, 10240, m)["partial"] <= b[2].numel()
     c = nl._workspace("cpu", 34816, 5120, max_m=16)  # capped M: 1 tile
     assert c[2].numel() >= ng.partial_elems(34816, 5120, 16)
+    # split-K ticket counters: one per column tile of the widest layer, zeroed
+    assert c[3].dtype.is_floating_point is False and c[3].numel() == 34816 // 32
+    assert not c[3].any() and a[3].numel() == 5120 // 32
 
 
 def test_entry_point():

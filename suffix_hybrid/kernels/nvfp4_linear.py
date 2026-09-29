@@ -27,6 +27,10 @@ Integration point (no fork, no _custom_ops patching):
     16..64), ROUTE[(N, K)]); ROUTE is ``DEFAULT_ROUTE`` overridden by
     ``SUFFIX_NVFP4_GEMM_ROUTE="NxK:maxM,..."`` (maxM 0 = always FlashInfer),
     e.g. from the in-pod bench's suggested route line.
+  * One launch per linear by default (nvfp4_gemm.plan: activation quant in
+    the GEMM prologue, split-K reduce by the last CTA per column tile);
+    ``SUFFIX_NVFP4_GEMM_FUSED=0`` restores the old quant + GEMM + reduce
+    launches exactly (``=reduce``: fuse only the reduce). Read at load.
   * Pre-quantized inputs (vLLM's fused SiLU*mul / RMSNorm + NVFP4 quant,
     ``input_quant_key() == kNvfp4Dynamic`` inherited) run our GEMM on vLLM's
     packed activation + swizzled scales (kernel asf_mode 1).
@@ -35,8 +39,9 @@ Startup (fatal when the gate is on): oxide manifest has ``nvfp4_gemm``,
 driver loads the cubin (``oxide_kernels.ensure_loaded``), SM family 12, and a
 per-(N, K) LAYER ORACLE on the real checkpoint weights at M in {1, 5, 16,
 17, 40, 64} (<= the layer's max M): ours vs the parent FlashInfer path AND vs
-the f64 exact-dequant reference, both input routes, before any CUDA graph
-is captured.
+the f64 exact-dequant reference, both input routes, and the single-launch
+path bit-identical to the old 3-launch one (outputs, aq/asf readback,
+ticket counters reset), before any CUDA graph is captured.
 Markers: ``[suffix nvfp4-gemm] NVFP4-GEMM armed`` / ``LAYER ORACLE PASS`` /
 ``NVFP4-GEMM ACTIVE``.
 
@@ -121,19 +126,21 @@ def eligible(n: int, k: int, rows: int, pad_bytes: int) -> str | None:
 def _workspace(dev, n: int, k: int, max_m: int = MAX_M):
     """Per-device scratch, grown at LOAD time only (never inside forward):
     aq [16*tiles*K/2] u8, asf [16*tiles*K/16] u8 (tiles = ceil(max_m/16)),
-    split-K partials f32 (worst M bucket of `plan`)."""
+    split-K partials f32 (worst M bucket of `plan`), split-K ticket
+    counters int32 [ceil(N/32)] (zeroed here, left zeroed by every launch)."""
     import torch
     from suffix_hybrid.kernels.nvfp4_gemm import partial_elems, tiles_for
     ws = _state["ws"].get(dev)
     rows = 16 * tiles_for(max_m)
-    need = (rows * k // 2, rows * k // 16, max(1, partial_elems(n, k, max_m)))
+    need = (rows * k // 2, rows * k // 16, max(1, partial_elems(n, k, max_m)), -(-n // 32))
     if ws is None or any(have.numel() < want for have, want in zip(ws, need)):
-        old = ws or (None, None, None)
+        old = ws or (None,) * 4
         sizes = [max(want, o.numel() if o is not None else 0)
                  for want, o in zip(need, old)]
         ws = (torch.empty(sizes[0], dtype=torch.uint8, device=dev),
               torch.empty(sizes[1], dtype=torch.uint8, device=dev),
-              torch.empty(sizes[2], dtype=torch.float32, device=dev))
+              torch.empty(sizes[2], dtype=torch.float32, device=dev),
+              torch.zeros(sizes[3], dtype=torch.int32, device=dev))
         _state["ws"][dev] = ws
     return ws
 
@@ -156,6 +163,7 @@ def _make_kernel_cls():
         PARAMS,
         dequant_torch,
         exact_ref,
+        fused_vs_old,
         oracle_ok,
         plan,
         plan_str,
@@ -203,32 +211,42 @@ def _make_kernel_cls():
             oxide_kernels.ensure_loaded(FAMILY, dev.index, params=PARAMS)
             _workspace(dev, n, k, max_m)
             # One device sync per layer at LOAD time; never in forward.
+            # (splits, fused flags) per M and route, fixed at load (graph-safe;
+            # SUFFIX_NVFP4_GEMM_FUSED read here, not in forward)
+            launch = {q: [(0, 0)] + [(pl["splits"], pl["flags"]) for pl in
+                                     (plan(n, k, m, prequant=q) for m in range(1, max_m + 1))]
+                      for q in (False, True)}
             cfg = dict(n=n, k=k, max_m=max_m, alpha=float(layer.alpha.item()),
                        g=float(layer.input_global_scale_inv.item()),
                        # rows past N are FlashInfer's zero padding (N % 32)
-                       w=layer.weight[:n],
-                       splits=[0] + [plan(n, k, m)["splits"] for m in range(1, max_m + 1)])
+                       w=layer.weight[:n], launch=launch)
             layer._sfx_nvfp4 = cfg
             if (n, k) not in _state["oracle"]:
                 _state["oracle"][(n, k)] = self._layer_oracle(layer, cfg)
             _state["layers_ours"] += 1
 
-        def _ours(self, layer, cfg, x2d, qa2d=None):
+        def _ours(self, layer, cfg, x2d, qa2d=None, fused=None):
+            """`fused` None: the load-time plan; else plan(fused=...) (oracle)."""
             n = cfg["n"]
             dev = layer.weight.device
-            aq, asf, partial = _state["ws"][dev]
+            aq, asf, partial, counters = _state["ws"][dev]
             stream = torch.cuda.current_stream(dev).cuda_stream
+            m = (x2d if qa2d is None else qa2d[0]).shape[0]
+            if fused is None:
+                splits, flags = cfg["launch"][qa2d is not None][m]
+            else:
+                pl = plan(n, cfg["k"], m, fused=fused, prequant=qa2d is not None)
+                splits, flags = pl["splits"], pl["flags"]
+            out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
             if qa2d is None:
-                out = torch.empty(x2d.shape[0], n, dtype=torch.bfloat16, device=dev)
                 native.nvfp4_gemm_cuda(x2d, cfg["w"], layer.weight_scale, aq, asf,
                                        partial, out, cfg["g"], cfg["alpha"],
-                                       cfg["splits"][x2d.shape[0]], stream)
+                                       splits, stream, flags, counters)
             else:
                 xq, xsf = qa2d
-                out = torch.empty(xq.shape[0], n, dtype=torch.bfloat16, device=dev)
                 native.nvfp4_gemm_q_cuda(xq, xsf, cfg["w"], layer.weight_scale,
-                                         partial, out, cfg["alpha"],
-                                         cfg["splits"][xq.shape[0]], stream)
+                                         partial, out, cfg["alpha"], splits, stream,
+                                         flags, counters)
             return out
 
         def _layer_oracle(self, layer, cfg):
@@ -247,12 +265,24 @@ def _make_kernel_cls():
             # proven bounds) would otherwise zero most blocks on both paths.
             amp = max(1.0, 448.0 * 6.0 / cfg["g"] / 20.0)
             ms = [m for m in ORACLE_MS if m <= cfg["max_m"]]
+            aq_ws, asf_ws, _, counters = _state["ws"][dev]
             for m in ms:
                 x = (torch.randn(m, k, generator=gen, device=dev) * amp).bfloat16()
                 ref = super().apply_weights(layer, x).float()
-                ours = self._ours(layer, cfg, x).float()
                 xq, xsf = scaled_fp4_quant(x, layer.input_global_scale_inv,
                                            is_sf_swizzled_layout=True)
+                # single launch == old 3-launch path, bit for bit (both routes)
+                for q, run in ((False, lambda f: self._ours(layer, cfg, x, fused=f)),
+                               (True, lambda f: self._ours(layer, cfg, None, (xq, xsf), fused=f))):
+                    fq = plan(n, k, m, fused=True, prequant=q)["fused_quant"]
+                    diff = fused_vs_old(run, aq_ws[: m * k // 2], asf_ws[: m * k // 16],
+                                        counters, fq)
+                    if diff is not None:
+                        raise RuntimeError(
+                            f"{MARKER} LAYER ORACLE FAIL N={n} K={k} M={m} "
+                            f"{'prequant' if q else 'bf16'} {plan_str(plan(n, k, m, prequant=q))}: "
+                            f"{diff} — refusing to serve with {GATE}=1")
+                ours = self._ours(layer, cfg, x).float()  # production plan; aq/asf readback below
                 ours_q = self._ours(layer, cfg, None, (xq, xsf)).float()
                 exact = exact_ref(xq, xsf, layer.weight, layer.weight_scale,
                                   cfg["alpha"], n).bfloat16().float()
@@ -273,9 +303,8 @@ def _make_kernel_cls():
                     # scales for some g (silicon 2026-09-29: 2e-2 at o_proj g=93).
                     # So: kernel quant == spec bit-for-bit, GEMM == exact product
                     # of that quant, and vs FlashInfer only the triangle bound.
-                    aq, asf, _ = _state["ws"][dev]
-                    q_own = aq[: m * k // 2].view(m, k // 2)
-                    sf_own = asf[: m * k // 16].view(m, k // 16)
+                    q_own = aq_ws[: m * k // 2].view(m, k // 2)
+                    sf_own = asf_ws[: m * k // 16].view(m, k // 16)
                     q_spec, sfb_spec, _ = quantize(x.float().cpu().numpy(), cfg["g"])
                     qmis = float(np.mean(q_own.cpu().numpy() != q_spec)
                                  + np.mean(sf_own.cpu().numpy() != sfb_spec))
@@ -302,11 +331,11 @@ def _make_kernel_cls():
                         f"{MARKER} LAYER ORACLE FAIL N={n} K={k} M={m} "
                         f"{plan_str(plan(n, k, m))}: {why} — refusing to serve with {GATE}=1")
             torch.cuda.synchronize(dev)
-            plans = " ".join(f"M{m}:{plan(n, k, m)['tiles']}t/{plan(n, k, m)['splits']}s"
-                             for m in ms)
+            plans = " ".join(f"M{m}:{plan(n, k, m)['tiles']}t/{plan(n, k, m)['splits']}s/"
+                             f"{plan(n, k, m)['launches']}L" for m in ms)
             _log(f"LAYER ORACLE PASS N={n} K={k} max_m={cfg['max_m']} [{plans}] "
                  f"max_rel_vs_flashinfer={worst:.2e} max_rel_vs_exact={worst_ref:.2e} "
-                 f"(bf16 + prequant routes)")
+                 f"(bf16 + prequant routes; single launch == old 3-launch bits)")
             return worst
 
         def apply_weights(self, layer, x, bias=None):
