@@ -71,6 +71,12 @@ ACT_CODE = {"silu": 0, "gelu_tanh": 1}
 GEMMA_MOE = (128, 2816, 704, 8, "gelu_tanh", 1, 0)
 GLM_EP = (256, 6144, 2048, 8, "silu", 8, 5)  # TP=8+EP rank 5: experts 160..191
 GLM_TP8 = (256, 6144, 256, 8, "silu", 1, 0)  # TP=8 without EP: I/8 shard
+# qwen3.8-flash-next TP=2+EP (512 experts, top-10), with the REAL a1 gscales
+# of checkpoint layers 0 (1/0.0013892765) and 1 (1/0.0013718378): layer 1's
+# serving LAYER ORACLE failed its all-off-rank-rows case (2026-09-29).
+QWEN_EP0 = (512, 2560, 640, 10, "silu", 2, 0, 1 / 0.0013892764691263437)
+QWEN_EP1 = (512, 2560, 640, 10, "silu", 2, 0, 1 / 0.0013718378031626344)
+QWEN_EP1R1 = (512, 2560, 640, 10, "silu", 2, 1, 1 / 0.0013718378031626344)
 HBM_BPS = 1.79e12  # RTX PRO 6000 Max-Q
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _MID = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
@@ -146,7 +152,9 @@ def quant_codes(x, g: float):
     blk = x.float().reshape(r, k // 16, 16)
     g = torch.tensor(g, dtype=torch.float32, device=x.device)
     amax = blk.abs().amax(-1)
-    sf8 = torch.clamp(amax * (g / 6.0), max=448.0).to(torch.float8_e4m3fn)
+    # g / 6 as tensor / tensor: IEEE division like the kernel (torch turns
+    # tensor / python-scalar into a reciprocal multiply, 1 ulp off for some g)
+    sf8 = torch.clamp(amax * (g / torch.full_like(g, 6.0)), max=448.0).to(torch.float8_e4m3fn)
     sf = sf8.float()
     inv = torch.where(sf == 0, torch.zeros_like(sf), g / torch.where(sf == 0, 1.0, sf))
     s = blk * inv[..., None]
@@ -288,7 +296,7 @@ def route_twin(ids, e_count: int, base: int = 0):
     return se, so, sc, pl
 
 
-def make_problem(e_count, hdim, idim, act="gelu_tanh", device="cpu", seed=0, wstd=0.05):
+def make_problem(e_count, hdim, idim, act="gelu_tanh", device="cpu", seed=0, wstd=0.05, a1g=None):
     """Random NVFP4 routed-experts layer in vLLM's post-processing FlashInfer
     CUTLASS layout (w13 = [up; gate], 128x4-swizzled per-expert scales, g1/g2
     = 1/(g_w*g_a), shared activation gscales calibrated on a random batch)."""
@@ -310,7 +318,7 @@ def make_problem(e_count, hdim, idim, act="gelu_tanh", device="cpu", seed=0, wst
             q, sfb = quant_codes(wf, float(gw[e]))
             w[e] = q
             s[e] = swizzle(sfb)
-    a1g = 2688.0 / 4.5  # randn(H) amax ~ 4-4.5
+    a1g = 2688.0 / 4.5 if a1g is None else a1g  # randn(H) amax ~ 4-4.5 unless a real layer's
     p = dict(w13=w13, w2=w2, act=ACT_CODE[act], act_name=act, a1g=a1g, a2g=1.0,
              w13_sf=s13.view(torch.float8_e4m3fn).reshape(e_count, rp13, cp13),
              w2_sf=s2.view(torch.float8_e4m3fn).reshape(e_count, rp2, cp2),
@@ -402,6 +410,17 @@ def stages(p, x, ids, tw, ws, out):
     xr = qdq(x.float(), p["a1g"])
     got = {"xq": frac(xq, xr)}
     bad_rows = [(r, int((xq[r] != xr[r]).sum())) for r in range(m) if (xq[r] != xr[r]).any()]
+    bad_block = ""
+    if bad_rows:  # first differing 16-block: raw inputs, both scales, the global scale
+        r0 = bad_rows[0][0]
+        b0 = int(torch.nonzero((xq[r0] != xr[r0]).view(-1, 16).any(-1))[0])
+        blk = x[r0, b0 * 16:(b0 + 1) * 16].float()
+        k_sf = int(asf[:m * hdim // 16].view(m, -1)[r0, b0])
+        s_sf = int(quant_codes(x[r0:r0 + 1].float(), p["a1g"])[1][0, b0])
+        bad_block = (f" first_bad=(row {r0} blk {b0} amax={float(blk.abs().max()):.6g} "
+                     f"g={p['a1g']!r} kernel_sf=0x{k_sf:02x} spec_sf=0x{s_sf:02x} "
+                     f"x={[round(v, 4) for v in blk.tolist()]} kernel_q={xq[r0, b0*16:(b0+1)*16].tolist()} "
+                     f"spec_q={xr[r0, b0*16:(b0+1)*16].tolist()})")
     vp = torch.nonzero(ids.reshape(-1) >= 0).reshape(-1)
     h = inter[:pairs * idim].view(pairs, idim)[vp]
     h_ref = torch.zeros(pairs, idim, dtype=torch.float64, device=x.device)
@@ -426,7 +445,7 @@ def stages(p, x, ids, tw, ws, out):
     got["comb"] = frac(out.float(), acc.bfloat16().float())
     ok = all(got[k] <= STAGE_TOL[k] for k in got)
     return ok, ("stages " + " ".join(f"{k}={v:.1e}" for k, v in got.items())
-                + (f" xq_bad_rows={bad_rows[:8]}" if bad_rows else ""))
+                + (f" xq_bad_rows={bad_rows[:8]}{bad_block}" if bad_rows else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -827,9 +846,10 @@ def _dev_problem(dev, case, seed=0):
     """Synthetic weights for ONE rank: E_global/ep_size local experts,
     id_base = ep_rank * E_local (vLLM linear expert_map)."""
     import torch
-    e_global, hdim, idim, topk, act, ep_size, ep_rank = case
+    e_global, hdim, idim, topk, act, ep_size, ep_rank = case[:7]
     local = e_global // ep_size
-    p = make_problem(local, hdim, idim, act, device=dev, seed=seed)
+    p = make_problem(local, hdim, idim, act, device=dev, seed=seed,
+                     a1g=case[7] if len(case) > 7 else None)
     p["a1g_t"] = torch.full((local,), p["a1g"], dtype=torch.float32, device=dev)
     p["a2g_t"] = torch.full((local,), p["a2g"], dtype=torch.float32, device=dev)
     p.update(ep_size=ep_size, ep_rank=ep_rank, id_base=ep_rank * local, E_global=e_global)
@@ -837,7 +857,7 @@ def _dev_problem(dev, case, seed=0):
 
 
 def _case_name(case) -> str:
-    e_global, hdim, idim, topk, act, ep_size, ep_rank = case
+    e_global, hdim, idim, topk, act, ep_size, ep_rank = case[:7]
     ep = f" EP{ep_size} rank{ep_rank} ({e_global // ep_size} local)" if ep_size > 1 else ""
     return f"E={e_global} H={hdim} I={idim} top{topk} {act}{ep}"
 
@@ -845,7 +865,8 @@ def _case_name(case) -> str:
 CONCURRENCY = (1, 8, 16, 32)  # decode tokens per step -> routed rows = M * topk
 GLM_MS = (1, 6, 32, 64)  # MTP k=5: one seq verifies 6 tokens per step
 ORACLE_CASES = ((GEMMA_MOE, CONCURRENCY), ((64, 2048, 768, 8, "silu", 1, 0), CONCURRENCY),
-                (GLM_EP, GLM_MS), (GLM_TP8, GLM_MS))
+                (GLM_EP, GLM_MS), (GLM_TP8, GLM_MS),
+                (QWEN_EP0, (1, 5, 8, 40)), (QWEN_EP1, (1, 5, 8, 40)), (QWEN_EP1R1, (1, 5, 8, 40)))
 BENCH_CASES = ((GEMMA_MOE, CONCURRENCY), (GLM_EP, (1, 6, 12, 24, 48, 64, 96, 192)),
                (GLM_TP8, (1, 6, 12, 24, 48, 64, 96, 192)))
 
@@ -861,7 +882,7 @@ def oracle(cases=ORACLE_CASES):
     stream = torch.cuda.current_stream(dev).cuda_stream
     lines = []
     for case, ms in cases:
-        e_global, hdim, idim, topk, act, ep_size, _ = case
+        e_global, hdim, idim, topk, act, ep_size, _ = case[:7]
         p = _dev_problem(dev, case)
         base, local = p["id_base"], e_global // ep_size
         ws = workspace(dev, max(ms), topk, hdim, idim, local)
@@ -925,7 +946,7 @@ def bench(cases=BENCH_CASES, iters=200):
     dev = torch.device("cuda", torch.cuda.current_device())
     res = {}
     for case, ms in cases:
-        e_global, hdim, idim, topk, act, ep_size, _ = case
+        e_global, hdim, idim, topk, act, ep_size, _ = case[:7]
         p = _dev_problem(dev, case, seed=1)
         base, local = p["id_base"], e_global // ep_size
         ws = workspace(dev, max(ms), topk, hdim, idim, local)

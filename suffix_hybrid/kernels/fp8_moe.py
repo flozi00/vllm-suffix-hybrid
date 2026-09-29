@@ -117,7 +117,11 @@ def quant_fp8(x, ue8m0: bool = False, stage: str = "x"):
     eps, smin = quant_params(ue8m0, stage)
     r, k = x.shape
     g = x.float().reshape(r, k // 128, 128)
-    s = g.abs().amax(-1).clamp_min(eps) / FP8_MAX
+    amax = g.abs().amax(-1).clamp_min(eps)
+    # tensor / tensor = IEEE division like the kernel (div.rn) and vLLM's CUDA
+    # quant; tensor / python-scalar is a reciprocal multiply in torch (1 ulp off
+    # in ~half the groups -> every dequantized value of the group differs).
+    s = amax / torch.full_like(amax, FP8_MAX)
     s = s.clamp_min(smin)
     if ue8m0:
         s = pow2_ceil(s.clamp_min(1e-10))
