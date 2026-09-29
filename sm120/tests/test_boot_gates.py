@@ -76,12 +76,13 @@ def test_nvfp4_moe_gates_run_the_kernel_module_cli():
     src = (REPO / "sitecustomize.py").read_text()
     ns = {}
     exec(src[src.index("_BOOT_GATES = {"):src.index("\n_boot_gates = ")], ns)
-    for mode in ("oracle", "bench"):
+    for mode in ("oracle", "bench", "sweep"):
         argv, env = ns["_BOOT_GATES"][f"nvfp4_moe_{mode}"]
         assert argv == ["-m", "suffix_hybrid.kernels.nvfp4_moe", mode] and env == {}
     # the module's CLI dispatches exactly these modes (no GPU needed to check)
     mod = (REPO / "suffix_hybrid" / "kernels" / "nvfp4_moe.py").read_text()
     assert 'if mode in ("oracle", "both")' in mod and 'if mode in ("bench", "both")' in mod
+    assert 'if mode in ("sweep",)' in mod
 
 
 def test_nvfp4_moe_gate_runs_once_with_feature_gates_stripped(tmp_path):

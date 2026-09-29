@@ -317,6 +317,10 @@ mod oxide;
 mod nvfp4_gemm_oxide;
 #[cfg(feature = "oxide-kernels")]
 mod nvfp4_moe_oxide;
+#[cfg(feature = "oxide-kernels")]
+mod fp8_moe_oxide;
+#[cfg(feature = "oxide-kernels")]
+mod dsa_indexer_oxide;
 mod nvfp4_ds_mla;
 #[cfg(feature = "oxide-kernels")]
 mod nvfp4_ds_mla_oxide;
@@ -451,9 +455,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "oxide-kernels")]
     m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_q_cuda, m)?)?;
     #[cfg(feature = "oxide-kernels")]
-    m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_splits, m)?)?;
-    #[cfg(feature = "oxide-kernels")]
     m.add_function(wrap_pyfunction!(nvfp4_moe_oxide::nvfp4_moe_cuda, m)?)?;
+    #[cfg(feature = "oxide-kernels")]
+    m.add_function(wrap_pyfunction!(nvfp4_moe_oxide::nvfp4_moe_attrs, m)?)?;
+    #[cfg(feature = "oxide-kernels")]
+    m.add_function(wrap_pyfunction!(fp8_moe_oxide::fp8_moe_cuda, m)?)?;
+    #[cfg(feature = "oxide-kernels")]
+    m.add_function(wrap_pyfunction!(dsa_indexer_oxide::dsa_indexer_logits_cuda, m)?)?;
     // NVFP4 ds-MLA (GLM 5.3 sparse-MLA reader cache): plan module always
     // built (CPU-verified sizes the split workspace); CUDA ops under
     // oxide-kernels. HAS_NVFP4_DSMLA_CUDA is the startup kernel-path

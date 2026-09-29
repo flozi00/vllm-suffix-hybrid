@@ -27,6 +27,8 @@ PYTHONPATH. Each section is independently gated:
                                pod before serving (fatal only with NVP4KV=1)
   SUFFIX_FICACHE=seed|dump|both -> FlashInfer autotune cache seed/harvest
                                (inert otherwise, degrades on failure)
+  SUFFIX_MTP_TUNE=1         -> online idle-time MTP draft-head LoRA tuning
+                               (suffix_hybrid/mtp_tune/; logged refusal)
   SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] -> in-pod torch.profiler summary
                                ("[suffix-prof]" lines; fail-soft)
 Prod sets none of them, so all five are inert there. The kernels gate lives
@@ -191,7 +193,8 @@ if os.environ.get("SUFFIX_SM120_NVP4DSMLA", "").strip() == "1":
 # SUFFIX_NVFP4_DENSE=1 (same hook): allowlisted BF16 linears -> vLLM ModelOpt
 # NVFP4 W4A4 layers (static activation global scale from proven input bounds).
 if (os.environ.get("SUFFIX_FP8_DENSE", "").strip() == "1"
-        or os.environ.get("SUFFIX_NVFP4_DENSE", "").strip() == "1"):
+        or os.environ.get("SUFFIX_NVFP4_DENSE", "").strip() == "1"
+        or os.environ.get("SUFFIX_ACT_AMAX_RECORD", "").strip()):
     try:
         from fp8_dense_patch import install_post_import_hook as _fp8d_hook
         _fp8d_hook()
@@ -227,6 +230,19 @@ if os.environ.get("SUFFIX_HYBRID_WRAP", "").strip() == "1":
         # site.py swallows Exception and continues unpatched. SystemExit is a
         # BaseException, so an incompatible enabled worker cannot silently run.
         raise SystemExit(f"suffix hybrid installation failed: {exc}") from exc
+
+# Online idle-time MTP draft-head tuning (suffix_hybrid/mtp_tune/): engine
+# idle hook + V2 runner load_model hook (LoRA on the MTP dense linears,
+# capture on rank 0). After the wrap so its propose wrapper sits outside
+# ours. Optional feature: a failure is a logged refusal, never fatal.
+if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
+    try:
+        from suffix_hybrid.mtp_tune import install as _mtp_tune_install
+        _mtp_tune_install()
+    except Exception as exc:  # noqa: BLE001 - optional feature
+        import sys
+        print(f"[suffix mtp-tune] install failed (tuning off): {exc!r}",
+              file=sys.stderr, flush=True)
 
 # In-pod engine-step profiler (suffix_hybrid/step_profiler.py):
 # SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] profiles N EngineCore steps once
@@ -269,12 +285,12 @@ if (os.environ.get("SUFFIX_OXIDE_PROBE", "").strip() == "1"
     subprocess.run([sys.executable, "-m", "suffix_hybrid.oxide_kernels"])
 
 # NVFP4 W4A4 decode-GEMM spike (qwen38-27b-kernels.md §7): SUFFIX_NVFP4_GEMM_
-# SPIKE=oracle|bench|both runs `python -m suffix_hybrid.kernels.nvfp4_gemm`
+# SPIKE=oracle|bench|both|sweep runs `python -m suffix_hybrid.kernels.nvfp4_gemm`
 # once per pod in a CHILD process (its CUDA context is gone before vLLM sizes
 # memory). Evidence only: markers "[suffix nvfp4-gemm] NVFP4-GEMM ORACLE
 # PASS|FAIL" and "bench ..." lines; never gates serving.
 _nvfp4_gemm = os.environ.get("SUFFIX_NVFP4_GEMM_SPIKE", "").strip().lower()
-if _nvfp4_gemm in ("oracle", "bench", "both") and not os.environ.get(
+if _nvfp4_gemm in ("oracle", "bench", "both", "sweep") and not os.environ.get(
         "SUFFIX_NVFP4_GEMM_SPIKE_DONE"):
     import subprocess
     import sys
@@ -306,6 +322,27 @@ _BOOT_GATES = {
     # ours vs vLLM FlashInfer vs f64 spec + per-stage readback; then us/call.
     "nvfp4_moe_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "oracle"], {}),
     "nvfp4_moe_bench": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "bench"], {}),
+    # cold-L2 us of every tune candidate per M (qwen EP0, gemma, GLM EP/TP8)
+    # vs FlashInfer -> paste-able SUFFIX_NVFP4_MOE_TUNE + recommended MAX_M.
+    "nvfp4_moe_sweep": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "sweep"], {}),
+    # FP8 128x128-block routed experts (SUFFIX_FP8_MOE, qwen3.8 MTP draft
+    # shape E 512 / EP2 ranks 0+1, H 2560, I 640, top-10; one GPU = one rank):
+    # ours vs vLLM Triton vs f64 spec + per-stage readback; then us/call.
+    "fp8_moe_oracle": (["-m", "suffix_hybrid.kernels.fp8_moe", "oracle"], {}),
+    "fp8_moe_bench": (["-m", "suffix_hybrid.kernels.fp8_moe", "bench"], {}),
+    # DSA indexer logits (SUFFIX_SM120_DSA_INDEXER, GLM-5.3 H=32 / DeepSeek
+    # H=64 decode native + flattened MTP rows, prefill): ours vs the Triton
+    # shim fallback vs f64, top-2048 sets, vLLM persistent_topk on a
+    # NaN-poisoned output; then us/call vs Triton + GB/s vs HBM roofline.
+    "dsa_indexer_oracle": (["-m", "suffix_hybrid.kernels.dsa_indexer", "oracle"], {}),
+    "dsa_indexer_bench": (["-m", "suffix_hybrid.kernels.dsa_indexer", "bench"], {}),
+    # NVFP4 W4A4 dense decode GEMM (SUFFIX_NVFP4_GEMM), M <= 64 at the qwen
+    # 27b / gemma / qwen-flash TP2 shapes: ours vs exact ref + vLLM FlashInfer
+    # (both input routes); bench us/call vs FlashInfer + suggested
+    # SUFFIX_NVFP4_GEMM_ROUTE; sweep adds the measured best split per case.
+    "nvfp4_gemm_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "oracle"], {}),
+    "nvfp4_gemm_bench": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "bench"], {}),
+    "nvfp4_gemm_sweep": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "sweep"], {}),
     # NVFP4 lm_head (SUFFIX_NVFP4_LMHEAD) at the qwen / gemma / GLM-TP8 head
     # shapes: screen vs exact quantized ref + greedy == bf16; then us/call
     # bf16 head vs NVFP4 screen + rescore (CUDA graphs).

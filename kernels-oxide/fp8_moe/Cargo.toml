@@ -1,0 +1,14 @@
+# FP8 block-scaled (128x128 weights, 1x128 activations) MoE decode (qwen3.8 MTP
+# draft routed experts): e4m3 m16n8k32 mma. Standalone crate (own [workspace]);
+# built only by scripts/oxide_build.py (arch from oxide-variants.json).
+[package]
+name = "fp8_moe"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "ec4aa4797956534578a1af010f86252a0b6d8626" }
+cuda-core = "0.3.1"

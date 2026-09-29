@@ -2,6 +2,8 @@
 """SUFFIX_NVFP4_GEMM vLLM wiring: gate, eligibility routing, workspace,
 VLLM_DISABLED_KERNELS union, entry point. (vLLM itself is not importable on
 the CPU test host; the kernel class is exercised by the in-pod layer oracle.)"""
+import os
+os.environ["SUFFIX_NVFP4_GEMM_FUSED_MAX_M"] = "64"  # these tests exercise fusion at every M
 import configparser
 import pathlib
 import sys
@@ -24,9 +26,41 @@ def test_eligibility():
     assert nl.eligible(34816, 5120, 34816, 0) is None
     assert nl.eligible(5120, 17408, 5120, 0) is None
     assert nl.eligible(2816, 2112, 2816, 0) is None  # gemma down
-    assert "padded" in nl.eligible(128, 5120, 96, 0)  # N padded beyond output
+    # FlashInfer pads N to % 32 with zero rows: we read the first N rows
+    assert nl.eligible(336, 10240, 352, 0) is None  # qwen-flash HC down+inject
+    assert nl.eligible(48, 2560, 64, 0) is None
+    assert nl.eligible(10240, 320, 10240, 0) is None  # HC up, K = 320
     assert "padded" in nl.eligible(5120, 5184, 5120, 32)
-    assert "% 32" in nl.eligible(5136, 5120, 5136, 0)
+    assert "% 16" in nl.eligible(5128, 5120, 5152, 0)
+    assert "% 64" in nl.eligible(5120, 5152, 5120, 0)
+    assert "rows" in nl.eligible(128, 5120, 96, 0)
+
+
+def test_max_m_env(monkeypatch):
+    monkeypatch.delenv(nl.MAX_M_ENV, raising=False)
+    assert nl.max_m_env() == 64
+    monkeypatch.setenv(nl.MAX_M_ENV, "16")
+    assert nl.max_m_env() == 16
+    for bad in ("15", "65", "x", "-1"):
+        monkeypatch.setenv(nl.MAX_M_ENV, bad)
+        with pytest.raises(ValueError, match="16..64"):
+            nl.max_m_env()
+
+
+def test_route_table_parsing(monkeypatch):
+    assert nl.parse_route("") == {}
+    assert nl.parse_route("2560 x 3072:16, 336X10240:0,") == {(2560, 3072): 16,
+                                                             (336, 10240): 0}
+    for bad in ("2560x3072", "2560:16", "axb:1", "2560x3072:65", "1x2x3:4"):
+        with pytest.raises(ValueError, match=nl.ROUTE_ENV):
+            nl.parse_route(bad)
+    monkeypatch.setattr(nl, "DEFAULT_ROUTE", {(8192, 2560): 40, (640, 2560): 16})
+    monkeypatch.setenv(nl.ROUTE_ENV, "8192x2560:24")
+    route = nl.route_table()  # env overrides the default table entry-wise
+    assert route == {(8192, 2560): 24, (640, 2560): 16}
+    assert nl.layer_max_m(8192, 2560, 64, route) == 24
+    assert nl.layer_max_m(640, 2560, 64, route) == 16
+    assert nl.layer_max_m(2560, 3072, 32, route) == 32  # unlisted: the env cap
 
 
 def test_disable_earlier_is_a_union(monkeypatch):
@@ -38,12 +72,22 @@ def test_disable_earlier_is_a_union(monkeypatch):
 
 
 def test_workspace_grows_at_load_only(monkeypatch):
+    from suffix_hybrid.kernels import nvfp4_gemm as ng
     monkeypatch.setattr(nl, "_state", dict(nl._state, ws={}))
     a = nl._workspace("cpu", 5120, 17408)
-    assert a[0].numel() == 16 * 17408 // 2 and a[2].numel() == 8 * 16 * 5120
-    b = nl._workspace("cpu", 34816, 5120)  # wider N, shorter K
-    assert b[0].numel() == 16 * 17408 // 2 and b[2].numel() == 8 * 16 * 34816
+    assert a[0].numel() == 64 * 17408 // 2 and a[1].numel() == 64 * 17408 // 16
+    assert a[2].numel() == ng.partial_elems(5120, 17408) >= 5 * 16 * 5120
+    b = nl._workspace("cpu", 336, 10240)  # narrow N, deep split
+    assert b[0].numel() == 64 * 17408 // 2
+    assert b[2].numel() == max(a[2].numel(), ng.partial_elems(336, 10240))
     assert nl._workspace("cpu", 128, 128) is b  # no realloc when it fits
+    for m in range(1, 65):  # every M fits the workspace of its layer
+        assert ng.plan(336, 10240, m)["partial"] <= b[2].numel()
+    c = nl._workspace("cpu", 34816, 5120, max_m=16)  # capped M: 1 tile
+    assert c[2].numel() >= ng.partial_elems(34816, 5120, 16)
+    # split-K ticket counters: one per column tile of the widest layer, zeroed
+    assert c[3].dtype.is_floating_point is False and c[3].numel() == 34816 // 32
+    assert not c[3].any() and a[3].numel() == 5120 // 32
 
 
 def test_entry_point():

@@ -91,6 +91,12 @@ def _norm_bound(norm, k):
     return 1.01 * math.sqrt(k) * float(w.detach().float().abs().max())
 
 
+def _k_of(mod) -> int:
+    """Per-rank input features: ReplicatedLinear (Qwen4Exp HyperConnection
+    projections) has no input_size_per_partition; its full input is local."""
+    return getattr(mod, "input_size_per_partition", None) or mod.input_size
+
+
 def act_bound(name, modules):
     """(A, rule) = proven |input| bound of linear `name`, or None."""
     for glob, v in act_overrides():
@@ -101,7 +107,7 @@ def act_bound(name, modules):
     layer, mod = modules.get(block), modules[name]
     if layer is None:
         return None
-    k = mod.input_size_per_partition
+    k = _k_of(mod)
     if sub == "self_attn" and leaf in ("qkv_proj", "q_proj"):
         b = _norm_bound(getattr(layer, "input_layernorm", None), k)
         return None if b is None else (b, "input_layernorm")
@@ -119,7 +125,7 @@ def act_bound(name, modules):
         norm = getattr(layer, "pre_feedforward_layernorm", None)
         if gu is None or gu.weight.dtype != torch.bfloat16:
             return None
-        r = _norm_bound(norm, gu.input_size_per_partition)
+        r = _norm_bound(norm, _k_of(gu))
         if r is None:
             return None
         w = gu.weight.detach()
@@ -182,8 +188,9 @@ def convert_layer(name, mod, act_amax):
     method = _builder()(SimpleNamespace(group_size=GROUP), "NVFP4", name)
     wl = getattr(mod, "weight_loader_v2", None) or getattr(mod, "weight_loader", None)
     with torch.device(w.device):
-        method.create_weights(mod, mod.input_size_per_partition,
-                              list(mod.output_partition_sizes), mod.input_size,
+        method.create_weights(mod, _k_of(mod),
+                              list(getattr(mod, "output_partition_sizes", None) or [mod.output_size]),
+                              mod.input_size,
                               mod.output_size, mod.params_dtype, weight_loader=wl)
     if (tuple(mod.weight.shape) != tuple(q.shape) or mod.weight.dtype != q.dtype
             or tuple(mod.weight_scale.shape) != tuple(sf.shape)):
