@@ -27,6 +27,8 @@ PYTHONPATH. Each section is independently gated:
                                pod before serving (fatal only with NVP4KV=1)
   SUFFIX_FICACHE=seed|dump|both -> FlashInfer autotune cache seed/harvest
                                (inert otherwise, degrades on failure)
+  SUFFIX_MTP_TUNE=1         -> online idle-time MTP draft-head LoRA tuning
+                               (suffix_hybrid/mtp_tune/; logged refusal)
   SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] -> in-pod torch.profiler summary
                                ("[suffix-prof]" lines; fail-soft)
 Prod sets none of them, so all five are inert there. The kernels gate lives
@@ -228,6 +230,19 @@ if os.environ.get("SUFFIX_HYBRID_WRAP", "").strip() == "1":
         # site.py swallows Exception and continues unpatched. SystemExit is a
         # BaseException, so an incompatible enabled worker cannot silently run.
         raise SystemExit(f"suffix hybrid installation failed: {exc}") from exc
+
+# Online idle-time MTP draft-head tuning (suffix_hybrid/mtp_tune/): engine
+# idle hook + V2 runner load_model hook (LoRA on the MTP dense linears,
+# capture on rank 0). After the wrap so its propose wrapper sits outside
+# ours. Optional feature: a failure is a logged refusal, never fatal.
+if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
+    try:
+        from suffix_hybrid.mtp_tune import install as _mtp_tune_install
+        _mtp_tune_install()
+    except Exception as exc:  # noqa: BLE001 - optional feature
+        import sys
+        print(f"[suffix mtp-tune] install failed (tuning off): {exc!r}",
+              file=sys.stderr, flush=True)
 
 # In-pod engine-step profiler (suffix_hybrid/step_profiler.py):
 # SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] profiles N EngineCore steps once
