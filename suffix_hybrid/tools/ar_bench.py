@@ -11,6 +11,13 @@ runs), and checks both give the same sums. Prints one "[suffix ar-bench]" line
 per size plus the P2P access matrix. Evidence only; exit 0 unless it crashed.
 
     python -m suffix_hybrid.tools.ar_bench [--sizes-kib 12,48,96,192,384,768,1536] [--iters 200]
+        [--matrix] [--qar] [--hidden 6144]
+
+--matrix: every nccl_split.CANDIDATES communicator x the autotune sizes, timed
+by the SAME code as SUFFIX_NCCL_AUTOTUNE (exact-sum check, median, MAX over
+ranks, no budget) + the bands autotune would pick. --qar (implies --matrix):
+nccl_qar int8/fp8 compressed all-reduce vs the best NCCL candidate per size,
+rel-l2 error vs an fp32 NCCL sum, and whether all ranks got identical bytes.
 """
 from __future__ import annotations
 
@@ -21,7 +28,43 @@ import sys
 MARK = "[suffix ar-bench]"
 
 
-def _worker(rank: int, world: int, port: int, sizes, iters: int, q, split: str = "") -> None:
+def _matrix(cpu, rank, hidden, qar, out) -> None:
+    import torch
+
+    from suffix_hybrid import nccl_split as ns
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    dev = torch.device("cuda", rank)
+    auto = PyNcclCommunicator(group=cpu, device=dev)
+    sizes = ns.autotune_sizes(hidden)
+    table, comms, errors = ns.tune(cpu, dev, auto, sizes, budget_s=1e9)
+    for spec, comm in comms.items():
+        if spec != "default":
+            comm.destroy()
+    out["matrix"] = {"sizes": sizes, "table": table, "errors": errors}
+    if not qar:
+        return
+    from suffix_hybrid.nccl_qar import PyncclQar
+
+    rows = []
+    for nbytes in sizes:
+        g = torch.Generator(device="cuda").manual_seed(4321 + rank)
+        x = torch.randn(nbytes // 2, device="cuda", dtype=torch.bfloat16, generator=g)
+        exact = auto.all_reduce(x.float())
+        row = {"bytes": nbytes}
+        for mode in ("int8", "fp8"):
+            qc = PyncclQar(auto, mode)
+            y = qc.all_reduce(x)
+            row[mode] = {"err": float((y.float() - exact).norm() / exact.norm()),
+                         "sum": float(y.view(torch.int16).double().sum()),
+                         "us": ns.time_us(lambda: qc.all_reduce(x), 7 if nbytes <= 8 << 20 else 3)}
+            del y
+        rows.append(row)
+    out["qar"] = rows
+
+
+def _worker(rank: int, world: int, port: int, sizes, iters: int, q, split: str = "",
+            matrix: bool = False, qar: bool = False, hidden: int = 6144) -> None:
     import torch
     import torch.distributed as dist
 
@@ -89,6 +132,8 @@ def _worker(rank: int, world: int, port: int, sizes, iters: int, q, split: str =
             a_us = timed(lambda t: auto.all_reduce(t), x.clone())
             s_us = timed(lambda t: small.all_reduce(t), x.clone())
             out["rows"].append({"kib": kib, "split": True, "auto_us": a_us, "small_us": s_us})
+    if matrix or qar:
+        _matrix(cpu, rank, hidden, qar, out)
     if rank == 0:
         out["p2p"] = [[int(i == j or torch.cuda.can_device_access_peer(i, j))
                        for j in range(world)] for i in range(world)]
@@ -103,6 +148,9 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--split", default="", help="NCCL_ALGO[/NCCL_PROTO] for a second PyNccl comm, "
                     "e.g. allreduce:tree or allreduce:ring/Simple")
+    ap.add_argument("--matrix", action="store_true", help="all autotune candidates x sizes")
+    ap.add_argument("--qar", action="store_true", help="compressed all-reduce vs best NCCL (implies --matrix)")
+    ap.add_argument("--hidden", type=int, default=6144, help="model hidden size for the token sizes")
     a = ap.parse_args()
     import torch
     import torch.multiprocessing as mp
@@ -115,7 +163,8 @@ def main() -> int:
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = 29500 + os.getpid() % 1000
-    procs = [ctx.Process(target=_worker, args=(r, world, port, sizes, a.iters, q, a.split))
+    procs = [ctx.Process(target=_worker, args=(r, world, port, sizes, a.iters, q, a.split,
+                                                  a.matrix, a.qar, a.hidden))
              for r in range(world)]
     [p.start() for p in procs]
     res = [q.get(timeout=900) for _ in procs]
@@ -142,7 +191,33 @@ def main() -> int:
             err = max(r["ca_max_abs_err"] for r in rows)
             line += f" | custom-AR {ca:8.1f} us ({nccl / ca:4.2f}x) max|err| {err:.3g}"
         print(line, flush=True)
+    if "matrix" in res[0]:
+        _print_matrix(res)
     return 0
+
+
+def _print_matrix(res) -> None:
+    from suffix_hybrid import nccl_split as ns
+
+    m = res[0]["matrix"]  # already MAX-reduced over ranks inside tune()
+    sizes, table = m["sizes"], m["table"]
+    short = {c: c.removeprefix("allreduce:") for c in table}
+    for i, nbytes in enumerate(sizes):
+        cells = " | ".join(f"{short[c]} {table[c][i]:8.1f}" for c in table)
+        best = min(table, key=lambda c: table[c][i])
+        line = (f"{MARK} matrix {ns.fmt_size(nbytes):>6s}: {cells} | best {short[best]} "
+                f"({table['default'][i] / table[best][i]:4.2f}x vs default)")
+        if "qar" in res[0]:
+            rows = [r["qar"][i] for r in res]
+            for mode in ("int8", "fp8"):
+                us = max(r[mode]["us"] for r in rows)
+                same = len({r[mode]["sum"] for r in rows}) == 1
+                line += (f" | qar-{mode} {us:8.1f} us ({table[best][i] / us:4.2f}x vs best) "
+                         f"rel-l2 {rows[0][mode]['err']:.2e} ranks-identical {same}")
+        print(line, flush=True)
+    print(f"{MARK} matrix failed: {m['errors'] or '-'}", flush=True)
+    print(f"{MARK} matrix bands (margin 5 %): SUFFIX_NCCL_BANDS={ns.bands_str(ns.build_bands(sizes, table))}",
+          flush=True)
 
 
 if __name__ == "__main__":

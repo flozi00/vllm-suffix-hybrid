@@ -249,8 +249,11 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
 # the load bucket (c1/c2-6/c7-12/c13-24/c25+) held <skip> steps, <per>
 # windows per bucket; one "[suffix-prof]" summary block per window.
 # Fail-soft: a profiler error never touches serving.
-# Size-routed NCCL all-reduce (suffix_hybrid/nccl_split.py): unset = inert.
-if os.environ.get("SUFFIX_NCCL_SMALL_ALGO", "").strip():
+# Size-routed NCCL all-reduce (suffix_hybrid/nccl_split.py): SUFFIX_NCCL_BANDS /
+# SUFFIX_NCCL_SMALL_* (static bands), SUFFIX_NCCL_AUTOTUNE=1, SUFFIX_NCCL_QAR.
+# The module decides from its own gates; all unset = inert.
+if any(os.environ.get(k, "").strip() for k in ("SUFFIX_NCCL_SMALL_ALGO", "SUFFIX_NCCL_BANDS",
+                                               "SUFFIX_NCCL_AUTOTUNE", "SUFFIX_NCCL_QAR")):
     from suffix_hybrid.nccl_split import install_post_import_hook as _ncsplit_hook
     _ncsplit_hook()
 
@@ -423,6 +426,13 @@ _BOOT_GATES = {
                                       "allreduce:ring/Simple", "--sizes-kib", "48,192,768,1536"], {}),
     "allreduce_split_bench_tree_simple": (["-m", "suffix_hybrid.tools.ar_bench", "--split",
                                            "allreduce:tree/Simple", "--sizes-kib", "48,192,768,1536"], {}),
+    # Every SUFFIX_NCCL_AUTOTUNE candidate x size (16 KiB..128 MiB + GLM tokens x
+    # 6144 x 2), same timing code as the autotune, + the bands it would choose.
+    "allreduce_matrix_bench": (["-m", "suffix_hybrid.tools.ar_bench", "--matrix",
+                                "--sizes-kib", "48"], {}),
+    # Same + nccl_qar int8/fp8 compressed all-reduce vs best NCCL per size.
+    "allreduce_qar_bench": (["-m", "suffix_hybrid.tools.ar_bench", "--qar",
+                             "--sizes-kib", "48"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():
