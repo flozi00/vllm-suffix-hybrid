@@ -24,6 +24,10 @@ that the SM120 NVFP4-KV overlay is a no-op against these exact versions:
 - `vllm_0.30.0/attention_backends_utils.py` — `vllm/v1/attention/backends/utils.py`
   at v0.30.0 (`split_decodes_and_prefills`, for the HiSparse staging-plan replay).
 
+- `vllm_0.30.0/deepseek_v32_model.py` — `vllm/models/deepseek_v32/nvidia/model.py`
+  at v0.30.0: the decoder-layer / model forward statements
+  `suffix_hybrid/tp_overlap.py` re-implements as pipeline segments (`ANCHORS`).
+
 Do not edit these files; they are regression fixtures. If upstream drifts
 (newer vLLM/FI in the image), the patch layer must fail closed and a new
 fixture + anchor set is required.

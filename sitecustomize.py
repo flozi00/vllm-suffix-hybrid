@@ -31,6 +31,8 @@ PYTHONPATH. Each section is independently gated:
                                (suffix_hybrid/mtp_tune/; logged refusal)
   SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] -> in-pod torch.profiler summary
                                ("[suffix-prof]" lines; fail-soft)
+  SUFFIX_TP_OVERLAP=1       -> logs that the TP micro-batch overlap is not
+                               wired into serving yet (docs/tp-overlap.md)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -257,6 +259,14 @@ if any(os.environ.get(k, "").strip() for k in ("SUFFIX_NCCL_SMALL_ALGO", "SUFFIX
     from suffix_hybrid.nccl_split import install_post_import_hook as _ncsplit_hook
     _ncsplit_hook()
 
+# TP micro-batch overlap (suffix_hybrid/tp_overlap.py): the pipelined forward
+# + oracle/bench exist, the vLLM runner integration does not yet
+# (docs/tp-overlap.md "Remaining"). Say so instead of silently ignoring it.
+if os.environ.get("SUFFIX_TP_OVERLAP", "").strip() == "1":
+    import sys
+    print("[suffix tp-overlap] SUFFIX_TP_OVERLAP=1 but the serving integration is not "
+          "wired (docs/tp-overlap.md); decode runs unsplit", file=sys.stderr, flush=True)
+
 if os.environ.get("SUFFIX_PROFILE_WORKER", "").strip():
     try:
         from suffix_hybrid.step_profiler import install_worker_hook
@@ -433,6 +443,17 @@ _BOOT_GATES = {
     # Same + nccl_qar int8/fp8 compressed all-reduce vs best NCCL per size.
     "allreduce_qar_bench": (["-m", "suffix_hybrid.tools.ar_bench", "--qar",
                              "--sizes-kib", "48"], {}),
+    # TP micro-batch overlap (suffix_hybrid/tp_overlap.py, docs/tp-overlap.md) on
+    # a GLM-width toy stack at TP 2/4/8 with real PyNccl all-reduces: oracle =
+    # overlapped (eager + CUDA graph) bitwise == split-sequential; bench = step
+    # ms unsplit / split-seq / overlap / compute-only / comm-only.
+    "tp_overlap_oracle": (["-m", "suffix_hybrid.tp_overlap_bench", "oracle"], {}),
+    "tp_overlap_bench": (["-m", "suffix_hybrid.tp_overlap_bench", "bench"], {}),
+    # Same bench with the all-reduces on an allreduce:ring/Simple communicator:
+    # half-batch messages (0.5-1.1 MiB) sit in the band where NCCL's default
+    # protocol is pathological on worker-06 (nccl_split router territory).
+    "tp_overlap_bench_ring_simple": (["-m", "suffix_hybrid.tp_overlap_bench", "bench",
+                                      "--spec", "allreduce:ring/Simple"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():
