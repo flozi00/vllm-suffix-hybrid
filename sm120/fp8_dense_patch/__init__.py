@@ -36,6 +36,9 @@ model), same anchor and DENY_LAYERS. Allowlisted LinearBase layers become
 vLLM ModelOpt NVFP4 W4A4 layers (vLLM's own method + kernel selection, so
 SUFFIX_NVFP4_GEMM serves them too). It runs BEFORE the FP8 mode, which then
 only sees what is still UnquantizedLinearMethod; both gates may be on.
+``SUFFIX_HC_FUSED_QUANT=1`` then fuses the activation quant of the converted
+Qwen4Exp HyperConnection consumers into their producer kernels
+(suffix_hybrid/kernels/hc_fused_quant.py, load-time oracle, fail closed).
 """
 
 import fnmatch
@@ -184,6 +187,12 @@ def _suffix_fp8_dense_convert(model) -> None:
         from . import nvfp4  # torch/vllm: worker side only
 
         nvfp4.convert_model(model)
+        if os.environ.get("SUFFIX_HC_FUSED_QUANT", "").strip() == "1":
+            # Qwen4Exp HC glue kernels emit the NVFP4 input of the linears
+            # just converted (suffix_hybrid/kernels/hc_fused_quant.py)
+            from suffix_hybrid.kernels import hc_fused_quant
+
+            hc_fused_quant.wire(model)
     if fp8_enabled():
         from . import runtime
 

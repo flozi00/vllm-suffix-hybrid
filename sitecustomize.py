@@ -346,6 +346,12 @@ _BOOT_GATES = {
     "nvfp4_gemm_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "oracle"], {}),
     "nvfp4_gemm_bench": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "bench"], {}),
     "nvfp4_gemm_sweep": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "sweep"], {}),
+    # SUFFIX_HC_FUSED_QUANT (qwen3.8-flash-next HC glue + NVFP4 quant):
+    # fused ops == stock vLLM op bits + spec quant bits at M 1..2700 (zeros,
+    # saturation), FlashInfer GEMM on fused vs vLLM-quant input; then us per
+    # HC boundary fused vs unfused (CUDA graphs).
+    "hc_fused_quant_oracle": (["-m", "suffix_hybrid.kernels.hc_fused_quant", "oracle"], {}),
+    "hc_fused_quant_bench": (["-m", "suffix_hybrid.kernels.hc_fused_quant", "bench"], {}),
     # NVFP4 lm_head (SUFFIX_NVFP4_LMHEAD) at the qwen / gemma / GLM-TP8 head
     # shapes: screen vs exact quantized ref + greedy == bf16; then us/call
     # bf16 head vs NVFP4 screen + rescore (CUDA graphs).
