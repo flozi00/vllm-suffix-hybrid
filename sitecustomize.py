@@ -346,6 +346,7 @@ _BOOT_GATES = {
     "nvfp4_gemm_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "oracle"], {}),
     "nvfp4_gemm_bench": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "bench"], {}),
     "nvfp4_gemm_sweep": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "sweep"], {}),
+    "nvfp4_gemm_prefill": (["-m", "suffix_hybrid.kernels.nvfp4_gemm", "prefill"], {}),
     # NVFP4 lm_head (SUFFIX_NVFP4_LMHEAD) at the qwen / gemma / GLM-TP8 head
     # shapes: screen vs exact quantized ref + greedy == bf16; then us/call
     # bf16 head vs NVFP4 screen + rescore (CUDA graphs).

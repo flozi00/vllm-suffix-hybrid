@@ -906,6 +906,32 @@ def bench(ms=BENCH_MS, shapes=tuple(ALL_SHAPES), iters=200, sweep=False):
     return res
 
 
+def prefill_bench(ms=(512, 2700, 8192), shapes=None, iters=30):
+    """Prefill-sized M: vLLM NVFP4 path (scaled_fp4_quant + FlashInfer CUTLASS
+    FP4 mm, what SUFFIX_NVFP4_DENSE layers run above our decode max M) vs a
+    plain BF16 matmul of the same (N, K) (what the BF16 checkpoint layer
+    ran), plus the quant alone. Decides per shape whether prefill should keep
+    a BF16 copy (qwen A/B 2026-09-30: +15 % TTFT at ~2.7k-token prefill)."""
+    import torch
+    from vllm import _custom_ops as ops
+    dev = torch.device("cuda", torch.cuda.current_device())
+    shapes = shapes or QWEN_FLASH_SHAPES
+    for name, (n, k) in shapes.items():
+        wb = (torch.randn(n, k, device=dev) * 0.02).bfloat16()
+        for m in ms:
+            _, t = _dev_problem(m, n, k, dev, max_splits=1)
+            x = t["x"]
+            fp4 = _graph_us(lambda s: _vllm(t, n), dev, iters)
+            q = _graph_us(lambda s: ops.scaled_fp4_quant(x, t["g"]), dev, iters)
+            bf = _graph_us(lambda s: x @ wb.T, dev, iters)
+            print(f"{MARKER} prefill {name} N={n} K={k} M={m}: fp4 (quant+mm) {fp4:8.1f} us "
+                  f"(quant {q:6.1f}) | bf16 mm {bf:8.1f} us | fp4/bf16 x{fp4 / bf:4.2f} "
+                  f"{'FP4-WINS' if fp4 < bf else 'BF16-WINS'}", file=sys.stderr, flush=True)
+            del t
+        del wb
+        torch.cuda.empty_cache()
+
+
 def main(argv=None):
     mode = (argv or sys.argv[1:] or ["oracle"])[0]
     try:
@@ -913,6 +939,8 @@ def main(argv=None):
             print(oracle(), file=sys.stderr, flush=True)
         if mode in ("bench", "both", "sweep"):
             bench(sweep=mode == "sweep")
+        if mode == "prefill":
+            prefill_bench()
         return 0
     except Exception as exc:
         print(f"{MARKER} NVFP4-GEMM {mode.upper()} FAIL: {type(exc).__name__}: {exc}",
