@@ -71,7 +71,7 @@ def validate_engine(vllm_config):
     if not vllm_config.use_v2_model_runner:
         raise ValueError("pplx-decider plugin requires model runner V2")
     if (parallel.pipeline_parallel_size != 1 or parallel.tensor_parallel_size != 1
-            or parallel.enable_dbo or getattr(parallel, "ubatch_size", 1) != 1):
+            or parallel.enable_dbo or getattr(parallel, "ubatch_size", 0) not in (0, 1)):
         raise ValueError("decision adapter currently supports TP=1, PP=1 and no DBO")
     if not model.enforce_eager:
         raise ValueError("decision adapter requires --enforce-eager until capture parity passes")

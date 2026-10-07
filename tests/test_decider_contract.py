@@ -32,7 +32,7 @@ def engine_config():
               scheduler_config=NS(enable_chunked_prefill=False,
                                   max_num_batched_tokens=8192),
               parallel_config=NS(pipeline_parallel_size=1, tensor_parallel_size=1,
-                                 enable_dbo=False),
+                                 enable_dbo=False, ubatch_size=0),
               speculative_config=None, use_v2_model_runner=True)
 
 
@@ -94,6 +94,18 @@ class ContractTests(unittest.TestCase):
         config = engine_config()
         config.use_v2_model_runner = False
         with self.assertRaisesRegex(ValueError, "runner V2"):
+            validate_engine(config)
+
+    def test_accepts_native_disabled_microbatch_defaults_and_single_batch(self):
+        # vLLM 0.30.0 ParallelConfig.ubatch_size defaults to 0; 0 and 1 both
+        # select one physical batch when DBO is off. Only >1 enables ubatching.
+        config = engine_config()
+        self.assertEqual(config.parallel_config.ubatch_size, 0)
+        validate_engine(config)
+        config.parallel_config.ubatch_size = 1
+        validate_engine(config)
+        config.parallel_config.ubatch_size = 2
+        with self.assertRaisesRegex(ValueError, "no DBO"):
             validate_engine(config)
 
     def test_plugin_off_does_not_import_vllm(self):
