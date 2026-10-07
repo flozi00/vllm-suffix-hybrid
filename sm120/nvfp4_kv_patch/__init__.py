@@ -551,6 +551,26 @@ def _nvfp4_own_attn_gate(builder) -> bool:
     return impl.builder_gate(builder, hp.window_left, hp.logits_soft_cap)
 
 
+def _nvfp4_own_attn_qlens(qo_indptr_cpu, num_decodes):
+    """(q_max, row_budget) of the decode rows. Computed once per step: the
+    V2 runner passes ONE fresh query_start_loc_cpu object to all KV-group
+    builders of a step (attn_utils.build_attn_metadata), and _takes/_decode
+    ask 3x per build -> 1 numpy pass per step instead of ~18 CPU-tensor
+    max().item() rounds (gemma c=1: 6 groups, ~0.17 ms/step). The cache
+    holds the tensor itself, so its id cannot be recycled while cached."""
+    c = _NVFP4_QLENS_CACHE
+    if c[0] is qo_indptr_cpu and c[1] == num_decodes:
+        return c[2]
+    a = qo_indptr_cpu.numpy()[:num_decodes + 1]
+    q_lens = (a[1:] - a[:-1]).tolist()
+    r = (max(q_lens), _nvfp4_own_attn.row_budget(q_lens))
+    c[:] = [qo_indptr_cpu, num_decodes, r]
+    return r
+
+
+_NVFP4_QLENS_CACHE = [None, -1, None]
+
+
 def _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes) -> bool:
     """K2 serves this step's decode rows (ragged q lengths included, no
     FlashInfer plan, paged indices or host seq_lens); False only for a
@@ -558,8 +578,7 @@ def _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes) -> bool:
     on FlashInfer's fa2 decode wrapper (faster kernel at that width)."""
     if num_decodes <= 0:
         return False
-    q_lens = qo_indptr_cpu[1:num_decodes + 1] - qo_indptr_cpu[:num_decodes]
-    if int(q_lens.max().item()) > 1:
+    if _nvfp4_own_attn_qlens(qo_indptr_cpu, num_decodes)[0] > 1:
         return True
     return num_decodes <= _nvfp4_own_attn.K2_Q1_MAX_BATCH
 
@@ -570,14 +589,13 @@ def _nvfp4_own_attn_decode(builder, block_table, seq_lens, qo_indptr,
     qo_indptr on the device); None when fa2 keeps them (see _takes)."""
     if not _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes):
         return None
-    q_lens = qo_indptr_cpu[1:num_decodes + 1] - qo_indptr_cpu[:num_decodes]
-    q_max = max(int(q_lens.max().item()), 1)
+    q_max, budget = _nvfp4_own_attn_qlens(qo_indptr_cpu, num_decodes)
     return FIDecode(wrapper=_nvfp4_own_attn.DecodeWrapper(
         block_table[:num_decodes], seq_lens[:num_decodes],
-        qo_indptr[:num_decodes + 1], q_max, builder.num_qo_heads,
+        qo_indptr[:num_decodes + 1], max(q_max, 1), builder.num_qo_heads,
         builder.num_kv_heads, builder.head_dim, builder.page_size,
         builder.window_left, builder.sm_scale, builder.logits_soft_cap,
-        _nvfp4_own_attn.row_budget(q_lens.tolist())))
+        budget))
 
 
 def _nvfp4_exact_seq_lens_cpu(builder, cm):
