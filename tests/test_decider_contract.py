@@ -7,7 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+try:
+    import suffix_hybrid
+except ModuleNotFoundError as error:
+    if error.name != "suffix_hybrid":
+        raise
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suffix_hybrid.decider_contract import (
     checkpoint_contract, configure_model, validate_engine, validate_tokenizer)
 from suffix_hybrid.decider_plugin import register

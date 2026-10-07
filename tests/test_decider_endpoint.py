@@ -1,5 +1,6 @@
 """Exercise native endpoint boundary without requiring a GPU or vLLM install."""
 import json
+import importlib.util
 import os
 import sys
 import unittest
@@ -7,9 +8,24 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace as NS
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import suffix_hybrid
-from suffix_hybrid_decider_ep import DecisionEndpointPlugin, model_names
+try:
+    import suffix_hybrid
+except ModuleNotFoundError as error:
+    if error.name != "suffix_hybrid":
+        raise
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import suffix_hybrid
+
+# This root-level endpoint module ships in runtime_bundle, not the native
+# wheel. Load that adapter explicitly without shadowing the installed wheel
+# package used by every other pytest module in Linux CI.
+endpoint_spec = importlib.util.spec_from_file_location(
+    "suffix_hybrid_decider_ep_test", Path(__file__).resolve().parents[1]
+    / "suffix_hybrid_decider_ep.py")
+endpoint_module = importlib.util.module_from_spec(endpoint_spec)
+endpoint_spec.loader.exec_module(endpoint_module)
+DecisionEndpointPlugin = endpoint_module.DecisionEndpointPlugin
+model_names = endpoint_module.model_names
 
 
 class Response:
