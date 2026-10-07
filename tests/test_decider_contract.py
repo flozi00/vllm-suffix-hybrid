@@ -138,6 +138,35 @@ class ContractTests(unittest.TestCase):
                 validate_engine(config)
             raw[field] = previous
 
+    def test_nvfp4_validation_tracks_config_resolution_lifecycle(self):
+        config = engine_config()
+        config.model_config.quantization = "modelopt_fp4"
+        config.model_config.hf_config = NS(quantization_config={
+            "quantization": {"quant_algo": "W4A16_NVFP4", "group_size": 16,
+                             "kv_cache_quant_algo": None}})
+        config.quant_config = None
+        validate_engine(config, require_resolved_quantization=False)
+        config.cache_config.enable_prefix_caching = True
+        with self.assertRaisesRegex(ValueError, "forbid prefix caching"):
+            validate_engine(config, require_resolved_quantization=False)
+        config.cache_config.enable_prefix_caching = False
+        with self.assertRaisesRegex(ValueError, "serialized W4A16"):
+            validate_engine(config, require_resolved_quantization=True)
+        raw = config.model_config.hf_config.quantization_config["quantization"]
+        raw["quant_algo"] = "NVFP4"
+        with self.assertRaisesRegex(ValueError, "serialized W4A16"):
+            validate_engine(config, require_resolved_quantization=False)
+        raw["quant_algo"] = "W4A16_NVFP4"
+        config.quant_config = NS(quant_method="W4A16_NVFP4",
+                                 is_checkpoint_nvfp4_serialized=True,
+                                 group_size=32, kv_cache_quant_algo=None)
+        with self.assertRaisesRegex(ValueError, "serialized W4A16"):
+            validate_engine(config, require_resolved_quantization=False)
+        with self.assertRaisesRegex(ValueError, "serialized W4A16"):
+            validate_engine(config, require_resolved_quantization=True)
+        config.quant_config.group_size = 16
+        validate_engine(config, require_resolved_quantization=True)
+
     def test_plugin_off_does_not_import_vllm(self):
         with patch.dict("os.environ", {"SUFFIX_PPLX_DECIDER": "0"}):
             with patch("suffix_hybrid.decider_plugin.version", side_effect=AssertionError("imported runtime")):

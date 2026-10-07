@@ -46,7 +46,7 @@ def validate_tokenizer(tokenizer, saved):
             raise ValueError("checkpoint decision codes differ from tokenizer")
 
 
-def validate_engine(vllm_config):
+def validate_engine(vllm_config, *, require_resolved_quantization=True):
     model = vllm_config.model_config
     cache = vllm_config.cache_config
     scheduler = vllm_config.scheduler_config
@@ -85,8 +85,12 @@ def validate_engine(vllm_config):
         if (not isinstance(serialized, dict)
                 or serialized.get("quant_algo") != "W4A16_NVFP4"
                 or serialized.get("group_size") != 16
-                or serialized.get("kv_cache_quant_algo", "missing") is not None
-                or getattr(native, "quant_method", None) != "W4A16_NVFP4"
+                or serialized.get("kv_cache_quant_algo", "missing") is not None):
+            raise ValueError("decision NVFP4 requires a serialized W4A16_NVFP4 checkpoint")
+        # vLLM's config hook precedes native quant_config resolution. Only
+        # that hook may defer the native check; model construction is strict.
+        if (require_resolved_quantization or native is not None) and (
+                getattr(native, "quant_method", None) != "W4A16_NVFP4"
                 or getattr(native, "is_checkpoint_nvfp4_serialized", False) is not True
                 or getattr(native, "group_size", None) != 16
                 or getattr(native, "kv_cache_quant_algo", "missing") is not None):

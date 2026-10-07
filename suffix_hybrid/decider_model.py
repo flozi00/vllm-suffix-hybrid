@@ -34,7 +34,7 @@ class PplxDeciderForSequenceClassification(
         "language_model.": "language_model.model.", "mtp.": None})
 
     def __init__(self, *, vllm_config, prefix=""):
-        validate_engine(vllm_config)
+        validate_engine(vllm_config, require_resolved_quantization=True)
         self._decision_saved = checkpoint_contract(vllm_config.model_config.model)
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.vllm_config = vllm_config

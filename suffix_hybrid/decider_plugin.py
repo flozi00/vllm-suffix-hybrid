@@ -20,7 +20,10 @@ def register():
         @staticmethod
         def verify_and_update_config(vllm_config):
             Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
-            validate_engine(vllm_config)
+            # vLLM0.30 resolves quant_config after this hook. Check serialized
+            # metadata/invariants here; the model constructor checks the
+            # resolved native format before any backbone allocation.
+            validate_engine(vllm_config, require_resolved_quantization=False)
 
     MODELS_CONFIG_MAP[ARCHITECTURE] = DecisionConfig
     ModelRegistry.register_model(
