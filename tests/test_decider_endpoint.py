@@ -36,6 +36,7 @@ class Response:
 class EndpointTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.calls = []
+        self.token_input_factory_calls = []
         owner = self
         class Engine:
             def check_admission(self):
@@ -58,8 +59,13 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         responses.JSONResponse = Response
         pooling = ModuleType("vllm.pooling_params")
         pooling.PoolingParams = lambda **kwargs: NS(**kwargs)
+        inputs = ModuleType("vllm.inputs.engine")
+        def tokens_input(token_ids):
+            self.token_input_factory_calls.append(token_ids)
+            return {"type": "token", "prompt_token_ids": token_ids}
+        inputs.tokens_input = tokens_input
         self.modules = {"fastapi": fastapi, "fastapi.responses": responses,
-                        "vllm.pooling_params": pooling}
+                        "vllm.pooling_params": pooling, "vllm.inputs.engine": inputs}
         self.native = NS(decider_prepare=self.prepare, decider_answer=self.answer)
 
     def prepare(self, request_json, codes_json):
@@ -92,6 +98,9 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.content["usage"]["output_tokens"], 0)
         prompt, params = self.calls[2]
         self.assertEqual(prompt["prompt_token_ids"], [9, 8, 7])
+        self.assertEqual(prompt["type"], "token")
+        self.assertEqual(self.token_input_factory_calls, [[9, 8, 7]])
+        self.assertIs(prompt["prompt_token_ids"], self.token_input_factory_calls[0])
         self.assertFalse(params.use_activation)
         self.assertEqual(params.task, "classify")
         raw_logits, temperature = self.calls[-1]
@@ -109,6 +118,30 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         result = await self.invoke({"model": "decider", "images": ["x"]})
         self.assertEqual(result.status_code, 400)
         self.assertEqual(self.calls, [])
+
+    async def test_unexpected_wrapped_engine_error_logs_cause_and_propagates(self):
+        async def encode(*args):
+            try:
+                raise ValueError("engine input failure witness")
+            except ValueError as cause:
+                raise RuntimeError() from cause
+            yield
+        self.context["engine"].encode = encode
+        with self.assertLogs(endpoint_module.logger, level="ERROR") as captured:
+            with self.assertRaises(RuntimeError) as raised:
+                await self.invoke({"model": "decider"})
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+        self.assertIn("engine input failure witness", "\n".join(captured.output))
+        self.assertIn("Traceback", "\n".join(captured.output))
+
+    async def test_engine_value_error_is_not_misreported_as_bad_client_input(self):
+        async def encode(*args):
+            raise ValueError("unexpected engine failure")
+            yield
+        self.context["engine"].encode = encode
+        with self.assertLogs(endpoint_module.logger, level="ERROR"):
+            with self.assertRaisesRegex(ValueError, "unexpected engine failure"):
+                await self.invoke({"model": "decider"})
 
     def test_model_aliases_follow_standard_vllm_args(self):
         self.assertEqual(model_names(NS(served_model_name="alias"), NS(model="path")), ["alias"])

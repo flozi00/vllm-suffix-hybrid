@@ -6,11 +6,14 @@ answer math are owned by Rust. Do not deploy with the stock Rust frontend:
 it does not discover endpoint_plugins or support the pooling engine protocol.
 """
 import json
+import logging
 import os
 import uuid
 
 from suffix_hybrid.decider_contract import (
     ENDPOINT_NAME, checkpoint_contract, validate_tokenizer)
+
+logger = logging.getLogger(__name__)
 
 
 class DecisionEndpointPlugin:
@@ -25,6 +28,7 @@ class DecisionEndpointPlugin:
 
         async def systemone(request: Request):
             from suffix_hybrid import _native
+            from vllm.inputs.engine import tokens_input
             from vllm.pooling_params import PoolingParams
             context = request.app.state.suffix_decider
             try:
@@ -34,7 +38,7 @@ class DecisionEndpointPlugin:
                 body_json = json.dumps(body, ensure_ascii=False)
                 prepared = json.loads(_native.decider_prepare(
                     body_json, json.dumps(context["saved"]["codes"])))
-                logits, input_tokens = [], 0
+                prompts, input_tokens = [], 0
                 for row in prepared["rows"]:
                     token_ids = context["tokenizer"].apply_chat_template(
                         row["messages"], tokenize=True,
@@ -42,10 +46,20 @@ class DecisionEndpointPlugin:
                     if not token_ids or len(token_ids) > context["max_model_len"]:
                         raise ValueError("decision input must fit model limit without truncation")
                     input_tokens += len(token_ids)
+                    prompts.append(tokens_input(token_ids))
+            except (ValueError, TypeError, KeyError) as error:
+                return JSONResponse({"error": str(error)}, status_code=400)
+
+            # Inputs are already rendered with the checkpoint's exact chat
+            # template. Native EngineInput bypasses the deprecated raw-prompt
+            # renderer path and preserves those token IDs without re-rendering.
+            try:
+                logits = []
+                for prompt in prompts:
                     final = None
                     context["engine"].check_admission()
                     async for result in context["engine"].encode(
-                            {"prompt_token_ids": token_ids},
+                            prompt,
                             PoolingParams(task="classify", use_activation=False),
                             "decider-" + uuid.uuid4().hex):
                         final = result
@@ -57,8 +71,12 @@ class DecisionEndpointPlugin:
                 response["usage"]["input_tokens"] = input_tokens
                 print("SUFFIX_PPLX_DECIDER REQUEST completed rows=" + str(len(logits)), flush=True)
                 return JSONResponse(response)
-            except (ValueError, TypeError, KeyError) as error:
-                return JSONResponse({"error": str(error)}, status_code=400)
+            except Exception:
+                # EngineGenerateError may have an empty str() while retaining
+                # its actual failure in __cause__. exc_info logs that entire
+                # chain. Unexpected engine failures remain server failures.
+                logger.exception("SUFFIX_PPLX_DECIDER unexpected inference failure")
+                raise
 
         app.add_api_route("/v1/systemone", systemone, methods=["POST"],
                           name="suffix_pplx_decider_systemone")
