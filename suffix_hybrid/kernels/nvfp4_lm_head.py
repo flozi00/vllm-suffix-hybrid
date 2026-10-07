@@ -35,6 +35,17 @@ the bf16 rows and scattered back. W4A4 alone has rel ~0.13 logit noise
 greedy / top-k picks see stock logits, only the tail keeps the noise.
 CUDA-graph capturable.
 
+Host path (``SUFFIX_NVFP4_LMHEAD_GRAPH``, default ON, ``0`` = eager): the
+V2 runner calls compute_logits EAGERLY every step, and the ~15 launches
+above cost ~0.3-0.5 ms of Python/dispatch per step (gemma c=1 profile,
+2026-10-07). At load we capture one CUDA graph per M = 1..max_m over static
+x / out buffers (one shared pool, intermediates reused across M); the hot
+path is then ``x_static[:M].copy_(x)`` + ``graphs[M].replay()`` and returns
+a view of the static out rows (overwritten by the next call on the same
+head; every V2 consumer reads it before that, in stream order). Bit-identity
+graph vs eager is checked at load (fatal). Inside a foreign capture (e.g. a
+drafter graph) the eager ops are captured as before.
+
 Markers: ``[suffix nvfp4-lmhead] armed`` / ``LOAD ORACLE PASS`` / ``ACTIVE``.
 CLI (in-pod, no model): ``python -m suffix_hybrid.kernels.nvfp4_lm_head
 oracle|bench|both``; boot gates ``nvfp4_lmhead_oracle`` / ``nvfp4_lmhead_bench``.
@@ -60,6 +71,7 @@ MARKER = "[suffix nvfp4-lmhead]"
 FAMILY = "nvfp4_gemm"
 MAX_M = 64  # kernel limit (4 m16 tiles); default of MAX_M_ENV
 MAX_M_ENV = "SUFFIX_NVFP4_LMHEAD_MAX_M"  # 16 = the pre-2026-10-07 cap
+GRAPH_ENV = "SUFFIX_NVFP4_LMHEAD_GRAPH"  # "0" -> eager hot path
 ORACLE_MS = (1, 4, 16, 17, 40, 64)  # every tile bucket + non-multiple-of-16 rows
 FP4_RANGE = 448.0 * 6.0  # e4m3 max * e2m1 max: g = FP4_RANGE / amax
 PLUMB_REL = 2e-2  # ours vs exact quantized reference (same bar as nvfp4_gemm)
@@ -89,6 +101,10 @@ def max_m_env() -> int:
     return int(raw)
 
 
+def graph_on() -> bool:
+    return os.environ.get(GRAPH_ENV, "1").strip() != "0"
+
+
 def eligible(n: int, k: int, dtype: str) -> str | None:
     """Why an lm_head shard [n, k] cannot use our kernel, or None."""
     if dtype != "torch.bfloat16":
@@ -113,6 +129,14 @@ def logits_nvfp4(x2, w, g_w: float, quant, gemm):
     top = out.topk(min(RESCORE, out.shape[-1]), dim=-1).indices  # [M, R]
     exact = torch.bmm(w[top], x2.unsqueeze(-1)).squeeze(-1)  # [M, R] bf16
     return out.scatter_(1, top, exact)
+
+
+def replay(st, x2):
+    """Graph hot path: x2 [M, K] -> view of the static out rows [M, N]."""
+    m = x2.shape[0]
+    st["gx"][:m].copy_(x2)
+    st["graphs"][m].replay()
+    return st["gout"][:m]
 
 
 def greedy_ok(ref, got) -> bool:
@@ -159,6 +183,8 @@ def fidelity(ref, got) -> dict:
 # device side (SM120 + oxide bundle + vLLM)
 # ---------------------------------------------------------------------------
 def _device_ops(native):
+    from unittest import mock
+
     import torch
     from vllm._custom_ops import scaled_fp4_quant
 
@@ -183,20 +209,52 @@ def _device_ops(native):
     def quant(x2, g):
         return scaled_fp4_quant(x2, g, is_sf_swizzled_layout=True)
 
-    def run(st, x2):
+    def run(st, x2, out=None):
         dev = x2.device
 
         def gemm(xq, xsf, alpha):
-            out = torch.empty(xq.shape[0], st["n"], dtype=torch.bfloat16, device=dev)
+            o = out if out is not None else torch.empty(
+                xq.shape[0], st["n"], dtype=torch.bfloat16, device=dev)
             splits, flags = st["launch"][xq.shape[0]]
-            native.nvfp4_gemm_q_cuda(xq, xsf, st["wq"], st["wsf"], st["partial"], out,
+            native.nvfp4_gemm_q_cuda(xq, xsf, st["wq"], st["wsf"], st["partial"], o,
                                      alpha, splits,
                                      torch.cuda.current_stream(dev).cuda_stream,
                                      flags, st["counters"])
-            return out
+            return o
         return logits_nvfp4(x2, st["w"], st["g_w"], quant, gemm)
 
-    return prepare, quant, run
+    def capture(st):
+        """One CUDA graph of run() per M = 1..max_m over static gx [max_m, K]
+        / gout [max_m, N] (shared pool), then a bit-identity check graph vs
+        eager on ORACLE_MS (fatal). Load time only."""
+        dev = st["w"].device
+        max_m, cur = st["max_m"], torch.cuda.current_stream(dev)
+        gx = torch.zeros(max_m, st["k"], dtype=torch.bfloat16, device=dev)
+        gout = torch.empty(max_m, st["n"], dtype=torch.bfloat16, device=dev)
+        pool, s, graphs = torch.cuda.graph_pool_handle(), torch.cuda.Stream(dev), [None]
+        s.wait_stream(cur)
+        # torch.cuda.graph() runs gc.collect() + empty_cache() per capture;
+        # skip them for our 64 small captures (vLLM's capture does the same)
+        with torch.cuda.stream(s), mock.patch("gc.collect", lambda *a: 0), \
+                mock.patch("torch.cuda.empty_cache", lambda: None):
+            for m in range(1, max_m + 1):
+                run(st, gx[:m], gout[:m])  # warm-up (cuBLAS / topk workspaces)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=pool, stream=s):
+                    run(st, gx[:m], gout[:m])
+                graphs.append(g)
+        cur.wait_stream(s)
+        st.update(gx=gx, gout=gout, graphs=graphs)
+        gen = torch.Generator(device=dev).manual_seed(1)
+        for m in (m for m in ORACLE_MS if m <= max_m):
+            x = torch.randn(m, st["k"], generator=gen, device=dev, dtype=torch.bfloat16)
+            want = run(st, x)
+            if not torch.equal(replay(st, x), want):
+                raise RuntimeError(f"{MARKER} GRAPH CHECK FAIL N={st['n']} K={st['k']} "
+                                   f"M={m}: graph replay != eager (set {GRAPH_ENV}=0)")
+        torch.cuda.synchronize(dev)
+
+    return prepare, quant, run, capture
 
 
 def load_oracle(st, run, quant, stock, n_rows=256, seed=0) -> dict:
@@ -251,7 +309,7 @@ def _make_head_cls(native):
     )
     from suffix_hybrid import oxide_kernels
 
-    prepare, quant, run = _device_ops(native)
+    prepare, quant, run, capture = _device_ops(native)
 
     class SuffixNvFp4LMHeadMethod(UnquantizedEmbeddingMethod):
         """Stock bf16 head + NVFP4 copy for M <= max M decode rows."""
@@ -285,6 +343,10 @@ def _make_head_cls(native):
                                f"top1={v['top1']:.2f}" for m, v in r.items() if m != "plumb_rel")
                 _log(f"LOAD ORACLE PASS N={n} K={k} splits={st['splits']} "
                      f"rel_vs_exact={r['plumb_rel']:.2e}; vs bf16 (random x) {fid}")
+            if graph_on():
+                capture(st)
+                _log(f"GRAPHS N={n} K={k}: M=1..{st['max_m']} captured, "
+                     "bit-identical to eager")
             layer._sfx_lmhead = st
             _state["heads"] += 1
 
@@ -294,7 +356,11 @@ def _make_head_cls(native):
             if (st is None or bias is not None or x.dtype != torch.bfloat16
                     or not 1 <= rows <= st["max_m"]):
                 return self.inner.apply(layer, x, bias)
-            out = run(st, x.reshape(rows, st["k"]))
+            x2 = x.reshape(rows, st["k"])
+            if "graphs" in st and not torch.cuda.is_current_stream_capturing():
+                out = replay(st, x2)
+            else:  # gate off, or inside a foreign capture (drafter graphs)
+                out = run(st, x2)
             if not _state["active"]:
                 _state["active"] = True
                 _log(summary())
@@ -383,7 +449,7 @@ def main(argv=None) -> int:
         if torch.cuda.get_device_capability()[0] != 12:
             raise RuntimeError("sm_120a SASS needs cc 12.x")
         oxide_kernels.ensure_loaded(FAMILY, params=PARAMS)
-        prepare, quant, run = _device_ops(native)
+        prepare, quant, run, capture = _device_ops(native)
         dev = torch.device("cuda", torch.cuda.current_device())
         for name, (n, k) in SHAPES.items():
             w = _synthetic(n, k, dev)

@@ -144,3 +144,31 @@ def test_max_m_env(monkeypatch):
         monkeypatch.setenv(lh.MAX_M_ENV, bad)
         with pytest.raises(ValueError, match="16..64"):
             lh.max_m_env()
+
+
+def test_graph_replay_path_matches_eager(monkeypatch):
+    """replay(): static x rows in, static out rows back, per-M graph; a CPU
+    stand-in 'graph' re-runs the eager hot path on the static slices (what
+    the captured graph does on device) and must equal the eager call."""
+    n, k, max_m = 1024, 256, 8
+    w, _x, g_w, (quant, gemm) = _lm_problem(n=n, k=k, m=1)
+
+    class G:
+        def __init__(self, m):
+            self.m = m
+
+        def replay(self):
+            st["gout"][:self.m].copy_(lh.logits_nvfp4(st["gx"][:self.m], w, g_w, quant, gemm))
+
+    st = {"gx": torch.zeros(max_m, k, dtype=torch.bfloat16),
+          "gout": torch.empty(max_m, n, dtype=torch.bfloat16),
+          "graphs": [None] + [G(m) for m in range(1, max_m + 1)]}
+    for m in (1, 3, max_m):
+        x = _lm_problem(n=n, k=k, m=m, seed=m)[1]
+        got = lh.replay(st, x)
+        assert got.shape == (m, n) and got.data_ptr() == st["gout"].data_ptr()
+        assert torch.equal(got, lh.logits_nvfp4(x, w, g_w, quant, gemm))
+    monkeypatch.delenv(lh.GRAPH_ENV, raising=False)
+    assert lh.graph_on()
+    monkeypatch.setenv(lh.GRAPH_ENV, "0")
+    assert not lh.graph_on()
