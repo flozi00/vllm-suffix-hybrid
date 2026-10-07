@@ -63,6 +63,27 @@ the speculative decoding, suffix-cache, NVFP4 KV, or GDN decode-only hooks:
 decision inference consists of a prefill and readout, so those paths do
 not provide its performance evidence.
 
+For the RTX 5090 memory budget, the decision-specific offline converter
+creates a native vLLM **W4A16_NVFP4** checkpoint. This is weight-only NVFP4
+with BF16 activations through upstream Marlin; it requires no activation
+calibration or complete model on a GPU:
+
+```sh
+python3 -m suffix_hybrid.tools.quantize_pplx_nvfp4 \
+  --src /work/in --out /work/out --threads 4
+```
+
+It streams the indexed BF16 backbone on CPU in row chunks and bounded output
+shards. Embeddings, vision, GDN gates/norm/state and the separate decision
+head stay high precision. Decision config and tokenizer files are preserved;
+original release metadata is retained as `source-release-manifest.json`,
+with source hashes in `suffix_quant_manifest.json`. The head remains outside
+the backbone index. Serve the converted checkpoint with the same plugin
+settings and `--quantization modelopt_fp4`; the adapter accepts only the
+serialized `W4A16_NVFP4` variant, preserving its BF16 readout. This path uses
+native Marlin, so do not arm the custom W4A4 GEMM hook. GPU engagement,
+decision probability/choice parity and performance still require measurement.
+
 The normal vLLM API authentication middleware also covers this `/v1/` route.
 Example request:
 
@@ -82,6 +103,7 @@ use `/v1/systemone` for calibrated decisions.
 
 ```sh
 python3 tests/test_decider_contract.py
+python3 -m pytest tests/test_quantize_pplx_nvfp4.py
 python3 scripts/test_runtime_bundle.py
 cargo test --no-default-features pplx_decider
 ```

@@ -77,8 +77,22 @@ def validate_engine(vllm_config):
         raise ValueError("decision adapter requires --enforce-eager until capture parity passes")
     if model.dtype.__str__() != "torch.bfloat16":
         raise ValueError("decision backbone and readout require bfloat16 compute")
-    if getattr(model, "quantization", None) not in (None, "fp8"):
-        raise ValueError("decision adapter currently supports BF16 or upstream FP8")
+    quantization = getattr(model, "quantization", None)
+    if quantization == "modelopt_fp4":
+        config = getattr(model.hf_config, "quantization_config", None)
+        native = getattr(vllm_config, "quant_config", None)
+        serialized = config.get("quantization") if isinstance(config, dict) else None
+        if (not isinstance(serialized, dict)
+                or serialized.get("quant_algo") != "W4A16_NVFP4"
+                or serialized.get("group_size") != 16
+                or serialized.get("kv_cache_quant_algo", "missing") is not None
+                or getattr(native, "quant_method", None) != "W4A16_NVFP4"
+                or getattr(native, "is_checkpoint_nvfp4_serialized", False) is not True
+                or getattr(native, "group_size", None) != 16
+                or getattr(native, "kv_cache_quant_algo", "missing") is not None):
+            raise ValueError("decision NVFP4 requires a serialized W4A16_NVFP4 checkpoint")
+    elif quantization not in (None, "fp8"):
+        raise ValueError("decision adapter supports BF16, upstream FP8 or weight-only NVFP4")
 
 
 def configure_model(model_config):

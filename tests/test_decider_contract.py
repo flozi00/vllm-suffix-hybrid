@@ -108,6 +108,36 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no DBO"):
             validate_engine(config)
 
+    def test_nvfp4_requires_native_serialized_weight_only_contract(self):
+        config = engine_config()
+        config.model_config.quantization = "modelopt_fp4"
+        config.model_config.hf_config = NS(quantization_config={
+            "quantization": {"quant_algo": "W4A16_NVFP4", "group_size": 16,
+                             "kv_cache_quant_algo": None}})
+        config.quant_config = NS(quant_method="W4A16_NVFP4",
+                                 is_checkpoint_nvfp4_serialized=True,
+                                 group_size=16, kv_cache_quant_algo=None)
+        validate_engine(config)
+        config.model_config.hf_config.quantization_config["quantization"]["quant_algo"] = "NVFP4"
+        with self.assertRaisesRegex(ValueError, "serialized W4A16"):
+            validate_engine(config)
+        config.model_config.hf_config.quantization_config["quantization"]["quant_algo"] = "W4A16_NVFP4"
+        config.quant_config.is_checkpoint_nvfp4_serialized = False
+        with self.assertRaisesRegex(ValueError, "serialized W4A16"):
+            validate_engine(config)
+        config.quant_config.is_checkpoint_nvfp4_serialized = True
+        for field, bad_value in (("group_size", 32), ("kv_cache_quant_algo", "FP8")):
+            previous = getattr(config.quant_config, field)
+            setattr(config.quant_config, field, bad_value)
+            with self.assertRaisesRegex(ValueError, "serialized W4A16"):
+                validate_engine(config)
+            setattr(config.quant_config, field, previous)
+            raw = config.model_config.hf_config.quantization_config["quantization"]
+            raw[field] = bad_value
+            with self.assertRaisesRegex(ValueError, "serialized W4A16"):
+                validate_engine(config)
+            raw[field] = previous
+
     def test_plugin_off_does_not_import_vllm(self):
         with patch.dict("os.environ", {"SUFFIX_PPLX_DECIDER": "0"}):
             with patch("suffix_hybrid.decider_plugin.version", side_effect=AssertionError("imported runtime")):
