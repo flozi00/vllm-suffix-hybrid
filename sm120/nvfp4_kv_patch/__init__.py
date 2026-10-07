@@ -52,6 +52,11 @@ Mechanics (why not file-shadowing or plain method rebinding)
   ``FLASHINFER_EXTRA_CUDAFLAGS`` (honoured by flashinfer.jit.cpp_ext for
   every JIT op) at apply() time — before any attention kernel is planned.
 
+Host-free planning (``SUFFIX_FI_PLAN_HOSTFREE=1``, default off, fa2 route
+only): build() never reads the device -- host seq_lens from the runner's
+exact CPU copy also under async scheduling without spec decode (H23),
+persistent pinned staging (H25/H26), per-builder event fence (H27).
+
 Scope: GQA/MHA only, head_dim <= 256, or 512 with SUFFIX_SM120_NVP4KV_HD512=1
 (enforced; set only after ``python -m nvfp4_kv_patch.oracle`` passes). MLA never selects this
 backend; DCP, attention sinks, cascade and trtllm-gen/XQA paths stay strict.
@@ -78,7 +83,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-09-25.12"
+PATCH_REVISION = "2026-10-07.13"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -546,6 +551,26 @@ def _nvfp4_own_attn_gate(builder) -> bool:
     return impl.builder_gate(builder, hp.window_left, hp.logits_soft_cap)
 
 
+def _nvfp4_own_attn_qlens(qo_indptr_cpu, num_decodes):
+    """(q_max, row_budget) of the decode rows. Computed once per step: the
+    V2 runner passes ONE fresh query_start_loc_cpu object to all KV-group
+    builders of a step (attn_utils.build_attn_metadata), and _takes/_decode
+    ask 3x per build -> 1 numpy pass per step instead of ~18 CPU-tensor
+    max().item() rounds (gemma c=1: 6 groups, ~0.17 ms/step). The cache
+    holds the tensor itself, so its id cannot be recycled while cached."""
+    c = _NVFP4_QLENS_CACHE
+    if c[0] is qo_indptr_cpu and c[1] == num_decodes:
+        return c[2]
+    a = qo_indptr_cpu.numpy()[:num_decodes + 1]
+    q_lens = (a[1:] - a[:-1]).tolist()
+    r = (max(q_lens), _nvfp4_own_attn.row_budget(q_lens))
+    c[:] = [qo_indptr_cpu, num_decodes, r]
+    return r
+
+
+_NVFP4_QLENS_CACHE = [None, -1, None]
+
+
 def _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes) -> bool:
     """K2 serves this step's decode rows (ragged q lengths included, no
     FlashInfer plan, paged indices or host seq_lens); False only for a
@@ -553,8 +578,7 @@ def _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes) -> bool:
     on FlashInfer's fa2 decode wrapper (faster kernel at that width)."""
     if num_decodes <= 0:
         return False
-    q_lens = qo_indptr_cpu[1:num_decodes + 1] - qo_indptr_cpu[:num_decodes]
-    if int(q_lens.max().item()) > 1:
+    if _nvfp4_own_attn_qlens(qo_indptr_cpu, num_decodes)[0] > 1:
         return True
     return num_decodes <= _nvfp4_own_attn.K2_Q1_MAX_BATCH
 
@@ -565,26 +589,29 @@ def _nvfp4_own_attn_decode(builder, block_table, seq_lens, qo_indptr,
     qo_indptr on the device); None when fa2 keeps them (see _takes)."""
     if not _nvfp4_own_attn_takes(qo_indptr_cpu, num_decodes):
         return None
-    q_lens = qo_indptr_cpu[1:num_decodes + 1] - qo_indptr_cpu[:num_decodes]
-    q_max = max(int(q_lens.max().item()), 1)
+    q_max, budget = _nvfp4_own_attn_qlens(qo_indptr_cpu, num_decodes)
     return FIDecode(wrapper=_nvfp4_own_attn.DecodeWrapper(
         block_table[:num_decodes], seq_lens[:num_decodes],
-        qo_indptr[:num_decodes + 1], q_max, builder.num_qo_heads,
+        qo_indptr[:num_decodes + 1], max(q_max, 1), builder.num_qo_heads,
         builder.num_kv_heads, builder.head_dim, builder.page_size,
         builder.window_left, builder.sm_scale, builder.logits_soft_cap,
-        _nvfp4_own_attn.row_budget(q_lens.tolist())))
+        budget))
 
 
 def _nvfp4_exact_seq_lens_cpu(builder, cm):
     """Host seq_lens WITHOUT a device sync: the V2 runner's CPU upper bound
-    is exact outside async scheduling (vllm/v1/attention/backend.py
-    seq_lens_cpu_upper_bound: optimistic only for async-spec decode rows).
-    Sampled equality check against the device (first 64 builds, then every
-    4096th) fails closed. None -> caller syncs as stock."""
+    is exact except for async-SPEC decode rows (vllm/v1/attention/backend.py
+    seq_lens_cpu_upper_bound). Taken under sync scheduling, and under async
+    scheduling without a speculative config when SUFFIX_FI_PLAN_HOSTFREE
+    armed the builder. Sampled equality check against the device (first 64
+    builds, then every 4096th) fails closed. None -> caller syncs as stock."""
     ub = getattr(cm, "seq_lens_cpu_upper_bound", None)
     cfg = builder.vllm_config
+    async_exact = (getattr(builder, "_fi_hostfree", False)
+                   and getattr(cfg, "speculative_config", None) is None)
     if (ub is None or builder.use_dcp
-            or getattr(cfg.scheduler_config, "async_scheduling", True)
+            or (getattr(cfg.scheduler_config, "async_scheduling", True)
+                and not async_exact)
             or tuple(ub.shape) != tuple(cm.seq_lens.shape)):
         return None
     n = _NVFP4_SEQ_LENS_CHECKS[0] = _NVFP4_SEQ_LENS_CHECKS[0] + 1
@@ -603,6 +630,45 @@ def _nvfp4_exact_seq_lens_cpu(builder, cm):
 
 
 _NVFP4_SEQ_LENS_CHECKS = [0]
+
+
+# SUFFIX_FI_PLAN_HOSTFREE=1 (fa2 nvfp4 route, default off): build() never
+# reads the device. H23 takes host seq_lens also under async scheduling (no
+# spec decode); H25 makes the indptr / last-page-len staging buffers
+# persistent pinned memory (direct async H2D, no per-step pin_memory());
+# H26 drops the decode kv_lens pin (fa2 plan() reads it on the host only).
+# Pinned host memory (those buffers + each wrapper's page-locked plan
+# workspace) is rewritten only after the previous build's H2D copies ran:
+# one CUDA event per builder, recorded after build() and waited on at the
+# next build (H27). Those copies sit at the head of the previous step, so
+# the wait is ~free -- unlike the stock per-group seq_lens.cpu(), which
+# drains the whole stream.
+def _fi_plan_hostfree(builder) -> bool:
+    import os
+
+    return (os.environ.get("SUFFIX_FI_PLAN_HOSTFREE", "").strip() == "1"
+            and getattr(builder, "use_fa2_nvfp4_kv", False)
+            and not builder.use_dcp)
+
+
+def _fi_hostfree_build(build):
+    def wrapped(self, *args, **kwargs):
+        if not getattr(self, "_fi_hostfree", False):
+            return build(self, *args, **kwargs)
+        live = (self.device.type == "cuda"
+                and not torch.cuda.is_current_stream_capturing())
+        if live and self._fi_plan_ev is not None:
+            self._fi_plan_ev.synchronize()
+        try:
+            return build(self, *args, **kwargs)
+        finally:
+            if live:
+                if self._fi_plan_ev is None:
+                    self._fi_plan_ev = torch.cuda.Event()
+                self._fi_plan_ev.record()
+
+    wrapped.__wrapped__ = build
+    return wrapped
 
 '''
 
@@ -984,6 +1050,56 @@ _BACKEND_EDITS = [
                         self.use_xqa
                         or getattr(self, "use_own_nvfp4_attn", False)),
 """,
+        1,
+    ),
+    # ---- H25: SUFFIX_FI_PLAN_HOSTFREE -> persistent PINNED staging for the
+    # FlashInfer indptr / last-page-len host buffers (stock: pageable +
+    # a fresh pin_memory() per copy and per plan arg). Reuse is fenced by H27.
+    (
+        "hostfree_pinned_buffers",
+        """        # Preparing persistent buffers
+        self.paged_kv_indptr = CpuGpuBuffer(
+            max_num_reqs + 1, dtype=torch.int32, device=self.device, pin_memory=False
+        )
+        self.paged_kv_indices = torch.zeros(
+            max_num_pages, dtype=torch.int32, device=self.device
+        )
+        self.paged_kv_last_page_len = CpuGpuBuffer(
+            max_num_reqs, dtype=torch.int32, device=self.device, pin_memory=False
+        )""",
+        """        # Preparing persistent buffers
+        self._fi_hostfree = _fi_plan_hostfree(self)
+        self._fi_plan_ev = None
+        self.paged_kv_indptr = CpuGpuBuffer(
+            max_num_reqs + 1, dtype=torch.int32, device=self.device,
+            pin_memory=self._fi_hostfree and PIN_MEMORY,
+        )
+        self.paged_kv_indices = torch.zeros(
+            max_num_pages, dtype=torch.int32, device=self.device
+        )
+        self.paged_kv_last_page_len = CpuGpuBuffer(
+            max_num_reqs, dtype=torch.int32, device=self.device,
+            pin_memory=self._fi_hostfree and PIN_MEMORY,
+        )""",
+        1,
+    ),
+    # ---- H26: fa2 decode plan() never copies kv_lens to the GPU (only the
+    # trtllm-gen / cute-dsl branches do): skip its per-step pin under H25.
+    (
+        "hostfree_no_kv_lens_pin",
+        """                if PIN_MEMORY:
+                    kv_lens_decode_cpu = kv_lens_decode_cpu.pin_memory()""",
+        """                if PIN_MEMORY and not getattr(self, "_fi_hostfree", False):
+                    kv_lens_decode_cpu = kv_lens_decode_cpu.pin_memory()""",
+        1,
+    ),
+    # ---- H27: fence pinned-buffer reuse across builds (see helper).
+    (
+        "hostfree_build_fence",
+        """    def use_cascade_attention(self, *args, **kwargs) -> bool:""",
+        """    build = _fi_hostfree_build(build)
+
+    def use_cascade_attention(self, *args, **kwargs) -> bool:""",
         1,
     ),
     # ---- H16: per-KV-group mm mask decision at builder init (window_left

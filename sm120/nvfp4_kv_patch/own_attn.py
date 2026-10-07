@@ -47,8 +47,16 @@ LOG2E = 1.4426950408889634
 MAX_Q_LEN = 16
 # Plain q_len-1 decode batches up to this width run on K2 (no FlashInfer
 # plan/indices/host work per KV group); wider ones stay on FA2's decode
-# kernel, which is faster per call there (oracle --bench q1 rows).
-K2_Q1_MAX_BATCH = 8
+# kernel, which is faster per call there (oracle --bench q1 rows) -- but
+# FA2's per-step plan costs host copies/syncs the kernel bench never sees,
+# so the cap is tunable end to end via SUFFIX_SM120_NVP4KV_Q1_MAX_BATCH.
+# Tradeoff: stock FA2 steps pay one blocking seq_lens D2H per KV group
+# under async scheduling (gemma c25+: 6/step); SUFFIX_FI_PLAN_HOSTFREE=1
+# removes it, leaving FA2 ~tens of us host per group (numpy indptr, 2 async
+# H2D, the Triton page-index copy, FI's C++ plan) that async scheduling
+# hides. Hostfree ON -> keep 8 unless an A/B shows K2 wins e2e wider;
+# hostfree OFF -> a wider cap also trades kernel time for those syncs.
+K2_Q1_MAX_BATCH = int(os.environ.get("SUFFIX_SM120_NVP4KV_Q1_MAX_BATCH", "8"))
 
 _PLANS: dict = {}
 _SMS: dict = {}

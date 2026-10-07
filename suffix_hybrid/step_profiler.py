@@ -475,6 +475,82 @@ class _Session:
         self._uninstrument()
 
 
+PYSTACK_ENV = "SUFFIX_PROFILE_PYSTACK"
+
+
+class _PySession(_Session):
+    """SUFFIX_PROFILE_PYSTACK=1: same load-bucketed windows, but instead of
+    torch.profiler (which inflates host time several-fold) a daemon thread
+    samples the engine thread's Python stack every ~200 us and prints the
+    top inclusive / self frames -- where the per-step CPU actually goes."""
+
+    def start(self, engine, label: str = "-") -> None:
+        self._reset_window()
+        self.label = label
+        self.samples: Counter = Counter()
+        self.selfs: Counter = Counter()
+        self.nsamp = 0
+        self.stop_evt = threading.Event()
+        tid = threading.get_ident()
+
+        def sample():
+            while not self.stop_evt.wait(0.0002):
+                f = sys._current_frames().get(tid)
+                seen = set()
+                top = True
+                while f is not None:
+                    co = f.f_code
+                    key = (f"{co.co_filename.rsplit('/site-packages/', 1)[-1]}"
+                           f":{co.co_name}")
+                    if top:
+                        self.selfs[key] += 1
+                        top = False
+                    if key not in seen:
+                        seen.add(key)
+                        self.samples[key] += 1
+                    f = f.f_back
+                self.nsamp += 1
+
+        self.thread = threading.Thread(target=sample, name="suffix-pystack",
+                                       daemon=True)
+        # The sampler needs the GIL; a short switch interval makes the engine
+        # thread yield every ~200 us so samples are not biased to C calls.
+        self.switch = sys.getswitchinterval()
+        sys.setswitchinterval(0.0002)
+        self.phase = "prof"
+        self.t_start = time.perf_counter()
+        self.thread.start()
+        _say(f"START pystack window {self.windows + 1} [{label}]: {self.n} "
+             f"steps (pid {os.getpid()})")
+
+    def end_step(self, executed: bool) -> None:
+        pass
+
+    def stop(self) -> None:
+        self.stop_evt.set()
+        sys.setswitchinterval(self.switch)
+        self.thread.join(timeout=1.0)
+        self.windows += 1
+        self.done[self.label] += 1
+        self.stable = 0
+        self.phase = "wait" if self.windows < MAX_WINDOWS else "done"
+        wall = time.perf_counter() - self.t_start
+        n = max(self.nsamp, 1)
+        ms = wall * 1e3 / self.n
+        lines = [f"BEGIN pystack window {self.windows} [{self.label}] "
+                 f"{self.n} steps, {ms:.3f} ms/step wall, {self.nsamp} samples"
+                 f" (ms/step = share x wall/step)"]
+        lines.append("inclusive top 45: share | ms/step | frame")
+        for k, v in self.samples.most_common(45):
+            lines.append(f"  {v / n:6.1%} | {v / n * ms:7.3f} | {k}")
+        lines.append("self top 25: share | ms/step | frame")
+        for k, v in self.selfs.most_common(25):
+            lines.append(f"  {v / n:6.1%} | {v / n * ms:7.3f} | {k}")
+        lines.append(f"END pystack window {self.windows}")
+        print("\n".join(f"{MARK} {ln}" for ln in lines), file=sys.stderr,
+              flush=True)
+
+
 def wrap_step(orig, sess: _Session):
     """Wrap EngineCoreProc._process_engine_step. Never alters its result."""
 
@@ -482,6 +558,12 @@ def wrap_step(orig, sess: _Session):
     def step(self, *a, **kw):
         if sess.phase == "done":
             return orig(self, *a, **kw)
+        if not getattr(sess, "engine_logged", False):
+            sess.engine_logged = True
+            print(f"{MARK} engine: async_scheduling="
+                  f"{getattr(self, 'async_scheduling', '?')} batch_queue_size="
+                  f"{getattr(self, 'batch_queue_size', '?')}",
+                  file=sys.stderr, flush=True)
         if sess.phase == "wait":
             try:
                 b = sess.bucket_of(self)
@@ -532,8 +614,9 @@ def _patch(module) -> None:
     cls = getattr(module, "EngineCoreProc", None)
     if cfg is None or cls is None or getattr(cls, _FINDER_MARK, False):
         return
+    py = os.environ.get(PYSTACK_ENV, "") not in ("", "0")
     cls._process_engine_step = wrap_step(cls._process_engine_step,
-                                         _Session(*cfg))
+                                         (_PySession if py else _Session)(*cfg))
     cls._suffix_step_profiler = True
     _say(f"armed on EngineCoreProc._process_engine_step: {cfg[0]} steps "
          f"per window after {cfg[1]} steady steps, {cfg[2]} window(s) per "

@@ -2217,6 +2217,12 @@ def install_v2():
             # wrapper must pass stochastic rows through untouched.
             probabilistic = getattr(speculator, "draft_logits", None) \
                 is not None
+            if os.environ.get("SUFFIX_HYBRID_ASYNC", "").strip() == "1":
+                # Async-scheduling-compatible path (default OFF; see
+                # suffix_hybrid/async_spec.py). Gate unset: never imported.
+                from suffix_hybrid import async_spec
+                async_spec.install(self, speculator, k, group, probabilistic)
+                return result
             if os.environ.get(
                     "SUFFIX_HYBRID_SUFFIX_ONLY", "").strip() == "1":
                 if probabilistic:

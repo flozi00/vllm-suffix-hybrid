@@ -8,6 +8,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 from suffix_hybrid.kernels import nvfp4_gemm as ng
@@ -132,3 +133,107 @@ def test_load_oracle_runs_for_every_m(monkeypatch):
     monkeypatch.setattr(lh, "PLUMB_REL", 5e-2)
     res = lh.load_oracle(st, run, quant, lambda x: x @ w.t(), n_rows=128)
     assert {"m1", "m4", f"m{lh.MAX_M}"} <= set(res) and res["plumb_rel"] <= lh.PLUMB_REL
+
+
+def test_max_m_env(monkeypatch):
+    monkeypatch.delenv(lh.MAX_M_ENV, raising=False)
+    assert lh.max_m_env() == 64
+    monkeypatch.setenv(lh.MAX_M_ENV, "16")
+    assert lh.max_m_env() == 16
+    for bad in ("15", "65", "x"):
+        monkeypatch.setenv(lh.MAX_M_ENV, bad)
+        with pytest.raises(ValueError, match="16..64"):
+            lh.max_m_env()
+
+
+def test_graph_replay_path_matches_eager(monkeypatch):
+    """replay(): static x rows in, static out rows back, per-M graph; a CPU
+    stand-in 'graph' re-runs the eager hot path on the static slices (what
+    the captured graph does on device) and must equal the eager call."""
+    n, k, max_m = 1024, 256, 8
+    w, _x, g_w, (quant, gemm) = _lm_problem(n=n, k=k, m=1)
+
+    class G:
+        def __init__(self, m):
+            self.m = m
+
+        def replay(self):
+            st["gout"][:self.m].copy_(lh.logits_nvfp4(st["gx"][:self.m], w, g_w, quant, gemm))
+
+    st = {"gx": torch.zeros(max_m, k, dtype=torch.bfloat16),
+          "gout": torch.empty(max_m, n, dtype=torch.bfloat16),
+          "graphs": [None] + [G(m) for m in range(1, max_m + 1)]}
+    for m in (1, 3, max_m):
+        x = _lm_problem(n=n, k=k, m=m, seed=m)[1]
+        got = lh.replay(st, x)
+        assert got.shape == (m, n) and got.data_ptr() == st["gout"].data_ptr()
+        assert torch.equal(got, lh.logits_nvfp4(x, w, g_w, quant, gemm))
+    monkeypatch.delenv(lh.GRAPH_ENV, raising=False)
+    assert lh.graph_on()
+    monkeypatch.setenv(lh.GRAPH_ENV, "0")
+    assert not lh.graph_on()
+
+
+def test_backend_env(monkeypatch):
+    monkeypatch.delenv(lh.BACKEND_ENV, raising=False)
+    assert lh.backend_env() == "auto"
+    for v in ("ours", "FlashInfer", " auto "):
+        monkeypatch.setenv(lh.BACKEND_ENV, v)
+        assert lh.backend_env() == v.strip().lower()
+    monkeypatch.setenv(lh.BACKEND_ENV, "cutlass")
+    with pytest.raises(ValueError, match="auto|ours|flashinfer"):
+        lh.backend_env()
+
+
+def test_choose_backends_per_m_nearest_timed_point_up():
+    times = {"ours": {1: 500.0, 4: 300.0, 16: 300.0},
+             "flashinfer": {1: 250.0, 4: 300.0, 16: 400.0}}
+    got = lh.choose_backends(times, 16)
+    assert got[0] is None and len(got) == 17
+    assert got[1] == "flashinfer"  # faster at M=1
+    assert got[2:5] == ["ours"] * 3  # M=2..4 -> the M=4 point, tie -> ours
+    assert got[5:] == ["ours"] * 12  # -> the M=16 point
+
+
+def test_select_backends_forced_skips_timing_auto_times_cold(capsys):
+    def boom(ms):
+        raise AssertionError("forced backend must not time")
+    assert lh.select_backends(8, 64, 16, boom, "flashinfer") == [None] + ["flashinfer"] * 16
+    assert lh.select_backends(8, 64, 16, boom, "ours") == [None] + ["ours"] * 16
+    seen = []
+
+    def time_fn(ms):
+        seen.append(list(ms))
+        return {"ours": {m: 10.0 + m for m in ms}, "flashinfer": {m: 8.0 + 2 * m for m in ms}}
+    got = lh.select_backends(262144, 2816, 64, time_fn, "auto")
+    assert seen == [[1, 2, 4, 8, 16, 24, 32, 48, 64]]  # nvfp4_linear.autoroute_ms(64)
+    assert got[1] == "flashinfer" and got[2] == "ours" and got[64] == "ours"  # tie at M=2
+    err = capsys.readouterr().err
+    assert ("[suffix nvfp4-lmhead] BACKEND M=1: flashinfer 10.0 us vs ours 11.0 us "
+            "-> flashinfer, M=2: flashinfer 12.0 us vs ours 12.0 us -> ours") in err
+    assert "M=1..64: flashinfer 1, ours 63)" in err
+
+
+def test_load_oracle_passes_on_either_backend_contract(monkeypatch):
+    """Both GEMMs honour gemm(xq, xsf, alpha) -> acc * alpha; FlashInfer's
+    applies alpha to the fp32 accumulator (twin below), ours as before. The
+    rescore and the oracle are backend-agnostic: same pass for both."""
+    n, k = 1024, 256
+    w, _x, g_w, (quant, gemm) = _lm_problem(n=n, k=k, m=1)
+    wq, bits, _ = ng.quantize(w.float().numpy(), g_w)
+    st = {"n": n, "k": k, "g_w": g_w, "wq": torch.from_numpy(wq),
+          "wsf": torch.from_numpy(ng.swizzle_sf(bits)), "max_m": 16}
+    wdq = torch.from_numpy(ng.dequant(wq, ng.e4m3_bits_to_f32(bits)))
+
+    def fi_gemm(xq, xsf, alpha):
+        m = xq.shape[0]
+        xb = xsf.numpy()[lh.sf_index(np.arange(m), k // 16)]
+        xd = torch.from_numpy(ng.dequant(xq.numpy(), ng.e4m3_bits_to_f32(xb)))
+        return (xd @ wdq.t() * alpha).bfloat16()
+
+    gemms = {"ours": gemm, "flashinfer": fi_gemm}
+    monkeypatch.setattr(lh, "PLUMB_REL", 5e-2)  # CPU twins round to bf16 (see above)
+    res = {b: lh.load_oracle(st, lambda _s, x, b=b: lh.logits_nvfp4(x, w, g_w, quant, gemms[b]),
+                             quant, lambda x: x @ w.t(), n_rows=128) for b in lh.BACKENDS}
+    for r in res.values():
+        assert r["plumb_rel"] <= lh.PLUMB_REL and r["m16"]["top1"] == 1.0

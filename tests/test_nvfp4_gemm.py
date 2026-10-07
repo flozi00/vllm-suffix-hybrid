@@ -278,3 +278,113 @@ def test_fused_default_only_m1(monkeypatch):
     monkeypatch.delenv("SUFFIX_NVFP4_GEMM_FUSED_MAX_M", raising=False)
     assert ng.plan(336, 10240, 1)["flags"]          # M=1: single launch
     assert not ng.plan(336, 10240, 5)["flags"]      # M>=5: old path (serial fixup tail on silicon)
+
+
+# --- L2 prefetch lookahead (flag bits 8..15 of the nvfp4_gemm_f entries) ---
+def test_pf_plan_flags_and_env(monkeypatch):
+    monkeypatch.delenv(ng.PF_ENV, raising=False)
+    monkeypatch.delenv("SUFFIX_NVFP4_GEMM_FUSED_MAX_M", raising=False)
+    assert ng.pf_env() is None
+    base = ng.plan(34816, 5120, 8)
+    assert base["flags"] == 0 and base["entry"] == "nvfp4_gemm_t1" and base["pf"] == 0
+    p = ng.plan(34816, 5120, 8, pf=8)  # pf without fusion: f entry, same work
+    assert p["flags"] == 8 << ng.PF_SHIFT and p["entry"] == "nvfp4_gemm_f1"
+    assert (p["launches"], p["splits"], p["smem"]) == (base["launches"], base["splits"], 16)
+    p1 = ng.plan(5120, 17408, 1, pf=8)  # M=1: fused bits kept under the pf bits
+    assert p1["flags"] & 0xFF == ng.plan(5120, 17408, 1)["flags"] and p1["flags"] >> 8 == 8
+    assert p1["smem"] == ng.plan(5120, 17408, 1)["smem"]
+    monkeypatch.setenv(ng.PF_ENV, "4")
+    assert ng.pf_env() == 4 and ng.plan(34816, 5120, 8)["flags"] == 4 << 8
+    for bad in ("x", "256", "-1"):
+        monkeypatch.setenv(ng.PF_ENV, bad)
+        with pytest.raises(ValueError, match=ng.PF_ENV):
+            ng.plan(34816, 5120, 8)
+    with pytest.raises(ValueError):
+        ng.plan(34816, 5120, 8, pf=256)
+
+
+def test_pf_host_op_accepts_only_known_bits():
+    host = (ROOT / "src" / "nvfp4_gemm_oxide.rs").read_text()
+    assert "pub const PF_MASK: u32 = 0xFF << 8;" in host
+    assert "fused & !(FUSE_QUANT | FUSE_REDUCE | PF_MASK) != 0" in host
+    src = (ROOT / "kernels-oxide" / "nvfp4_gemm" / "src" / "main.rs").read_text()
+    assert f"pub const PF_SHIFT: u32 = {ng.PF_SHIFT};" in src
+    assert "let pf = (flags >> PF_SHIFT) & 0xFF;" in src
+
+
+def test_pf_only_steers_prefetches():
+    """Static half of "any pf is bit-identical" (the layer oracle checks it
+    on silicon too): in the kernel source `pf` only reaches the prefetch
+    helpers, which only compute addresses and issue prefetch.global.L2 —
+    no load, no store, no other asm (cf. nvfp4_moe's tunables test)."""
+    src = (ROOT / "kernels-oxide" / "nvfp4_gemm" / "src" / "main.rs").read_text()
+    allowed = [r"\s*pf: u32,", r"\s*let pf = \(flags >> PF_SHIFT\) & 0xFF;",
+               r"\s*if pf == 0 \{", r"\s*let e = if s0 \+ 1 \+ pf < s1 \{ s0 \+ 1 \+ pf \} else \{ s1 \};",
+               r"\s*pf_head\(pf, k_begin / 64, k_end / 64, lane, w_row, wsf, n0, kb_pad\);",
+               r"\s*if pf != 0 && k0 / 64 \+ pf < k_end / 64 \{",
+               r"\s*pf_step\(k0 / 64 \+ pf, lane, w_row, wsf, n0, src.kb_pad\);",
+               r"\s*fn pf_head\(pf: u32, .*",
+               r".*k_loop::<MT>\(k_begin, k_end, lane, src, w_row, wsf, n0, b0, pf\)"]
+    for ln in src.splitlines():
+        code = ln.split("//")[0]
+        if re.search(r"\bpf\b", code):
+            assert any(re.fullmatch(a, code.rstrip()) for a in allowed), ln
+    for fn in ("pf_l2", "pf_step", "pf_head"):
+        body = re.search(rf"fn {fn}\(.*?\n    \}}\n", src, re.S).group(0)
+        assert "*" not in body.replace("*const", "").replace("*mut", "").replace(" * ", ""), fn
+        asm = re.findall(r'ptx_asm!\(\s*"([^"]*)"', body)
+        assert asm in ([], ["prefetch.global.L2 [%0];"]), (fn, asm)
+
+
+def _gemm_pf_stream(pf, s0, s1, rows, sf_line):
+    """pf_head + k_loop's pf_step for one warp as written: [(iteration,
+    address)], iteration -1 = pf_head, s = the loop iteration loading step
+    s (s0 < s < s1). rows = the 8 rows' byte addresses (lane/4 = g)."""
+    out = []
+    if pf == 0:
+        return out
+    e = min(s0 + 1 + pf, s1)
+    for a in rows:
+        for t in range(4):
+            out += [(-1, a + 32 * sp) for sp in range(s0 + t, e, 4)
+                    if sp == s0 or (a + 32 * sp) % 128 == 0]
+    out += [(-1, sf_line(sp)) for lane in range(32) for sp in range(s0 + lane, e, 32)]
+    for s in range(s0 + 1, s1):
+        if s + pf < s1:
+            out += [(s, a + 32 * (s + pf)) for a in rows if (a + 32 * (s + pf)) % 128 == 0]
+            out.append((s, sf_line(s + pf)))
+    return out
+
+
+@pytest.mark.parametrize("n,k", [(34816, 5120), (5120, 17408), (2816, 2112), (10240, 320),
+                                 (336, 10240)])
+@pytest.mark.parametrize("pf", [1, 4, 8, 64])
+def test_pf_covers_every_weight_and_scale_line_in_bounds(n, k, pf):
+    """Every 128 B line a warp's mma loads touch in its split (weight rows,
+    rows K/2 apart and not always 128-aligned, + swizzled scale words) is
+    prefetched before the loop iteration that loads it, and no prefetch
+    address leaves the weight / scale tensors."""
+    base, sfbase = 1 << 30, 1 << 40  # torch allocations are >= 256 B aligned
+    kh, steps = k // 2, k // 64
+    kb_pad, rows_pad = -(-(k // 16) // 4) * 4, -(-n // 128) * 128
+    for m in (1, 17):
+        pl = ng.plan(n, k, m)
+        for split in sorted({0, pl["splits"] - 1}):
+            s0, s1 = split * pl["kps"], min(steps, (split + 1) * pl["kps"])
+            for n0 in sorted({0, 8 * (n // 16), n - 8}):
+                rows = [base + (n0 + g) * kh for g in range(8)]
+                got = _gemm_pf_stream(pf, s0, s1, rows,
+                                      lambda sp: sfbase + int(ng.sf_offset(n0, 4 * sp, kb_pad)))
+                want = {(a + 32 * sp + o) // 128 for a in rows for sp in range(s0, s1)
+                        for o in (0, 31)}
+                want |= {(sfbase + int(ng.sf_offset(r, 4 * sp + j, kb_pad))) // 128
+                         for sp in range(s0, s1) for r in range(n0, n0 + 8) for j in range(4)}
+                lines = {a // 128 for _, a in got}
+                assert want <= lines, sorted(want - lines)[:4]
+                for it, a in got:
+                    in_w = base <= a < base + n * kh
+                    assert in_w or sfbase <= a < sfbase + rows_pad * kb_pad
+                    if in_w:  # issued before the iteration loading its step
+                        sp = ((a - base) % kh) // 32
+                        assert it < max(sp, s0 + 1)
+    assert _gemm_pf_stream(0, 0, 80, [base], lambda sp: base) == []

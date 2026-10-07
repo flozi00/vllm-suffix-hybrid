@@ -404,9 +404,64 @@ pub mod kernels {
         c
     }
 
+    /// L2 prefetch of the line holding `p` (a hint: never faults, never
+    /// changes data; only addresses inside the weight / scale tensors).
+    #[inline(always)]
+    fn pf_l2(p: *const u8) {
+        unsafe {
+            ptx_asm!("prefetch.global.L2 [%0];", in("l") p as u64);
+        }
+    }
+
+    /// Lookahead prologue of a warp's weight stream (nvfp4_moe's pf_head):
+    /// the lines of k64 steps [s0, min(s0 + 1 + pf, s1)) — the k loop
+    /// prefetches step s + pf at its iteration s >= s0 + 1. Row lane/4's
+    /// steps s0 + t (mod 4) by lane (g, t) (the window's first step always,
+    /// later ones where a 128 B line starts), the 8 rows' scale line of
+    /// step sp by lane sp - s0 (mod 32). pf = 0: off.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn pf_head(pf: u32, s0: u32, s1: u32, lane: u32, w_row: *const u8, wsf: *const u8,
+               n0: u32, kb_pad: u32) {
+        if pf == 0 {
+            return;
+        }
+        let e = if s0 + 1 + pf < s1 { s0 + 1 + pf } else { s1 };
+        let mut sp = s0 + lane % 4;
+        while sp < e {
+            let a = unsafe { w_row.add((32 * sp) as usize) };
+            if sp == s0 || (a as u64) % 128 == 0 {
+                pf_l2(a);
+            }
+            sp += 4;
+        }
+        let mut sp = s0 + lane;
+        while sp < e {
+            pf_l2(unsafe { wsf.add(sf_offset(n0, 4 * sp, kb_pad)) });
+            sp += 32;
+        }
+    }
+
+    /// k loop lookahead: step `sp`'s weight line of row lane/4 where a 128 B
+    /// line starts (lanes t == 0) and the 8 rows' scale line (lane 1).
+    #[inline(always)]
+    fn pf_step(sp: u32, lane: u32, w_row: *const u8, wsf: *const u8, n0: u32, kb_pad: u32) {
+        if lane % 4 == 0 {
+            let a = unsafe { w_row.add((32 * sp) as usize) };
+            if (a as u64) % 128 == 0 {
+                pf_l2(a);
+            }
+        }
+        if lane == 1 {
+            pf_l2(unsafe { wsf.add(sf_offset(n0, 4 * sp, kb_pad)) });
+        }
+    }
+
     /// The k loop over [k_begin, k_end) with a 2-stage software pipeline
     /// (next step's loads in flight while the current step's MT mmas issue).
     /// `b0` = the first step's weight fragment, already loaded by the caller.
+    /// pf != 0: iteration k0 also L2-prefetches step k0/64 + pf (pf_step;
+    /// the caller ran pf_head). Hints only: loads and f32 op order unchanged.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn k_loop<const MT: usize>(
@@ -418,6 +473,7 @@ pub mod kernels {
         wsf: *const u8,
         n0: u32,
         b0: ([u32; 2], u32),
+        pf: u32,
     ) -> [[f32; 4]; MT] {
         let mut c = [[0.0f32; 4]; MT];
         if k_begin < k_end {
@@ -426,6 +482,9 @@ pub mod kernels {
             let mut k0 = k_begin + 64;
             while k0 < k_end {
                 let nxt = load_step_src::<MT>(k0, lane, src, w_row, wsf, n0);
+                if pf != 0 && k0 / 64 + pf < k_end / 64 {
+                    pf_step(k0 / 64 + pf, lane, w_row, wsf, n0, src.kb_pad);
+                }
                 c = mma_all(c, cur);
                 cur = nxt;
                 k0 += 64;
@@ -606,6 +665,8 @@ pub mod kernels {
 
     pub const FUSE_QUANT: u32 = 1;
     pub const FUSE_REDUCE: u32 = 2;
+    /// flags bits 8..15: L2 prefetch lookahead in k64 steps (0 = off).
+    pub const PF_SHIFT: u32 = 8;
 
     /// The single-launch decode GEMM (entries nvfp4_gemm_f{MT}): gemm_body
     /// plus, per `flags`,
@@ -658,6 +719,13 @@ pub mod kernels {
     ///   next launch is stream-ordered after it (kernel boundary). No CTA
     ///   waits on another (no spin): no deadlock, any residency.
     ///   Counters: one u32 per column tile, zeroed once at load, >= grid.x.
+    /// PF (flags >> PF_SHIFT, k64 steps, 0 = off; may come without any fuse
+    ///   bit = gemm_t's work through this entry): L2 prefetch lookahead of
+    ///   the warp's weight rows + scale lines (pf_head before the prologue,
+    ///   pf_step in the k loop). Cold-L2 decode is DRAM-latency bound: one
+    ///   k64 step (8 rows x 32 B per warp) in flight per warp leaves ~6 KB
+    ///   per SM outstanding vs ~10 KB needed at 1.8 TB/s; the lookahead
+    ///   asks for whole 128 B lines pf steps early. Hints only: bit-identical.
     /// Warps past N do not exit early here: they take part in the prologue
     /// and the barriers, and only skip their mma / stores.
     #[inline(always)]
@@ -703,6 +771,11 @@ pub mod kernels {
         } else {
             ([0; 2], 0)
         };
+        let pf = (flags >> PF_SHIFT) & 0xFF;
+        if active {
+            // before the quant prologue: DRAM fills while x is quantized
+            pf_head(pf, k_begin / 64, k_end / 64, lane, w_row, wsf, n0, kb_pad);
+        }
         let fq = flags & FUSE_QUANT != 0;
         let astr = kps * 32 + 16;
         let sstr = 4 * (kps | 1);
@@ -744,11 +817,11 @@ pub mod kernels {
             let c = if fq {
                 let src = ASrc { aq: qa, a_stride: astr, a_rows: m, k_base: k_begin, asf: qs,
                                  swz: false, sf_stride: sstr, kb_pad };
-                k_loop::<MT>(k_begin, k_end, lane, src, w_row, wsf, n0, b0)
+                k_loop::<MT>(k_begin, k_end, lane, src, w_row, wsf, n0, b0, pf)
             } else {
                 let src = ASrc { aq, a_stride, a_rows, k_base: 0, asf, swz: asf_mode != 0,
                                  sf_stride: nkb, kb_pad };
-                k_loop::<MT>(k_begin, k_end, lane, src, w_row, wsf, n0, b0)
+                k_loop::<MT>(k_begin, k_end, lane, src, w_row, wsf, n0, b0, pf)
             };
             store_tile::<MT>(c, out, partial, m, n, out_stride, split, n0, lane, alpha);
         }
