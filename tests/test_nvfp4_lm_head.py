@@ -8,6 +8,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 from suffix_hybrid.kernels import nvfp4_gemm as ng
@@ -132,3 +133,14 @@ def test_load_oracle_runs_for_every_m(monkeypatch):
     monkeypatch.setattr(lh, "PLUMB_REL", 5e-2)
     res = lh.load_oracle(st, run, quant, lambda x: x @ w.t(), n_rows=128)
     assert {"m1", "m4", f"m{lh.MAX_M}"} <= set(res) and res["plumb_rel"] <= lh.PLUMB_REL
+
+
+def test_max_m_env(monkeypatch):
+    monkeypatch.delenv(lh.MAX_M_ENV, raising=False)
+    assert lh.max_m_env() == 64
+    monkeypatch.setenv(lh.MAX_M_ENV, "16")
+    assert lh.max_m_env() == 16
+    for bad in ("15", "65", "x"):
+        monkeypatch.setenv(lh.MAX_M_ENV, bad)
+        with pytest.raises(ValueError, match="16..64"):
+            lh.max_m_env()

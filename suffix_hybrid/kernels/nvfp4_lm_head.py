@@ -25,7 +25,8 @@ exact layout our GEMM reads), then a LOAD ORACLE per head: ours vs the exact
 quantized reference on sampled vocab rows (fatal) + fidelity vs the stock
 bf16 head (rel / cos / top-1 agreement, logged).
 
-Hot path (M = rows <= 16, bf16, no bias; else the stock method): dynamic
+Hot path (M = rows <= SUFFIX_NVFP4_LMHEAD_MAX_M, default 64 = 4 m16 tiles,
+16..64; bf16, no bias; else the stock method): dynamic
 per-call activation scale on device (g_x = 448*6/amax(x), no host sync),
 ``scaled_fp4_quant`` -> ``nvfp4_gemm_q_cuda`` with alpha = 1/g_w -> ``*
 1/g_x`` in place -> top-RESCORE candidates per row recomputed EXACTLY from
@@ -57,7 +58,9 @@ from suffix_hybrid.kernels.nvfp4_gemm import (
 GATE = "SUFFIX_NVFP4_LMHEAD"
 MARKER = "[suffix nvfp4-lmhead]"
 FAMILY = "nvfp4_gemm"
-MAX_M = 16
+MAX_M = 64  # kernel limit (4 m16 tiles); default of MAX_M_ENV
+MAX_M_ENV = "SUFFIX_NVFP4_LMHEAD_MAX_M"  # 16 = the pre-2026-10-07 cap
+ORACLE_MS = (1, 4, 16, 17, 40, 64)  # every tile bucket + non-multiple-of-16 rows
 FP4_RANGE = 448.0 * 6.0  # e4m3 max * e2m1 max: g = FP4_RANGE / amax
 PLUMB_REL = 2e-2  # ours vs exact quantized reference (same bar as nvfp4_gemm)
 RESCORE = 64  # NVFP4 top candidates per row re-scored exactly in bf16
@@ -74,6 +77,16 @@ def _log(msg: str) -> None:
 
 def gate_on() -> bool:
     return os.environ.get(GATE, "").strip() == "1"
+
+
+def max_m_env() -> int:
+    """SUFFIX_NVFP4_LMHEAD_MAX_M (default 64): largest M on the NVFP4 head."""
+    raw = os.environ.get(MAX_M_ENV, "").strip()
+    if not raw:
+        return MAX_M
+    if not raw.isdigit() or not 16 <= int(raw) <= MAX_M:
+        raise ValueError(f"{MAX_M_ENV}={raw!r}: need an integer in 16..{MAX_M}")
+    return int(raw)
 
 
 def eligible(n: int, k: int, dtype: str) -> str | None:
@@ -150,17 +163,20 @@ def _device_ops(native):
     from vllm._custom_ops import scaled_fp4_quant
 
     def prepare(w):
-        """bf16 [N, K] -> dict(wq, wsf, g_w, splits, partial). Load time only."""
+        """bf16 [N, K] -> dict(wq, wsf, g_w, launch, partial). Load time only."""
         n, k = w.shape
         amax = float(torch.linalg.vector_norm(w, float("inf")).float())  # no |W| copy
         g_w = FP4_RANGE / max(amax, 1e-12)
         wq, wsf = scaled_fp4_quant(
             w, torch.tensor(g_w, dtype=torch.float32, device=w.device),
             is_sf_swizzled_layout=True)
-        pl = plan(n, k, MAX_M, prequant=True)  # M <= 16: one tile bucket
-        return dict(n=n, k=k, w=w, wq=wq, wsf=wsf, g_w=g_w,
-                    splits=pl["splits"], flags=pl["flags"],  # fused split-K reduce
-                    partial=torch.empty(max(1, partial_elems(n, k, MAX_M)),
+        max_m = max_m_env()
+        # (splits, flags) per M, fixed at load (no planning in the hot path)
+        launch = [(0, 0)] + [(pl["splits"], pl["flags"]) for pl in
+                             (plan(n, k, m, prequant=True) for m in range(1, max_m + 1))]
+        return dict(n=n, k=k, w=w, wq=wq, wsf=wsf, g_w=g_w, max_m=max_m,
+                    splits=launch[max_m][0], launch=launch,
+                    partial=torch.empty(max(1, partial_elems(n, k, max_m)),
                                         dtype=torch.float32, device=w.device),
                     counters=torch.zeros(-(-n // 32), dtype=torch.int32, device=w.device))
 
@@ -172,10 +188,11 @@ def _device_ops(native):
 
         def gemm(xq, xsf, alpha):
             out = torch.empty(xq.shape[0], st["n"], dtype=torch.bfloat16, device=dev)
+            splits, flags = st["launch"][xq.shape[0]]
             native.nvfp4_gemm_q_cuda(xq, xsf, st["wq"], st["wsf"], st["partial"], out,
-                                     alpha, st["splits"],
+                                     alpha, splits,
                                      torch.cuda.current_stream(dev).cuda_stream,
-                                     st["flags"], st["counters"])
+                                     flags, st["counters"])
             return out
         return logits_nvfp4(x2, st["w"], st["g_w"], quant, gemm)
 
@@ -197,7 +214,7 @@ def load_oracle(st, run, quant, stock, n_rows=256, seed=0) -> dict:
     wq_rows = st["wq"][torch.from_numpy(rows).to(dev)].cpu().numpy()
     gen = torch.Generator(device=dev).manual_seed(seed)
     res = {"plumb_rel": 0.0}
-    for m in (1, 4, MAX_M):
+    for m in (m for m in ORACLE_MS if m <= st.get("max_m", MAX_M)):
         x = torch.randn(m, k, generator=gen, device=dev, dtype=torch.bfloat16)
         got = run(st, x)
         amax = float(x.abs().amax().float())
@@ -237,7 +254,7 @@ def _make_head_cls(native):
     prepare, quant, run = _device_ops(native)
 
     class SuffixNvFp4LMHeadMethod(UnquantizedEmbeddingMethod):
-        """Stock bf16 head + NVFP4 copy for M <= 16 decode rows."""
+        """Stock bf16 head + NVFP4 copy for M <= max M decode rows."""
         supports_pre_processed_weights = False  # IPC weight cache: fail loud
 
         def __init__(self, inner):
@@ -275,7 +292,7 @@ def _make_head_cls(native):
             st = getattr(layer, "_sfx_lmhead", None)
             rows = x.numel() // x.shape[-1] if x.numel() else 0
             if (st is None or bias is not None or x.dtype != torch.bfloat16
-                    or not 1 <= rows <= MAX_M):
+                    or not 1 <= rows <= st["max_m"]):
                 return self.inner.apply(layer, x, bias)
             out = run(st, x.reshape(rows, st["k"]))
             if not _state["active"]:
@@ -323,6 +340,7 @@ def register():
     from vllm.model_executor.custom_op import PluggableLayer, op_registry_oot
 
     native = oxide_kernels.native()
+    max_m = max_m_env()  # malformed env: fail at startup
     for fn in ("nvfp4_gemm_q_cuda",):
         if not hasattr(native, fn):
             raise RuntimeError(f"{GATE}=1 but _native lacks {fn} (oxide-kernels build)")
@@ -337,7 +355,7 @@ def register():
     _state["hook"] = torch.nn.modules.module.register_module_forward_pre_hook(
         _first_forward_check)
     _state["armed"] = True
-    _log(f"armed: ParallelLMHead OOT-registered (M<={MAX_M} -> NVFP4 decode GEMM, "
+    _log(f"armed: ParallelLMHead OOT-registered (M<={max_m} -> NVFP4 decode GEMM, "
          "else stock bf16)")
     return _state
 
@@ -375,7 +393,7 @@ def main(argv=None) -> int:
                 _log(f"ORACLE {name} N={n} K={k}: rel_vs_exact={r['plumb_rel']:.2e} "
                      + " ".join(f"{m}={v}" for m, v in r.items() if m != "plumb_rel"))
             if mode in ("bench", "both"):
-                for m in (1, 4, MAX_M):
+                for m in (1, 4, 16, st["max_m"]):
                     x = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
                     t = [_graph_us(lambda: x @ w.t(), dev), _graph_us(lambda: run(st, x), dev)]
                     roof = [n * k * 2 / 1.79e6, n * k * 0.5625 / 1.79e6]
