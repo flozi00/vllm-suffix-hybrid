@@ -162,7 +162,7 @@ def write_backbone(src, out, files, amax, key_group, row_chunk, shard_bytes):
 
 def convert(src, out, row_chunk=128, shard_mib=256, threads=4):
     import torch
-    src, out = Path(src), Path(out)
+    src, out = Path(src).absolute(), Path(out).absolute()
     if row_chunk < 1 or shard_mib < 1 or threads < 1:
         raise ValueError("row chunk, shard size and CPU threads must be positive")
     if out.is_symlink() or (out.exists() and (not out.is_dir() or any(out.iterdir()))):
@@ -176,8 +176,11 @@ def convert(src, out, row_chunk=128, shard_mib=256, threads=4):
     if (src / "release-manifest.json").is_file():
         source_names.append("release-manifest.json")
     source_hashes = {name: shared.sha256_file(src / name) for name in source_names}
-    out.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(tempfile.mkdtemp(prefix=out.name + ".partial-", dir=out.parent))
+    # In the console, out is itself a PVC subPath mountpoint. Keep staging
+    # on that filesystem and never remove/replace the output directory root.
+    out.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".pending-", dir=out))
+    published = []
     try:
         stats = write_backbone(src, temporary, files, amax, key_group,
                                row_chunk, shard_mib * 2**20)
@@ -210,10 +213,20 @@ def convert(src, out, row_chunk=128, shard_mib=256, threads=4):
                     "versions": {"torch": torch.__version__, "safetensors": importlib.metadata.version("safetensors")},
                     "seconds": round(time.time() - started, 2)}
         (temporary / "suffix_quant_manifest.json").write_text(json.dumps(manifest, indent=2))
-        if out.exists():
-            out.rmdir()
-        os.replace(temporary, out)
+        if set(out.iterdir()) != {temporary}:
+            raise ValueError("output changed while converting; refusing overwrite")
+        # Upload is gated on DONE after this transaction. Publish weights/head
+        # and provenance first, then the loader configuration and index last.
+        last = {"hf_quant_config.json": 1, "config.json": 2,
+                "model.safetensors.index.json": 3}
+        for file in sorted(temporary.iterdir(), key=lambda path: (last.get(path.name, 0), path.name)):
+            target = out / file.name
+            os.replace(file, target)
+            published.append(target)
+        temporary.rmdir()
     except BaseException:
+        for file in reversed(published):
+            file.unlink(missing_ok=True)
         shutil.rmtree(temporary, ignore_errors=True)
         raise
     print(f"[quantize-nvfp4] DONE W4A16_NVFP4 {stats['quantized']} linears, {stats['file_bytes'] / 2**30:.2f} GiB backbone", flush=True)

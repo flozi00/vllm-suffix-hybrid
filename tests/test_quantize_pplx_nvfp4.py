@@ -1,5 +1,8 @@
 """Native-packed decision weights without head/index contamination or CUDA."""
 import json
+import os
+from pathlib import Path
+import tempfile
 
 import pytest
 import torch
@@ -98,6 +101,53 @@ def test_rejects_head_in_backbone_index_and_nonempty_output(tmp_path):
     (source / "model.safetensors.index.json").write_text(json.dumps(index))
     with pytest.raises(ValueError, match="readout must remain separate"):
         quantizer.convert(source, output)
+
+
+def test_publication_stays_inside_output_mount_and_never_replaces_mount_root(tmp_path, monkeypatch):
+    source, output = tmp_path / "source", tmp_path / "mounted-output"
+    source.mkdir()
+    output.mkdir()
+    fixture_checkpoint(source)
+    real_mkdtemp, real_replace, real_rmdir = tempfile.mkdtemp, os.replace, Path.rmdir
+    moved = []
+    def mounted_mkdtemp(*args, **kwargs):
+        assert Path(kwargs["dir"]) == output, "staging escaped the mounted output filesystem"
+        return real_mkdtemp(*args, **kwargs)
+    def mounted_replace(src, dst):
+        src, dst = Path(src), Path(dst)
+        assert src.parent.parent == output and dst.parent == output
+        assert dst != output, "attempted to replace output mount root"
+        moved.append(dst.name)
+        return real_replace(src, dst)
+    def mounted_rmdir(path):
+        assert path != output, "attempted to remove output mount root"
+        return real_rmdir(path)
+    monkeypatch.setattr(tempfile, "mkdtemp", mounted_mkdtemp)
+    monkeypatch.setattr(os, "replace", mounted_replace)
+    monkeypatch.setattr(Path, "rmdir", mounted_rmdir)
+    quantizer.convert(source, output, threads=1)
+    assert moved[-3:] == ["hf_quant_config.json", "config.json", "model.safetensors.index.json"]
+    assert not any(path.name.startswith(".pending-") for path in output.iterdir())
+
+
+def test_partial_publish_failure_cleans_own_files_and_leaves_mount_root(tmp_path, monkeypatch, capsys):
+    source, output = tmp_path / "source", tmp_path / "mounted-output"
+    source.mkdir()
+    output.mkdir()
+    fixture_checkpoint(source)
+    real_replace = os.replace
+    moves = 0
+    def failing_replace(src, dst):
+        nonlocal moves
+        moves += 1
+        if moves == 3:
+            raise OSError("simulated publication failure")
+        return real_replace(src, dst)
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError, match="simulated publication failure"):
+        quantizer.convert(source, output, threads=1)
+    assert output.is_dir() and not list(output.iterdir())
+    assert "[quantize-nvfp4] DONE" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("key", [PREFIX + "linear_attn.in_proj_a.weight",
