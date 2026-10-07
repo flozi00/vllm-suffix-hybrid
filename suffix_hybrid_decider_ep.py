@@ -40,9 +40,20 @@ class DecisionEndpointPlugin:
                     body_json, json.dumps(context["saved"]["codes"])))
                 prompts, input_tokens = [], 0
                 for row in prepared["rows"]:
-                    token_ids = context["tokenizer"].apply_chat_template(
-                        row["messages"], tokenize=True,
+                    rendered = context["tokenizer"].apply_chat_template(
+                        row["messages"], tokenize=False,
                         add_generation_prompt=True, enable_thinking=False)
+                    if not isinstance(rendered, str):
+                        raise ValueError("decision chat template must render text")
+                    # Transformers versions differ in the default tokenized
+                    # chat-template return shape. Encode the exact rendered
+                    # prefix, as the checkpoint's publisher does, instead of
+                    # accidentally passing BatchEncoding dictionary keys.
+                    token_ids = context["tokenizer"].encode(
+                        rendered, add_special_tokens=False)
+                    if not isinstance(token_ids, list) or any(
+                            type(token) is not int or token < 0 for token in token_ids):
+                        raise ValueError("decision tokenizer must return integer token IDs")
                     if not token_ids or len(token_ids) > context["max_model_len"]:
                         raise ValueError("decision input must fit model limit without truncation")
                     input_tokens += len(token_ids)

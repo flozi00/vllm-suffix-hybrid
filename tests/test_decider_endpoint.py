@@ -47,6 +47,12 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         class Tokenizer:
             def apply_chat_template(self, *args, **kwargs):
                 owner.calls.append(kwargs)
+                # Match the installed Transformers tokenizer's mapping
+                # return when tokenizing a chat template. The endpoint must
+                # use rendered text instead of assuming a list by default.
+                return {"input_ids": [9, 8, 7]} if kwargs["tokenize"] else "exact rendered prefix"
+            def encode(self, text, **kwargs):
+                owner.calls.append((text, kwargs))
                 return [9, 8, 7]
         self.context = {"engine": Engine(), "tokenizer": Tokenizer(),
                         "saved": {"codes": ["A", "B"], "temperature": 1.0087417621345625},
@@ -96,7 +102,9 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.content["usage"]["input_tokens"], 3)
         self.assertEqual(result.content["usage"]["output_tokens"], 0)
-        prompt, params = self.calls[2]
+        self.assertFalse(self.calls[0]["tokenize"])
+        self.assertEqual(self.calls[1], ("exact rendered prefix", {"add_special_tokens": False}))
+        prompt, params = self.calls[3]
         self.assertEqual(prompt["prompt_token_ids"], [9, 8, 7])
         self.assertEqual(prompt["type"], "token")
         self.assertEqual(self.token_input_factory_calls, [[9, 8, 7]])
@@ -112,6 +120,13 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         result = await self.invoke({"model": "decider"})
         self.assertEqual(result.status_code, 400)
         self.assertNotIn("admitted", self.calls)
+
+    async def test_non_integer_token_ids_never_reach_engine(self):
+        self.context["tokenizer"].encode = lambda *args, **kwargs: ["input_ids"]
+        result = await self.invoke({"model": "decider"})
+        self.assertEqual(result.status_code, 400)
+        self.assertNotIn("admitted", self.calls)
+        self.assertEqual(self.token_input_factory_calls, [])
 
     async def test_native_validation_failure_is_client_error(self):
         self.native.decider_prepare = lambda *args: (_ for _ in ()).throw(ValueError("images unsupported"))
