@@ -50,14 +50,18 @@ vllm serve /weights \
   --max-model-len 8192 \
   --max-num-batched-tokens 8192 \
   --max-num-seqs 1 \
+  --language-model-only \
   --no-enable-prefix-caching \
   --no-enable-chunked-prefill \
   --mamba-cache-mode none \
   --enforce-eager
 ```
 
-Use BF16 first on a 96GB GPU. Add `--quantization fp8` only for a separately
-measured FP8 arm. It uses upstream vLLM quantization and supported GEMM
+Use BF16 first on a 96GB GPU or a CPU-offloaded reference pool. FP8 was
+validated on one RTX 5090 with 25.24 GiB model memory: a 20-case comparison
+against native vLLM BF16 matched all 13 choices, with maximum probability
+drift 0.0042902. Publisher PyTorch GPU parity and performance remain
+unmeasured. Add `--quantization fp8` for that arm. It uses upstream vLLM quantization and supported GEMM
 kernels on the backbone, preserving the BF16 decision head. Do not enable
 the speculative decoding, suffix-cache, NVFP4 KV, or GDN decode-only hooks:
 decision inference consists of a prefill and readout, so those paths do
@@ -82,7 +86,18 @@ the backbone index. Serve the converted checkpoint with the same plugin
 settings and `--quantization modelopt_fp4`; the adapter accepts only the
 serialized `W4A16_NVFP4` variant, preserving its BF16 readout. This path uses
 native Marlin, so do not arm the custom W4A4 GEMM hook. GPU engagement,
-decision probability/choice parity and performance still require measurement.
+endpoint and repeat checks passed on RTX 5090 at 15.54 GiB model memory.
+All 13 choices in 20 bounded synthetic cases matched the native vLLM BF16
+reference; maximum probability drift was 0.0312534. This does not establish
+publisher PyTorch GPU parity, broader accuracy, or a performance speedup.
+Keep `--language-model-only` for the supported text route to suppress unused
+vision allocation/profiling. The conversion produced 73 objects totaling
+16.04 GiB, including 59 backbone shards; the readout and decision/tokenizer
+metadata were preserved. The inference-console deployment recipes and
+recorded quality fixtures are the reproducible cluster configuration.
+For this NVFP4 arm on RTX 5090, `--gpu-memory-utilization 0.60` passed
+8192-token warmup with an 18.81 GiB engine memory budget. Marlin weight-only
+compression saves memory; latency and throughput have not been benchmarked.
 
 The normal vLLM API authentication middleware also covers this `/v1/` route.
 Example request:
