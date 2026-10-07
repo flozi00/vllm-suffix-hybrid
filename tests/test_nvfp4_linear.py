@@ -173,3 +173,125 @@ def test_first_forward_hook_logs_selection(monkeypatch, capsys):
     torch.nn.Linear(2, 2)(torch.zeros(1, 2))
     err = capsys.readouterr().err
     assert "NVFP4-GEMM SELECTION" in err and "5120x17408:ours x64" in err
+
+
+# --- M-dependent dispatch through torch.ops.suffix_nvfp4.linear ------------
+import torch  # noqa: E402
+
+
+class _StubKernel:
+    """CPU stand-in for SuffixNvFp4LinearKernel: ours -> 1s, stock -> 2s."""
+
+    def __init__(self):
+        self.calls = []
+
+    def _ours(self, layer, cfg, x2d, qa2d=None):
+        m = (x2d if qa2d is None else qa2d[0]).shape[0]
+        self.calls.append(("ours", m, qa2d is not None))
+        return torch.ones(m, cfg["n"], dtype=torch.bfloat16)
+
+    def _stock(self, layer, x2d, xsf=None):
+        self.calls.append(("stock", x2d.shape[0], xsf is not None))
+        return torch.full((x2d.shape[0], layer._sfx_nvfp4["n"]), 2.0, dtype=torch.bfloat16)
+
+
+def _stub_layer(monkeypatch, n=48, max_m=64, name="model.layers.0.mlp.down_proj"):
+    import types
+    monkeypatch.setattr(nl, "_state", dict(nl._state, layers={}, captured={},
+                                           graph_logged=set(), active_logged=True))
+    kern, layer = _StubKernel(), types.SimpleNamespace(_sfx_nvfp4={"n": n, "max_m": max_m})
+    layer._sfx_nvfp4["key"] = nl.register_layer(kern, layer, name)
+    return kern, layer, nl.register_op()
+
+
+def test_op_fake_shape_and_dtype():
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    op = nl.register_op()
+    with FakeTensorMode():
+        for x, xsf in ((torch.empty(7, 256, dtype=torch.bfloat16), None),
+                       (torch.empty(7, 128, dtype=torch.uint8), torch.empty(128, 4))):
+            out = op(x, xsf, 48, "unused")
+            assert out.shape == (7, 48) and out.dtype == torch.bfloat16
+
+
+def test_op_routes_per_m_both_inputs(monkeypatch):
+    import torch
+    kern, layer, op = _stub_layer(monkeypatch, max_m=40)
+    key = layer._sfx_nvfp4["key"]
+    for m, want in ((1, 1.0), (40, 1.0), (41, 2.0), (200, 2.0), (0, None)):
+        out = op(torch.zeros(m, 256, dtype=torch.bfloat16), None, 48, key)
+        assert out.shape == (m, 48) and (m == 0 or float(out[0, 0]) == want)
+        out = op(torch.zeros(m, 128, dtype=torch.uint8), torch.zeros(128, 4), 48, key)
+        assert out.shape == (m, 48) and (m == 0 or float(out[0, 0]) == want)
+    assert [c[0] for c in kern.calls] == ["ours"] * 4 + ["stock"] * 6
+    assert [c[2] for c in kern.calls] == [False, True] * 5  # prequant reaches both paths
+
+
+def test_register_layer_keys_are_unique_and_stable(monkeypatch):
+    import types
+    _, layer, _ = _stub_layer(monkeypatch)
+    other = types.SimpleNamespace(_sfx_nvfp4=None)
+    k2 = nl.register_layer(object(), other, "model.layers.0.mlp.down_proj")
+    assert k2 == "model.layers.0.mlp.down_proj#1"
+    assert nl.register_layer(object(), other, "x") == k2  # reload keeps the key
+
+
+def _compiled(fn):
+    import torch
+    torch._dynamo.reset()
+    # vLLM VLLM_COMPILE: fullgraph, dims marked dynamic, every guard skipped
+    return torch.compile(fn, fullgraph=True, dynamic=False, backend="aot_eager",
+                         options={"guard_filter_fn": torch.compiler.skip_all_guards_unsafe})
+
+
+def test_compiled_dispatch_is_not_baked(monkeypatch):
+    """Trace at M=200 (vLLM traces at max_num_batched_tokens), then M=1: the
+    op must still pick ours. The old Python branch, compiled the same way,
+    bakes the stock path (the 2026-10-07 silicon finding) — asserted too, so
+    this test keeps proving what it claims."""
+    import torch
+    kern, layer, op = _stub_layer(monkeypatch)
+    cfg = layer._sfx_nvfp4
+
+    def new(x):  # what SuffixNvFp4LinearKernel.apply_weights traces now
+        return op(x.reshape(-1, x.shape[-1]), None, cfg["n"], cfg["key"]).view(
+            *x.shape[:-1], cfg["n"]) * 3
+
+    def old(x):  # the pre-fix Python branch
+        rows = x.numel() // x.shape[-1]
+        y = (kern._ours(layer, cfg, x) if rows <= cfg["max_m"]
+             else kern._stock(layer, x))
+        return y * 3
+
+    for fn, want_small in ((new, "ours"), (old, "stock")):
+        kern.calls.clear()
+        c = _compiled(fn)
+        big = torch.zeros(200, 256, dtype=torch.bfloat16)
+        torch._dynamo.mark_dynamic(big, 0)
+        assert c(big).shape == (200, 48)
+        small = c(torch.zeros(1, 256, dtype=torch.bfloat16))
+        assert small.shape == (1, 48)
+        assert float(small[0, 0]) == (3.0 if want_small == "ours" else 6.0), fn.__name__
+        if fn is new:  # runtime calls: trace-time fake calls never hit the kernel
+            assert [c[:2] for c in kern.calls] == [("stock", 200), ("ours", 1)]
+
+
+def test_in_graph_log_once_per_captured_m(monkeypatch, capsys):
+    import types
+    import torch
+    kern, layer, op = _stub_layer(monkeypatch, max_m=64)
+    k2 = types.SimpleNamespace(_sfx_nvfp4={"n": 48, "max_m": 16})
+    k2._sfx_nvfp4["key"] = nl.register_layer(kern, k2, "l1")
+    monkeypatch.setattr(nl, "_capturing", lambda: True)
+    x = torch.zeros(32, 256, dtype=torch.bfloat16)
+    op(x, None, 48, layer._sfx_nvfp4["key"])  # M=32: only the max_m=64 layer is ours
+    op(x, None, 48, k2._sfx_nvfp4["key"])     # stock: not counted
+    op(x[:8], None, 48, layer._sfx_nvfp4["key"])  # M=8: 1 of 2 so far -> no line
+    err = capsys.readouterr().err
+    assert "NVFP4-GEMM in-graph: 1 layers captured on ours at M=32" in err
+    assert "at M=8" not in err
+    op(x[:8], None, 48, k2._sfx_nvfp4["key"])
+    op(x[:8], None, 48, k2._sfx_nvfp4["key"])  # FULL + PIECEWISE re-capture: no repeat
+    err = capsys.readouterr().err
+    assert err.count("NVFP4-GEMM in-graph: 2 layers captured on ours at M=8") == 1

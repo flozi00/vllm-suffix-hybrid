@@ -43,7 +43,17 @@ the f64 exact-dequant reference, both input routes, and the single-launch
 path bit-identical to the old 3-launch one (outputs, aq/asf readback,
 ticket counters reset), before any CUDA graph is captured.
 Markers: ``[suffix nvfp4-gemm] NVFP4-GEMM armed`` / ``LAYER ORACLE PASS`` /
-``NVFP4-GEMM ACTIVE``.
+``NVFP4-GEMM ACTIVE`` / ``NVFP4-GEMM in-graph: N layers captured on ours at M=m``
+(one per captured M; the proof the kernel is in the CUDA graphs).
+
+Compile: the per-call M decision runs inside ``torch.ops.suffix_nvfp4.linear``
+(opaque to Dynamo, fake impl for shapes), never as a Python branch in the
+traced forward — vLLM traces once at M = max_num_batched_tokens with guards
+skipped, which baked FlashInfer into every decode graph before 2026-10-07.
+Prequantized activations cross the op as (packed data, swizzled scales).
+The bf16 route's activation quant is inside the op, so vLLM's
+norm/act + NVFP4-quant fusion passes see no scaled_fp4_quant for these
+layers (decode quantizes in our GEMM prologue anyway).
 
 Hot path: no allocation besides the output tensor (like every vLLM linear),
 no host sync (alpha / global scale cached as floats at load), launches on
@@ -67,11 +77,94 @@ ORACLE_MS = (1, 5, 16, 17, 40, 64)
 # bench prints the suggested ROUTE); empty = every eligible shape up to MAX_M.
 DEFAULT_ROUTE: dict = {}
 _state = {"armed": False, "oracle": {}, "layers_ours": 0, "layers_stock": 0,
-          "ws": {}, "instances": 0, "shapes": {}, "checked": False, "hook": None}
+          "ws": {}, "instances": 0, "shapes": {}, "checked": False, "hook": None,
+          "layers": {}, "captured": {}, "graph_logged": set()}
+OP_NS = "suffix_nvfp4"
+_LIB = None
 
 
 def _log(msg: str) -> None:
     print(f"{MARKER} {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# M-dependent dispatch as an opaque torch custom op.
+# vLLM compiles the model forward once with a symbolic batch hinted at
+# max_num_batched_tokens and SKIPS all guards (compilation/wrapper.py
+# skip_all_guards_unsafe): a Python `if rows <= max_m` in apply_weights is
+# evaluated once at trace time (8192 -> FlashInfer) and baked into every
+# CUDA graph. Like vLLM's own M-dependent kernels (torch.ops.vllm.*), the
+# route decision lives inside an op Dynamo cannot see into; the op body runs
+# with concrete shapes (eager, piecewise and at CUDA-graph capture).
+# ---------------------------------------------------------------------------
+def register_layer(kernel, layer, name: str) -> str:
+    """Make (kernel, layer) reachable from the op by a graph-constant string
+    (vLLM's layer_name convention). Deterministic per process (prefix, then
+    #i on collision, e.g. a drafter reusing target prefixes); re-registering
+    the same layer keeps its key."""
+    key = getattr(layer, "_sfx_nvfp4_key", None)
+    if key is None:
+        key, i = name or "nvfp4_linear", 1
+        while key in _state["layers"]:
+            key, i = f"{name}#{i}", i + 1
+        layer._sfx_nvfp4_key = key
+    _state["layers"][key] = (kernel, layer)
+    return key
+
+
+def _capturing() -> bool:
+    import torch
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def _note_capture(key: str, m: int) -> None:
+    """One line per captured M once every layer that routes M to us has been
+    captured on our kernel: the in-graph proof (the eager ACTIVE line is not)."""
+    seen = _state["captured"].setdefault(m, set())
+    seen.add(key)
+    want = sum(1 for _, ly in _state["layers"].values()
+               if ly._sfx_nvfp4 is not None and m <= ly._sfx_nvfp4["max_m"])
+    if len(seen) >= want and m not in _state["graph_logged"]:
+        _state["graph_logged"].add(m)
+        _log(f"NVFP4-GEMM in-graph: {len(seen)} layers captured on ours at M={m}")
+
+
+def _op_impl(x, xsf, n: int, layer: str):
+    """x: bf16 [M, K] (xsf None) or vLLM-prequantized packed [M, K/2] u8 with
+    its swizzled scales xsf. -> bf16 [M, n]. Our kernel for 1 <= M <= the
+    layer's max M, else the parent's (stock FlashInfer) apply_weights."""
+    kernel, ly = _state["layers"][layer]
+    cfg = ly._sfx_nvfp4
+    m = x.shape[0]
+    if not 1 <= m <= cfg["max_m"]:
+        return kernel._stock(ly, x, xsf)
+    out = kernel._ours(ly, cfg, x if xsf is None else None,
+                       None if xsf is None else (x, xsf))
+    if not _state.get("active_logged"):
+        _state["active_logged"] = True
+        _log(summary())
+    if _capturing():
+        _note_capture(layer, m)
+    return out
+
+
+def _op_fake(x, xsf, n: int, layer: str):
+    import torch
+    return x.new_empty((x.shape[0], n), dtype=torch.bfloat16)
+
+
+def register_op():
+    """torch.ops.suffix_nvfp4.linear(x, xsf, n, layer) (idempotent)."""
+    global _LIB
+    import torch
+    if _LIB is None:
+        lib = torch.library.Library(OP_NS, "FRAGMENT")
+        lib.define("linear(Tensor x, Tensor? xsf, int n, str layer) -> Tensor")
+        for key in ("CUDA", "CPU"):
+            lib.impl("linear", _op_impl, key)
+        lib._register_fake("linear", _op_fake)
+        _LIB = lib
+    return getattr(torch.ops, OP_NS).linear
 
 
 def gate_on() -> bool:
@@ -151,6 +244,7 @@ def _make_kernel_cls():
         FlashInferCutlassNvFp4LinearKernel,
     )
     from vllm.model_executor.layers.fusion.quant_activation import (
+        QuantizedActivation,
         as_quantized_activation,
     )
     from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
@@ -172,6 +266,7 @@ def _make_kernel_cls():
     )
 
     native = oxide_kernels.native()
+    op = register_op()
 
     class SuffixNvFp4LinearKernel(FlashInferCutlassNvFp4LinearKernel):
         """FlashInfer-CUTLASS NVFP4 linear + our sm_120a decode GEMM for M <= max M."""
@@ -221,6 +316,7 @@ def _make_kernel_cls():
                        # rows past N are FlashInfer's zero padding (N % 32)
                        w=layer.weight[:n], launch=launch)
             layer._sfx_nvfp4 = cfg
+            cfg["key"] = register_layer(self, layer, getattr(layer, "prefix", ""))
             if (n, k) not in _state["oracle"]:
                 _state["oracle"][(n, k)] = self._layer_oracle(layer, cfg)
             _state["layers_ours"] += 1
@@ -338,27 +434,33 @@ def _make_kernel_cls():
                  f"(bf16 + prequant routes; single launch == old 3-launch bits)")
             return worst
 
+        def _stock(self, layer, x2d, xsf=None):
+            """The parent's apply_weights on the op's 2D operands (M > max M)."""
+            if xsf is None:
+                return super().apply_weights(layer, x2d)
+            qa = QuantizedActivation(x2d, xsf, torch.bfloat16,
+                                     torch.Size((x2d.shape[0], x2d.shape[1] * 2)),
+                                     self.input_quant_key())
+            return super().apply_weights(layer, qa)
+
         def apply_weights(self, layer, x, bias=None):
+            """Static checks (dtype, eligibility) here; the M-dependent route
+            inside torch.ops.suffix_nvfp4.linear (see _op_impl)."""
             cfg = getattr(layer, "_sfx_nvfp4", None)
             if cfg is None:
                 return super().apply_weights(layer, x, bias)
             qa = as_quantized_activation(x, self.input_quant_key())
             if qa is not None:
-                data = qa.data
-                rows = data.numel() // data.shape[-1] if data.numel() else 0
-                if not (1 <= rows <= cfg["max_m"]) or qa.orig_dtype != torch.bfloat16:
+                if qa.orig_dtype != torch.bfloat16:
                     return super().apply_weights(layer, x, bias)
-                out = self._ours(layer, cfg, None, (data.reshape(rows, -1), qa.scale))
+                data = qa.data
+                out = op(data.reshape(-1, data.shape[-1]), qa.scale, cfg["n"], cfg["key"])
                 shape = [*qa.orig_shape[:-1], cfg["n"]]
             else:
-                rows = x.numel() // x.shape[-1] if x.numel() else 0
-                if not (1 <= rows <= cfg["max_m"]) or x.dtype != torch.bfloat16:
+                if x.dtype != torch.bfloat16:
                     return super().apply_weights(layer, x, bias)
-                out = self._ours(layer, cfg, x.reshape(rows, x.shape[-1]))
+                out = op(x.reshape(-1, x.shape[-1]), None, cfg["n"], cfg["key"])
                 shape = [*x.shape[:-1], cfg["n"]]
-            if not _state.get("active_logged"):
-                _state["active_logged"] = True
-                _log(summary())
             if bias is not None:
                 out = out + bias
             return out.view(*shape)
