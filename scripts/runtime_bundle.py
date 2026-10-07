@@ -126,6 +126,27 @@ def bundle(wheel, output, revision, qgdn_cubins=None, attn_cubins=None,
             / 'entry_points.txt').exists():
         raise ValueError('runtime bundle requires the suffix_qwen_gdn '
                         'dist-info entry_points.txt')
+    # Decision adapter is inert unless BOTH explicitly allowlisted and armed.
+    # Ship model registration metadata plus the native vLLM HTTP plugin seam;
+    # the stock Rust frontend cannot load the latter (deployment must gate it).
+    decision_ep = repo / 'suffix_hybrid_decider_ep.py'
+    if not decision_ep.is_file():
+        raise ValueError('runtime bundle requires suffix_hybrid_decider_ep')
+    data = decision_ep.read_bytes()
+    (output / decision_ep.name).write_bytes(data)
+    hashes[decision_ep.name] = hashlib.sha256(data).hexdigest()
+    decision_distinfo = repo / 'suffix_pplx_decider_ep-1.0.dist-info'
+    for src in sorted(decision_distinfo.glob('*')):
+        if not src.is_file():
+            continue
+        rel = PurePosixPath(decision_distinfo.name, src.name)
+        data = src.read_bytes()
+        dest = output / PurePosixPath(*rel.parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        hashes[str(rel)] = hashlib.sha256(data).hexdigest()
+    if not (output / decision_distinfo.name / 'entry_points.txt').is_file():
+        raise ValueError('runtime bundle requires decision dist-info entry_points.txt')
     seeds_root = ficache_root / 'seeds'
     if seeds_root.is_dir():
         for src in sorted(seeds_root.rglob('*')):

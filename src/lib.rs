@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use pyo3::prelude::*;
+mod pplx_decider;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -383,8 +384,24 @@ fn cubin_store_driver_check(py: Python<'_>, device_ordinal: usize) -> PyResult<u
     })
 }
 
+/// SystemOne CPU helpers keep per-request algorithms in Rust.
+#[pyfunction]
+fn decider_prepare(py: Python<'_>, request_json: String, codes_json: String) -> PyResult<String> {
+    py.detach(|| guard_py("decider_prepare", || {
+        pplx_decider::prepare(&request_json, &codes_json).map_err(pyo3::exceptions::PyValueError::new_err)
+    }))
+}
+#[pyfunction]
+fn decider_answer(py: Python<'_>, request_json: String, logits_json: String, temperature: f64) -> PyResult<String> {
+    py.detach(|| guard_py("decider_answer", || {
+        pplx_decider::answer(&request_json, &logits_json, temperature).map_err(pyo3::exceptions::PyValueError::new_err)
+    }))
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(decider_prepare, m)?)?;
+    m.add_function(wrap_pyfunction!(decider_answer, m)?)?;
     m.add_class::<SuffixCache>()?;
     m.add_class::<engine::Engine>()?;
     m.add_class::<mixer::HybridMixer>()?;
