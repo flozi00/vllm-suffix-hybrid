@@ -31,6 +31,8 @@ PYTHONPATH. Each section is independently gated:
                                (suffix_hybrid/mtp_tune/; logged refusal)
   SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] -> in-pod torch.profiler summary
                                ("[suffix-prof]" lines; fail-soft)
+  SUFFIX_SAMPLER_WARMUP=0   -> disable the DEFAULT-ON boot JIT of the top-k/
+                               top-p sampler kernels (V2 runner; fail-soft)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -243,6 +245,21 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
         import sys
         print(f"[suffix mtp-tune] install failed (tuning off): {exc!r}",
               file=sys.stderr, flush=True)
+
+# Sampler warmup (suffix_hybrid/sampler_warmup.py): DEFAULT ON,
+# SUFFIX_SAMPLER_WARMUP=0 disables. Wraps the V2 worker's warmup_kernels to
+# compile vLLM's top-k/top-p Triton variants at boot (the V2 Sampler never
+# registers them; prod saw "JIT compilation during inference: _topp_sb_*").
+# Hook only fires on import of vllm.v1.worker.gpu_worker; failure = log line.
+if os.environ.get("SUFFIX_SAMPLER_WARMUP", "1").strip() != "0":
+    try:
+        from suffix_hybrid.sampler_warmup import (
+            install_post_import_hook as _sw_hook)
+        _sw_hook()
+    except Exception as exc:  # noqa: BLE001 - latency-only feature
+        import sys
+        print(f"[suffix sampler-warmup] hook install failed (warmup off): "
+              f"{exc!r}", file=sys.stderr, flush=True)
 
 # In-pod engine-step profiler (suffix_hybrid/step_profiler.py):
 # SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] profiles N EngineCore steps once
