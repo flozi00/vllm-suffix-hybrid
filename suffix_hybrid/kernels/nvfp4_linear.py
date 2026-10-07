@@ -35,6 +35,27 @@ Integration point (no fork, no _custom_ops patching):
     ``input_quant_key() == kNvfp4Dynamic`` inherited) run our GEMM on vLLM's
     packed activation + swizzled scales (kernel asf_mode 1).
 
+Load-time cold-L2 AUTOROUTE (``SUFFIX_NVFP4_GEMM_AUTOROUTE``, default ON
+with the gate; ``=0`` off): the first layer of every (N, K) not pinned by
+``SUFFIX_NVFP4_GEMM_ROUTE`` times OUR GEMM vs the parent FlashInfer path on
+its real weights, both input routes (bf16 / vLLM-prequantized: the op picks
+per call), at M in AUTOROUTE_MS (<= the M cap), each from a CUDA graph with
+the L2 flushed before every replay (read of a 2x-L2 scratch: serving's
+regime, where a layer's weights were last touched a whole step ago; warm
+replays made ours look 2x faster than it serves on qwen 27B), median of
+AUTOROUTE_REPS. FlashInfer is autotuned first (its serving tactic). Route
+per (shape, input route) = the largest M prefix where ours *
+(1 + margin) <= FlashInfer (``SUFFIX_NVFP4_GEMM_AUTOROUTE_MARGIN``, default
+0.03); never winning -> FlashInfer only. Unless ``SUFFIX_NVFP4_GEMM_PF``
+pins it, ours is timed at each L2-prefetch lookahead in nvfp4_gemm.PF_AUTO
+and the faster one is served (bit-identical outputs either way). Timings
+are cached as JSON (``SUFFIX_NVFP4_GEMM_AUTOROUTE_CACHE``, default
+~/.cache/suffix_hybrid/nvfp4_gemm_autoroute.json) keyed by GPU name, shape,
+cubin sha256, FlashInfer version and the launch plans, so restarts skip the
+timing; startup timing is bounded by AUTOROUTE_BUDGET_S (later shapes ->
+FlashInfer, logged). Lines: ``AUTOROUTE NxK: ...`` per shape, ``AUTOROUTE
+summary`` at the first forward.
+
 Startup (fatal when the gate is on): oxide manifest has ``nvfp4_gemm``,
 driver loads the cubin (``oxide_kernels.ensure_loaded``), SM family 12, and a
 per-(N, K) LAYER ORACLE on the real checkpoint weights at M in {1, 5, 16,
@@ -61,8 +82,10 @@ torch's current stream -> CUDA-graph capturable.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 
 GATE = "SUFFIX_NVFP4_GEMM"
 MARKER = "[suffix nvfp4-gemm]"
@@ -76,9 +99,17 @@ ORACLE_MS = (1, 5, 16, 17, 40, 64)
 # Filled from the in-pod bench (python -m suffix_hybrid.kernels.nvfp4_gemm
 # bench prints the suggested ROUTE); empty = every eligible shape up to MAX_M.
 DEFAULT_ROUTE: dict = {}
+AUTOROUTE_ENV = "SUFFIX_NVFP4_GEMM_AUTOROUTE"
+MARGIN_ENV = "SUFFIX_NVFP4_GEMM_AUTOROUTE_MARGIN"
+CACHE_ENV = "SUFFIX_NVFP4_GEMM_AUTOROUTE_CACHE"
+AUTOROUTE_MS = (1, 2, 4, 8, 16, 24, 32, 48, 64)
+AUTOROUTE_REPS = 15
+AUTOROUTE_BUDGET_S = 20.0
+ROUTES = ("bf16", "prequant")
 _state = {"armed": False, "oracle": {}, "layers_ours": 0, "layers_stock": 0,
           "ws": {}, "instances": 0, "shapes": {}, "checked": False, "hook": None,
-          "layers": {}, "captured": {}, "graph_logged": set()}
+          "layers": {}, "captured": {}, "graph_logged": set(), "autoroute": {},
+          "ar_s": 0.0, "sha": ""}
 OP_NS = "suffix_nvfp4"
 _LIB = None
 
@@ -123,20 +154,29 @@ def _note_capture(key: str, m: int) -> None:
     seen = _state["captured"].setdefault(m, set())
     seen.add(key)
     want = sum(1 for _, ly in _state["layers"].values()
-               if ly._sfx_nvfp4 is not None and m <= ly._sfx_nvfp4["max_m"])
+               if ly._sfx_nvfp4 is not None and m <= _served_max(ly._sfx_nvfp4))
     if len(seen) >= want and m not in _state["graph_logged"]:
         _state["graph_logged"].add(m)
         _log(f"NVFP4-GEMM in-graph: {len(seen)} layers captured on ours at M={m}")
 
 
+def _served_max(cfg, prequant: bool | None = None) -> int:
+    """The layer's max M on ours for an input route (None: the route the op
+    last saw; cfg without "max_m_q" = one max for both routes)."""
+    q = cfg.get("q_seen", False) if prequant is None else prequant
+    return cfg.get("max_m_q", cfg["max_m"]) if q else cfg["max_m"]
+
+
 def _op_impl(x, xsf, n: int, layer: str):
     """x: bf16 [M, K] (xsf None) or vLLM-prequantized packed [M, K/2] u8 with
     its swizzled scales xsf. -> bf16 [M, n]. Our kernel for 1 <= M <= the
-    layer's max M, else the parent's (stock FlashInfer) apply_weights."""
+    layer's max M of that input route, else the parent's (stock FlashInfer)
+    apply_weights."""
     kernel, ly = _state["layers"][layer]
     cfg = ly._sfx_nvfp4
     m = x.shape[0]
-    if not 1 <= m <= cfg["max_m"]:
+    cfg["q_seen"] = xsf is not None
+    if not 1 <= m <= _served_max(cfg):
         return kernel._stock(ly, x, xsf)
     out = kernel._ours(ly, cfg, x if xsf is None else None,
                        None if xsf is None else (x, xsf))
@@ -205,6 +245,129 @@ def layer_max_m(n: int, k: int, max_m: int, route: dict) -> int:
     return min(max_m, route.get((n, k), max_m))
 
 
+def autoroute_on() -> bool:
+    return os.environ.get(AUTOROUTE_ENV, "1").strip() != "0"
+
+
+def margin_env() -> float:
+    raw = os.environ.get(MARGIN_ENV, "").strip()
+    try:
+        v = float(raw) if raw else 0.03
+    except ValueError:
+        v = -1.0
+    if not 0.0 <= v < 1.0:
+        raise ValueError(f"{MARGIN_ENV}={raw!r}: want a fraction in [0, 1)")
+    return v
+
+
+def autoroute_ms(cap: int) -> list:
+    """Timed M points up to the M cap (the cap itself always included)."""
+    return sorted({m for m in AUTOROUTE_MS if m <= cap} | {cap})
+
+
+def decide(times: dict, margin: float) -> dict:
+    """times {route: {"fi": {M: us}, "pf<p>": {M: us}, ...}} -> {route:
+    (max M on ours, pf)}: pf = the lookahead with the lowest summed time,
+    max M = the largest timed-M prefix where ours * (1 + margin) <= fi (M
+    between timed points beyond it -> FlashInfer; 0 = never ours)."""
+    from suffix_hybrid.kernels.nvfp4_gemm import route_from_bench
+    out = {}
+    for r, t in times.items():
+        fi = t["fi"]
+        pf = min((int(c[2:]) for c in t if c != "fi"), key=lambda p: sum(t[f"pf{p}"].values()))
+        ours = t[f"pf{pf}"]
+        res = {(0, 0, m): (fi[m], ours[m]) for m in fi}
+        out[r] = (route_from_bench(res, sorted(fi), margin)[(0, 0)], pf)
+    return out
+
+
+def autoroute_line(n: int, k: int, times: dict, dec: dict, note: str = "") -> str:
+    """One log line per shape: route per input route, then ours/fi us per
+    timed M (bf16|prequant)."""
+    head = " / ".join(f"ours<=M{dec[r][0]} {r} (pf {dec[r][1]})" for r in dec)
+    pts = ", ".join(
+        f"M={m}: " + "|".join(f"{times[r][f'pf{dec[r][1]}'][m]:.1f}/{times[r]['fi'][m]:.1f}"
+                              for r in dec)
+        for m in sorted(next(iter(times.values()))["fi"]))
+    return f"AUTOROUTE {n}x{k}: {head} (ours/fi us {'|'.join(dec)} at {pts}){note}"
+
+
+def cache_path() -> str:
+    return os.environ.get(CACHE_ENV) or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+        "suffix_hybrid", "nvfp4_gemm_autoroute.json")
+
+
+def cache_get(key: str):
+    """Timings stored under `key` ({route: {path: {M: us}}}), or None."""
+    try:
+        with open(cache_path()) as f:
+            hit = json.load(f).get(key)
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(hit, dict):
+        return None
+    return {r: {c: {int(m): float(us) for m, us in v.items()} for c, v in t.items()}
+            for r, t in hit.items()}
+
+
+def cache_put(key: str, times: dict) -> None:
+    """Merge-write (atomic rename: TP ranks may write concurrently; last one
+    wins, each entry is a complete measurement). Best effort."""
+    path = cache_path()
+    try:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        data[key] = times
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as exc:
+        _log(f"AUTOROUTE cache not written ({path}): {exc}")
+
+
+def autoroute_shape(n: int, k: int, cap: int, dev_name: str, time_fn) -> dict:
+    """{route: (max M on ours, pf)} for one (N, K): cached cold-L2 timings,
+    or time_fn(ms, pfs) -> {route: {"fi" | "pf<p>": {M: us}}} now (the
+    kernel class's _time_shape; mocked on CPU). Over the startup budget ->
+    FlashInfer for both routes. Logs the AUTOROUTE line."""
+    import hashlib
+
+    from suffix_hybrid.kernels.nvfp4_gemm import PF_AUTO, pf_env, plan
+    ms = autoroute_ms(cap)
+    pfs = (pf_env(),) if pf_env() is not None else PF_AUTO
+    try:
+        import flashinfer
+        fi_ver = getattr(flashinfer, "__version__", "?")
+    except ImportError:
+        fi_ver = "-"
+    # the launch plans timed (fusion env, split policy, pf): a change re-times
+    plans = [(q, p, m, plan(n, k, m, prequant=q, pf=p)["flags"], plan(n, k, m)["splits"])
+             for q in (False, True) for p in pfs for m in ms]
+    sig = hashlib.sha256(repr((plans, AUTOROUTE_REPS)).encode()).hexdigest()[:12]
+    ckey = "|".join((dev_name, f"{n}x{k}", _state["sha"][:12], f"fi{fi_ver}", sig))
+    times, note = cache_get(ckey), " [cached]"
+    if times is None:
+        if _state["ar_s"] > AUTOROUTE_BUDGET_S:
+            _log(f"AUTOROUTE {n}x{k}: startup budget {AUTOROUTE_BUDGET_S:.0f} s spent -> "
+                 "FlashInfer (a restart reuses the cached shapes and times the rest)")
+            return {r: (0, 0) for r in ROUTES}
+        t0 = time.monotonic()
+        times = time_fn(ms, pfs)
+        dt = time.monotonic() - t0
+        _state["ar_s"] += dt
+        cache_put(ckey, times)
+        note = f" [timed {dt:.1f} s]"
+    dec = decide(times, margin_env())
+    _log(autoroute_line(n, k, times, dec, note))
+    return dec
+
+
 def eligible(n: int, k: int, rows: int, pad_bytes: int) -> str | None:
     """Why a layer with N = output_size_per_partition, K, and `rows` weight
     rows (FlashInfer pads N to % 32 with zero rows; we read the first N)
@@ -255,10 +418,13 @@ def _make_kernel_cls():
 
     from suffix_hybrid.kernels.nvfp4_gemm import (
         PARAMS,
+        PF_SHIFT,
+        _graph_us,
         dequant_torch,
         exact_ref,
         fused_vs_old,
         oracle_ok,
+        pf_env,
         plan,
         plan_str,
         quantize,
@@ -291,44 +457,109 @@ def _make_kernel_cls():
             n = layer.output_size_per_partition
             k = layer.weight.shape[1] * 2
             why = eligible(n, k, layer.weight.shape[0], nvfp4_weight_padding_bytes(layer))
-            max_m = layer_max_m(n, k, max_m_env(), route_table())
-            if why is None and max_m < 1:
-                why = f"{ROUTE_ENV} routes N={n} K={k} to FlashInfer"
+            cap, route = max_m_env(), route_table()
             layer._sfx_nvfp4 = None
-            route = "flashinfer" if why is not None else f"ours<=M{max_m}"
-            key = f"{n}x{k}:{route}"
+            cfg = None
+            if why is None:
+                dev = layer.weight.device
+                oxide_kernels.ensure_loaded(FAMILY, dev.index, params=PARAMS)
+                _workspace(dev, n, k, cap)
+                # One device sync per layer at LOAD time; never in forward.
+                cfg = dict(n=n, k=k, alpha=float(layer.alpha.item()),
+                           g=float(layer.input_global_scale_inv.item()),
+                           # rows past N are FlashInfer's zero padding (N % 32)
+                           w=layer.weight[:n])
+                if (n, k) in route:  # explicit SUFFIX_NVFP4_GEMM_ROUTE / DEFAULT_ROUTE
+                    mm = layer_max_m(n, k, cap, route)
+                    dec = {r: (mm, pf_env() or 0) for r in ROUTES}
+                elif not autoroute_on():
+                    dec = {r: (cap, pf_env() or 0) for r in ROUTES}
+                else:
+                    if (n, k) not in _state["autoroute"]:
+                        _state["autoroute"][(n, k)] = autoroute_shape(
+                            n, k, cap, torch.cuda.get_device_name(dev),
+                            lambda ms, pfs: self._time_shape(layer, cfg, ms, pfs))
+                    dec = _state["autoroute"][(n, k)]
+                cfg.update(max_m=dec["bf16"][0], max_m_q=dec["prequant"][0])
+                if max(cfg["max_m"], cfg["max_m_q"]) < 1:
+                    why = (f"{ROUTE_ENV} routes N={n} K={k} to FlashInfer" if (n, k) in route
+                           else "AUTOROUTE: FlashInfer faster at every timed M (cold L2)")
+            if why is not None:
+                route_s = "flashinfer"
+            elif cfg["max_m"] == cfg["max_m_q"]:
+                route_s = f"ours<=M{cfg['max_m']}"
+            else:
+                route_s = f"ours<=M{cfg['max_m']},prequant<=M{cfg['max_m_q']}"
+            key = f"{n}x{k}:{route_s}"
             _state["shapes"][key] = _state["shapes"].get(key, 0) + 1
             if why is not None:
                 _state["layers_stock"] += 1
                 _log(f"layer N={n} K={k} stays on FlashInfer CUTLASS: {why}")
                 return
-            dev = layer.weight.device
-            oxide_kernels.ensure_loaded(FAMILY, dev.index, params=PARAMS)
-            _workspace(dev, n, k, max_m)
-            # One device sync per layer at LOAD time; never in forward.
-            # (splits, fused flags) per M and route, fixed at load (graph-safe;
-            # SUFFIX_NVFP4_GEMM_FUSED read here, not in forward)
-            launch = {q: [(0, 0)] + [(pl["splits"], pl["flags"]) for pl in
-                                     (plan(n, k, m, prequant=q) for m in range(1, max_m + 1))]
-                      for q in (False, True)}
-            cfg = dict(n=n, k=k, max_m=max_m, alpha=float(layer.alpha.item()),
-                       g=float(layer.input_global_scale_inv.item()),
-                       # rows past N are FlashInfer's zero padding (N % 32)
-                       w=layer.weight[:n], launch=launch)
+            # (splits, flags) per M and input route, fixed at load (graph-safe;
+            # SUFFIX_NVFP4_GEMM_FUSED read here, not in forward); pf per route
+            top = max(cfg["max_m"], cfg["max_m_q"])
+            cfg["launch"] = {q: [(0, 0)] + [(pl["splits"], pl["flags"]) for pl in
+                                            (plan(n, k, m, prequant=q, pf=dec[r][1])
+                                             for m in range(1, top + 1))]
+                             for q, r in ((False, "bf16"), (True, "prequant"))}
             layer._sfx_nvfp4 = cfg
             cfg["key"] = register_layer(self, layer, getattr(layer, "prefix", ""))
             if (n, k) not in _state["oracle"]:
                 _state["oracle"][(n, k)] = self._layer_oracle(layer, cfg)
             _state["layers_ours"] += 1
 
-        def _ours(self, layer, cfg, x2d, qa2d=None, fused=None):
-            """`fused` None: the load-time plan; else plan(fused=...) (oracle)."""
+        def _time_shape(self, layer, cfg, ms, pfs):
+            """Cold-L2 median us of ours (each pf) and the parent FlashInfer
+            path, both input routes, at every M in ms: {route: {"fi" |
+            "pf<p>": {M: us}}}. GPU only; one 2x-L2 scratch per shape."""
+            from vllm._custom_ops import scaled_fp4_quant
+            n, k = cfg["n"], cfg["k"]
+            dev = layer.weight.device
+            l2 = int(getattr(torch.cuda.get_device_properties(dev), "L2_cache_size", 0)
+                     or 128 << 20)
+            buf = torch.zeros(max(2 * l2, 256 << 20) // 4, dtype=torch.float32, device=dev)
+            flush = lambda: buf.sum()  # reads: clean lines, no write-back in the window
+            try:
+                from flashinfer.autotuner import autotune
+            except ImportError:
+                autotune = None
+            gen = torch.Generator(device=dev).manual_seed(n * 7 + k)
+            amp = max(1.0, 448.0 * 6.0 / cfg["g"] / 20.0)  # the oracle's design point
+            times = {r: {"fi": {}, **{f"pf{p}": {} for p in pfs}} for r in ROUTES}
+            for m in ms:
+                x = (torch.randn(m, k, generator=gen, device=dev) * amp).bfloat16()
+                xq, xsf = scaled_fp4_quant(x, layer.input_global_scale_inv,
+                                           is_sf_swizzled_layout=True)
+                if autotune is not None:  # FlashInfer's serving tactic for this M
+                    with autotune(True):
+                        self._stock(layer, x)
+                        self._stock(layer, xq, xsf)
+                for r, xx, qa in (("bf16", x, None), ("prequant", None, (xq, xsf))):
+                    stock = ((lambda s: self._stock(layer, x)) if qa is None
+                             else (lambda s: self._stock(layer, xq, xsf)))
+                    times[r]["fi"][m] = _graph_us(stock, dev, AUTOROUTE_REPS, flush)
+                    for p in pfs:
+                        pl = plan(n, k, m, prequant=qa is not None, pf=p)
+                        times[r][f"pf{p}"][m] = _graph_us(
+                            lambda s, pl=pl, xx=xx, qa=qa: self._ours(
+                                layer, cfg, xx, qa, launch=(pl["splits"], pl["flags"])),
+                            dev, AUTOROUTE_REPS, flush)
+            del buf
+            torch.cuda.empty_cache()
+            return times
+
+        def _ours(self, layer, cfg, x2d, qa2d=None, fused=None, launch=None):
+            """`fused` None: the load-time plan; else plan(fused=...) (oracle).
+            `launch` (splits, flags): exactly that (autoroute / oracle)."""
             n = cfg["n"]
             dev = layer.weight.device
             aq, asf, partial, counters = _state["ws"][dev]
             stream = torch.cuda.current_stream(dev).cuda_stream
             m = (x2d if qa2d is None else qa2d[0]).shape[0]
-            if fused is None:
+            if launch is not None:
+                splits, flags = launch
+            elif fused is None:
                 splits, flags = cfg["launch"][qa2d is not None][m]
             else:
                 pl = plan(n, cfg["k"], m, fused=fused, prequant=qa2d is not None)
@@ -360,7 +591,8 @@ def _make_kernel_cls():
             # 2688 / g): a static global far above N(0,1) (SUFFIX_NVFP4_DENSE's
             # proven bounds) would otherwise zero most blocks on both paths.
             amp = max(1.0, 448.0 * 6.0 / cfg["g"] / 20.0)
-            ms = [m for m in ORACLE_MS if m <= cfg["max_m"]]
+            top = max(cfg["max_m"], cfg["max_m_q"])
+            ms = [m for m in ORACLE_MS if m <= top] or [top]
             aq_ws, asf_ws, _, counters = _state["ws"][dev]
             for m in ms:
                 x = (torch.randn(m, k, generator=gen, device=dev) * amp).bfloat16()
@@ -378,6 +610,20 @@ def _make_kernel_cls():
                             f"{MARKER} LAYER ORACLE FAIL N={n} K={k} M={m} "
                             f"{'prequant' if q else 'bf16'} {plan_str(plan(n, k, m, prequant=q))}: "
                             f"{diff} — refusing to serve with {GATE}=1")
+                # production plan with an L2 prefetch lookahead == the same
+                # launch without it, bit for bit (prefetch is a hint)
+                for q, args in ((False, (x,)), (True, (None, (xq, xsf)))):
+                    sp, fl = cfg["launch"][q][m]
+                    if fl >> PF_SHIFT:
+                        a = self._ours(layer, cfg, *args).view(torch.int16)
+                        b = self._ours(layer, cfg, *args,
+                                       launch=(sp, fl & ((1 << PF_SHIFT) - 1))).view(torch.int16)
+                        if not torch.equal(a, b):
+                            raise RuntimeError(
+                                f"{MARKER} LAYER ORACLE FAIL N={n} K={k} M={m} "
+                                f"{'prequant' if q else 'bf16'} pf={fl >> PF_SHIFT}: output "
+                                f"!= pf 0 ({int((a != b).sum())} elements) — refusing to "
+                                f"serve with {GATE}=1")
                 ours = self._ours(layer, cfg, x).float()  # production plan; aq/asf readback below
                 ours_q = self._ours(layer, cfg, None, (xq, xsf)).float()
                 exact = exact_ref(xq, xsf, layer.weight, layer.weight_scale,
@@ -429,7 +675,8 @@ def _make_kernel_cls():
             torch.cuda.synchronize(dev)
             plans = " ".join(f"M{m}:{plan(n, k, m)['tiles']}t/{plan(n, k, m)['splits']}s/"
                              f"{plan(n, k, m)['launches']}L" for m in ms)
-            _log(f"LAYER ORACLE PASS N={n} K={k} max_m={cfg['max_m']} [{plans}] "
+            _log(f"LAYER ORACLE PASS N={n} K={k} max_m={cfg['max_m']} "
+                 f"max_m_prequant={cfg['max_m_q']} [{plans}] "
                  f"max_rel_vs_flashinfer={worst:.2e} max_rel_vs_exact={worst_ref:.2e} "
                  f"(bf16 + prequant routes; single launch == old 3-launch bits)")
             return worst
@@ -565,6 +812,9 @@ def _first_forward_check(module, args):
     _log(f"NVFP4-GEMM SELECTION: NVFP4 dense linear kernel = SuffixNvFp4LinearKernel "
          f"({_state['instances']} instances; target quantization={tq}); per shape "
          f"(NxK:route x layers): {shapes}; layer census: {cen}")
+    ar = autoroute_summary()
+    if ar:
+        _log(ar)
     _log(summary())
 
 
@@ -600,6 +850,7 @@ def register():
     ent = [k for k in oxide_kernels.manifest()["kernels"] if k["name"] == FAMILY]
     if not ent:
         raise RuntimeError(f"{GATE}=1 but the oxide manifest has no {FAMILY!r} cubin")
+    _state["sha"] = ent[0]["sha256"]  # autoroute cache key: timings follow the cubin
     cls = _make_kernel_cls()
     earlier = [c.__name__ for c in _POSSIBLE_NVFP4_KERNELS.get(PlatformEnum.CUDA, [])
                if c is not cls]
@@ -613,11 +864,26 @@ def register():
     _state["hook"] = torch.nn.modules.module.register_module_forward_pre_hook(
         _first_forward_check)
     _state["armed"] = True
+    margin_env()  # malformed env: fail at startup
     routes = ",".join(f"{n}x{k}:{mm}" for (n, k), mm in route.items()) or "-"
+    routes += (f"; autoroute ON (cold L2, margin {margin_env():.0%}, cache {cache_path()})"
+               if autoroute_on() else "; autoroute OFF")
     _log(f"NVFP4-GEMM armed: SuffixNvFp4LinearKernel registered (M<={max_m} -> "
          f"sm_120a mxf4nvf4 SASS, sha256 {ent[0]['sha256'][:12]}; else FlashInfer "
          f"CUTLASS; route {routes}); disabled earlier candidates: {','.join(added) or '-'}")
     return _state
+
+
+def autoroute_summary() -> str | None:
+    ar = _state["autoroute"]
+    if not ar:
+        return None
+    on = {r: sum(1 for d in ar.values() if d[r][0] > 0) for r in ROUTES}
+    fi_only = sum(1 for d in ar.values() if all(d[r][0] == 0 for r in ROUTES))
+    return (f"AUTOROUTE summary: {len(ar)} shapes, ours serves {on['bf16']} (bf16) / "
+            f"{on['prequant']} (prequant), FlashInfer only {fi_only}; timing "
+            f"{_state['ar_s']:.1f} s (budget {AUTOROUTE_BUDGET_S:.0f} s), margin "
+            f"{margin_env():.0%}")
 
 
 def summary() -> str:

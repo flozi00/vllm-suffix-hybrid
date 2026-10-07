@@ -295,3 +295,125 @@ def test_in_graph_log_once_per_captured_m(monkeypatch, capsys):
     op(x[:8], None, 48, k2._sfx_nvfp4["key"])  # FULL + PIECEWISE re-capture: no repeat
     err = capsys.readouterr().err
     assert err.count("NVFP4-GEMM in-graph: 2 layers captured on ours at M=8") == 1
+
+
+# --- load-time cold-L2 autoroute (timing mocked: the GPU path is in-pod) ---
+def _times(fi, **ours):
+    """{route: {"fi": {M: us}, "pf<p>": {M: us}}} for both routes."""
+    ms = sorted(fi)
+    t = {"fi": dict(fi), **{k: dict(zip(ms, v)) for k, v in ours.items()}}
+    return {r: {c: dict(v) for c, v in t.items()} for r in nl.ROUTES}
+
+
+def test_autoroute_ms_clips_to_cap():
+    assert nl.autoroute_ms(64) == [1, 2, 4, 8, 16, 24, 32, 48, 64]
+    assert nl.autoroute_ms(40) == [1, 2, 4, 8, 16, 24, 32, 40]
+    assert nl.autoroute_ms(16) == [1, 2, 4, 8, 16]
+
+
+def test_decide_prefix_margin_and_pf():
+    fi = {1: 100.0, 2: 100.0, 4: 100.0, 8: 100.0}
+    # pf0 wins to M=2 (98 at M=4 is inside the 3 % margin: not a win)
+    t = _times(fi, pf0=[90.0, 96.0, 98.0, 80.0], pf8=[95.0, 99.0, 99.0, 99.0])
+    assert nl.decide(t, 0.03) == {"bf16": (2, 0), "prequant": (2, 0)}
+    assert nl.decide(t, 0.0)["bf16"] == (8, 0)  # contiguous prefix to the end
+    # the faster lookahead (summed over M) is the one served and judged
+    t = _times(fi, pf0=[200.0] * 4, pf8=[50.0, 60.0, 70.0, 101.0])
+    assert nl.decide(t, 0.03)["bf16"] == (4, 8)
+    # never winning at M=1 -> FlashInfer only, even if later M would win
+    t = _times(fi, pf0=[150.0, 10.0, 10.0, 10.0])
+    assert nl.decide(t, 0.03)["bf16"] == (0, 0)
+    # routes decide independently (prequant skips our quant: can win alone)
+    t = _times(fi, pf0=[150.0] * 4)
+    t["prequant"]["pf0"] = {m: 50.0 for m in fi}
+    assert nl.decide(t, 0.03) == {"bf16": (0, 0), "prequant": (8, 0)}
+
+
+def test_margin_env(monkeypatch):
+    monkeypatch.delenv(nl.MARGIN_ENV, raising=False)
+    assert nl.margin_env() == 0.03
+    monkeypatch.setenv(nl.MARGIN_ENV, "0.1")
+    assert nl.margin_env() == 0.1
+    for bad in ("x", "-0.1", "1.5"):
+        monkeypatch.setenv(nl.MARGIN_ENV, bad)
+        with pytest.raises(ValueError, match=nl.MARGIN_ENV):
+            nl.margin_env()
+
+
+def test_autoroute_default_on(monkeypatch):
+    monkeypatch.delenv(nl.AUTOROUTE_ENV, raising=False)
+    assert nl.autoroute_on()
+    monkeypatch.setenv(nl.AUTOROUTE_ENV, "0")
+    assert not nl.autoroute_on()
+
+
+def test_cache_roundtrip_and_corrupt_file(monkeypatch, tmp_path):
+    path = tmp_path / "sub" / "ar.json"
+    monkeypatch.setenv(nl.CACHE_ENV, str(path))
+    assert nl.cache_get("k") is None  # no file
+    t = _times({1: 10.0, 8: 20.0}, pf0=[5.0, 6.0])
+    nl.cache_put("k", t)
+    nl.cache_put("k2", t)  # merge, not overwrite
+    assert nl.cache_get("k") == t and nl.cache_get("k2") == t  # int M keys restored
+    path.write_text("{not json")
+    assert nl.cache_get("k") is None
+    nl.cache_put("k3", t)  # a corrupt file is replaced, never fatal
+    assert nl.cache_get("k3") == t
+
+
+def test_autoroute_shape_times_once_then_caches(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv(nl.CACHE_ENV, str(tmp_path / "ar.json"))
+    monkeypatch.delenv("SUFFIX_NVFP4_GEMM_PF", raising=False)
+    monkeypatch.setattr(nl, "_state", dict(nl._state, ar_s=0.0, sha="abc123"))
+    calls = []
+
+    def time_fn(ms, pfs):  # ours wins to M=8 on qwen-like cold numbers
+        calls.append((tuple(ms), tuple(pfs)))
+        fi = {m: 40.0 + m for m in ms}
+        return {r: {"fi": fi, **{f"pf{p}": {m: (30.0 if m <= 8 else 90.0) - p for m in ms}
+                                 for p in pfs}} for r in nl.ROUTES}
+
+    dec = nl.autoroute_shape(34816, 5120, 64, "RTX 5090", time_fn)
+    assert dec == {"bf16": (8, 8), "prequant": (8, 8)}
+    assert calls == [((1, 2, 4, 8, 16, 24, 32, 48, 64), (0, 8))]
+    err = capsys.readouterr().err
+    assert ("AUTOROUTE 34816x5120: ours<=M8 bf16 (pf 8) / ours<=M8 prequant (pf 8) "
+            "(ours/fi us bf16|prequant at M=1: 22.0/41.0|22.0/41.0, M=2:") in err
+    assert "[timed" in err
+    assert nl.autoroute_shape(34816, 5120, 64, "RTX 5090", time_fn) == dec
+    assert len(calls) == 1 and "[cached]" in capsys.readouterr().err
+    # another GPU / cubin / plan is another key: timed again
+    nl.autoroute_shape(34816, 5120, 64, "RTX PRO 6000", time_fn)
+    monkeypatch.setenv("SUFFIX_NVFP4_GEMM_PF", "0")  # pinned lookahead: one candidate
+    nl.autoroute_shape(34816, 5120, 64, "RTX 5090", time_fn)
+    assert calls[1:] == [(calls[0][0], (0, 8)), (calls[0][0], (0,))]
+
+
+def test_autoroute_budget_sends_untimed_shapes_to_flashinfer(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv(nl.CACHE_ENV, str(tmp_path / "ar.json"))
+    monkeypatch.setattr(nl, "_state", dict(nl._state, ar_s=nl.AUTOROUTE_BUDGET_S + 1, sha=""))
+    dec = nl.autoroute_shape(5120, 17408, 64, "g", lambda ms, pfs: pytest.fail("timed"))
+    assert dec == {"bf16": (0, 0), "prequant": (0, 0)}
+    assert "budget" in capsys.readouterr().err
+
+
+def test_autoroute_summary(monkeypatch):
+    monkeypatch.setattr(nl, "_state", dict(nl._state, ar_s=2.5, autoroute={
+        (1, 1): {"bf16": (8, 0), "prequant": (16, 8)},
+        (2, 2): {"bf16": (0, 0), "prequant": (0, 0)},
+        (3, 3): {"bf16": (0, 0), "prequant": (4, 0)}}))
+    line = nl.autoroute_summary()
+    assert "3 shapes, ours serves 1 (bf16) / 2 (prequant), FlashInfer only 1" in line
+    monkeypatch.setattr(nl, "_state", dict(nl._state, autoroute={}))
+    assert nl.autoroute_summary() is None
+
+
+def test_op_routes_by_input_route_max(monkeypatch):
+    """bf16 and prequant inputs have their own autoroute max M."""
+    kern, layer, op = _stub_layer(monkeypatch, max_m=0)
+    layer._sfx_nvfp4["max_m_q"] = 8
+    key = layer._sfx_nvfp4["key"]
+    op(torch.zeros(4, 256, dtype=torch.bfloat16), None, 48, key)
+    op(torch.zeros(4, 128, dtype=torch.uint8), torch.zeros(128, 4), 48, key)
+    op(torch.zeros(9, 128, dtype=torch.uint8), torch.zeros(128, 4), 48, key)
+    assert [c[0] for c in kern.calls] == ["stock", "ours", "stock"]

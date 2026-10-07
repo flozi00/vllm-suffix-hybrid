@@ -20,6 +20,8 @@ const GEMM_F: [&str; 4] = ["nvfp4_gemm_f1", "nvfp4_gemm_f2", "nvfp4_gemm_f3", "n
 /// `fused` flag bits (kernel FUSE_QUANT / FUSE_REDUCE).
 pub const FUSE_QUANT: u32 = 1;
 pub const FUSE_REDUCE: u32 = 2;
+/// flags bits 8..15: L2 prefetch lookahead in k64 steps (a hint; nvfp4_gemm_f only).
+pub const PF_MASK: u32 = 0xFF << 8;
 /// Split-K fixup staging budget in floats (ch splits x M x 32 + the M x 32
 /// running sums <= this): see `fused_layout`.
 pub const STAGE_FLOATS: usize = 4096;
@@ -266,7 +268,7 @@ fn fused_args(
     device: usize,
     x: (u64, usize, f32),
 ) -> PyResult<Fused> {
-    if fused & !(FUSE_QUANT | FUSE_REDUCE) != 0 {
+    if fused & !(FUSE_QUANT | FUSE_REDUCE | PF_MASK) != 0 {
         return Err(PyValueError::new_err(format!("fused={fused}: unknown flag bits")));
     }
     let mut cptr = 0;
@@ -462,7 +464,7 @@ pub fn nvfp4_gemm_q_cuda<'py>(
 
 #[cfg(test)]
 mod tests {
-    use super::{fused_layout, split_ranges, tiles_for, FUSE_QUANT, FUSE_REDUCE, GEMM};
+    use super::{fused_layout, split_ranges, tiles_for, FUSE_QUANT, FUSE_REDUCE, GEMM, PF_MASK};
 
     #[test]
     fn tiles_pick_the_entry_from_m_only() {
@@ -492,5 +494,8 @@ mod tests {
         assert_eq!(fused_layout(64, 8, 6, FUSE_REDUCE), (16 + 2 * 64 * 32 * 4, 1));
         assert_eq!(fused_layout(5, 40, 1, FUSE_QUANT), (16 + 5 * (40 * 32 + 16) + 5 * 4 * 41, 1));
         assert_eq!(fused_layout(17, 5, 2, 0), (16, 2));
+        // prefetch bits never change the smem plan
+        assert_eq!(fused_layout(16, 14, 3, both | 8 << 8), fused_layout(16, 14, 3, both));
+        assert_eq!(fused_layout(17, 5, 2, PF_MASK), (16, 2));
     }
 }

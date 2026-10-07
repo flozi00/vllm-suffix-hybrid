@@ -123,11 +123,30 @@ FUSED_QUANT_MAX_M = 64  # ponytail: static; bench old-vs-fused rows retune it
 # linear); from M=5 the last-CTA split-K fixup is a serial tail (HC down
 # 336x10240 S=54: 10 -> 22 us at M=5, 60 us at M=16). Fuse only up to this M.
 FUSED_MAX_M_ENV = "SUFFIX_NVFP4_GEMM_FUSED_MAX_M"
+# L2 weight prefetch lookahead (k64 steps, 0 = off) in flag bits 8..15 of the
+# nvfp4_gemm_f entries (a hint: same loads, same f32 op order -> bit-identical
+# outputs; kernels-oxide/nvfp4_gemm `pf_head` / `pf_step`). Unset = the
+# load-time autoroute times PF_AUTO per shape and keeps the faster; a value
+# pins it (0 = the pre-2026-10-07 kernel path exactly).
+PF_ENV = "SUFFIX_NVFP4_GEMM_PF"
+PF_SHIFT, PF_MAX = 8, 255
+PF_AUTO = (0, 8)
 
 
 def fused_max_m() -> int:
     import os
     return int(os.environ.get(FUSED_MAX_M_ENV, "1") or 1)
+def pf_env() -> int | None:
+    """SUFFIX_NVFP4_GEMM_PF: None (unset: autoroute picks from PF_AUTO, else 0)
+    or the pinned lookahead 0..PF_MAX. Loud on anything else."""
+    raw = os.environ.get(PF_ENV, "").strip()
+    if not raw:
+        return None
+    if not raw.isdigit() or int(raw) > PF_MAX:
+        raise ValueError(f"{PF_ENV}={raw!r}: want an integer in 0..{PF_MAX}")
+    return int(raw)
+
+
 QUANT_SMEM_MAX = 20 * 1024  # prologue A+scales: keeps >= 4 CTAs/SM (TARGET_CTAS)
 
 
@@ -176,11 +195,13 @@ def fused_layout(m: int, kps: int, splits: int, flags: int) -> tuple:
 
 
 def plan(n: int, k: int, m: int, splits: int | None = None, fused: str | bool | None = None,
-         prequant: bool = False) -> dict:
+         prequant: bool = False, pf: int | None = None) -> dict:
     """What the host op launches for (N, K, M): GEMM entry, grid, k64 steps
     per split, launched splits (no empty trailing split), and the fusion
     flags (`fused`: None = SUFFIX_NVFP4_GEMM_FUSED, True/"all", "reduce",
-    False/"off"; `prequant` = vLLM-quantized input: nothing to quantize)."""
+    False/"off"; `prequant` = vLLM-quantized input: nothing to quantize;
+    `pf` = L2 prefetch lookahead, None = SUFFIX_NVFP4_GEMM_PF or 0; pf > 0
+    always launches the nvfp4_gemm_f entry, fusion bits as planned)."""
     tiles = tiles_for(m)
     steps = k // 64
     s = splits_for(n, k, m) if splits is None else splits
@@ -193,19 +214,22 @@ def plan(n: int, k: int, m: int, splits: int | None = None, fused: str | bool | 
     fq = (mode == "all" and not prequant and m <= FUSED_QUANT_MAX_M
           and quant_smem(m, kps) <= QUANT_SMEM_MAX)
     fr = mode != "off" and s > 1
-    flags = FUSE_QUANT * fq | FUSE_REDUCE * fr
+    pf = (pf_env() or 0) if pf is None else pf
+    if not 0 <= pf <= PF_MAX:
+        raise ValueError(f"pf={pf}: want 0..{PF_MAX}")
+    flags = FUSE_QUANT * fq | FUSE_REDUCE * fr | pf << PF_SHIFT
     smem, ch = fused_layout(m, kps, s, flags)
     return dict(tiles=tiles, splits=s, kps=kps, grid=grid, ctas=grid[0] * grid[1],
                 entry=f"nvfp4_gemm_{'f' if flags else 't'}{tiles}",
                 partial=(s * m * n if s > 1 else 0), fused_quant=fq, fused_reduce=fr,
-                flags=flags, smem=smem if flags else 0, ch=ch,
+                flags=flags, pf=pf, smem=smem if flags else 0, ch=ch,
                 launches=1 + (not fq and not prequant) + (s > 1 and not fr))
 
 
 def plan_str(p: dict) -> str:
     fz = ("q" if p["fused_quant"] else "") + ("r" if p["fused_reduce"] else "")
     return (f"tiles={p['tiles']} splits={p['splits']} kps={p['kps']} "
-            f"ctas={p['ctas']} fused={fz or '-'} launches={p['launches']}")
+            f"ctas={p['ctas']} fused={fz or '-'} pf={p['pf']} launches={p['launches']}")
 
 
 def partial_elems(n: int, k: int, max_m: int = MAX_M) -> int:
@@ -806,7 +830,11 @@ def oracle(ms=ORACLE_MS, shapes=("mlp_gate_up", "mlp_down", "gdn_in_proj_qkvz", 
     return f"{MARKER} NVFP4-GEMM ORACLE PASS ({len(lines)} cases, sm_120a mxf4nvf4 mma)"
 
 
-def _graph_us(fn, dev, iters):
+def _graph_us(fn, dev, iters, flush=None):
+    """us per call of fn(stream) replayed from a CUDA graph: the mean of
+    back-to-back replays (L2-WARM), or with `flush` (a callable run before
+    EVERY replay, outside the timed window: a cold L2 per call, serving's
+    regime — nvfp4_moe._graph_us) the MEDIAN over `iters` replays."""
     import torch
     s = torch.cuda.Stream(dev)
     s.wait_stream(torch.cuda.current_stream(dev))
@@ -814,11 +842,22 @@ def _graph_us(fn, dev, iters):
         fn(s)  # warm (FlashInfer tactic selection happens here)
         torch.cuda.synchronize(dev)
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=s):
+        # thread_local: another thread's CUDA calls (load-time autoroute runs
+        # inside vLLM's model load) must not invalidate this capture
+        with torch.cuda.graph(g, stream=s, capture_error_mode="thread_local"):
             fn(s)
     torch.cuda.current_stream(dev).wait_stream(s)
     g.replay()
     torch.cuda.synchronize(dev)
+    if flush is not None:
+        ev = [(torch.cuda.Event(True), torch.cuda.Event(True)) for _ in range(iters)]
+        for a, b in ev:
+            flush()
+            a.record()
+            g.replay()
+            b.record()
+        torch.cuda.synchronize(dev)
+        return sorted(a.elapsed_time(b) for a, b in ev)[iters // 2] * 1000.0
     e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
     e0.record()
     for _ in range(iters):
@@ -828,9 +867,10 @@ def _graph_us(fn, dev, iters):
     return e0.elapsed_time(e1) * 1000.0 / iters
 
 
-def route_from_bench(res: dict, ms=BENCH_MS) -> dict:
-    """{(N, K): largest benched M such that ours won at every benched M' <=
-    it} from bench results {(N, K, M): (vllm_us, ours_us)}; 0 = never."""
+def route_from_bench(res: dict, ms=BENCH_MS, margin: float = 0.0) -> dict:
+    """{(N, K): largest benched M such that ours won (by >= `margin`: ours *
+    (1 + margin) <= vllm) at every benched M' <= it} from bench results
+    {(N, K, M): (vllm_us, ours_us)}; 0 = never."""
     out = {}
     for (n, k) in dict.fromkeys((n, k) for n, k, _ in res):
         best = 0
@@ -838,7 +878,7 @@ def route_from_bench(res: dict, ms=BENCH_MS) -> dict:
             if (n, k, m) not in res:
                 continue
             v, o = res[(n, k, m)]
-            if o > v:
+            if o * (1.0 + margin) > v:
                 break
             best = m
         out[(n, k)] = best
