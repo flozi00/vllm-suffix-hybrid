@@ -47,8 +47,10 @@ LOG2E = 1.4426950408889634
 MAX_Q_LEN = 16
 # Plain q_len-1 decode batches up to this width run on K2 (no FlashInfer
 # plan/indices/host work per KV group); wider ones stay on FA2's decode
-# kernel, which is faster per call there (oracle --bench q1 rows).
-K2_Q1_MAX_BATCH = 8
+# kernel, which is faster per call there (oracle --bench q1 rows) -- but
+# FA2's per-step plan costs host copies/syncs the kernel bench never sees,
+# so the cap is tunable end to end via SUFFIX_SM120_NVP4KV_Q1_MAX_BATCH.
+K2_Q1_MAX_BATCH = int(os.environ.get("SUFFIX_SM120_NVP4KV_Q1_MAX_BATCH", "8"))
 
 _PLANS: dict = {}
 _SMS: dict = {}
