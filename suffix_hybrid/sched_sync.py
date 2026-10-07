@@ -60,6 +60,13 @@ Arming (checked once, per process, at install):
   * SUFFIX_HYBRID_SYNC_SCHED=0  → never arm (explicit operator opt-out)
   * else SUFFIX_HYBRID_WRAP=1   → arm (prod never sets WRAP, so this is
     dev-pool-only by construction)
+
+SUFFIX_HYBRID_ASYNC=1 (suffix_hybrid/async_spec.py, read per config build):
+the wrap does NOT force sync. It only neutralizes
+speculative_config.disable_padded_drafter_batch=True (the V2 runner never
+reads it; its only effect is VllmConfig turning async off,
+config/vllm.py:1427-1471) and leaves async_scheduling as the operator set
+it (None resolves to True for MTP).
 """
 import functools
 import importlib.util
@@ -130,6 +137,11 @@ def install_post_import_hook() -> None:
     finder = _Finder()
     setattr(finder, _marker, True)
     sys.meta_path.insert(0, finder)
+    if os.environ.get("SUFFIX_HYBRID_ASYNC", "").strip() == "1":
+        print("suffix_hybrid sched-sync: armed in ASYNC mode (sync NOT "
+              "forced; disable_padded_drafter_batch neutralized)",
+              file=sys.stderr, flush=True)
+        return
     print("suffix_hybrid sched-sync: armed (async scheduling will be forced "
           "OFF for this process tree when the wrap is active)",
           file=sys.stderr, flush=True)
@@ -145,6 +157,8 @@ def _patch(module) -> None:
 
     @functools.wraps(original)
     def create_engine_config(self, *args, **kwargs):
+        if os.environ.get("SUFFIX_HYBRID_ASYNC", "").strip() == "1":
+            return _async_config(self, original, args, kwargs)
         # Instance attribute shadowing the dataclass default: the original
         # reads self.async_scheduling at arg_utils.py:2448 and passes our
         # explicit False into SchedulerConfig, so the None→True chain in
@@ -166,3 +180,24 @@ def _patch(module) -> None:
     print("suffix_hybrid sched-sync: EngineArgs.create_engine_config "
           "wrapped (explicit async_scheduling=False at config build)",
           file=sys.stderr, flush=True)
+
+def _async_config(args, original, a, kw):
+    """SUFFIX_HYBRID_ASYNC=1 config build: never force sync.
+
+    Drops disable_padded_drafter_batch=True (async killer, unread by the V2
+    runner) and keeps the operator's async_scheduling (None -> True for MTP).
+    """
+    spec = getattr(args, "speculative_config", None)
+    dropped = isinstance(spec, dict) and bool(
+        spec.get("disable_padded_drafter_batch"))
+    if dropped:
+        args.speculative_config = {**spec, "disable_padded_drafter_batch": False}
+    had = getattr(args, "async_scheduling", None)
+    result = original(args, *a, **kw)
+    sched = getattr(result, "scheduler_config", None)
+    final = getattr(sched, "async_scheduling", "ATTR-MISSING")
+    print(f"suffix_hybrid sched-sync: ASYNC gate, sync NOT forced "
+          f"async_scheduling {had!r} -> scheduler_config.{final!r} "
+          f"disable_padded_drafter_batch dropped={dropped}",
+          file=sys.stderr, flush=True)
+    return result
