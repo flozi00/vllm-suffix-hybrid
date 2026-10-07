@@ -482,6 +482,12 @@ def wrap_step(orig, sess: _Session):
     def step(self, *a, **kw):
         if sess.phase == "done":
             return orig(self, *a, **kw)
+        if not getattr(sess, "engine_logged", False):
+            sess.engine_logged = True
+            print(f"{MARK} engine: async_scheduling="
+                  f"{getattr(self, 'async_scheduling', '?')} batch_queue_size="
+                  f"{getattr(self, 'batch_queue_size', '?')}",
+                  file=sys.stderr, flush=True)
         if sess.phase == "wait":
             try:
                 b = sess.bucket_of(self)
