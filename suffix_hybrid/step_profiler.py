@@ -54,9 +54,15 @@ _FINDER_MARK = "_suffix_step_profiler"
 
 SYNC_APIS = ("cudaStreamSynchronize", "cudaDeviceSynchronize",
              "cudaEventSynchronize", "cudaMemcpy", "cudaMemcpyAsync",
-             "cuStreamSynchronize", "cuCtxSynchronize", "cuMemcpyDtoH")
+             "cuStreamSynchronize", "cuCtxSynchronize", "cuMemcpyDtoH",
+             # ROCm (roctracer names under the same cuda_runtime category)
+             "hipStreamSynchronize", "hipDeviceSynchronize",
+             "hipEventSynchronize", "hipMemcpy", "hipMemcpyAsync",
+             "hipMemcpyWithStream")
 LAUNCH_APIS = ("cudaLaunchKernel", "cudaLaunchKernelExC", "cuLaunchKernel",
-               "cuLaunchKernelEx", "cudaGraphLaunch", "cuGraphLaunch")
+               "cuLaunchKernelEx", "cudaGraphLaunch", "cuGraphLaunch",
+               "hipLaunchKernel", "hipExtLaunchKernel", "hipModuleLaunchKernel",
+               "hipExtModuleLaunchKernel", "hipGraphLaunch")
 
 # Ordered: first match wins. MoE before attention (flashinfer ships both).
 CATEGORIES = [
@@ -70,7 +76,7 @@ CATEGORIES = [
     ("kv-cache write", r"reshape_and_cache|concat_and_cache|cache_kernel"
      r"|kv_cache"),
     ("dense GEMM", r"gemm|gemv|cutlass|cublas|nvjet|xmma|matmul|scaled_mm"
-     r"|splitk|sm\d+_|mma"),
+     r"|splitk|sm\d+_|mma|cijk_|wvsplitk|hipblaslt"),
     ("quant (act/Q)", r"quant|fp4|fp8"),
     ("norm/rope/activation", r"norm|rms|rotary|rope|silu|gelu|act_and_mul"
      r"|softcap|tanh|activation"),
