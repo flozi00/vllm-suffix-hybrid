@@ -461,6 +461,9 @@ _BOOT_GATES = {
     # ROCm card facts: arch/CUs, AITER tuned-config coverage for this CU count,
     # HBM bandwidth, BF16 vs MXFP4 GEMM at the qwen3.8-flash TP1 decode shapes.
     "rocm_probe": (["-m", "suffix_hybrid.tools.rocm_probe"], {}),
+    # MXFP4 lm_head (SUFFIX_MXFP4_LMHEAD) at the qwen3.8-flash head: fidelity +
+    # us/call of the graphed screen+rescore vs the stock bf16 head, M=1..16.
+    "mxfp4_lmhead_bench": (["-m", "suffix_hybrid.kernels.mxfp4_lm_head"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():
