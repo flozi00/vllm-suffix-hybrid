@@ -458,6 +458,9 @@ _BOOT_GATES = {
     # Same + nccl_qar int8/fp8 compressed all-reduce vs best NCCL per size.
     "allreduce_qar_bench": (["-m", "suffix_hybrid.tools.ar_bench", "--qar",
                              "--sizes-kib", "48"], {}),
+    # ROCm card facts: arch/CUs, AITER tuned-config coverage for this CU count,
+    # HBM bandwidth, BF16 vs MXFP4 GEMM at the qwen3.8-flash TP1 decode shapes.
+    "rocm_probe": (["-m", "suffix_hybrid.tools.rocm_probe"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():
