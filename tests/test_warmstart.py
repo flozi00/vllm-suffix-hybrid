@@ -183,12 +183,14 @@ def test_bench_hist_reader_rejects_garbage(tmp_path):
         bg.hist_file_sequences(str(p))
 
 
-def test_bench_payload_gains_return_token_ids_only_when_dumping(tmp_path):
+def test_bench_payload_always_requests_token_ids(tmp_path):
+    # Spec decode streams several tokens per chunk: throughput is counted
+    # from delta token_ids, so every payload asks for them (not only dumps).
     bg = _load_bench()
     plain = NS(dump_histories=None, ignore_eos=False, model="m")
     dumping = NS(dump_histories="out.jsonl", ignore_eos=False, model="m")
     msgs = [{"role": "user", "content": "hi"}]
-    assert "return_token_ids" not in bg.build_payload(plain, msgs, 8)
+    assert bg.build_payload(plain, msgs, 8)["return_token_ids"] is True
     assert bg.build_payload(dumping, msgs, 8)["return_token_ids"] is True
 
 
