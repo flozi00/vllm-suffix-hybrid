@@ -79,30 +79,58 @@ def hbm(iters: int) -> None:
 
 
 def gemms(ms: list[int], iters: int) -> None:
+    """BF16 vs both vLLM MXFP4 linear paths, operands laid out exactly as
+    vllm kernels/linear/mxfp4/aiter.py prepares them: Triton afp4wfp4 (scales
+    stored [K/32, N]) and, for the ASM-eligible shapes, per_1x32 HIP quant +
+    CK/ASM gemm_a4w4 on (16, 16)-shuffled weights (VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=1)."""
     import torch
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
+    asm = None
+    try:
+        from aiter import gemm_a4w4, per_1x32_f4_quant_hip
+        from aiter.ops.shuffle import shuffle_weight
+        asm = (gemm_a4w4, per_1x32_f4_quant_hip, shuffle_weight)
+    except Exception as exc:  # noqa: BLE001
+        say(f"asm gemm_a4w4 unavailable: {exc!r}")
     for name, n, k in SHAPES:
         w16 = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 0.02
         wq, ws = dynamic_mxfp4_quant(w16)
+        ws_t = ws.T.contiguous()
+        wq_a = ws_a = None
+        if asm is not None and n % 32 == 0 and (k // 32) % 8 == 0:
+            sm, sn = ws.shape
+            ws_a = ws.view(sm // 32, 2, 16, sn // 8, 2, 4, 1).permute(
+                0, 3, 5, 2, 4, 1, 6).contiguous().view(sm, sn)
+            wq_a = asm[2](wq, layout=(16, 16))
         for m in ms:
             x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+            ref = torch.nn.functional.linear(x, w16).float()
             bf16 = _time_us(lambda: torch.nn.functional.linear(x, w16), iters)
+            line = f"gemm {name} M={m} N={n} K={k}: bf16 {bf16:.1f} us"
 
-            def fp4():
+            def tri():
                 xq, xs = dynamic_mxfp4_quant(x)
-                return gemm_afp4wfp4(xq, wq, xs, ws, torch.bfloat16)
+                y = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+                gemm_afp4wfp4(xq, wq, xs, ws_t.T, torch.bfloat16, y)
+                return y
 
-            try:
-                ref = torch.nn.functional.linear(x, w16).float()
-                err = ((fp4().float() - ref).norm() / ref.norm()).item()
-                q4 = _time_us(fp4, iters)
-                say(f"gemm {name} M={m} N={n} K={k}: bf16 {bf16:.1f} us | "
-                    f"mxfp4(triton, quant incl) {q4:.1f} us | rel-l2 {err:.3f}")
-            except Exception as exc:  # noqa: BLE001 - evidence, keep going
-                say(f"gemm {name} M={m}: bf16 {bf16:.1f} us | mxfp4 FAILED {exc!r}")
-        del w16, wq, ws
+            def asm_fn():
+                xq, xs = asm[1](x, shuffle=True)
+                return asm[0](xq, wq_a.view(xq.dtype), xs, ws_a.view(xs.dtype),
+                              dtype=torch.bfloat16, bpreshuffle=True)[:m]
+
+            for label, fn in (("triton", tri), ("asm", asm_fn if wq_a is not None else None)):
+                if fn is None:
+                    continue
+                try:
+                    err = ((fn().float() - ref).norm() / ref.norm()).item()
+                    line += f" | {label} {_time_us(fn, iters):.1f} us (rel {err:.3f})"
+                except Exception as exc:  # noqa: BLE001 - evidence, keep going
+                    line += f" | {label} FAILED {exc!r}"[:200]
+            say(line)
+        del w16, wq, ws, ws_t, wq_a, ws_a
         torch.cuda.empty_cache()
 
 
