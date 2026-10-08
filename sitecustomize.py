@@ -461,6 +461,15 @@ _BOOT_GATES = {
     # ROCm card facts: arch/CUs, AITER tuned-config coverage for this CU count,
     # HBM bandwidth, BF16 vs MXFP4 GEMM at the qwen3.8-flash TP1 decode shapes.
     "rocm_probe": (["-m", "suffix_hybrid.tools.rocm_probe"], {}),
+    # One MXFP4 GEMM path per process (HIP faults are sticky): Triton, Triton
+    # with a sync after the activation quant, ASM; blocking launches pin the
+    # failing kernel.
+    "rocm_fp4_triton": (["-m", "suffix_hybrid.tools.rocm_probe", "--only", "triton",
+                         "--m", "1,16"], {"HIP_LAUNCH_BLOCKING": "1"}),
+    "rocm_fp4_triton_sync": (["-m", "suffix_hybrid.tools.rocm_probe", "--only", "triton-sync",
+                              "--m", "1"], {"HIP_LAUNCH_BLOCKING": "1"}),
+    "rocm_fp4_asm": (["-m", "suffix_hybrid.tools.rocm_probe", "--only", "asm",
+                      "--m", "1,16"], {"HIP_LAUNCH_BLOCKING": "1"}),
     # MXFP4 lm_head (SUFFIX_MXFP4_LMHEAD) at the qwen3.8-flash head: fidelity +
     # us/call of the graphed screen+rescore vs the stock bf16 head, M=1..16.
     "mxfp4_lmhead_bench": (["-m", "suffix_hybrid.kernels.mxfp4_lm_head"], {}),

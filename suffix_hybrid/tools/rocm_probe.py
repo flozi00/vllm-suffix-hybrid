@@ -78,7 +78,7 @@ def hbm(iters: int) -> None:
     say(f"hbm copy 2 GiB: {2 * x.numel() / us / 1e3:.0f} GB/s (read+write)")
 
 
-def gemms(ms: list[int], iters: int) -> None:
+def gemms(ms: list[int], iters: int, only: str = "") -> None:
     """BF16 vs both vLLM MXFP4 linear paths, operands laid out exactly as
     vllm kernels/linear/mxfp4/aiter.py prepares them: Triton afp4wfp4 (scales
     stored [K/32, N]) and, for the ASM-eligible shapes, per_1x32 HIP quant +
@@ -112,6 +112,10 @@ def gemms(ms: list[int], iters: int) -> None:
 
             def tri():
                 xq, xs = dynamic_mxfp4_quant(x)
+                if only == "triton-sync":  # pin a fault on the quant vs the GEMM
+                    torch.cuda.synchronize()
+                    say(f"  quant ok M={m}: xq {tuple(xq.shape)} xs {tuple(xs.shape)} "
+                        f"{xs.dtype} stride {xs.stride()}")
                 y = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
                 gemm_afp4wfp4(xq, wq, xs, ws_t.T, torch.bfloat16, y)
                 return y
@@ -122,7 +126,7 @@ def gemms(ms: list[int], iters: int) -> None:
                               dtype=torch.bfloat16, bpreshuffle=True)[:m]
 
             for label, fn in (("triton", tri), ("asm", asm_fn if wq_a is not None else None)):
-                if fn is None:
+                if fn is None or (only and not only.startswith(label)):
                     continue
                 try:
                     err = ((fn().float() - ref).norm() / ref.norm()).item()
@@ -138,10 +142,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--m", default="1,4,16,64")
     ap.add_argument("--iters", type=int, default=50)
+    ap.add_argument("--only", default="", choices=("", "triton", "triton-sync", "asm"),
+                    help="one MXFP4 path, GEMMs only (one process per path: a HIP fault "
+                         "in one must not poison the next)")
     a = ap.parse_args()
     cus = device()
-    for fn in (lambda: aiter_info(cus), lambda: hbm(a.iters),
-               lambda: gemms([int(v) for v in a.m.split(",")], a.iters)):
+    sections = (lambda: aiter_info(cus), lambda: hbm(a.iters))
+    if a.only:
+        sections = ()
+    for fn in (*sections, lambda: gemms([int(v) for v in a.m.split(",")], a.iters, a.only)):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001 - one section failing is evidence
