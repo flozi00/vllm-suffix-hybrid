@@ -10,6 +10,12 @@ Prints "[suffix lds-probe]" lines: amdgpu driver version, the KFD topology's
 LDS / feature properties, torch's device limits, then one CHILD process per
 Triton matmul config (a 401 is sticky for the process) with the kernel's
 compiled shared-memory size and whether the launch succeeded.
+
+Every failing config of the first run had 2 pipeline stages, which on gfx950
+also turns on Triton's direct-to-LDS async copies. So each config runs in three
+modes: default; noasync (TRITON_HIP_USE_ASYNC_COPY=0); cap64k (rocm_lds_cap
+refits to <= 64 KiB). Size-only failures pass in cap64k; async-copy failures
+also pass in noasync, and fail even for small pipelined tiles.
 """
 from __future__ import annotations
 
@@ -21,8 +27,10 @@ import sys
 
 MARK = "[suffix lds-probe]"
 # (BLOCK_M, BLOCK_N, BLOCK_K, num_stages): rising LDS footprint
-CONFIGS = [(64, 64, 64, 1), (128, 128, 64, 1), (128, 128, 64, 2), (128, 128, 128, 2),
-           (256, 256, 64, 2), (256, 256, 128, 2)]
+CONFIGS = [(64, 64, 32, 2), (128, 128, 32, 2), (128, 128, 64, 1), (128, 128, 64, 2),
+           (128, 256, 128, 1), (256, 256, 128, 1), (128, 128, 128, 2)]
+MODES = {"default": {}, "noasync": {"TRITON_HIP_USE_ASYNC_COPY": "0"},
+         "cap64k": {"SUFFIX_ROCM_LDS_CAP": "65536"}}
 
 
 def say(msg: str) -> None:
@@ -55,7 +63,7 @@ def host_facts() -> None:
     say("torch props: " + json.dumps(fields, default=str)[:1500])
 
 
-def one(cfg) -> None:
+def one(cfg, mode: str) -> None:
     """Child: compile + launch one bf16 tl.dot matmul config, report LDS + outcome."""
     import torch
     import triton
@@ -80,27 +88,28 @@ def one(cfg) -> None:
     grid = (m // bm, n // bn)
     try:
         h = mm.warmup(a, b, c, m, n, k, BM=bm, BN=bn, BK=bk, num_stages=st, grid=grid)
-        shared = getattr(h.metadata, "shared", "?")
+        shared = f"{getattr(h.metadata, 'shared', '?')} B/{getattr(h.metadata, 'num_stages', '?')}st"
     except Exception as exc:  # noqa: BLE001
-        say(f"cfg {cfg}: COMPILE FAILED {exc!r}"[:300])
+        say(f"{mode} cfg {cfg}: COMPILE FAILED {exc!r}"[:300])
         return
     try:
         mm[grid](a, b, c, m, n, k, BM=bm, BN=bn, BK=bk, num_stages=st)
         torch.cuda.synchronize()
         err = ((c.float() - (a.float() @ b.float())).norm() / (a.float() @ b.float()).norm()).item()
-        say(f"cfg {cfg}: shared {shared} B -> LAUNCH OK (rel {err:.1e})")
+        say(f"{mode} cfg {cfg}: shared {shared} -> LAUNCH OK (rel {err:.1e})")
     except Exception as exc:  # noqa: BLE001
-        say(f"cfg {cfg}: shared {shared} B -> LAUNCH FAILED {exc!r}"[:300])
+        say(f"{mode} cfg {cfg}: shared {shared} -> LAUNCH FAILED {exc!r}"[:300])
 
 
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--one":
-        one(tuple(int(v) for v in sys.argv[2].split(",")))
+        one(tuple(int(v) for v in sys.argv[2].split(",")), sys.argv[3])
         return 0
     host_facts()
-    for cfg in CONFIGS:
-        subprocess.run([sys.executable, "-m", "suffix_hybrid.tools.rocm_lds_probe", "--one",
-                        ",".join(map(str, cfg))], env=dict(os.environ), timeout=600)
+    for mode, extra in MODES.items():
+        for cfg in CONFIGS:
+            subprocess.run([sys.executable, "-m", "suffix_hybrid.tools.rocm_lds_probe", "--one",
+                            ",".join(map(str, cfg)), mode], env={**os.environ, **extra}, timeout=600)
     return 0
 
 
