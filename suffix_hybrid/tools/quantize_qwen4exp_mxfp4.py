@@ -3,6 +3,8 @@
 
     python -m suffix_hybrid.tools.quantize_qwen4exp_mxfp4 --src DIR --out DIR \
         [--risky mxfp4|bf16] [--workers 4] [--threads 1]
+    S3_BUCKET=... python -m suffix_hybrid.tools.quantize_qwen4exp_mxfp4 --s3-src PREFIX \
+        --s3-out PREFIX --out DIR [--tmp DIR] [--overwrite] [...]   (streaming, no staging)
 
 Source: the official Qwen/Qwen3.8-Flash-Next-FP8 layout (Qwen4ExpForConditionalGeneration,
 quant_method "fp8", weight_block_size [128, 128]): routed experts are F8_E4M3 with a
@@ -319,39 +321,98 @@ def convert_shard(src: str, out: str, name: str, keys: list, scale_files: dict, 
     save_file(tensors, str(Path(out) / name), metadata={"format": "pt"})
     return {"name": name, "keys": sorted(tensors), "kinds": dict(kinds),
             "tensor_bytes": sum(t.numel() * t.element_size() for t in tensors.values()),
+            "file_bytes": (Path(out) / name).stat().st_size,
             "sha256": sha256_file(src_dir / name), "seconds": round(time.time() - started, 1)}
 
 
-def _run_shards(src: Path, out: Path, weight_map: dict, risky: str, workers: int,
-                threads: int) -> list[dict]:
-    # Imported by name so spawn workers resolve it the same way under `python -m`.
-    from suffix_hybrid.tools import quantize_qwen4exp_mxfp4 as tool
+def _shard_args(weight_map: dict) -> list[tuple]:
+    """(shard name, its keys, {expert scale_inv key: shard holding it}) per input shard."""
     by_shard = {}
     for key, name in weight_map.items():
         by_shard.setdefault(name, []).append(key)
-    names = sorted(by_shard)
-    args = []
-    for n in names:
-        scales = {k + "_scale_inv": weight_map[k + "_scale_inv"]
-                  for k in by_shard[n] if EXPERT_RE.match(k)}
-        args.append((str(src), str(out), n, by_shard[n], scales, risky, threads))
-    results = []
+    return [(n, by_shard[n], {k + "_scale_inv": weight_map[k + "_scale_inv"]
+                              for k in by_shard[n] if EXPERT_RE.match(k)})
+            for n in sorted(by_shard)]
+
+
+def _pool(fn_name: str, args: list[tuple], workers: int) -> list[dict]:
+    # Imported by name so spawn workers resolve it the same way under `python -m`.
+    from suffix_hybrid.tools import quantize_qwen4exp_mxfp4 as tool
+    fn, results = getattr(tool, fn_name), []
     if workers == 1:
-        for a in args:
-            results.append(tool.convert_shard(*a))
-            print(f"[mxfp4] wrote {a[2]} ({len(results)}/{len(names)})", flush=True)
-        return results
-    ctx = multiprocessing.get_context("spawn")  # fresh interpreters, no forked torch pools
-    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-        for r in pool.map(tool.convert_shard, *zip(*args)):
+        it = (fn(*a) for a in args)
+    else:
+        ctx = multiprocessing.get_context("spawn")  # fresh interpreters, no forked torch pools
+        pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+        it = pool.map(fn, *zip(*args))
+    try:
+        for r in it:
             results.append(r)
-            print(f"[mxfp4] wrote {r['name']} ({len(results)}/{len(names)}, {r['seconds']} s)",
+            print(f"[mxfp4] wrote {r['name']} ({len(results)}/{len(args)}, {r['seconds']} s)",
                   flush=True)
+    finally:
+        if workers != 1:
+            pool.shutdown(cancel_futures=True)
     return results
 
 
-def convert(src, out, risky="mxfp4", workers=4, threads=1) -> dict:
+def _write_meta(dst: Path, src_meta: Path, config: dict, results: list, expected: Counter,
+                risky: str, workers: int, threads: int, started: float):
+    """Index, side files, config.json and the manifest into dst -> (stats, kinds)."""
     import torch
+    kinds, out_map = Counter(), {}
+    for r in results:
+        kinds.update(r["kinds"])
+        for key in r["keys"]:
+            if key in out_map:
+                raise ValueError(f"duplicate output tensor {key}")
+            out_map[key] = r["name"]
+    if any(kinds[k] != expected[k] for k in ("expert", "mxfp4", "copy")):
+        raise ValueError(f"converted {dict(kinds)}, planned {dict(expected)}")
+    tensor_bytes = sum(r["tensor_bytes"] for r in results)
+    (dst / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": tensor_bytes}, "weight_map": dict(sorted(out_map.items()))},
+        indent=2))
+    for f in src_meta.iterdir():
+        if (f.is_file() and not f.name.startswith(".") and f.name not in SKIP_FILES
+                and (f.suffix in COPY_SUFFIXES or f.name in ("LICENSE", "NOTICE"))):
+            shutil.copy2(f, dst / f.name)
+    source_sha = {r["name"]: r["sha256"] for r in results}
+    for f in ("config.json", "model.safetensors.index.json"):
+        source_sha[f] = sha256_file(src_meta / f)
+    config["quantization_config"] = quark_config(risky)
+    config.setdefault("text_config", {})["ple_embedding_dtype"] = PLE_EMBEDDING_DTYPE
+    (dst / "config.json").write_text(json.dumps(config, indent=2))
+    stats = {"tensors": dict(kinds), "tensor_bytes": tensor_bytes,
+             "file_bytes": sum(r["file_bytes"] for r in results),
+             "seconds": round(time.time() - started, 1)}
+    manifest = {
+        "kind": "qwen4exp_quark_mxfp4",
+        "source_sha256": source_sha,
+        "quantization": config["quantization_config"],
+        "text_config_overrides": {"ple_embedding_dtype": PLE_EMBEDDING_DTYPE},
+        "recipe": {"weights": "RTN OCP-MX MXFP4 (Quark scale_calculation_mode even), CPU",
+                   "experts": "block-FP8 source dequantized (w * weight_scale_inv) then MXFP4",
+                   "activations": "dynamic MXFP4 at runtime; no calibration",
+                   "risky": risky, "ple": "FP8 table copied unchanged",
+                   "workers": workers, "threads": threads},
+        "versions": {"tool": TOOL_VERSION, "python": sys.version.split()[0],
+                     "torch": torch.__version__,
+                     "safetensors": importlib.metadata.version("safetensors"),
+                     "plugin_revision": os.environ.get("SUFFIX_PLUGIN_REVISION")},
+        "stats": stats,
+    }
+    (dst / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
+    return stats, kinds
+
+
+def _done(kinds, stats, risky) -> None:
+    print(f"{DONE_MARKER} quark-mxfp4 risky={risky}: {kinds['expert']} experts + "
+          f"{kinds['mxfp4']} dense -> MXFP4, {kinds['copy']} copied, "
+          f"{stats['file_bytes'] / 2**30:.2f} GiB in {stats['seconds']} s", flush=True)
+
+
+def convert(src, out, risky="mxfp4", workers=4, threads=1) -> dict:
     src, out = Path(src).absolute(), Path(out).absolute()
     if risky not in RISKY_CHOICES or workers < 1 or threads < 1:
         raise ValueError("bad --risky/--workers/--threads")
@@ -367,50 +428,10 @@ def convert(src, out, risky="mxfp4", workers=4, threads=1) -> dict:
     pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=out))
     published = []
     try:
-        results = _run_shards(src, pending, weight_map, risky, workers, threads)
-        kinds, out_map = Counter(), {}
-        for r in results:
-            kinds.update(r["kinds"])
-            for key in r["keys"]:
-                if key in out_map:
-                    raise ValueError(f"duplicate output tensor {key}")
-                out_map[key] = r["name"]
-        if any(kinds[k] != expected[k] for k in ("expert", "mxfp4", "copy")):
-            raise ValueError(f"converted {dict(kinds)}, planned {dict(expected)}")
-        tensor_bytes = sum(r["tensor_bytes"] for r in results)
-        (pending / "model.safetensors.index.json").write_text(json.dumps(
-            {"metadata": {"total_size": tensor_bytes}, "weight_map": dict(sorted(out_map.items()))},
-            indent=2))
-        for f in src.iterdir():
-            if (f.is_file() and not f.name.startswith(".") and f.name not in SKIP_FILES
-                    and (f.suffix in COPY_SUFFIXES or f.name in ("LICENSE", "NOTICE"))):
-                shutil.copy2(f, pending / f.name)
-        config["quantization_config"] = quark_config(risky)
-        config.setdefault("text_config", {})["ple_embedding_dtype"] = PLE_EMBEDDING_DTYPE
-        (pending / "config.json").write_text(json.dumps(config, indent=2))
-        source_sha = {r["name"]: r["sha256"] for r in results}
-        for f in ("config.json", "model.safetensors.index.json"):
-            source_sha[f] = sha256_file(src / f)
-        stats = {"tensors": dict(kinds), "tensor_bytes": tensor_bytes,
-                 "file_bytes": sum((pending / r["name"]).stat().st_size for r in results),
-                 "seconds": round(time.time() - started, 1)}
-        manifest = {
-            "kind": "qwen4exp_quark_mxfp4",
-            "source_sha256": source_sha,
-            "quantization": config["quantization_config"],
-            "text_config_overrides": {"ple_embedding_dtype": PLE_EMBEDDING_DTYPE},
-            "recipe": {"weights": "RTN OCP-MX MXFP4 (Quark scale_calculation_mode even), CPU",
-                       "experts": "block-FP8 source dequantized (w * weight_scale_inv) then MXFP4",
-                       "activations": "dynamic MXFP4 at runtime; no calibration",
-                       "risky": risky, "ple": "FP8 table copied unchanged",
-                       "workers": workers, "threads": threads},
-            "versions": {"tool": TOOL_VERSION, "python": sys.version.split()[0],
-                         "torch": torch.__version__,
-                         "safetensors": importlib.metadata.version("safetensors"),
-                         "plugin_revision": os.environ.get("SUFFIX_PLUGIN_REVISION")},
-            "stats": stats,
-        }
-        (pending / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
+        results = _pool("convert_shard", [(str(src), str(pending), n, keys, scales, risky, threads)
+                                          for n, keys, scales in _shard_args(weight_map)], workers)
+        stats, kinds = _write_meta(pending, src, config, results, expected, risky, workers,
+                                   threads, started)
         if set(out.iterdir()) != {pending}:
             raise ValueError("output changed while converting; refusing to publish")
         last = {"config.json": 2, "model.safetensors.index.json": 1}
@@ -423,22 +444,127 @@ def convert(src, out, risky="mxfp4", workers=4, threads=1) -> dict:
             f.unlink(missing_ok=True)
         shutil.rmtree(pending, ignore_errors=True)
         raise
-    print(f"{DONE_MARKER} quark-mxfp4 risky={risky}: {kinds['expert']} experts + "
-          f"{kinds['mxfp4']} dense -> MXFP4, {kinds['copy']} copied, "
-          f"{stats['file_bytes'] / 2**30:.2f} GiB in {stats['seconds']} s", flush=True)
+    _done(kinds, stats, risky)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# streaming mode: bucket -> bucket, one shard per worker on local scratch
+# (no node in the cluster has room to stage 173 GiB in + 115 GiB out)
+# ---------------------------------------------------------------------------
+def _s3():
+    """boto3 client for the in-cluster bucket (endpoint + keys: the weights Secret env)."""
+    try:
+        import boto3
+    except ImportError:  # the console's job scripts install it the same way
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet",
+                               "--disable-pip-version-check", "boto3"])
+        import boto3
+    from botocore.config import Config
+    return boto3.client("s3", endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+                        config=Config(s3={"addressing_style": "path"},
+                                      retries={"max_attempts": 5}))
+
+
+def _list(s3, bucket: str, prefix: str) -> dict:
+    return {o["Key"][len(prefix):]: o["Size"]
+            for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+            for o in page.get("Contents", [])}
+
+
+def stream_shard(bucket, src_prefix, out_prefix, tmp, name, keys, scale_files, risky, threads):
+    """Worker: fetch input shard `name` (+ any shard holding its scales), convert it,
+    upload the output shard, delete the local copies."""
+    s3 = _s3()
+    work = Path(tmp) / f"w-{name}"
+    shutil.rmtree(work, ignore_errors=True)
+    (work / "in").mkdir(parents=True)
+    (work / "out").mkdir()
+    try:
+        for shard in sorted({name, *scale_files.values()}):
+            s3.download_file(bucket, src_prefix + shard, str(work / "in" / shard))
+        r = convert_shard(str(work / "in"), str(work / "out"), name, keys, scale_files, risky,
+                          threads)
+        s3.upload_file(str(work / "out" / name), bucket, out_prefix + name)
+        return r
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def convert_s3(bucket, src_prefix, out_prefix, out, tmp, risky="mxfp4", workers=4, threads=1,
+               overwrite=False) -> dict:
+    """s3://bucket/src_prefix (block FP8) -> s3://bucket/out_prefix (MXFP4) without a
+    staged copy: scratch holds ~2 shards per worker. config.json is uploaded LAST
+    (weight staging treats it as the commit marker); `out` keeps the metadata files
+    and the manifest, where the console job's run gate looks for them."""
+    if risky not in RISKY_CHOICES or workers < 1 or threads < 1:
+        raise ValueError("bad --risky/--workers/--threads")
+    started, s3 = time.time(), _s3()
+    sp, op = src_prefix.strip("/") + "/", out_prefix.strip("/") + "/"
+    if sp.startswith(op) or op.startswith(sp):
+        raise ValueError(f"source {sp} and output {op} prefixes overlap")
+    out, tmp = Path(out).absolute(), Path(tmp).absolute()
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"--out {out} is not empty (refusing to overwrite)")
+    existing = sorted(_list(s3, bucket, op))
+    if existing and not overwrite:
+        raise SystemExit(f"s3://{bucket}/{op} already holds {len(existing)} objects "
+                         "(refusing to overwrite)")
+    for i in range(0, len(existing), 1000):
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": op + k}
+                                                             for k in existing[i:i + 1000]]})
+    meta = tmp / "src-meta"
+    shutil.rmtree(meta, ignore_errors=True)
+    meta.mkdir(parents=True)
+    src_objs = _list(s3, bucket, sp)
+    for n in src_objs:
+        if "/" not in n and not n.endswith(".safetensors"):
+            s3.download_file(bucket, sp + n, str(meta / n))
+    config, weight_map, expected = source_plan(meta, risky)
+    missing = sorted(set(weight_map.values()) - set(src_objs))
+    if missing:
+        raise ValueError(f"index names {len(missing)} shards missing from s3://{bucket}/{sp}: "
+                         f"{missing[:3]}")
+    print(f"[mxfp4] streaming s3://{bucket}/{sp} -> {op}: {len(weight_map)} tensors in "
+          f"{len(set(weight_map.values()))} shards; plan {dict(expected)} (risky={risky})",
+          flush=True)
+    results = _pool("stream_shard", [(bucket, sp, op, str(tmp), n, keys, scales, risky, threads)
+                                     for n, keys, scales in _shard_args(weight_map)], workers)
+    out.mkdir(parents=True, exist_ok=True)
+    stats, kinds = _write_meta(out, meta, config, results, expected, risky, workers, threads,
+                               started)
+    for f in sorted((p for p in out.iterdir() if p.is_file()),
+                    key=lambda p: (p.name == "config.json", p.name)):  # config.json last
+        s3.upload_file(str(f), bucket, op + f.name)
+    shutil.rmtree(meta, ignore_errors=True)
+    _done(kinds, stats, risky)
     return stats
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--src", required=True, type=Path)
-    ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--src", type=Path, help="staged FP8 checkpoint directory")
+    ap.add_argument("--out", required=True, type=Path,
+                    help="output directory (streaming mode: metadata + manifest only)")
+    ap.add_argument("--s3-src", help="streaming mode: source prefix in $S3_BUCKET")
+    ap.add_argument("--s3-out", help="streaming mode: output prefix in $S3_BUCKET")
+    ap.add_argument("--tmp", type=Path, default=Path("/tmp/mxfp4"),
+                    help="streaming mode: shard scratch directory")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="streaming mode: replace a non-empty output prefix")
     ap.add_argument("--risky", choices=RISKY_CHOICES, default="mxfp4",
                     help="attention q/k/v + linear_attn in_proj_qkv/z: MXFP4 (default) or BF16")
     ap.add_argument("--workers", type=int, default=4, help="input shards converted in parallel")
     ap.add_argument("--threads", type=int, default=1, help="torch threads per worker")
     args = ap.parse_args(argv)
-    convert(args.src, args.out, args.risky, args.workers, args.threads)
+    if bool(args.s3_src) != bool(args.s3_out) or bool(args.s3_src) == bool(args.src):
+        ap.error("give either --src, or --s3-src with --s3-out")
+    if args.s3_src:
+        convert_s3(os.environ["S3_BUCKET"], args.s3_src, args.s3_out, args.out, args.tmp,
+                   args.risky, args.workers, args.threads, args.overwrite)
+    else:
+        convert(args.src, args.out, args.risky, args.workers, args.threads)
     return 0
 
 

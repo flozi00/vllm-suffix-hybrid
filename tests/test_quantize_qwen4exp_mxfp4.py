@@ -380,3 +380,65 @@ def test_refuses_nonempty_out_and_wrong_source(tmp_path):
     (src / "config.json").write_text(json.dumps(cfg))
     with pytest.raises(ValueError, match="block-FP8"):
         q.main(["--src", str(src), "--out", str(tmp_path / "out2")])
+
+
+class _FakeS3:
+    """The boto3 calls the streaming mode makes, backed by a local directory."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def _path(self, bucket, key):
+        return self.root / bucket / key
+
+    def get_paginator(self, _op):
+        fake = self
+
+        class _P:
+            def paginate(self, Bucket, Prefix):
+                base = fake.root / Bucket
+                keys = sorted(p.relative_to(base).as_posix() for p in base.rglob("*")
+                              if p.is_file())
+                return [{"Contents": [{"Key": k, "Size": (base / k).stat().st_size}
+                                      for k in keys if k.startswith(Prefix)]}]
+        return _P()
+
+    def download_file(self, bucket, key, path):
+        import shutil
+        shutil.copyfile(self._path(bucket, key), path)
+
+    def upload_file(self, path, bucket, key):
+        import shutil
+        dst = self._path(bucket, key)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, dst)
+        self.order = getattr(self, "order", []) + [key]
+
+    def delete_objects(self, Bucket, Delete):
+        for o in Delete["Objects"]:
+            self._path(Bucket, o["Key"]).unlink()
+
+
+def test_streaming_matches_local(tmp_path, monkeypatch, capsys):
+    src = tmp_path / "bucket" / "fp8"
+    src.mkdir(parents=True)
+    _tiny_fp8_checkpoint(src)
+    q.main(["--src", str(src), "--out", str(tmp_path / "local")])
+    fake = _FakeS3(tmp_path)
+    monkeypatch.setattr(q, "_s3", lambda: fake)
+    monkeypatch.setenv("S3_BUCKET", "bucket")
+    args = ["--s3-src", "fp8", "--s3-out", "mx", "--out", str(tmp_path / "meta"),
+            "--tmp", str(tmp_path / "scratch"), "--workers", "1"]
+    assert q.main(args) == 0
+    assert q.DONE_MARKER in capsys.readouterr().out
+    mx = tmp_path / "bucket" / "mx"
+    local = sorted(p.name for p in (tmp_path / "local").iterdir())
+    assert sorted(p.name for p in mx.iterdir()) == local
+    for name in local:
+        if name != q.MANIFEST_NAME:  # the manifest carries timings
+            assert (mx / name).read_bytes() == (tmp_path / "local" / name).read_bytes(), name
+    assert fake.order[-1] == "mx/config.json"  # commit marker last
+    assert not any((tmp_path / "scratch").glob("w-*"))  # shard scratch cleaned
+    with pytest.raises(SystemExit, match="refusing to overwrite"):
+        q.main(args[:5] + [str(tmp_path / "meta2")] + args[6:])
+    assert q.main(args[:5] + [str(tmp_path / "meta3")] + args[6:] + ["--overwrite"]) == 0
