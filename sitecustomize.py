@@ -473,6 +473,8 @@ _BOOT_GATES = {
     # Host/KFD/torch device limits + one Triton matmul per LDS size, each in
     # its own process: which kernels launch on this card and runtime.
     "rocm_lds_probe": (["-m", "suffix_hybrid.tools.rocm_lds_probe"], {"AMD_LOG_LEVEL": "1"}),
+    # Same host/KFD facts (incl. io_link atomics flags) without the kernel matrix.
+    "rocm_host_facts": (["-m", "suffix_hybrid.tools.rocm_lds_probe", "--facts"], {}),
     # MXFP4 lm_head (SUFFIX_MXFP4_LMHEAD) at the qwen3.8-flash head: fidelity +
     # us/call of the graphed screen+rescore vs the stock bf16 head, M=1..16.
     "mxfp4_lmhead_bench": (["-m", "suffix_hybrid.kernels.mxfp4_lm_head"], {}),

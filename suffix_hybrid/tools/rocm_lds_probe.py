@@ -56,6 +56,13 @@ def host_facts() -> None:
                 "num_xcc", "capability", "capability2", "device_id", "fw_version",
                 "sdma_fw_version", "max_engine_clk_fcompute", "debug_prop")
         say(f"kfd {props.split('/')[-2]}: " + " ".join(f"{k}={kv[k]}" for k in keep if k in kv))
+        # flags bit 2/3 = CRAT NO_ATOMICS_32/64_BIT: HIP refuses hostcall kernels
+        # ("Pcie atomics not enabled") when the CPU<->GPU link has no atomics.
+        for link in sorted(glob.glob(os.path.join(os.path.dirname(props), "io_links", "*", "properties"))):
+            lk = dict(line.split() for line in open(link) if len(line.split()) == 2)
+            flags = int(lk.get("flags", "0"))
+            say(f"kfd io_link {link.split('/')[-4]}->{lk.get('node_to')}: type={lk.get('type')} "
+                f"flags={flags:#x} no_atomics32={bool(flags & 4)} no_atomics64={bool(flags & 8)}")
     import torch
     p = torch.cuda.get_device_properties(0)
     fields = {k: getattr(p, k) for k in dir(p) if not k.startswith("_")
@@ -106,6 +113,8 @@ def main() -> int:
         one(tuple(int(v) for v in sys.argv[2].split(",")), sys.argv[3])
         return 0
     host_facts()
+    if "--facts" in sys.argv:
+        return 0
     for mode, extra in MODES.items():
         for cfg in CONFIGS:
             subprocess.run([sys.executable, "-m", "suffix_hybrid.tools.rocm_lds_probe", "--one",
