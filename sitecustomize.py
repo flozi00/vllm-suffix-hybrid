@@ -39,6 +39,7 @@ PYTHONPATH. Each section is independently gated:
                                >384-row kernel needs hostcall = PCIe atomics)
   SUFFIX_ROCM_QSA_MQA=1     -> ROCm: QSA indexer scores only visible columns
                                (suffix_hybrid/kernels/qsa_mqa_rocm.py)
+  SUFFIX_ROCM_QSA_SPARSE_SKIP=1 -> ROCm: QSA sparse attention skips all -1 tiles
   SUFFIX_ROCM_MXFP4_A16=1   -> ROCm: dense MXFP4 linears at M <= SUFFIX_ROCM_MXFP4_A16_MAX_M
                                (default 32) as one AITER gemm_a16wfp4 launch
   SUFFIX_ROCM_GDN_MTP=1     -> ROCm: GDN MTP-verify core via AITER's strided
@@ -263,7 +264,8 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
 # one module before its first import; any failure is fatal (fail closed).
 if any(os.environ.get(_g, "").strip() == "1"
        for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS", "SUFFIX_ROCM_QSA_MQA",
-                  "SUFFIX_ROCM_MXFP4_A16", "SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_HC_FUSE")):
+                  "SUFFIX_ROCM_MXFP4_A16", "SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_HC_FUSE",
+                  "SUFFIX_ROCM_QSA_SPARSE_SKIP")):
     from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
     _rp_hook()
 # SUFFIX_ROCM_HC_FUSE rewrites Dynamo-traced code. vLLM's AOT-compile artifacts are
@@ -496,6 +498,8 @@ _BOOT_GATES = {
     "rocm_host_facts": (["-m", "suffix_hybrid.tools.rocm_lds_probe", "--facts"], {}),
     # SUFFIX_ROCM_QSA_MQA kernel vs vLLM's qsa_mqa_paged: equality on visible columns + us/call.
     "qsa_mqa_bench": (["-m", "suffix_hybrid.kernels.qsa_mqa_rocm"], {}),
+    # SUFFIX_ROCM_QSA_SPARSE_SKIP: patched vs stock QSA sparse attention, bitwise + us/call.
+    "qsa_sparse_bench": (["-m", "suffix_hybrid.kernels.qsa_sparse_rocm"], {}),
     # SUFFIX_ROCM_GDN_MTP vs vLLM's spec branch of _forward_core_rocm: outputs, every
     # state page byte, graph replay with new slots + graphed us/call (MTP-4 verify).
     "gdn_mtp_bench": (["-m", "suffix_hybrid.kernels.gdn_mtp_rocm"], {}),

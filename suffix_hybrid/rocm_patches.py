@@ -22,6 +22,10 @@ SUFFIX_ROCM_QSA_TOPK_ROWS=1: the Qwen4Exp QSA indexer runs top_k_per_row_decode
 SUFFIX_ROCM_QSA_MQA=1: the QSA indexer scores only each row's visible columns
   (suffix_hybrid/kernels/qsa_mqa_rocm.py) instead of the whole 262k-context
   page-table width: 16.1 of 62.9 ms/step at 32 concurrent MTP-4 requests.
+SUFFIX_ROCM_QSA_SPARSE_SKIP=1: the QSA sparse attention kernel skips selection
+  tiles whose slots are all -1 (every context shorter than the 2048-token
+  budget pads the 2051-slot selection with -1); such a tile is a no-op in the
+  online softmax, so the output is bit-identical (boot gate qsa_sparse_bench).
 SUFFIX_ROCM_MXFP4_A16=1: dense MXFP4 linears (non-ASM AITER path) at M <=
   SUFFIX_ROCM_MXFP4_A16_MAX_M (default 32) run as one AITER gemm_a16wfp4 launch
   that quantizes the activations in-kernel, instead of dynamic_mxfp4_quant +
@@ -40,6 +44,7 @@ SUFFIX_ROCM_HC_FUSE=1: Qwen4Exp GatedResidual.mix / combine_and_mix run
 import importlib.util
 import os
 import sys
+import textwrap
 from typing import NamedTuple
 
 
@@ -69,6 +74,63 @@ _HC_FUSED = (
     "        return hidden_states, block_input, injection\n"
     "\n")
 
+_QSA_SPARSE_BODY = (  # vllm/models/qwen4_exp/amd/ops/qsa.py @81198e97: tile body of
+    # _qsa_sparse_paged_gqa_splitk_kernel's loop, byte-exact
+    '        safe_token = tl.maximum(logical_token, 0)\n'
+    '        logical_page = safe_token // PAGE_SIZE\n'
+    '        page_offset = safe_token % PAGE_SIZE\n'
+    '        valid = (\n'
+    '            (request >= 0)\n'
+    '            & (request < num_requests)\n'
+    '            & (logical_token >= 0)\n'
+    '            & (logical_page < PAGE_TABLE_WIDTH)\n'
+    '        )\n'
+    '        physical_page = tl.load(\n'
+    '            block_table_ptr\n'
+    '            + safe_request * stride_table_req\n'
+    '            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),\n'
+    '            mask=valid,\n'
+    '            other=-1,\n'
+    '        )\n'
+    '        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)\n'
+    '        # physical_page * block stride can overflow int32 for large caches.\n'
+    '        safe_page = tl.maximum(physical_page, 0).to(tl.int64)\n'
+    '        keys = tl.load(\n'
+    '            k_cache_ptr\n'
+    '            + safe_page[None, :] * stride_k_block\n'
+    '            + page_offset[None, :] * stride_k_token\n'
+    '            + kv_head * stride_k_head\n'
+    '            + dim_offsets[:, None],\n'
+    '            mask=valid[None, :],\n'
+    '            other=0.0,\n'
+    '        )\n'
+    '        values = tl.load(\n'
+    '            v_cache_ptr\n'
+    '            + safe_page[:, None] * stride_v_block\n'
+    '            + page_offset[:, None] * stride_v_token\n'
+    '            + kv_head * stride_v_head\n'
+    '            + dim_offsets[None, :],\n'
+    '            mask=valid[:, None],\n'
+    '            other=0.0,\n'
+    '        )\n'
+    '        scores = tl.dot(query, keys)\n'
+    '        # Scaling scores avoids re-quantizing a scaled query to BF16.\n'
+    '        scores *= softmax_scale_log2\n'
+    '        scores = tl.where(valid[None, :], scores, -1.0e20)\n'
+    '        next_max = tl.maximum(max_value, tl.max(scores, axis=1))\n'
+    '        alpha = tl.math.exp2(max_value - next_max)\n'
+    '        probabilities = tl.where(\n'
+    '            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0\n'
+    '        )\n'
+    '        accumulator = tl.dot(\n'
+    '            probabilities.to(values.dtype),\n'
+    '            values,\n'
+    '            acc=accumulator * alpha[:, None],\n'
+    '        )\n'
+    '        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)\n'
+    '        max_value = next_max\n'
+)
+
 # gate -> Patch, or a tuple of Patches the gate applies together.
 PATCHES = {
     "SUFFIX_ROCM_AITER_PAD": Patch(
@@ -89,6 +151,12 @@ PATCHES = {
         "vllm.models.qwen4_exp.amd.ops.qsa",
         "QSA scores over visible columns only",
         after="suffix_hybrid.kernels.qsa_mqa_rocm:install"),
+    "SUFFIX_ROCM_QSA_SPARSE_SKIP": Patch(
+        "vllm.models.qwen4_exp.amd.ops.qsa",
+        "QSA sparse attention skips all-padding tiles",
+        _QSA_SPARSE_BODY,
+        "        if tl.max(logical_token, axis=0) >= 0:  # suffix: an all -1 tile is a no-op\n"
+        + textwrap.indent(_QSA_SPARSE_BODY, "    ")),
     "SUFFIX_ROCM_MXFP4_A16": Patch(
         "vllm.model_executor.kernels.linear.mxfp4.aiter",
         "dense MXFP4 small M via AITER gemm_a16wfp4",
