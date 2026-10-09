@@ -282,10 +282,12 @@ PATCHES = {
               "                out = torch.empty(\n"
               "                    (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev\n"
               "                )\n",
-              "            if _need_fp4:  # suffix SUFFIX_ROCM_AITER_FLYDSL_ZERO: no stale padded tail\n"
-              "                out = (torch.zeros if inter_dim_pad > 0 else torch.empty)(\n"
+              "            if _need_fp4:\n"
+              "                out = torch.empty(\n"
               "                    (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev\n"
-              "                )\n"),
+              "                )\n"
+              "                if inter_dim_pad > 0:  # suffix SUFFIX_ROCM_AITER_FLYDSL_ZERO: no stale tail\n"
+              "                    out.view(torch.uint8).zero_()  # fill_cuda has no fp4x2 kernel\n"),
         Patch("aiter.ops.flydsl.moe_kernels",
               "FlyDSL fp4 stage 1 scales zeroed when the inter dim is padded",
               "    out_scale_sorted_flat = (\n"
