@@ -22,6 +22,10 @@ SUFFIX_ROCM_QSA_TOPK_ROWS=1: the Qwen4Exp QSA indexer runs top_k_per_row_decode
 SUFFIX_ROCM_QSA_MQA=1: the QSA indexer scores only each row's visible columns
   (suffix_hybrid/kernels/qsa_mqa_rocm.py) instead of the whole 262k-context
   page-table width: 16.1 of 62.9 ms/step at 32 concurrent MTP-4 requests.
+SUFFIX_ROCM_GDN_MTP=1: the GDN MTP-verify core runs AITER's strided gated delta
+  rule on the packed qkv (suffix_hybrid/kernels/gdn_mtp_rocm.py), 11 -> 3
+  launches per GDN layer, and the output gate reads z from qkvz instead of a
+  copy. Two anchors in one module: a gate may carry a list of patches.
 """
 import importlib.util
 import os
@@ -56,6 +60,30 @@ PATCHES = {
         "vllm.models.qwen4_exp.amd.ops.qsa",
         "QSA scores over visible columns only",
         after="suffix_hybrid.kernels.qsa_mqa_rocm:install"),
+    "SUFFIX_ROCM_GDN_MTP": [
+        Patch(
+            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
+            "GDN MTP verify via AITER strided gated delta rule",
+            "        core_attn_out.zero_()\n"
+            "        num_tokens_all = qkvz.shape[0]\n",
+            "        if _suffix_gdn_mtp(self, qkvz, ba, core_attn_out, attn_metadata):\n"
+            "            return  # suffix gdn-mtp: all-spec verify batch\n"
+            "        core_attn_out.zero_()\n"
+            "        num_tokens_all = qkvz.shape[0]\n",
+            after="suffix_hybrid.kernels.gdn_mtp_rocm:install"),
+        Patch(
+            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
+            "GDN output gate reads z from qkvz",
+            "            return self._output_projection(core_attn_out, z)\n"
+            "        else:\n"
+            "            return self.forward_cuda(hidden_states)\n",
+            "            if not self.gqa_interleaved_layout:  # suffix gdn-mtp: z stays in qkvz\n"
+            "                qkv_size = (2 * self.key_dim + self.value_dim) // self.tp_size\n"
+            "                z = projected_states_qkvz[:, qkv_size:].view(z.shape)\n"
+            "            return self._output_projection(core_attn_out, z)\n"
+            "        else:\n"
+            "            return self.forward_cuda(hidden_states)\n"),
+    ],
 }
 _MARK = "_suffix_rocm_patch"
 
@@ -63,9 +91,10 @@ _MARK = "_suffix_rocm_patch"
 def enabled() -> dict:
     """Target module -> [Patch] for every gate set to 1, in PATCHES order."""
     todo: dict = {}
-    for gate, p in PATCHES.items():
+    for gate, ps in PATCHES.items():
         if os.environ.get(gate, "").strip() == "1":
-            todo.setdefault(p.target, []).append(p)
+            for p in ps if isinstance(ps, list) else [ps]:
+                todo.setdefault(p.target, []).append(p)
     return todo
 
 
