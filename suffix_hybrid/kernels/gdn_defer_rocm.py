@@ -59,9 +59,12 @@ def _gdn_defer_kernel(
     num_accepted, seq_lens, scale,
     stride_qkv_l, stride_a_l, stride_b_l, stride_o_l, stride_state_block, stride_idx_seq,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BV: tl.constexpr,
-    ZONE: tl.constexpr, ZONE_REACH: tl.constexpr, REC: tl.constexpr,
+    WIN: tl.constexpr, ZONE: tl.constexpr, ZONE_REACH: tl.constexpr, REC: tl.constexpr,
     USE_QK_L2NORM: tl.constexpr,
 ):
+    # Fully unrolled over the WIN = 1 + num_spec token slots (masked past the request's
+    # query length): no data-dependent loop, so every load (state, record, the tokens'
+    # q/k/v/a/b) can issue before the recurrence starts.
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -72,6 +75,7 @@ def _gdn_defer_kernel(
 
     o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
+    two = tl.arange(0, 2)
     tile = i_hv * V * K + o_v[:, None] * K + o_k[None, :]  # this program's [BV, K] state tile
     tile_base = i_hv * V * K + i_v * BV * K  # ... contiguous from here (BV x K floats)
     rec_v = K + tl.arange(0, BV)
@@ -89,26 +93,27 @@ def _gdn_defer_kernel(
     else:
         cur_zone = c_now < 0
         prev_zone = c_now < 0
-
-    if (acc >= 2) & (prev_zone == 0):
-        # Deferred: slot 0 holds the state after the previous step's token 0, slot 1's
-        # tile the inputs of its tokens 1.. -> replay the accepted ones.
-        if (slot0 <= 0) | (slot1 <= 0):
-            return
-        b_h = tl.zeros([BV, K], dtype=tl.float32)  # AITER's 0 + load (signed zeros)
-        b_h += tl.load(state + slot0 * stride_state_block + tile).to(tl.float32)
-        rec = state + slot1 * stride_state_block + tile_base
-        for t in range(1, acc):
-            r = rec + (t - 1) * REC
-            b_h = _gdn_token(b_h, tl.load(r + o_k), tl.load(r + rec_v), tl.load(r + K + BV),
-                             tl.load(r + K + BV + 1), A_log_v, dt_v, beta, threshold,
-                             USE_QK_L2NORM)
-    else:
-        read_slot = tl.load(idx_row + acc - 1).to(tl.int64)
-        if read_slot <= 0:
-            return
-        b_h = tl.zeros([BV, K], dtype=tl.float32)
-        b_h += tl.load(state + read_slot * stride_state_block + tile).to(tl.float32)
+    # Deferred: slot 0 holds the state after the previous step's token 0, slot 1's tile
+    # the inputs of its tokens 1.. -> replay the accepted ones. Else vLLM's contract.
+    deferred = (acc >= 2) & (prev_zone == 0)
+    read_slot = tl.where(deferred, slot0, tl.load(idx_row + acc - 1).to(tl.int64))
+    if read_slot <= 0:
+        return
+    if deferred & (slot1 <= 0):
+        return
+    b_h = tl.zeros([BV, K], dtype=tl.float32)  # AITER's 0 + load (signed zeros)
+    b_h += tl.load(state + read_slot * stride_state_block + tile).to(tl.float32)
+    rec = state + slot1 * stride_state_block + tile_base
+    for t in tl.static_range(1, WIN):
+        use = deferred & (t < acc)
+        r = rec + (t - 1) * REC
+        r_ab = tl.load(r + K + BV + two, mask=use, other=0.0)
+        h_new = _gdn_token(b_h, tl.load(r + o_k, mask=use, other=0.0),
+                           tl.load(r + rec_v, mask=use, other=0.0),
+                           tl.sum(tl.where(two == 0, r_ab, 0.0)),
+                           tl.sum(tl.where(two == 1, r_ab, 0.0)),
+                           A_log_v, dt_v, beta, threshold, USE_QK_L2NORM)
+        b_h = tl.where(use, h_new, b_h)
 
     p_q = qkv + bos * stride_qkv_l + i_h * K + o_k
     p_k = qkv + bos * stride_qkv_l + H * K + i_h * K + o_k
@@ -116,41 +121,36 @@ def _gdn_defer_kernel(
     p_a = a + bos * stride_a_l + i_hv
     p_b = b + bos * stride_b_l + i_hv
     p_o = o + bos * stride_o_l + i_hv * V + o_v
-    for i_t in range(0, n_tok):
-        b_q = tl.load(p_q).to(tl.float32)
-        b_k = tl.load(p_k).to(tl.float32)
-        b_v = tl.load(p_v).to(tl.float32)
-        a_raw = tl.load(p_a).to(tl.float32)
-        b_raw = tl.load(p_b).to(tl.float32)
+    for i_t in tl.static_range(WIN):
+        valid = i_t < n_tok
+        b_q = tl.load(p_q + i_t * stride_qkv_l, mask=valid, other=0.0).to(tl.float32)
+        b_k = tl.load(p_k + i_t * stride_qkv_l, mask=valid, other=0.0).to(tl.float32)
+        b_v = tl.load(p_v + i_t * stride_qkv_l, mask=valid, other=0.0).to(tl.float32)
+        a_raw = tl.load(p_a + i_t * stride_a_l, mask=valid, other=0.0).to(tl.float32)
+        b_raw = tl.load(p_b + i_t * stride_b_l, mask=valid, other=0.0).to(tl.float32)
         if USE_QK_L2NORM:
             b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
         b_q = b_q * scale
-        b_h = _gdn_token(b_h, b_k, b_v, a_raw, b_raw, A_log_v, dt_v, beta, threshold,
-                         USE_QK_L2NORM)
+        h_new = _gdn_token(b_h, b_k, b_v, a_raw, b_raw, A_log_v, dt_v, beta, threshold,
+                           USE_QK_L2NORM)
+        b_h = tl.where(valid, h_new, b_h)
         b_o = tl.sum(b_h * b_q[None, :], 1)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty))
+        tl.store(p_o + i_t * stride_o_l, b_o.to(p_o.dtype.element_ty), mask=valid)
         if i_t == 0:
-            if slot0 > 0:
-                tl.store(state + slot0 * stride_state_block + tile, b_h)
-        elif cur_zone:
+            tl.store(state + slot0 * stride_state_block + tile, b_h,
+                     mask=valid & (slot0 > 0))
+        else:
             slot_t = tl.load(idx_row + i_t).to(tl.int64)
-            if slot_t > 0:
-                tl.store(state + slot_t * stride_state_block + tile, b_h)
-        elif slot1 > 0:
-            r = state + slot1 * stride_state_block + tile_base + (i_t - 1) * REC
-            tl.store(r + o_k, b_k)
-            tl.store(r + rec_v, b_v)
-            tl.store(r + K + BV, a_raw)
-            tl.store(r + K + BV + 1, b_raw)
-        p_q += stride_qkv_l
-        p_k += stride_qkv_l
-        p_v += stride_qkv_l
-        p_a += stride_a_l
-        p_b += stride_b_l
-        p_o += stride_o_l
+            tl.store(state + slot_t * stride_state_block + tile, b_h,
+                     mask=valid & cur_zone & (slot_t > 0))
+            r = rec + (i_t - 1) * REC
+            keep = valid & (cur_zone == 0) & (slot1 > 0)
+            tl.store(r + o_k, b_k, mask=keep)
+            tl.store(r + rec_v, b_v, mask=keep)
+            tl.store(r + K + BV + two, tl.where(two == 0, a_raw, b_raw), mask=keep)
 
 
-CONFIG = (32, 4, 3)  # BV, num_warps, num_stages (AITER's; boot gate gdn_defer_bench sweeps)
+CONFIG = (32, 4, 1)  # BV, num_warps, num_stages (unrolled: no loop to pipeline)
 
 
 def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_accepted,
@@ -177,7 +177,8 @@ def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_a
         num_accepted, seq_lens, K**-0.5,
         qkv.stride(0), a.stride(0), b.stride(0), out.stride(0), state.stride(0),
         state_indices.stride(0),
-        H=num_k_heads, HV=hv, K=K, V=V, BV=BV, ZONE=zone, ZONE_REACH=2 * win, REC=REC,
+        H=num_k_heads, HV=hv, K=K, V=V, BV=BV, WIN=win, ZONE=zone, ZONE_REACH=2 * win,
+        REC=REC,
         USE_QK_L2NORM=True, num_warps=warps, num_stages=stages)
     return out
 
@@ -203,12 +204,15 @@ def install(module) -> None:
 
 def main() -> int:
     """Multi-step oracle on silicon at Qwen3.8-Flash-Next GDN shapes (16 qk / 48 v heads
-    x 128, MTP-4): AITER's fused_rearrange_sigmoid_gated_delta_rule (what
-    SUFFIX_ROCM_GDN_MTP serves) on one state pool, gdn_defer on a copy, 14 steps of random
-    acceptance with vLLM's align-mode copies emulated on both pools (post-step boundary
-    copy, pre-step running-block move with the accepted-count reset). Every step's outputs
-    must be bitwise equal; so must every slot a boundary copy reads. Then graphed us/call
-    at c1/c8/c32 in the deferred steady state."""
+    x 128, MTP-4), three state pools stepped together through random acceptance with
+    vLLM's align-mode copies emulated on each (post-step boundary copy, pre-step
+    running-block move with the accepted-count reset):
+      S  AITER's fused_rearrange_sigmoid_gated_delta_rule (what SUFFIX_ROCM_GDN_MTP serves),
+      R  gdn_defer with zone 1: every step writes all slots and reads vLLM's way,
+      D  gdn_defer under test (zone 0 = never stock-way, 24 = often, 1664 = serving).
+    D must equal R bitwise (outputs and every slot a boundary copy reads): the replay is
+    exact. R must stay within bf16 rounding of S (same math, other fp32 op schedule).
+    Then graphed us/call at c1/c8/c32 in the deferred steady state."""
     from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
         fused_rearrange_sigmoid_gated_delta_rule as aiter_gdr)
 
@@ -233,22 +237,23 @@ def main() -> int:
         gdn_defer(qkv, ba[:, HV:], ba[:, :HV], A_log, dt_bias, pool, cu, idx, acc, seq, out,
                   H, K, V, zone, config)
 
+    def q_of(step, r):  # a few rows draft fewer tokens
+        return win if r % 7 else 1 + (step + r) % win
+
     for zone, n_req, steps in ((0, 32, 10), (24, 32, 14), (1664, 32, 10), (24, 8, 14)):
         pool_blocks = n_req * win * 4 + 1
-        stock = torch.randn(pool_blocks, HV, V, K, device=dev) * 0.1
-        defer = stock.clone()
+        pools = {"S": torch.randn(pool_blocks, HV, V, K, device=dev) * 0.1}
+        pools["R"], pools["D"] = pools["S"].clone(), pools["S"].clone()
         free = (torch.randperm(pool_blocks - 1) + 1).tolist()
         windows = [[free.pop() for _ in range(win)] for _ in range(n_req)]
         c = torch.randint(0, 3 * zone + 50 if zone else 4000, (n_req,)).tolist()
         acc = [1] * n_req
-        ok, boundary_checks, moves, zone_steps = True, 0, 0, 0
-        def q_of(step, r):  # a few rows draft fewer tokens
-            return win if r % 7 else 1 + (step + r) % win
-
+        exact, worst_rs, checks, moves, stock_way = True, 0.0, 0, 0, 0
         for step in range(steps):
             qlens = [q_of(step, r) for r in range(n_req)]
             cu = torch.zeros(n_req + 1, dtype=torch.int32)
             cu[1:] = torch.tensor(qlens).cumsum(0)
+            cu = cu.to(dev)
             T = int(cu[-1])
             qkv = torch.randn(T, 2 * key_dim + value_dim, device=dev).to(bf16)
             ba = torch.randn(T, 2 * HV, device=dev).to(bf16)
@@ -257,17 +262,15 @@ def main() -> int:
             seq_t = torch.tensor([ci + q for ci, q in zip(c, qlens)], dtype=torch.int32,
                                  device=dev)
             if zone:
-                zone_steps += sum((ci + 2 * win) // zone > ci // zone for ci in c)
-            o_s = torch.full((T, HV, V), float("nan"), device=dev, dtype=bf16)
-            o_d = o_s.clone()
-            run_stock(stock, qkv, ba, cu.to(dev), idx, acc_t, o_s)
-            run_defer(defer, qkv, ba, cu.to(dev), idx, acc_t, seq_t, o_d, zone)
-            same = torch.equal(o_s, o_d)
-            ok &= same
-            if not same:
-                print(f"{MARK} zone {zone} step {step}: output mismatch, max abs diff "
-                      f"{(o_s.float() - o_d.float()).abs().nan_to_num(1e9).max().item():.2e}",
-                      flush=True)
+                stock_way += sum((ci + 2 * win) // zone > ci // zone for ci in c)
+            outs = {k: torch.full((T, HV, V), float("nan"), device=dev, dtype=bf16)
+                    for k in pools}
+            run_stock(pools["S"], qkv, ba, cu, idx, acc_t, outs["S"])
+            run_defer(pools["R"], qkv, ba, cu, idx, acc_t, seq_t, outs["R"], 1)
+            run_defer(pools["D"], qkv, ba, cu, idx, acc_t, seq_t, outs["D"], zone)
+            exact &= torch.equal(outs["D"], outs["R"])
+            worst_rs = max(worst_rs, ((outs["R"].float() - outs["S"].float()).abs()
+                                      / (2**-7 * outs["S"].float().abs() + 1e-3)).max().item())
             new_acc = [int(torch.randint(1, q + 1, ()).item()) for q in qlens]
             for r in range(n_req):
                 if not zone:
@@ -276,29 +279,31 @@ def main() -> int:
                 lo, hi = c[r] + 1, c[r] + new_acc[r]
                 bnd = hi // zone * zone
                 if bnd >= lo:
-                    s = windows[r][bnd - lo]
-                    boundary_checks += 1
-                    ok &= torch.equal(stock[s], defer[s])
-                # Pre-step running-block move: copy the committed state (slot acc - 1) to
-                # a new window's slot 0 and reset acc to 1, on both pools.
+                    sl = windows[r][bnd - lo]
+                    checks += 1
+                    exact &= torch.equal(pools["D"][sl], pools["R"][sl])
+                # Pre-step running-block move: copy the committed state (slot acc - 1) to a
+                # new window's slot 0 and reset acc to 1, on every pool.
                 if ((c[r] + qlens[r] - 1) // zone
                         != (c[r] + new_acc[r] + q_of(step + 1, r) - 1) // zone):
                     src = windows[r][new_acc[r] - 1]
                     new_win = [free.pop() for _ in range(win)]
-                    for pool in (stock, defer):
+                    for pool in pools.values():
                         pool[new_win[0]].copy_(pool[src])
                     free.extend(windows[r])
                     windows[r], new_acc[r] = new_win, 1
                     moves += 1
             c = [ci + ai for ci, ai in zip(c, new_acc)]
             acc = new_acc
+        ok = exact and worst_rs <= 1.0
         failed |= not ok
-        print(f"{MARK} zone {zone}, {n_req} requests x {steps} steps: "
-              f"{'MATCH (bitwise)' if ok else 'MISMATCH'} | stock-way steps {zone_steps}, "
-              f"boundary copies checked {boundary_checks}, running-block moves {moves}",
-              flush=True)
+        print(f"{MARK} zone {zone}, {n_req} requests x {steps} steps: deferred vs stock-way "
+              f"{'bitwise' if exact else 'MISMATCH'}, vs AITER worst {worst_rs:.2f} of the "
+              f"bf16 bound -> {'MATCH' if ok else 'MISMATCH'} | stock-way steps {stock_way}, "
+              f"boundary copies checked {checks}, running-block moves {moves}", flush=True)
 
-    # Steady state (no zone, accepted 1..5), graphed: stock (5 state writes) vs deferred.
+    # Steady state (accepted 1..5), graphed: AITER (5 state writes), gdn_defer stock-way
+    # (zone 1, 5 writes) and deferred (zone 0: 1 state write + the record).
     for n_req in (1, 8, 32):
         pool_blocks = n_req * win * 4 + 1
         pools = [torch.randn(pool_blocks, HV, V, K, device=dev) * 0.1 for _ in range(4)]
@@ -312,19 +317,19 @@ def main() -> int:
         seq_t = (torch.randint(100, 1500, (n_req,), dtype=torch.int32) + win).to(dev)
         out = torch.empty(T, HV, V, device=dev, dtype=bf16)
         t_s = _graph_us(lambda i: run_stock(pools[i % 4], qkv, ba, cu, idx, acc_t, out), 8)[0]
-        t_d = _graph_us(lambda i: run_defer(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t, out,
-                                            0), 8)[0]
+        t_r = _graph_us(lambda i: run_defer(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t, out,
+                                            1), 8)[0]
         sweep = []
-        for cfg in ((16, 2, 3), (16, 4, 3), (32, 2, 3), (32, 8, 3), (64, 4, 3), (64, 8, 3),
-                    (32, 4, 1), (32, 4, 2)):
+        for cfg in ((32, 4, 1), (16, 2, 1), (16, 4, 1), (32, 2, 1), (32, 8, 1), (64, 4, 1),
+                    (64, 8, 1)):
             try:
                 us = _graph_us(lambda i: run_defer(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t,
                                                    out, 0, cfg), 8)[0]
-                sweep.append(f"{cfg[0]}/{cfg[1]}w/{cfg[2]}s {us:.1f}")
+                sweep.append(f"{cfg[0]}/{cfg[1]}w {us:.1f}")
             except Exception as exc:  # noqa: BLE001 - a config that does not build is a datum
                 sweep.append(f"{cfg} {type(exc).__name__}")
-        print(f"{MARK} c{n_req} x mtp5 steady state: graphed stock {t_s:.1f} us -> "
-              f"deferred {t_d:.1f} us | sweep BV/warps/stages: {' | '.join(sweep)}", flush=True)
+        print(f"{MARK} c{n_req} x mtp5 steady state graphed: AITER {t_s:.1f} us, gdn_defer "
+              f"stock-way {t_r:.1f} us | deferred BV/warps: {' | '.join(sweep)}", flush=True)
     return 1 if failed else 0
 
 
