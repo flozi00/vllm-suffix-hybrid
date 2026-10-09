@@ -22,6 +22,13 @@ SUFFIX_ROCM_QSA_TOPK_ROWS=1: the Qwen4Exp QSA indexer runs top_k_per_row_decode
 SUFFIX_ROCM_QSA_MQA=1: the QSA indexer scores only each row's visible columns
   (suffix_hybrid/kernels/qsa_mqa_rocm.py) instead of the whole 262k-context
   page-table width: 16.1 of 62.9 ms/step at 32 concurrent MTP-4 requests.
+SUFFIX_ROCM_AITER_FLYDSL_PAD=1: AITER v0.1.24.post1 bug. A tuned fMoE row that pairs a
+  FlyDSL fp4 stage 1 (flydsl_moe1_*_fp4) with a flydsl_moe2_layout_* stage 2 passes the
+  inter pad (vLLM zero-pads 640 -> 768) to stage 1, which leaves columns 640..767 and
+  their e8m0 scales unwritten in torch.empty buffers, but stage 2 reads all 768 (no
+  K-pad skip): stale 0xFF scales are NaN -> garbage (GSM8K 0.105 on the MI350P with
+  our tuned table). Stage 1 now writes the zero tail for layout stage 2s (boot gate
+  moe_fp4_oracle); the default and prefill paths keep the pad.
 SUFFIX_ROCM_QSA_SPARSE_SKIP=1: the QSA sparse attention kernel skips selection
   tiles whose slots are all -1 (every context shorter than the 2048-token
   budget pads the 2051-slot selection with -1); such a tile is a no-op in the
@@ -246,6 +253,24 @@ PATCHES = {
         "vllm.models.qwen4_exp.amd.ops.qsa",
         "QSA scores over visible columns only",
         after="suffix_hybrid.kernels.qsa_mqa_rocm:install"),
+    "SUFFIX_ROCM_AITER_FLYDSL_PAD": Patch(
+        "aiter.fused_moe",
+        "FlyDSL fp4 stage 1 writes the padded inter columns for a layout stage 2",
+        "            stage1_func = functools.partial(\n"
+        "                _flydsl_stage1_wrapper,\n"
+        "                kernelName=kernelName1,\n"
+        "                activation=activation,\n"
+        "                inter_dim_pad=intermediate_pad,\n"
+        "                model_dim_pad=hidden_pad,\n"
+        "            )\n",
+        "            stage1_func = functools.partial(\n"
+        "                _flydsl_stage1_wrapper,\n"
+        "                kernelName=kernelName1,\n"
+        "                activation=activation,\n"
+        "                # suffix SUFFIX_ROCM_AITER_FLYDSL_PAD: moe2_layout GEMM2 has no K-pad skip\n"
+        "                inter_dim_pad=0 if is_flydsl2_layout else intermediate_pad,\n"
+        "                model_dim_pad=hidden_pad,\n"
+        "            )\n"),
     "SUFFIX_ROCM_QSA_SPARSE_SKIP": Patch(
         "vllm.models.qwen4_exp.amd.ops.qsa",
         "QSA sparse attention skips all-padding tiles",

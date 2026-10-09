@@ -40,6 +40,8 @@ PYTHONPATH. Each section is independently gated:
   SUFFIX_ROCM_QSA_MQA=1     -> ROCm: QSA indexer scores only visible columns
                                (suffix_hybrid/kernels/qsa_mqa_rocm.py)
   SUFFIX_ROCM_QSA_SPARSE_SKIP=1 -> ROCm: QSA sparse attention skips all -1 tiles
+  SUFFIX_ROCM_AITER_FLYDSL_PAD=1 -> AITER fMoE: FlyDSL fp4 stage 1 writes the padded tail
+                               for layout stage 2s (tuned-table NaN bug)
   SUFFIX_ROCM_MXFP4_A16=1   -> ROCm: dense MXFP4 linears at M <= SUFFIX_ROCM_MXFP4_A16_MAX_M
                                (default 32) as one AITER gemm_a16wfp4 launch
   SUFFIX_ROCM_GDN_MTP=1     -> ROCm: GDN MTP-verify core via AITER's strided
@@ -271,7 +273,8 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
 if any(os.environ.get(_g, "").strip() == "1"
        for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS", "SUFFIX_ROCM_QSA_MQA",
                   "SUFFIX_ROCM_MXFP4_A16", "SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_HC_FUSE",
-                  "SUFFIX_ROCM_QSA_SPARSE_SKIP", "SUFFIX_ROCM_GDN_ASYNC_IDX", "SUFFIX_ROCM_HC_DOWN")):
+                  "SUFFIX_ROCM_QSA_SPARSE_SKIP", "SUFFIX_ROCM_GDN_ASYNC_IDX", "SUFFIX_ROCM_HC_DOWN",
+                  "SUFFIX_ROCM_AITER_FLYDSL_PAD")):
     from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
     _rp_hook()
 # SUFFIX_ROCM_HC_FUSE / _HC_DOWN rewrite Dynamo-traced code. vLLM's AOT-compile artifacts
@@ -508,6 +511,10 @@ _BOOT_GATES = {
     "qsa_mqa_bench": (["-m", "suffix_hybrid.kernels.qsa_mqa_rocm"], {}),
     # SUFFIX_ROCM_QSA_SPARSE_SKIP: patched vs stock QSA sparse attention, bitwise + us/call.
     "qsa_sparse_bench": (["-m", "suffix_hybrid.kernels.qsa_sparse_rocm"], {}),
+    # Tuned fMoE table (suffix_hybrid/configs/mi350p_tuned_fmoe.csv) vs AITER's default MoE on
+    # vLLM-padded MXFP4 weights, with the SUFFIX_ROCM_AITER_FLYDSL_PAD fix active: NaN/cos check.
+    "moe_fp4_oracle": (["-m", "suffix_hybrid.tools.moe_fp4_oracle"],
+                       {"SUFFIX_ROCM_AITER_FLYDSL_PAD": "1"}),
     # SUFFIX_ROCM_GDN_MTP vs vLLM's spec branch of _forward_core_rocm: outputs, every
     # state page byte, graph replay with new slots + graphed us/call (MTP-4 verify).
     "gdn_mtp_bench": (["-m", "suffix_hybrid.kernels.gdn_mtp_rocm"], {}),
