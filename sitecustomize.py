@@ -482,6 +482,11 @@ _BOOT_GATES = {
     "rocm_host_facts": (["-m", "suffix_hybrid.tools.rocm_lds_probe", "--facts"], {}),
     # SUFFIX_ROCM_QSA_MQA kernel vs vLLM's qsa_mqa_paged: equality on visible columns + us/call.
     "qsa_mqa_bench": (["-m", "suffix_hybrid.kernels.qsa_mqa_rocm"], {}),
+    # AITER fused-MoE tuner for this card's CU count (qwen3.8-flash MXFP4 MoE; the
+    # _fse variant = shared expert fused as expert 513, top-11); prints the CSV.
+    "aiter_moe_tune": (["-m", "suffix_hybrid.tools.aiter_moe_tune"], {}),
+    "aiter_moe_tune_fse": (["-m", "suffix_hybrid.tools.aiter_moe_tune", "--expert", "513",
+                            "--topk", "11"], {}),
     # MXFP4 lm_head (SUFFIX_MXFP4_LMHEAD) at the qwen3.8-flash head: fidelity +
     # us/call of the graphed screen+rescore vs the stock bf16 head, M=1..16.
     "mxfp4_lmhead_bench": (["-m", "suffix_hybrid.kernels.mxfp4_lm_head"], {}),
