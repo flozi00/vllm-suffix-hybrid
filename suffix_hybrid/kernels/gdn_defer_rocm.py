@@ -31,7 +31,6 @@ import torch
 from vllm.triton_utils import tl, triton
 
 MARK = "[suffix gdn-defer]"
-REC = 256  # floats per recorded token: raw k (K = 128), v tile (BV = 32), a, b
 
 
 @triton.jit
@@ -107,13 +106,13 @@ def _gdn_defer_kernel(
     for t in tl.static_range(1, WIN):
         use = deferred & (t < acc)
         r = rec + (t - 1) * REC
+        r_k = tl.load(r + o_k, mask=use, other=0.0)  # issued up front, masked
+        r_v = tl.load(r + rec_v, mask=use, other=0.0)
         r_ab = tl.load(r + K + BV + two, mask=use, other=0.0)
-        h_new = _gdn_token(b_h, tl.load(r + o_k, mask=use, other=0.0),
-                           tl.load(r + rec_v, mask=use, other=0.0),
-                           tl.sum(tl.where(two == 0, r_ab, 0.0)),
-                           tl.sum(tl.where(two == 1, r_ab, 0.0)),
-                           A_log_v, dt_v, beta, threshold, USE_QK_L2NORM)
-        b_h = tl.where(use, h_new, b_h)
+        if use:  # only the accepted tokens pay for the recurrence
+            b_h = _gdn_token(b_h, r_k, r_v, tl.sum(tl.where(two == 0, r_ab, 0.0)),
+                             tl.sum(tl.where(two == 1, r_ab, 0.0)), A_log_v, dt_v, beta,
+                             threshold, USE_QK_L2NORM)
 
     p_q = qkv + bos * stride_qkv_l + i_h * K + o_k
     p_k = qkv + bos * stride_qkv_l + H * K + i_h * K + o_k
@@ -150,7 +149,8 @@ def _gdn_defer_kernel(
             tl.store(r + K + BV + two, tl.where(two == 0, a_raw, b_raw), mask=keep)
 
 
-CONFIG = (32, 4, 1)  # BV, num_warps, num_stages (unrolled: no loop to pipeline)
+CONFIG = (32, 2, 1)  # BV, num_warps, num_stages. MI350P k15 oracle (c32): 2 warps 202 us,
+# 4 warps 289 (the K reduction leaves the wave), AITER 225.
 
 
 def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_accepted,
@@ -165,8 +165,9 @@ def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_a
     BV, warps, stages = config or CONFIG
     K, V = head_k_dim, head_v_dim
     win = state_indices.shape[1]
-    assert K == triton.next_power_of_2(K) and V % BV == 0 and (win - 1) * REC <= BV * K
-    assert REC >= K + BV + 2 and state.dtype == torch.float32 and state.stride(-1) == 1
+    rec = (K + BV + 2 + 63) // 64 * 64  # floats per recorded token: raw k, the v tile, a, b
+    assert K == triton.next_power_of_2(K) and V % BV == 0 and (win - 1) * rec <= BV * K
+    assert state.dtype == torch.float32 and state.stride(-1) == 1
     assert state.shape[1:] == (hv, V, K) and state[0].is_contiguous()
     assert qkv.stride(1) == a.stride(1) == b.stride(1) == 1 and state_indices.stride(1) == 1
     assert out.stride(-1) == 1 and out.stride(-2) == V
@@ -178,7 +179,7 @@ def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_a
         qkv.stride(0), a.stride(0), b.stride(0), out.stride(0), state.stride(0),
         state_indices.stride(0),
         H=num_k_heads, HV=hv, K=K, V=V, BV=BV, WIN=win, ZONE=zone, ZONE_REACH=2 * win,
-        REC=REC,
+        REC=rec,
         USE_QK_L2NORM=True, num_warps=warps, num_stages=stages)
     return out
 
@@ -317,19 +318,19 @@ def main() -> int:
         seq_t = (torch.randint(100, 1500, (n_req,), dtype=torch.int32) + win).to(dev)
         out = torch.empty(T, HV, V, device=dev, dtype=bf16)
         t_s = _graph_us(lambda i: run_stock(pools[i % 4], qkv, ba, cu, idx, acc_t, out), 8)[0]
-        t_r = _graph_us(lambda i: run_defer(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t, out,
-                                            1), 8)[0]
-        sweep = []
-        for cfg in ((32, 4, 1), (16, 2, 1), (16, 4, 1), (32, 2, 1), (32, 8, 1), (64, 4, 1),
-                    (64, 8, 1)):
-            try:
-                us = _graph_us(lambda i: run_defer(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t,
-                                                   out, 0, cfg), 8)[0]
-                sweep.append(f"{cfg[0]}/{cfg[1]}w {us:.1f}")
-            except Exception as exc:  # noqa: BLE001 - a config that does not build is a datum
-                sweep.append(f"{cfg} {type(exc).__name__}")
-        print(f"{MARK} c{n_req} x mtp5 steady state graphed: AITER {t_s:.1f} us, gdn_defer "
-              f"stock-way {t_r:.1f} us | deferred BV/warps: {' | '.join(sweep)}", flush=True)
+        sweep = {0: [], 1: []}
+        for cfg in ((32, 2, 1), (32, 1, 1), (16, 1, 1), (16, 2, 1), (64, 1, 1), (64, 2, 1),
+                    (64, 4, 1), (128, 2, 1), (128, 4, 1)):
+            for zone in (0, 1):  # deferred, stock-way
+                try:
+                    us = _graph_us(lambda i: run_defer(pools[i % 4], qkv, ba, cu, idx, acc_t,
+                                                       seq_t, out, zone, cfg), 8)[0]
+                    sweep[zone].append(f"{cfg[0]}/{cfg[1]}w {us:.1f}")
+                except Exception as exc:  # noqa: BLE001 - a config that does not build is a datum
+                    sweep[zone].append(f"{cfg[0]}/{cfg[1]}w {type(exc).__name__}")
+        print(f"{MARK} c{n_req} x mtp5 steady state graphed: AITER {t_s:.1f} us | deferred "
+              f"BV/warps: {' | '.join(sweep[0])} | stock-way: {' | '.join(sweep[1])}",
+              flush=True)
     return 1 if failed else 0
 
 
