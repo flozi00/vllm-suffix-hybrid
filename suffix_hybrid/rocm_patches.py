@@ -64,7 +64,14 @@ SUFFIX_ROCM_HC_DOWN=1: the same two methods run both HC down projections (merged
   (default 64) a deterministic split-K Triton GEMM + fp32 reduce instead of
   hipBLASLt's split-K pair, above it vLLM's rocm_unquantized_gemm as before. Its
   anchors end where HC_FUSE's begin, so either gate works alone or with the other.
+SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non-ASM dense
+  MXFP4 path) takes GEMM-AFP4WFP4-N=<N>-K=<K>.json from suffix_hybrid/configs/afp4/ (boot
+  gate afp4_tune) before AITER's own tree. AITER keys these JSONs by arch + (N, K) only, so
+  the 128-CU MI350P otherwise runs the 256-CU MI355X DEFAULT.json tiles. A shape without a
+  plugin file resolves exactly as before. vLLM's preshuffle-tuned guard (probes 2x K) only
+  gates the ASM path (VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=1), not this one.
 """
+import glob
 import importlib.util
 import os
 import sys
@@ -237,6 +244,16 @@ _GDN_ASYNC_IDX = (
      "            non_spec_indices = prefill_indices = blk_table[m.non_spec_req_idx, 0]\n"),
 )
 
+# Tuned AITER gemm_afp4wfp4 JSONs (afp4_tune), named as AITER names them (K logical).
+AFP4_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "afp4")
+# aiter/ops/triton/utils/gemm_config_utils.py @ v0.1.24.post1, _get_gemm_config_cached:
+# AITER's N/K file probe, byte-exact (once in the file).
+_AFP4_PROBE = (
+    "    for suffix in specialized_suffixes:\n"
+    "        specialized_config = load_config_json(\n"
+    '            f"{cfg_dir}/{config_name}-{suffix}.json", required=False\n'
+    "        )\n")
+
 # gate -> Patch, or a tuple of Patches the gate applies together.
 PATCHES = {
     "SUFFIX_ROCM_AITER_PAD": Patch(
@@ -359,6 +376,20 @@ PATCHES = {
               "            prev_injection,\n" + _HC_DOWN,
               "            prev_injection,\n" + _HC_DOWN_NEW),
     ),
+    # Inside the lru-cached lookup: one file probe per (shape, M) per process; a plugin
+    # miss (None) falls through to AITER's own probe unchanged.
+    "SUFFIX_ROCM_AFP4_CONFIGS": Patch(
+        "aiter.ops.triton.utils.gemm_config_utils",
+        f"AITER GEMM-AFP4WFP4 configs from {AFP4_DIR} first "
+        f"({len(glob.glob(os.path.join(AFP4_DIR, 'GEMM-AFP4WFP4-N=*-K=*.json')))} shapes)",
+        _AFP4_PROBE,
+        "    for suffix in specialized_suffixes:\n"
+        "        specialized_config = (  # suffix SUFFIX_ROCM_AFP4_CONFIGS: plugin JSON first\n"
+        '            config_name == "GEMM-AFP4WFP4" and backend == "triton" and load_config_json(\n'
+        f'                {AFP4_DIR!r} f"/{{config_name}}-{{suffix}}.json", required=False)\n'
+        "        ) or load_config_json(\n"
+        '            f"{cfg_dir}/{config_name}-{suffix}.json", required=False\n'
+        "        )\n"),
 }
 _MARK = "_suffix_rocm_patch"
 
