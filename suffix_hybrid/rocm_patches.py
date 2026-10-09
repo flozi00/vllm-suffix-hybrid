@@ -47,6 +47,12 @@ SUFFIX_ROCM_GDN_ASYNC_IDX=1: the GDN metadata builder's mixed (prefill + spec
   indices once per build (nonzero + pinned async H2D, as vLLM's short_conv
   builder does), kept on the metadata for update_block_table's other GDN KV
   groups. Same rows in the same ascending order: bit-identical. Not ROCm-specific.
+SUFFIX_ROCM_HC_DOWN=1: the same two methods run both HC down projections (merged
+  down+inject 336x10240, final mixers' down 320x10240) through hc_down
+  (suffix_hybrid/kernels/hc_down_rocm.py): at M <= SUFFIX_ROCM_HC_DOWN_MAX_M
+  (default 64) a deterministic split-K Triton GEMM + fp32 reduce instead of
+  hipBLASLt's split-K pair, above it vLLM's rocm_unquantized_gemm as before. Its
+  anchors end where HC_FUSE's begin, so either gate works alone or with the other.
 """
 import importlib.util
 import os
@@ -80,6 +86,28 @@ _HC_FUSED = (
     "\n"
     "        return hidden_states, block_input, injection\n"
     "\n")
+# Both methods also share the down projection branch; the norm call's argument before
+# self.hc_norm.weight (hidden_states in mix, prev_injection in combine_and_mix) tells the
+# two anchors apart. They end before _HC_TAIL: disjoint from the HC_FUSE anchors.
+_HC_DOWN = (
+    "            self.hc_norm.weight,\n"
+    "            self.config.rms_norm_eps,\n"
+    "            self.hc_count,\n"
+    "        )\n"
+    "\n"
+    "        if self.use_combine:\n"
+    "            # produce injection logits for combine\n"
+    "            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]\n"
+    "            down_and_injection = self.input_mix_weight_down_block_inject(xn)\n"
+    "            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)\n"
+    "        else:\n"
+    "            lora = self.input_mix_weight_down(xn)\n")
+_HC_DOWN_NEW = _HC_DOWN.replace(
+    "self.input_mix_weight_down_block_inject(xn)",
+    "hc_down(  # suffix rocm-hc-down: split-K at small M\n"
+    "                xn, self.input_mix_weight_down_block_inject.weight\n"
+    "            )").replace(
+    "self.input_mix_weight_down(xn)", "hc_down(xn, self.input_mix_weight_down.weight)")
 
 _QSA_SPARSE_BODY = (  # vllm/models/qwen4_exp/amd/ops/qsa.py @81198e97: tile body of
     # _qsa_sparse_paged_gqa_splitk_kernel's loop, byte-exact
@@ -270,6 +298,15 @@ PATCHES = {
         Patch("vllm.v1.attention.backends.gdn_attn",
               f"GDN mixed-batch gathers by device row index ({site})", old, new)
         for site, old, new in _GDN_ASYNC_IDX),
+    "SUFFIX_ROCM_HC_DOWN": (
+        Patch(_HC, "HC down projection split-K at small M (mix)",
+              "            hidden_states,\n" + _HC_DOWN,
+              "            hidden_states,\n" + _HC_DOWN_NEW,
+              "suffix_hybrid.kernels.hc_down_rocm:install"),
+        Patch(_HC, "HC down projection split-K at small M (combine_and_mix)",
+              "            prev_injection,\n" + _HC_DOWN,
+              "            prev_injection,\n" + _HC_DOWN_NEW),
+    ),
 }
 _MARK = "_suffix_rocm_patch"
 
