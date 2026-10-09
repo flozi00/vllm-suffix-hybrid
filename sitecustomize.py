@@ -47,6 +47,8 @@ PYTHONPATH. Each section is independently gated:
   SUFFIX_ROCM_HC_FUSE=1     -> ROCm: Qwen4Exp HC silu + up GEMM + gate mix in one
                                kernel (suffix_hybrid/kernels/hc_fused_rocm.py);
                                forces VLLM_USE_AOT_COMPILE=0 (stale-artifact guard)
+  SUFFIX_ROCM_GDN_ASYNC_IDX=1 -> GDN builder: mixed-step row gathers by device index
+                               (no blocking H2D per mask; not ROCm-specific)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -265,7 +267,7 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
 if any(os.environ.get(_g, "").strip() == "1"
        for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS", "SUFFIX_ROCM_QSA_MQA",
                   "SUFFIX_ROCM_MXFP4_A16", "SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_HC_FUSE",
-                  "SUFFIX_ROCM_QSA_SPARSE_SKIP")):
+                  "SUFFIX_ROCM_QSA_SPARSE_SKIP", "SUFFIX_ROCM_GDN_ASYNC_IDX")):
     from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
     _rp_hook()
 # SUFFIX_ROCM_HC_FUSE rewrites Dynamo-traced code. vLLM's AOT-compile artifacts are

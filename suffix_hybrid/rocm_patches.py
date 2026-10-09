@@ -40,6 +40,13 @@ SUFFIX_ROCM_HC_FUSE=1: Qwen4Exp GatedResidual.mix / combine_and_mix run
   hc_silu -> up GEMM -> hc_gate_mix as one kernel
   (suffix_hybrid/kernels/hc_fused_rocm.py): 2 launches fewer per HC site (218
   per MTP-4 decode step) and no [M, 10240] gate round trip.
+SUFFIX_ROCM_GDN_ASYNC_IDX=1: the GDN metadata builder's mixed (prefill + spec
+  decode) branch indexes GPU tensors with CPU bool masks; each one is a pageable
+  blocking H2D copy (hipMemcpyWithStream) that waits for the GPU to drain, so
+  no mixed step overlaps under async scheduling. The masks become device row
+  indices once per build (nonzero + pinned async H2D, as vLLM's short_conv
+  builder does), kept on the metadata for update_block_table's other GDN KV
+  groups. Same rows in the same ascending order: bit-identical. Not ROCm-specific.
 """
 import importlib.util
 import os
@@ -131,6 +138,66 @@ _QSA_SPARSE_BODY = (  # vllm/models/qwen4_exp/amd/ops/qsa.py @81198e97: tile bod
     '        max_value = next_max\n'
 )
 
+# (site, anchor, rewrite) in vllm/v1/attention/backends/gdn_attn.py @81198e97, applied
+# in order: every GPU[cpu_mask] of the mixed branch becomes GPU[device row index].
+# CPU tensors (query_lens_cpu) keep the CPU masks.
+_GDN_TAG = "  # suffix gdn-async-idx\n"
+_GDN_FIELD = "    token_chunk_offset_ptr: torch.Tensor | None = None\n"
+_GDN_INIT = "        spec_sequence_masks_cpu: torch.Tensor | None = None\n"
+_GDN_CTOR = "            spec_sequence_masks_cpu=spec_sequence_masks_cpu,\n"
+_GDN_ASYNC_IDX = (
+    ("metadata fields", _GDN_FIELD, _GDN_FIELD +
+     "    # suffix gdn-async-idx: a mixed batch's device row indices, for update_block_table\n"
+     "    spec_req_idx: torch.Tensor | None = None\n"
+     "    non_spec_req_idx: torch.Tensor | None = None\n"),
+    ("build init", _GDN_INIT, _GDN_INIT + "        spec_req_idx = non_spec_req_idx = None" + _GDN_TAG),
+    ("state indices",
+     "                spec_state_indices_tensor = block_table_tensor[\n"
+     "                    spec_sequence_masks_cpu, : self.num_spec + 1\n"
+     "                ]\n"
+     "                non_spec_state_indices_tensor = block_table_tensor[\n"
+     "                    non_spec_sequence_masks_cpu, 0\n"
+     "                ]\n",
+     "                # suffix gdn-async-idx: GPU[cpu_mask] is a blocking pageable H2D copy;\n"
+     "                # the row indices go over once, pinned and async.\n"
+     "                spec_req_idx = async_tensor_h2d(\n"
+     "                    spec_sequence_masks_cpu.nonzero().flatten(),\n"
+     "                    device=query_start_loc.device,\n"
+     "                )\n"
+     "                non_spec_req_idx = async_tensor_h2d(\n"
+     "                    non_spec_sequence_masks_cpu.nonzero().flatten(),\n"
+     "                    device=query_start_loc.device,\n"
+     "                )\n"
+     "                spec_state_indices_tensor = block_table_tensor[\n"
+     "                    spec_req_idx, : self.num_spec + 1\n"
+     "                ]\n"
+     "                non_spec_state_indices_tensor = block_table_tensor[\n"
+     "                    non_spec_req_idx, 0\n"
+     "                ]\n"),
+    ("spec query_start_loc",
+     "                    query_lens[spec_sequence_masks_cpu],\n",
+     "                    query_lens[spec_req_idx]," + _GDN_TAG),
+    ("non-spec query_start_loc",
+     "                    query_lens[non_spec_sequence_masks_cpu],\n",
+     "                    query_lens[non_spec_req_idx]," + _GDN_TAG),
+    ("num_accepted_tokens",
+     "                num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]\n",
+     "                num_accepted_tokens = num_accepted_tokens[spec_req_idx]" + _GDN_TAG),
+    ("has_initial_state",
+     "                has_initial_state = has_initial_state[~spec_sequence_masks_cpu]\n",
+     "                has_initial_state = has_initial_state[non_spec_req_idx]" + _GDN_TAG),
+    ("metadata ctor", _GDN_CTOR, _GDN_CTOR +
+     "            spec_req_idx=spec_req_idx," + _GDN_TAG +
+     "            non_spec_req_idx=non_spec_req_idx,\n"),
+    ("update_block_table",
+     "            spec_indices = blk_table[masks, : self.num_spec + 1]\n"
+     "            non_spec_indices = prefill_indices = blk_table[~masks, 0]\n",
+     "            # suffix gdn-async-idx: build()'s device row indices, no blocking H2D\n"
+     "            assert m.spec_req_idx is not None and m.non_spec_req_idx is not None\n"
+     "            spec_indices = blk_table[m.spec_req_idx, : self.num_spec + 1]\n"
+     "            non_spec_indices = prefill_indices = blk_table[m.non_spec_req_idx, 0]\n"),
+)
+
 # gate -> Patch, or a tuple of Patches the gate applies together.
 PATCHES = {
     "SUFFIX_ROCM_AITER_PAD": Patch(
@@ -199,6 +266,10 @@ PATCHES = {
         Patch(_HC, "HC silu + up GEMM + gate mix in one kernel (combine_and_mix)",
               _HC_TAIL + "    def combine(\n", _HC_FUSED + "    def combine(\n"),
     ),
+    "SUFFIX_ROCM_GDN_ASYNC_IDX": tuple(
+        Patch("vllm.v1.attention.backends.gdn_attn",
+              f"GDN mixed-batch gathers by device row index ({site})", old, new)
+        for site, old, new in _GDN_ASYNC_IDX),
 }
 _MARK = "_suffix_rocm_patch"
 
