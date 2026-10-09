@@ -268,6 +268,15 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
         print(f"[suffix mtp-tune] install failed (tuning off): {exc!r}",
               file=sys.stderr, flush=True)
 
+# GPU telemetry (suffix_hybrid/gpu_mon.py): SUFFIX_GPU_MON=<seconds> logs amdgpu hwmon
+# temps / power / clocks from one process per pod. Never fatal.
+if os.environ.get("SUFFIX_GPU_MON", "").strip():
+    try:
+        from suffix_hybrid.gpu_mon import start as _gm_start
+        _gm_start()
+    except Exception:  # noqa: BLE001 - telemetry only
+        pass
+
 # ROCm vLLM source patches (suffix_hybrid/rocm_patches.py): each gate rewrites
 # one module before its first import; any failure is fatal (fail closed).
 if any(os.environ.get(_g, "").strip() == "1"
