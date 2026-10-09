@@ -35,6 +35,8 @@ PYTHONPATH. Each section is independently gated:
                                top-p sampler kernels (V2 runner; fail-soft)
   SUFFIX_ROCM_AITER_PAD=1   -> ROCm: pass raw MoE padding to AITER fused_moe
                                (vllm#46201; TP1 MXFP4 MoE corruption; fail closed)
+  SUFFIX_ROCM_QSA_TOPK_ROWS=1 -> ROCm: QSA indexer top-k in <=384-row chunks (the
+                               >384-row kernel needs hostcall = PCIe atomics)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -248,11 +250,12 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
         print(f"[suffix mtp-tune] install failed (tuning off): {exc!r}",
               file=sys.stderr, flush=True)
 
-# ROCm AITER MoE padding (suffix_hybrid/rocm_aiter_pad.py): source rewrite
-# before first import; any failure is fatal (the unpatched path corrupts TP1).
-if os.environ.get("SUFFIX_ROCM_AITER_PAD", "").strip() == "1":
-    from suffix_hybrid.rocm_aiter_pad import install_post_import_hook as _rap_hook
-    _rap_hook()
+# ROCm vLLM source patches (suffix_hybrid/rocm_patches.py): each gate rewrites
+# one module before its first import; any failure is fatal (fail closed).
+if any(os.environ.get(_g, "").strip() == "1"
+       for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS")):
+    from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
+    _rp_hook()
 
 # Sampler warmup (suffix_hybrid/sampler_warmup.py): DEFAULT ON,
 # SUFFIX_SAMPLER_WARMUP=0 disables. Wraps the V2 worker's warmup_kernels to
