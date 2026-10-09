@@ -149,8 +149,8 @@ def _gdn_defer_kernel(
             tl.store(r + K + BV + two, tl.where(two == 0, a_raw, b_raw), mask=keep)
 
 
-CONFIG = (32, 2, 1)  # BV, num_warps, num_stages. MI350P k15 oracle (c32): 2 warps 202 us,
-# 4 warps 289 (the K reduction leaves the wave), AITER 225.
+CONFIG = (16, 1, 1)  # BV, num_warps, num_stages. MI350P k16 oracle, graphed us c1/c8/c32:
+# 16/1w 15.0/52.5/179.1, 32/1w 20.3/54.0/173.8, 32/2w 20.0/56.3/196.2; AITER 19.9/66.4/225.5.
 
 
 def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_accepted,
