@@ -21,6 +21,8 @@ small M) against that redundancy (large M).
 
     python -m suffix_hybrid.kernels.hc_fused_rocm   # GPU oracle + us/call (boot gate hc_fuse_bench)
 """
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -28,6 +30,10 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 BLOCK_N = 16  # columns per stream in one block: HC * BLOCK_N dot columns
 TARGET_PROGRAMS = 128  # one program per CU (MI350P): no CU runs two silu prologues
+# MI350P oracle 2026-10-09 (graphed us/call vs stock silu + hipBLASLt + gate mix):
+# M<=16 12 -> 6.7, M=40 12.0 -> 10.6, M=160 15.4 -> 16.7..19.2, M=1024 44.6 -> 51.3.
+# Above MAX_M (c32 verify, prefill) the stock three launches stay faster.
+MAX_M = int(os.environ.get("SUFFIX_ROCM_HC_FUSE_MAX_M", "64"))
 
 
 @triton.jit(do_not_specialize=["M", "col_blocks"])
@@ -102,6 +108,9 @@ def _launch(lora, w_up, xn, hc_count, config=None):
 
 def _hc_up_gate_mix(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor,
                     hc_count: int) -> torch.Tensor:
+    if lora.shape[0] > MAX_M:
+        from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix, hc_silu
+        return hc_gate_mix(xn, torch.nn.functional.linear(hc_silu(lora, hc_count), w_up), hc_count)
     return _launch(lora, w_up, xn, hc_count)
 
 
