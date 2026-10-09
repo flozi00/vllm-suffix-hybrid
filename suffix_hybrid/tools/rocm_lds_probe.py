@@ -11,10 +11,11 @@ LDS / feature properties, torch's device limits, then one CHILD process per
 Triton matmul config (a 401 is sticky for the process) with the kernel's
 compiled shared-memory size and whether the launch succeeded.
 
-2026-10-09 on worker-09: every 2-stage config fails with gfx950's default
-direct-to-LDS async copies, even at 17 KB LDS; with TRITON_HIP_USE_ASYNC_COPY=0
-all pass. So each config runs async (default, env var removed) and noasync;
-the >64 KiB noasync rows tell whether LDS size is a second limit.
+2026-10-09 on worker-09 (in-tree amdgpu, Linux 7.0): every 2-stage config fails
+with gfx950's default direct-to-LDS async copies, even at 17 KB LDS; with
+TRITON_HIP_USE_ASYNC_COPY=0 all pass, 98 and 128 KiB LDS included. LDS size is
+no limit; MI350P pools on that host set TRITON_HIP_USE_ASYNC_COPY=0. Each config
+runs async (default, env var removed) and noasync.
 """
 from __future__ import annotations
 

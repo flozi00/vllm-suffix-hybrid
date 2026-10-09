@@ -35,8 +35,6 @@ PYTHONPATH. Each section is independently gated:
                                top-p sampler kernels (V2 runner; fail-soft)
   SUFFIX_ROCM_AITER_PAD=1   -> ROCm: pass raw MoE padding to AITER fused_moe
                                (vllm#46201; TP1 MXFP4 MoE corruption; fail closed)
-  SUFFIX_ROCM_LDS_CAP=<B>   -> ROCm: refit Triton kernels to <= B bytes LDS by
-                               dropping pipeline stages (MI350P >64 KiB fault)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -255,12 +253,6 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
 if os.environ.get("SUFFIX_ROCM_AITER_PAD", "").strip() == "1":
     from suffix_hybrid.rocm_aiter_pad import install_post_import_hook as _rap_hook
     _rap_hook()
-
-# ROCm Triton LDS cap (suffix_hybrid/rocm_lds_cap.py): wraps triton's compile
-# when it first imports; a drifted Triton fails that import (fail closed).
-if os.environ.get("SUFFIX_ROCM_LDS_CAP", "").strip():
-    from suffix_hybrid.rocm_lds_cap import install_post_import_hook as _rlc_hook
-    _rlc_hook()
 
 # Sampler warmup (suffix_hybrid/sampler_warmup.py): DEFAULT ON,
 # SUFFIX_SAMPLER_WARMUP=0 disables. Wraps the V2 worker's warmup_kernels to
