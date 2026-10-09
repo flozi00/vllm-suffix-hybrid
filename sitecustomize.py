@@ -43,6 +43,9 @@ PYTHONPATH. Each section is independently gated:
                                (default 32) as one AITER gemm_a16wfp4 launch
   SUFFIX_ROCM_GDN_MTP=1     -> ROCm: GDN MTP-verify core via AITER's strided
                                gated delta rule (suffix_hybrid/kernels/gdn_mtp_rocm.py)
+  SUFFIX_ROCM_HC_FUSE=1     -> ROCm: Qwen4Exp HC silu + up GEMM + gate mix in one
+                               kernel (suffix_hybrid/kernels/hc_fused_rocm.py);
+                               forces VLLM_USE_AOT_COMPILE=0 (stale-artifact guard)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -260,9 +263,15 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
 # one module before its first import; any failure is fatal (fail closed).
 if any(os.environ.get(_g, "").strip() == "1"
        for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS", "SUFFIX_ROCM_QSA_MQA",
-                  "SUFFIX_ROCM_MXFP4_A16", "SUFFIX_ROCM_GDN_MTP")):
+                  "SUFFIX_ROCM_MXFP4_A16", "SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_HC_FUSE")):
     from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
     _rp_hook()
+# SUFFIX_ROCM_HC_FUSE rewrites Dynamo-traced code. vLLM's AOT-compile artifacts are
+# keyed without traced sources and verified against the unpatched files on disk, so
+# a gate-off artifact would load into a gate-on pod and serve stock HC silently;
+# the classic compile cache hashes every traced file (hc_fused_rocm.py only when on).
+if os.environ.get("SUFFIX_ROCM_HC_FUSE", "").strip() == "1":
+    os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
 # Sampler warmup (suffix_hybrid/sampler_warmup.py): DEFAULT ON,
 # SUFFIX_SAMPLER_WARMUP=0 disables. Wraps the V2 worker's warmup_kernels to
@@ -490,6 +499,9 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_GDN_MTP vs vLLM's spec branch of _forward_core_rocm: outputs, every
     # state page byte, graph replay with new slots + graphed us/call (MTP-4 verify).
     "gdn_mtp_bench": (["-m", "suffix_hybrid.kernels.gdn_mtp_rocm"], {}),
+    # SUFFIX_ROCM_HC_FUSE kernel vs vLLM hc_silu -> F.linear -> hc_gate_mix: bf16
+    # bound + bit-exact share, us/call (HIP graphs, cold weights), BMxNG sweep.
+    "hc_fuse_bench": (["-m", "suffix_hybrid.kernels.hc_fused_rocm"], {}),
     # AITER fused-MoE tuner for this card's CU count (qwen3.8-flash MXFP4 MoE; the
     # _fse variant = shared expert fused as expert 513, top-11); prints the CSV.
     "aiter_moe_tune": (["-m", "suffix_hybrid.tools.aiter_moe_tune"], {}),

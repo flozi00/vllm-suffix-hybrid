@@ -32,6 +32,10 @@ SUFFIX_ROCM_GDN_MTP=1: the GDN MTP-verify core runs AITER's strided gated delta
   rule on the packed qkv (suffix_hybrid/kernels/gdn_mtp_rocm.py), 11 -> 3
   launches per GDN layer, and the output gate reads z from qkvz instead of a
   copy. Two anchors in one module: a gate may carry a list of patches.
+SUFFIX_ROCM_HC_FUSE=1: Qwen4Exp GatedResidual.mix / combine_and_mix run
+  hc_silu -> up GEMM -> hc_gate_mix as one kernel
+  (suffix_hybrid/kernels/hc_fused_rocm.py): 2 launches fewer per HC site (218
+  per MTP-4 decode step) and no [M, 10240] gate round trip.
 """
 import importlib.util
 import os
@@ -47,6 +51,25 @@ class Patch(NamedTuple):
     after: str = ""  # "module:function" called with the executed module ("" = none)
 
 
+# GatedResidual.mix and .combine_and_mix end in the same three ops; the next def
+# tells the two anchors apart.
+_HC = "vllm.models.qwen4_exp.amd.hyperconnection"
+_HC_TAIL = (
+    "        lora = hc_silu(lora, self.hc_count)\n"
+    "        gate = self.input_mix_weight_up(lora)  # [M, D]\n"
+    "        block_input = hc_gate_mix(xn, gate, self.hc_count)\n"
+    "\n"
+    "        return hidden_states, block_input, injection\n"
+    "\n")
+_HC_FUSED = (
+    "        block_input = hc_up_gate_mix(  # suffix rocm-hc-fuse: silu + up GEMM + gate mix\n"
+    "            lora, self.input_mix_weight_up.weight, xn, self.hc_count\n"
+    "        )\n"
+    "\n"
+    "        return hidden_states, block_input, injection\n"
+    "\n")
+
+# gate -> Patch, or a tuple of Patches the gate applies together.
 PATCHES = {
     "SUFFIX_ROCM_AITER_PAD": Patch(
         "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe",
@@ -101,6 +124,13 @@ PATCHES = {
             "        else:\n"
             "            return self.forward_cuda(hidden_states)\n"),
     ],
+    "SUFFIX_ROCM_HC_FUSE": (
+        Patch(_HC, "HC silu + up GEMM + gate mix in one kernel (mix)",
+              _HC_TAIL + "    def combine_and_mix(\n", _HC_FUSED + "    def combine_and_mix(\n",
+              "suffix_hybrid.kernels.hc_fused_rocm:install"),
+        Patch(_HC, "HC silu + up GEMM + gate mix in one kernel (combine_and_mix)",
+              _HC_TAIL + "    def combine(\n", _HC_FUSED + "    def combine(\n"),
+    ),
 }
 _MARK = "_suffix_rocm_patch"
 
@@ -108,9 +138,9 @@ _MARK = "_suffix_rocm_patch"
 def enabled() -> dict:
     """Target module -> [Patch] for every gate set to 1, in PATCHES order."""
     todo: dict = {}
-    for gate, ps in PATCHES.items():
+    for gate, patches in PATCHES.items():
         if os.environ.get(gate, "").strip() == "1":
-            for p in ps if isinstance(ps, list) else [ps]:
+            for p in (patches,) if isinstance(patches, Patch) else patches:
                 todo.setdefault(p.target, []).append(p)
     return todo
 
