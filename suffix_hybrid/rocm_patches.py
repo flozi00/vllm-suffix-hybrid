@@ -501,6 +501,11 @@ PATCHES = {
               "            )\n"
               "            last_recurrent_state = None\n",
               "suffix_hybrid.kernels.gdn_defer_rocm:install"),
+        Patch("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
+              "GDN spec verify (generic path): no q/k/v repack for the deferred kernel",
+              "        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)\n",
+              "        # suffix SUFFIX_ROCM_GDN_DEFER: the verify reads the packed mixed_qkv_spec\n"
+              "        query_spec = key_spec = value_spec = None\n"),
     ),
     "SUFFIX_ROCM_HC_DOWN": (
         Patch(_HC, "HC down projection split-K at small M (mix)",

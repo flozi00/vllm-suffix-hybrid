@@ -66,7 +66,7 @@ def test_forward_spec_and_generic_hook_call_gdn_defer(monkeypatch):
 
 
 def test_generic_path_rewrite():
-    meta, ctor, core = rp.PATCHES["SUFFIX_ROCM_GDN_DEFER"]
+    meta, ctor, core, _ = rp.PATCHES["SUFFIX_ROCM_GDN_DEFER"]
     src = rp.patch_source(core, "def f(self, spec_sequence_masks):\n" + core.old)
     assert "_suffix_gdn_defer_spec(" in src and "fused_sigmoid" not in src
     compile(src, "<t>", "exec")
