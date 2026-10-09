@@ -48,7 +48,7 @@ from collections import Counter, defaultdict
 ENV = "SUFFIX_PROFILE_STEPS"
 MARK = "[suffix-prof]"
 STEP = "suffix_step"
-TOP_K = 40
+TOP_K = int(os.environ.get("SUFFIX_PROFILE_TOP", "40"))  # kernels listed per window
 _TARGET_MODULE = "vllm.v1.engine.core"
 _FINDER_MARK = "_suffix_step_profiler"
 

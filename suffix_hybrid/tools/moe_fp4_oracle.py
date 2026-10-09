@@ -99,6 +99,7 @@ def run(x, w, ids, pad, tuned):
 
 
 ok = True
+inputs, first = {}, {}
 for M in (8, 32, 128, 256):
     x = torch.randn(M, H, device=dev, dtype=torch.bfloat16)
     ids = torch.stack([torch.randperm(E - 1, device=dev)[: TOPK - 1] for _ in range(M)])
@@ -107,6 +108,7 @@ for M in (8, 32, 128, 256):
         [torch.softmax(torch.randn(M, TOPK - 1, device=dev), -1),
          torch.sigmoid(torch.randn(M, 1, device=dev))], 1
     ).float()
+    inputs[M] = x, w, ids
     ref, kref = run(x, w, ids, 128, tuned=False)  # prod default path (GSM8K 0.97)
     print(f"[suffix moe-fp4-oracle] M={M} default pad=128: nan_rows={int(ref.isnan().any(1).sum())} {kref}")
     for name, pad, tuned in (("tuned pad=128", 128, True), ("tuned pad=0", 0, True),
@@ -117,6 +119,20 @@ for M in (8, 32, 128, 256):
             out.nan_to_num().flatten(), ref.nan_to_num().flatten(), 0).item()
         good = nan_rows == 0 and cos >= 0.99
         ok &= good
+        first.setdefault((M, name), out)
         print(f"[suffix moe-fp4-oracle]   {name:14s} {'PASS' if good else 'FAIL'} nan_rows={nan_rows} cos={cos:.5f} {kn}")
+# Largest first: buffers that outlive a call (SUFFIX_ROCM_AITER_FLYDSL_ZBUF) now hold a larger
+# call's data wherever the smaller one does not write; a padded tail that moved with the size
+# would read it.
+for M in (256, 128, 32, 8):
+    x, w, ids = inputs[M]
+    out, kn = run(x, w, ids, 128, True)
+    nan_rows = int(out.isnan().any(1).sum())
+    cos = torch.nn.functional.cosine_similarity(
+        out.nan_to_num().flatten(), first[(M, "tuned pad=128")].flatten(), 0).item()
+    good = nan_rows == 0 and cos >= 0.9999
+    ok &= good
+    print(f"[suffix moe-fp4-oracle] M={M} tuned pad=128 after larger calls: "
+          f"{'PASS' if good else 'FAIL'} nan_rows={nan_rows} cos vs first call={cos:.6f}")
 print("[suffix moe-fp4-oracle] " + ("ALL PASS" if ok else "SOME FAIL"), flush=True)
 sys.exit(0 if ok else 1)

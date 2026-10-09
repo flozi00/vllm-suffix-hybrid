@@ -73,6 +73,44 @@ def _hc_up_gate_mix_kernel(
         tl.store(out_ptr + rows[:, None] * stride_out + (n0 + cols)[None, :], y, mask=row_ok)
 
 
+@triton.jit(do_not_specialize=["M"])
+def _hc_up_gate_mix_ws_kernel(
+    lora_ptr, w_ptr, xn_ptr, out_ptr, M,
+    stride_lora, stride_w, stride_xn, stride_out,
+    D: tl.constexpr, HC: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, ROW_GROUPS: tl.constexpr,
+):
+    # Weight-stationary variant: program (c, r) loads the HC x BLOCK_N weight rows of
+    # column block c once and streams row blocks r, r + ROW_GROUPS, ... through them
+    # (each row block's silu is recomputed per column block). Same ops in the same
+    # order as _hc_up_gate_mix_kernel per output element.
+    j = tl.arange(0, HC * BLOCK_N)
+    stream_col = (j // BLOCK_N) * D + j % BLOCK_N
+    n0 = tl.program_id(0) * BLOCK_N
+    k0 = tl.arange(0, K0)
+    k1 = K0 + tl.arange(0, K1)
+    w_cols = w_ptr + (n0 + stream_col)[None, :] * stride_w
+    w0 = tl.load(w_cols + k0[:, None])
+    w1 = tl.load(w_cols + k1[:, None])
+    cols = tl.arange(0, BLOCK_N)
+    for rb in range(tl.program_id(1), tl.cdiv(M, BLOCK_M), ROW_GROUPS):
+        rows = rb * BLOCK_M + tl.arange(0, BLOCK_M)
+        row_ok = (rows < M)[:, None]
+        lora_rows = lora_ptr + rows[:, None] * stride_lora
+        x = tl.load(lora_rows + k0[None, :], mask=row_ok, other=0.0).to(tl.float32) / HC
+        a0 = (x * tl.sigmoid(x)).to(lora_ptr.dtype.element_ty)
+        x = tl.load(lora_rows + k1[None, :], mask=row_ok, other=0.0).to(tl.float32) / HC
+        a1 = (x * tl.sigmoid(x)).to(lora_ptr.dtype.element_ty)
+        acc = tl.dot(a0, w0)
+        acc = tl.dot(a1, w1, acc)
+        gate = acc.to(lora_ptr.dtype.element_ty).to(tl.float32)
+        xn = tl.load(xn_ptr + rows[:, None] * stride_xn + (n0 + stream_col)[None, :],
+                     mask=row_ok, other=0.0)
+        mixed = tl.sigmoid(gate) * xn.to(tl.float32)
+        y = tl.sum(tl.reshape(mixed, (BLOCK_M, HC, BLOCK_N)), axis=1) / HC
+        tl.store(out_ptr + rows[:, None] * stride_out + (n0 + cols)[None, :], y, mask=row_ok)
+
+
 def _config(m: int, n_blocks: int) -> tuple[int, int]:
     """(BLOCK_M, column groups) for m rows: the most groups that keep the grid
     at <= TARGET_PROGRAMS programs (fewer groups = less redundant silu)."""
@@ -95,7 +133,13 @@ def _launch(lora, w_up, xn, hc_count, config=None):
         raise ValueError(f"[suffix hc-fuse] unsupported HC shapes: lora {tuple(lora.shape)} "
                          f"w_up {tuple(w_up.shape)} xn {tuple(xn.shape)} hc_count {hc_count}")
     out = xn.new_empty((m, d))
-    if m:
+    if m and config and config[0] == "ws":
+        _, bm, row_groups, block_n = config
+        _hc_up_gate_mix_ws_kernel[(d // block_n, row_groups)](
+            lora, w_up, xn, out, m, lora.stride(0), w_up.stride(0), xn.stride(0), out.stride(0),
+            D=d, HC=hc_count, K0=k0, K1=k1, BLOCK_M=bm, BLOCK_N=block_n, ROW_GROUPS=row_groups,
+            num_warps=4, num_stages=2, matrix_instr_nonkdim=16)
+    elif m:
         bm, groups = config or _config(m, d // BLOCK_N)
         _hc_up_gate_mix_kernel[(triton.cdiv(m, bm), groups)](
             lora, w_up, xn, out, m, d // BLOCK_N // groups,
@@ -168,7 +212,7 @@ def main() -> int:
     w = ws[0]
     w_down = (torch.randn(k + 16, hc * d, device=dev) * 0.02).to(torch.bfloat16)
     failed = False
-    for m in (1, 5, 8, 16, 40, 160, 1024):
+    for m in (1, 5, 8, 16, 40, 64, 160, 256, 1024):
         # xn as the grouped Gemma RMSNorm leaves it; lora = the [:, :320] view of the
         # merged down+inject GEMM output (row stride 336), as in combine_and_mix.
         xn = (torch.randn(m, hc * d, device=dev)
@@ -209,21 +253,25 @@ def main() -> int:
               f"{diff / ref.float().abs().max().item():.2e} (worst {worst:.2f} of tol, "
               f"bit-exact {100 * exact:.3f}%) {'MATCH' if ok else 'MISMATCH'} | stock "
               f"{stock_us:.1f} us -> fused {fused_us:.1f} us [BMxNG {bm}x{groups}]", flush=True)
-        sweep = []  # (us, label) per config with 64..320 programs
-        for bm in (16, 32, 64):
-            if bm > max(16, triton.next_power_of_2(m)):
-                continue
-            for groups in (g for g in range(1, n_blocks + 1) if n_blocks % g == 0
-                           and 64 <= triton.cdiv(m, bm) * g <= 320):
-                try:
-                    good = verdict(_launch(lora, w, xn, hc, (bm, groups)))[0]
-                    us = _graph_us(lambda i: _launch(lora, ws[i], xn, hc, (bm, groups)), copies)[0]
-                    sweep.append((us, f"{bm}x{groups} {us:.1f}{'' if good else ' MISMATCH'}"))
-                except Exception as exc:  # noqa: BLE001 - a config that does not build is a datum
-                    good = False
-                    sweep.append((float("inf"), f"{bm}x{groups} {type(exc).__name__}"))
-                failed |= not good
-        print(f"[suffix hc-fuse] M={m} sweep BMxNG us: {' | '.join(s for _, s in sweep)} "
+        configs = [(bm, g) for bm in (16, 32, 64, 128)
+                   if bm <= max(16, triton.next_power_of_2(m))
+                   for g in range(1, n_blocks + 1)
+                   if n_blocks % g == 0 and 32 <= triton.cdiv(m, bm) * g <= 320]
+        configs += [("ws", bm, rg, bn) for bn in (16, 32) for bm in (16, 32, 64)
+                    if bm <= max(16, triton.next_power_of_2(m))
+                    for rg in (1, 2, 4) if rg <= triton.cdiv(m, bm)]
+        sweep = []  # (us, label) per config: BMxNG row-stationary, ws BM/RG/BN weight-stationary
+        for cfg in configs:
+            label = f"{cfg[0]}x{cfg[1]}" if cfg[0] != "ws" else f"ws{cfg[1]}/{cfg[2]}/{cfg[3]}"
+            try:
+                good = verdict(_launch(lora, w, xn, hc, cfg))[0]
+                us = _graph_us(lambda i: _launch(lora, ws[i], xn, hc, cfg), copies)[0]
+                sweep.append((us, f"{label} {us:.1f}{'' if good else ' MISMATCH'}"))
+            except Exception as exc:  # noqa: BLE001 - a config that does not build is a datum
+                good = False
+                sweep.append((float("inf"), f"{label} {type(exc).__name__}"))
+            failed |= not good
+        print(f"[suffix hc-fuse] M={m} sweep us: {' | '.join(s for _, s in sweep)} "
               f"-> best {min(sweep)[1]}", flush=True)
     return 1 if failed else 0
 

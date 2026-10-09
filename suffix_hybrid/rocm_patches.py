@@ -33,6 +33,10 @@ SUFFIX_ROCM_AITER_FLYDSL_ZERO=1: the cheaper fix for the same AITER bug (use ins
   _FLYDSL_PAD): stage 1 keeps skipping the padded inter tail, but its fp4 output and
   sorted e8m0 scale buffers are allocated zeroed when inter_dim_pad > 0 (AITER's a16w4
   stage 1 already does this), so the layout stage 2 reads 0 * 2^-127 = 0 there.
+SUFFIX_ROCM_AITER_FLYDSL_ZBUF=1: the same fix without the per-call memsets of _ZERO (use
+  instead of _ZERO / _PAD; two fills per MoE layer = 100 launches per MTP-4 step): the
+  padded stage-1 output and scales come from persistent zero-initialized buffers, one per
+  layout, grown only. Stage 1 never writes the padded tail, so it stays zero.
 SUFFIX_ROCM_QSA_SPARSE_SKIP=1: the QSA sparse attention kernel skips selection
   tiles whose slots are all -1 (every context shorter than the 2048-token
   budget pads the 2051-slot selection with -1); such a tile is a no-op in the
@@ -64,6 +68,12 @@ SUFFIX_ROCM_HC_DOWN=1: the same two methods run both HC down projections (merged
   (default 64) a deterministic split-K Triton GEMM + fp32 reduce instead of
   hipBLASLt's split-K pair, above it vLLM's rocm_unquantized_gemm as before. Its
   anchors end where HC_FUSE's begin, so either gate works alone or with the other.
+SUFFIX_ROCM_QSA_DENSE=1: Qwen4Exp QSA attention takes a request with seq_len <= the
+  token top-k (2048) and <= 5 query rows (MTP-4 verify, decode) as one dense block over
+  its context (suffix_hybrid/kernels/qsa_dense_rocm.py): its selection is exactly tokens
+  0..p, which vLLM's sparse kernel gathers once per query row (179 us per layer at c32).
+  Other requests keep vLLM's sparse kernel (copied with a row skip + the all -1 tile
+  skip); MTP steps that reuse the step-0 selection (indexer.skip_topk) stay stock.
 SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non-ASM dense
   MXFP4 path) takes GEMM-AFP4WFP4-N=<N>-K=<K>.json from suffix_hybrid/configs/afp4/ (boot
   gate afp4_tune) before AITER's own tree. AITER keys these JSONs by arch + (N, K) only, so
@@ -315,12 +325,83 @@ PATCHES = {
               "            padded_rows * padded_cols, dtype=torch.uint8, device=dev)\n"
               "        if _need_sort\n"),
     ),
+    "SUFFIX_ROCM_AITER_FLYDSL_ZBUF": (
+        Patch("aiter.ops.flydsl.moe_kernels", "FlyDSL zeroed-buffer helper",
+              "_KERNEL_PARAMS: dict[str, dict] = {}\n",
+              "_KERNEL_PARAMS: dict[str, dict] = {}\n"
+              "# suffix SUFFIX_ROCM_AITER_FLYDSL_ZBUF: stage 1 never writes the padded inter tail of\n"
+              "# its fp4 output / sorted e8m0 scales. One zero-initialized buffer per layout (key),\n"
+              "# grown only, every generation kept alive (captured HIP graphs hold the addresses):\n"
+              "# the tail stays zero from the allocation on, with no per-call memset.\n"
+              "_suffix_zbufs: dict = {}\n"
+              "\n"
+              "\n"
+              "def _suffix_zeroed(numel, key, dev):\n"
+              "    bufs = _suffix_zbufs.setdefault((key, str(dev)), [])\n"
+              "    if not bufs or bufs[-1].numel() < numel:\n"
+              "        size = max(numel, 2 * bufs[-1].numel()) if bufs else numel\n"
+              "        bufs.append(torch.zeros(size, dtype=torch.uint8, device=dev))\n"
+              "    return bufs[-1][:numel]\n"),
+        Patch("aiter.ops.flydsl.moe_kernels",
+              "FlyDSL fp4 stage 1 output from a persistent zeroed buffer when the inter dim is padded",
+              "            if _need_fp4:\n"
+              "                out = torch.empty(\n"
+              "                    (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev\n"
+              "                )\n",
+              "            if _need_fp4 and inter_dim_pad > 0:  # suffix SUFFIX_ROCM_AITER_FLYDSL_ZBUF\n"
+              "                out = _suffix_zeroed(\n"
+              "                    _sorted_rows * (inter_dim // 2), (\"out\", inter_dim, inter_dim_pad), dev\n"
+              "                ).view(dtypes.fp4x2).view(_sorted_rows, inter_dim // 2)\n"
+              "            elif _need_fp4:\n"
+              "                out = torch.empty(\n"
+              "                    (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev\n"
+              "                )\n"),
+        Patch("aiter.ops.flydsl.moe_kernels",
+              "FlyDSL fp4 stage 1 scales from a persistent zeroed buffer when the inter dim is padded",
+              "    out_scale_sorted_flat = (\n"
+              "        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)\n"
+              "        if _need_sort\n",
+              "    out_scale_sorted_flat = (  # suffix SUFFIX_ROCM_AITER_FLYDSL_ZBUF\n"
+              "        _suffix_zeroed(padded_rows * padded_cols,\n"
+              "                       (\"scale\", padded_cols, inter_dim, inter_dim_pad), dev)\n"
+              "        if _need_sort and inter_dim_pad > 0\n"
+              "        else torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)\n"
+              "        if _need_sort\n"),
+    ),
     "SUFFIX_ROCM_QSA_SPARSE_SKIP": Patch(
         "vllm.models.qwen4_exp.amd.ops.qsa",
         "QSA sparse attention skips all-padding tiles",
         _QSA_SPARSE_BODY,
         "        if tl.max(logical_token, axis=0) >= 0:  # suffix: an all -1 tile is a no-op\n"
         + textwrap.indent(_QSA_SPARSE_BODY, "    ")),
+    "SUFFIX_ROCM_QSA_DENSE": Patch(
+        "vllm.models.qwen4_exp.amd.qsa",
+        "QSA attention: dense path for requests within the token top-k",
+        "        from .ops.qsa import qsa_sparse_paged_attention\n"
+        "\n"
+        "        qsa_sparse_paged_attention(\n"
+        "            query[:num_tokens],\n"
+        "            key_cache,\n"
+        "            value_cache,\n"
+        "            logical_indices,\n"
+        "            attn_metadata.block_table,\n"
+        "            token_to_req,\n"
+        "            output[:num_tokens],\n"
+        "        )\n",
+        "        _suffix_qsa_attention(  # suffix SUFFIX_ROCM_QSA_DENSE: dense short requests\n"
+        "            query[:num_tokens],\n"
+        "            key_cache,\n"
+        "            value_cache,\n"
+        "            logical_indices,\n"
+        "            attn_metadata.block_table,\n"
+        "            token_to_req,\n"
+        "            output[:num_tokens],\n"
+        "            attn_metadata.seq_lens,\n"
+        "            attn_metadata.query_start_loc,\n"
+        "            layer.indexer.token_topk,\n"
+        "            dense=not layer.indexer.skip_topk,  # MTP steps > 0 reuse step 0's rows\n"
+        "        )\n",
+        "suffix_hybrid.kernels.qsa_dense_rocm:install"),
     "SUFFIX_ROCM_MXFP4_A16": Patch(
         "vllm.model_executor.kernels.linear.mxfp4.aiter",
         "dense MXFP4 small M via AITER gemm_a16wfp4",

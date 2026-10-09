@@ -72,10 +72,11 @@ def _hc_down_reduce_kernel(p_ptr, y_ptr, MN, SPLIT: tl.constexpr, BLOCK: tl.cons
 
 def _config(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
     """(BLOCK_M, BLOCK_N, BLOCK_K, SPLIT, num_warps): one M tile up to 64 rows, 64-column
-    slabs, the largest split of K into 256-wide slabs that keeps the grid at <=
-    TARGET_PROGRAMS (K = 10240, M <= 64: 40 splits, 6 x 40 = 240 programs)."""
+    slabs, the largest split of K into 128-wide slabs that keeps the grid at <=
+    TARGET_PROGRAMS (K = 10240, M <= 64: 40 splits, 6 x 40 = 240 programs; M = 160: 10).
+    MI350P sweep 2026-10-09, graphed us: M<=40 6.1..7.3 (256-wide 6.3..7.6), M=160 11.6 (13.5)."""
     bm = min(64, max(16, triton.next_power_of_2(m)))
-    bn, bk = 64, 256
+    bn, bk = 64, 128
     tiles, kb = triton.cdiv(n, bn) * triton.cdiv(m, bm), k // bk
     split = max((s for s in range(1, kb + 1) if kb % s == 0 and tiles * s <= TARGET_PROGRAMS),
                 default=1)

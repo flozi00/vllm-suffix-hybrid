@@ -239,6 +239,24 @@ def main() -> int:
         print(f"[suffix gdn-mtp] {name} ({real}+{pad} seqs x {win} tokens): {msg} | "
               f"graphed stock {t_stock:.1f} us -> new {t_new:.1f} us", flush=True)
 
+    # Deferred-commit ceiling: the c32 verify writes 5 states per sequence (one per MTP
+    # position) to keep rollback exact. Same batch with only slot 0 live (NULL slots are
+    # skipped), plus the card's copy bandwidth, says what writing 1 state would buy.
+    for name, live in (("all 5 state slots", None), ("slot 0 only", 1)):
+        st = case(32, 0, 0, [1])
+        if live:
+            st["md"].spec_state_indices_tensor[:, live:] = 0
+        print(f"[suffix gdn-mtp] c32 verify, {name} written: graphed "
+              f"{graphed_us(new, st):.1f} us", flush=True)
+    src = torch.empty(1 << 30, dtype=torch.uint8, device=dev)
+    dst = torch.empty_like(src)
+    for name, fn, nbytes in (("copy (read+write)", lambda: dst.copy_(src), 2 << 30),
+                             ("fill (write)", lambda: dst.fill_(1), 1 << 30),
+                             ("max (read)", lambda: src.max(), 1 << 30)):
+        us = _time_us(fn, 10)
+        print(f"[suffix gdn-mtp] HBM {name}: {nbytes / us / 1e6:.2f} TB/s", flush=True)
+    del src, dst
+
     # Graph safety: capture new on the padded c8 layout, then replay with 5 real
     # sequences and new indices, accepted counts, inputs and states.
     st = case(8, 8, 0, [1, 2, 3, 4, 5])
