@@ -22,6 +22,10 @@ SUFFIX_ROCM_QSA_TOPK_ROWS=1: the Qwen4Exp QSA indexer runs top_k_per_row_decode
 SUFFIX_ROCM_QSA_MQA=1: the QSA indexer scores only each row's visible columns
   (suffix_hybrid/kernels/qsa_mqa_rocm.py) instead of the whole 262k-context
   page-table width: 16.1 of 62.9 ms/step at 32 concurrent MTP-4 requests.
+SUFFIX_ROCM_HC_FUSE=1: Qwen4Exp GatedResidual.mix / combine_and_mix run
+  hc_silu -> up GEMM -> hc_gate_mix as one kernel
+  (suffix_hybrid/kernels/hc_fused_rocm.py): 2 launches fewer per HC site (218
+  per MTP-4 decode step) and no [M, 10240] gate round trip.
 """
 import importlib.util
 import os
@@ -37,6 +41,25 @@ class Patch(NamedTuple):
     after: str = ""  # "module:function" called with the executed module ("" = none)
 
 
+# GatedResidual.mix and .combine_and_mix end in the same three ops; the next def
+# tells the two anchors apart.
+_HC = "vllm.models.qwen4_exp.amd.hyperconnection"
+_HC_TAIL = (
+    "        lora = hc_silu(lora, self.hc_count)\n"
+    "        gate = self.input_mix_weight_up(lora)  # [M, D]\n"
+    "        block_input = hc_gate_mix(xn, gate, self.hc_count)\n"
+    "\n"
+    "        return hidden_states, block_input, injection\n"
+    "\n")
+_HC_FUSED = (
+    "        block_input = hc_up_gate_mix(  # suffix rocm-hc-fuse: silu + up GEMM + gate mix\n"
+    "            lora, self.input_mix_weight_up.weight, xn, self.hc_count\n"
+    "        )\n"
+    "\n"
+    "        return hidden_states, block_input, injection\n"
+    "\n")
+
+# gate -> Patch, or a tuple of Patches the gate applies together.
 PATCHES = {
     "SUFFIX_ROCM_AITER_PAD": Patch(
         "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe",
@@ -56,6 +79,13 @@ PATCHES = {
         "vllm.models.qwen4_exp.amd.ops.qsa",
         "QSA scores over visible columns only",
         after="suffix_hybrid.kernels.qsa_mqa_rocm:install"),
+    "SUFFIX_ROCM_HC_FUSE": (
+        Patch(_HC, "HC silu + up GEMM + gate mix in one kernel (mix)",
+              _HC_TAIL + "    def combine_and_mix(\n", _HC_FUSED + "    def combine_and_mix(\n",
+              "suffix_hybrid.kernels.hc_fused_rocm:install"),
+        Patch(_HC, "HC silu + up GEMM + gate mix in one kernel (combine_and_mix)",
+              _HC_TAIL + "    def combine(\n", _HC_FUSED + "    def combine(\n"),
+    ),
 }
 _MARK = "_suffix_rocm_patch"
 
@@ -63,9 +93,10 @@ _MARK = "_suffix_rocm_patch"
 def enabled() -> dict:
     """Target module -> [Patch] for every gate set to 1, in PATCHES order."""
     todo: dict = {}
-    for gate, p in PATCHES.items():
+    for gate, patches in PATCHES.items():
         if os.environ.get(gate, "").strip() == "1":
-            todo.setdefault(p.target, []).append(p)
+            for p in (patches,) if isinstance(patches, Patch) else patches:
+                todo.setdefault(p.target, []).append(p)
     return todo
 
 

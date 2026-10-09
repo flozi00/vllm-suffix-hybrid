@@ -49,6 +49,7 @@ def test_hook_rewrites_every_enabled_target(tmp_path, monkeypatch):
     monkeypatch.setitem(rp.PATCHES, "SUFFIX_ROCM_QSA_TOPK_ROWS", TOPK._replace(target="fake_qsa_ops"))
     monkeypatch.setitem(rp.PATCHES, "SUFFIX_ROCM_QSA_MQA",
                         MQA._replace(target="fake_qsa_ops", after="fake_qsa_kernel:install"))
+    monkeypatch.delitem(rp.PATCHES, "SUFFIX_ROCM_HC_FUSE")  # tests/test_hc_fused_wiring.py
     for gate in rp.PATCHES:
         monkeypatch.setenv(gate, "1")
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
