@@ -11,11 +11,10 @@ LDS / feature properties, torch's device limits, then one CHILD process per
 Triton matmul config (a 401 is sticky for the process) with the kernel's
 compiled shared-memory size and whether the launch succeeded.
 
-Every failing config of the first run had 2 pipeline stages, which on gfx950
-also turns on Triton's direct-to-LDS async copies. So each config runs in three
-modes: default; noasync (TRITON_HIP_USE_ASYNC_COPY=0); cap64k (rocm_lds_cap
-refits to <= 64 KiB). Size-only failures pass in cap64k; async-copy failures
-also pass in noasync, and fail even for small pipelined tiles.
+2026-10-09 on worker-09: every 2-stage config fails with gfx950's default
+direct-to-LDS async copies, even at 17 KB LDS; with TRITON_HIP_USE_ASYNC_COPY=0
+all pass. So each config runs async (default, env var removed) and noasync;
+the >64 KiB noasync rows tell whether LDS size is a second limit.
 """
 from __future__ import annotations
 
@@ -28,9 +27,9 @@ import sys
 MARK = "[suffix lds-probe]"
 # (BLOCK_M, BLOCK_N, BLOCK_K, num_stages): rising LDS footprint
 CONFIGS = [(64, 64, 32, 2), (128, 128, 32, 2), (128, 128, 64, 1), (128, 128, 64, 2),
-           (128, 256, 128, 1), (256, 256, 128, 1), (128, 128, 128, 2)]
-MODES = {"default": {}, "noasync": {"TRITON_HIP_USE_ASYNC_COPY": "0"},
-         "cap64k": {"SUFFIX_ROCM_LDS_CAP": "65536"}}
+           (128, 256, 128, 1), (256, 256, 128, 1), (128, 128, 128, 2), (128, 256, 128, 2),
+           (256, 256, 128, 2)]
+MODES = {"default": {"TRITON_HIP_USE_ASYNC_COPY": None}, "noasync": {"TRITON_HIP_USE_ASYNC_COPY": "0"}}
 
 
 def say(msg: str) -> None:
@@ -109,7 +108,8 @@ def main() -> int:
     for mode, extra in MODES.items():
         for cfg in CONFIGS:
             subprocess.run([sys.executable, "-m", "suffix_hybrid.tools.rocm_lds_probe", "--one",
-                            ",".join(map(str, cfg)), mode], env={**os.environ, **extra}, timeout=600)
+                            ",".join(map(str, cfg)), mode], timeout=600,
+                           env={k: v for k, v in {**os.environ, **extra}.items() if v is not None})
     return 0
 
 
