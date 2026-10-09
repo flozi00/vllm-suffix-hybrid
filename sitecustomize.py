@@ -41,6 +41,8 @@ PYTHONPATH. Each section is independently gated:
                                (suffix_hybrid/kernels/qsa_mqa_rocm.py)
   SUFFIX_ROCM_MXFP4_A16=1   -> ROCm: dense MXFP4 linears at M <= SUFFIX_ROCM_MXFP4_A16_MAX_M
                                (default 32) as one AITER gemm_a16wfp4 launch
+  SUFFIX_ROCM_GDN_MTP=1     -> ROCm: GDN MTP-verify core via AITER's strided
+                               gated delta rule (suffix_hybrid/kernels/gdn_mtp_rocm.py)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -258,7 +260,7 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
 # one module before its first import; any failure is fatal (fail closed).
 if any(os.environ.get(_g, "").strip() == "1"
        for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS", "SUFFIX_ROCM_QSA_MQA",
-                  "SUFFIX_ROCM_MXFP4_A16")):
+                  "SUFFIX_ROCM_MXFP4_A16", "SUFFIX_ROCM_GDN_MTP")):
     from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
     _rp_hook()
 
@@ -485,6 +487,9 @@ _BOOT_GATES = {
     "rocm_host_facts": (["-m", "suffix_hybrid.tools.rocm_lds_probe", "--facts"], {}),
     # SUFFIX_ROCM_QSA_MQA kernel vs vLLM's qsa_mqa_paged: equality on visible columns + us/call.
     "qsa_mqa_bench": (["-m", "suffix_hybrid.kernels.qsa_mqa_rocm"], {}),
+    # SUFFIX_ROCM_GDN_MTP vs vLLM's spec branch of _forward_core_rocm: outputs, every
+    # state page byte, graph replay with new slots + graphed us/call (MTP-4 verify).
+    "gdn_mtp_bench": (["-m", "suffix_hybrid.kernels.gdn_mtp_rocm"], {}),
     # AITER fused-MoE tuner for this card's CU count (qwen3.8-flash MXFP4 MoE; the
     # _fse variant = shared expert fused as expert 513, top-11); prints the CSV.
     "aiter_moe_tune": (["-m", "suffix_hybrid.tools.aiter_moe_tune"], {}),
