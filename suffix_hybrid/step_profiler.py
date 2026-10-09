@@ -223,8 +223,10 @@ def summarize(trace: dict, py_stats: dict | None = None) -> list[str]:
             f"{k} {v[0] / n:.1f} {v[1] / n / 1e3:.3f}"
             for k, v in sorted(host.items(), key=lambda kv: -kv[1][1])))
     if py_stats and py_stats.get("cg"):
-        out.append("cudagraph per step (signature: steps): " + " | ".join(
-            f"{sig}: {c}" for sig, c in py_stats["cg"].most_common(8)))
+        ms = py_stats.get("cg_ms") or {}
+        out.append("cudagraph per step (signature: steps, mean wall ms): " + " | ".join(
+            f"{sig}: {c}" + (f" @{ms[sig] / c:.1f}ms" if ms.get(sig) else "")
+            for sig, c in py_stats["cg"].most_common(8)))
     out.append(
         f"note: FULL graph replay = 1 cudaGraphLaunch on CPU; CUPTI kernels "
         f"inside graphs seen: {graph_kernels} of "
@@ -272,6 +274,7 @@ class _Session:
 
     def _reset_window(self) -> None:
         self.cg: Counter = Counter()
+        self.cg_ms: Counter = Counter()  # summed wall ms per signature (mixed vs decode steps)
         self.reqs = self.toks = self.emitted = self.steps = 0
         self.t_start = 0.0
 
@@ -422,12 +425,13 @@ class _Session:
         _say(f"START window {self.windows + 1} [{label}]: {self.n} steps "
              f"after {self.stable} steps in bucket (pid {os.getpid()})")
 
-    def end_step(self, executed: bool) -> None:
+    def end_step(self, executed: bool, dt: float = 0.0) -> None:
         if getattr(self, "cg_tracked", False) and executed:
             sig = " ".join(f"{k}x{v}" for k, v in sorted(self.cg_step.items()))
             if not any(k.startswith("target:") for k in self.cg_step):
                 sig = ("target:eager " + sig).strip()
             self.cg[sig] += 1
+            self.cg_ms[sig] += dt * 1e3
         self.cg_step.clear()
 
     def stop(self) -> None:
@@ -448,7 +452,7 @@ class _Session:
         path = f"/tmp/suffix-prof-{os.getpid()}-{self.windows}.json"
         prof.export_chrome_trace(path)
         py = {"reqs": self.reqs / self.n, "toks": self.toks / self.n,
-              "emitted": self.emitted / self.n, "cg": self.cg}
+              "emitted": self.emitted / self.n, "cg": self.cg, "cg_ms": self.cg_ms}
         head = (f"BEGIN summary window {self.windows} [{self.label}] "
                 f"({self.n} steps, trace {path})")
         _say(f"STOP after {wall * 1e3:.0f} ms wall; trace {path}; "
@@ -529,7 +533,7 @@ class _PySession(_Session):
         _say(f"START pystack window {self.windows + 1} [{label}]: {self.n} "
              f"steps (pid {os.getpid()})")
 
-    def end_step(self, executed: bool) -> None:
+    def end_step(self, executed: bool, dt: float = 0.0) -> None:
         pass
 
     def stop(self) -> None:
@@ -595,6 +599,7 @@ def wrap_step(orig, sess: _Session):
             rf.__enter__()
         except Exception:  # noqa: BLE001
             rf = None
+        t0 = time.perf_counter()
         try:
             r = orig(self, *a, **kw)
         finally:
@@ -604,7 +609,7 @@ def wrap_step(orig, sess: _Session):
                 except Exception:  # noqa: BLE001
                     pass
         try:
-            sess.end_step(bool(r))
+            sess.end_step(bool(r), time.perf_counter() - t0)
             sess.steps += bool(r)
             if sess.steps >= sess.n:
                 sess.stop()
