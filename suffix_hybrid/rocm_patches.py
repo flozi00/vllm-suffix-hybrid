@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ROCm source patches for vLLM, one gate each (armed by sitecustomize).
+"""ROCm patches for vLLM modules, one gate each (armed by sitecustomize).
 
-Each patch rewrites one module's source before its first (only) execution.
-Gate on and the anchor not found exactly once -> that import fails: an enabled
-pool must never serve the unpatched path silently. Stdlib only at import.
+A patch rewrites a module's source before its first (only) execution and/or
+calls an `after` hook with the executed module. Gate on and the anchor not
+found exactly once -> that import fails: an enabled pool must never serve the
+unpatched path silently. Stdlib only at import (hooks import lazily).
 
 SUFFIX_ROCM_AITER_PAD=1: vLLM pre-rounds hidden_pad/intermediate_pad before
   rocm_aiter_ops.fused_moe and doubles intermediate_pad at TP1; AITER's CK
@@ -18,6 +19,9 @@ SUFFIX_ROCM_QSA_TOPK_ROWS=1: the Qwen4Exp QSA indexer runs top_k_per_row_decode
   supported", then a sticky HIP 401): the first step with >384 new tokens
   killed the engine. Chunks of <= 384 rows stay on the length-aware kernel;
   rows are independent, so the selection is unchanged.
+SUFFIX_ROCM_QSA_MQA=1: the QSA indexer scores only each row's visible columns
+  (suffix_hybrid/kernels/qsa_mqa_rocm.py) instead of the whole 262k-context
+  page-table width: 16.1 of 62.9 ms/step at 32 concurrent MTP-4 requests.
 """
 import importlib.util
 import os
@@ -27,33 +31,42 @@ from typing import NamedTuple
 
 class Patch(NamedTuple):
     target: str
-    old: str
-    new: str
     label: str
+    old: str = ""    # source anchor replaced by `new` before the first exec ("" = none)
+    new: str = ""
+    after: str = ""  # "module:function" called with the executed module ("" = none)
 
 
 PATCHES = {
     "SUFFIX_ROCM_AITER_PAD": Patch(
         "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe",
+        "raw MoE padding to AITER",
         "            hidden_pad = hidden_pad // 128 * 128\n"
         "            intermediate_pad = (\n"
         "                intermediate_pad // 64 * 64 * (2 if moe_config.tp_size == 1 else 1)\n"
         "            )\n",
-        "            pass  # suffix rocm-aiter-pad: AITER aligns internally (vllm#46201)\n",
-        "raw MoE padding to AITER"),
+        "            pass  # suffix rocm-aiter-pad: AITER aligns internally (vllm#46201)\n"),
     "SUFFIX_ROCM_QSA_TOPK_ROWS": Patch(
         "vllm.models.qwen4_exp.amd.ops.qsa",
+        "QSA top-k in <=384-row chunks",
         "    rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))\n",
         "    rows_per_chunk = min(384, max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))"
-        "  # suffix: hostcall-free top-k\n",
-        "QSA top-k in <=384-row chunks"),
+        "  # suffix: hostcall-free top-k\n"),
+    "SUFFIX_ROCM_QSA_MQA": Patch(
+        "vllm.models.qwen4_exp.amd.ops.qsa",
+        "QSA scores over visible columns only",
+        after="suffix_hybrid.kernels.qsa_mqa_rocm:install"),
 }
 _MARK = "_suffix_rocm_patch"
 
 
 def enabled() -> dict:
-    """Target module -> Patch for every gate set to 1."""
-    return {p.target: p for gate, p in PATCHES.items() if os.environ.get(gate, "").strip() == "1"}
+    """Target module -> [Patch] for every gate set to 1, in PATCHES order."""
+    todo: dict = {}
+    for gate, p in PATCHES.items():
+        if os.environ.get(gate, "").strip() == "1":
+            todo.setdefault(p.target, []).append(p)
+    return todo
 
 
 def patch_source(patch: Patch, src: str) -> str:
@@ -76,8 +89,8 @@ def install_post_import_hook() -> bool:
 
     class _Finder:
         def find_spec(self, fullname, path=None, target=None):  # noqa: ARG002
-            patch = todo.pop(fullname, None)
-            if patch is None:
+            patches = todo.pop(fullname, None)
+            if patches is None:
                 return None
             # importlib.util.find_spec walks sys.meta_path: step aside meanwhile,
             # for good once every target is armed.
@@ -92,11 +105,18 @@ def install_post_import_hook() -> bool:
             loader = spec.loader
 
             def exec_module(module):
-                src = patch_source(patch, loader.get_source(fullname))
+                src = loader.get_source(fullname)
+                for p in patches:
+                    if p.old:
+                        src = patch_source(p, src)
                 exec(compile(src, module.__file__, "exec"), module.__dict__)
+                for p in patches:
+                    if p.after:
+                        mod_name, fn = p.after.split(":")
+                        getattr(importlib.import_module(mod_name), fn)(module)
+                    print(f"[suffix rocm-patch] ACTIVE: {p.label} ({fullname})",
+                          file=sys.stderr, flush=True)
                 setattr(module, _MARK, True)
-                print(f"[suffix rocm-patch] ACTIVE: {patch.label} ({fullname})",
-                      file=sys.stderr, flush=True)
 
             loader.exec_module = exec_module  # type: ignore[method-assign]
             return spec

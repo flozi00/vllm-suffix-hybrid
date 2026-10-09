@@ -37,6 +37,8 @@ PYTHONPATH. Each section is independently gated:
                                (vllm#46201; TP1 MXFP4 MoE corruption; fail closed)
   SUFFIX_ROCM_QSA_TOPK_ROWS=1 -> ROCm: QSA indexer top-k in <=384-row chunks (the
                                >384-row kernel needs hostcall = PCIe atomics)
+  SUFFIX_ROCM_QSA_MQA=1     -> ROCm: QSA indexer scores only visible columns
+                               (suffix_hybrid/kernels/qsa_mqa_rocm.py)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -253,7 +255,7 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
 # ROCm vLLM source patches (suffix_hybrid/rocm_patches.py): each gate rewrites
 # one module before its first import; any failure is fatal (fail closed).
 if any(os.environ.get(_g, "").strip() == "1"
-       for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS")):
+       for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS", "SUFFIX_ROCM_QSA_MQA")):
     from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
     _rp_hook()
 
@@ -478,6 +480,8 @@ _BOOT_GATES = {
     "rocm_lds_probe": (["-m", "suffix_hybrid.tools.rocm_lds_probe"], {"AMD_LOG_LEVEL": "1"}),
     # Same host/KFD facts (incl. io_link atomics flags) without the kernel matrix.
     "rocm_host_facts": (["-m", "suffix_hybrid.tools.rocm_lds_probe", "--facts"], {}),
+    # SUFFIX_ROCM_QSA_MQA kernel vs vLLM's qsa_mqa_paged: equality on visible columns + us/call.
+    "qsa_mqa_bench": (["-m", "suffix_hybrid.kernels.qsa_mqa_rocm"], {}),
     # MXFP4 lm_head (SUFFIX_MXFP4_LMHEAD) at the qwen3.8-flash head: fidelity +
     # us/call of the graphed screen+rescore vs the stock bf16 head, M=1..16.
     "mxfp4_lmhead_bench": (["-m", "suffix_hybrid.kernels.mxfp4_lm_head"], {}),

@@ -15,6 +15,7 @@ from suffix_hybrid import rocm_patches as rp
 
 PAD = rp.PATCHES["SUFFIX_ROCM_AITER_PAD"]
 TOPK = rp.PATCHES["SUFFIX_ROCM_QSA_TOPK_ROWS"]
+MQA = rp.PATCHES["SUFFIX_ROCM_QSA_MQA"]
 FAKE = {
     "fake_aiter_moe": (
         "def pads(hidden_pad, intermediate_pad, moe_config, activation):\n"
@@ -24,7 +25,10 @@ FAKE = {
     "fake_qsa_ops": (
         "_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024\n"
         "def chunk(columns):\n" + TOPK.old +
-        "    return rows_per_chunk\n"),
+        "    return rows_per_chunk\n"
+        "def qsa_mqa_paged():\n"
+        "    return 'stock'\n"),
+    "fake_qsa_kernel": "def install(module):\n    module.qsa_mqa_paged = lambda: 'suffix'\n",
 }
 
 
@@ -43,8 +47,10 @@ def test_hook_rewrites_every_enabled_target(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setitem(rp.PATCHES, "SUFFIX_ROCM_AITER_PAD", PAD._replace(target="fake_aiter_moe"))
     monkeypatch.setitem(rp.PATCHES, "SUFFIX_ROCM_QSA_TOPK_ROWS", TOPK._replace(target="fake_qsa_ops"))
-    monkeypatch.setenv("SUFFIX_ROCM_AITER_PAD", "1")
-    monkeypatch.setenv("SUFFIX_ROCM_QSA_TOPK_ROWS", "1")
+    monkeypatch.setitem(rp.PATCHES, "SUFFIX_ROCM_QSA_MQA",
+                        MQA._replace(target="fake_qsa_ops", after="fake_qsa_kernel:install"))
+    for gate in rp.PATCHES:
+        monkeypatch.setenv(gate, "1")
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
     assert rp.install_post_import_hook()
     try:
@@ -54,6 +60,7 @@ def test_hook_rewrites_every_enabled_target(tmp_path, monkeypatch):
         assert moe.pads(100, 384, cfg, "silu") == (100, 384)
         qsa = importlib.import_module("fake_qsa_ops")
         assert qsa.chunk(1024) == 384 and qsa.chunk(1 << 20) == 32  # cap, workspace bound kept
+        assert qsa.qsa_mqa_paged() == "suffix"  # after hook ran on the rewritten module
         assert getattr(moe, rp._MARK) and getattr(qsa, rp._MARK)
         assert not any(getattr(f, rp._MARK, False) for f in sys.meta_path)  # finder retired
     finally:
@@ -65,3 +72,4 @@ def test_gate_off_is_inert(monkeypatch):
     for gate in rp.PATCHES:
         monkeypatch.delenv(gate, raising=False)
     assert rp.install_post_import_hook() is False
+    assert MQA.after == "suffix_hybrid.kernels.qsa_mqa_rocm:install" and not MQA.old
