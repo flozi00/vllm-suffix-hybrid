@@ -33,7 +33,10 @@ from vllm.triton_utils import tl, triton
 
 MARK = "[suffix qsa-dense]"
 DENSE_BLOCK_M = 64  # query rows x group heads of one dense program
-DENSE_CONFIG = (64, 4, 1)  # BLOCK_N, num_warps, num_stages (boot gate qsa_dense_bench sweeps)
+# BLOCK_N, num_warps, num_stages, target programs (the context split: (requests x KV heads)
+# x splits ~ target). MI350P oracle 2026-10-09 (k13): 32/4w/1s c32 84 us vs 64/4w/1s 146.
+DENSE_CONFIG = (32, 4, 1, 256)
+DENSE_MIN_REQUESTS = 4  # c1..c3 graphs keep the stock launch pair (k13: c1 17.8 vs 18.4 us)
 
 
 @triton.jit
@@ -274,6 +277,65 @@ def _qsa_sparse_rows_kernel(
         )
 
 
+@triton.jit
+def _merge_row(partial_output_ptr, partial_lse_ptr, output_ptr, row, head, stride_output_row,
+               stride_output_head, num_rows, HEAD_DIM: tl.constexpr,
+               NUM_QUERY_HEADS: tl.constexpr, NUM_SPLITS: tl.constexpr,
+               BLOCK_SPLITS: tl.constexpr):
+    # vllm/models/qwen4_exp/amd/ops/qsa.py @81198e97 _qsa_merge_splitk_kernel body.
+    split_offsets = tl.arange(0, BLOCK_SPLITS)
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    split_mask = split_offsets < NUM_SPLITS
+    lse = tl.load(partial_lse_ptr + (split_offsets * num_rows + row) * NUM_QUERY_HEADS + head,
+                  mask=split_mask, other=-float("inf"))
+    lse_max = tl.max(lse, axis=0)
+    has_values = lse_max > -float("inf")
+    shifted = tl.where(split_mask & has_values, lse - lse_max, -float("inf"))
+    weights = tl.math.exp2(shifted)
+    denominator = tl.sum(weights, axis=0)
+    partial_output = tl.load(
+        partial_output_ptr
+        + ((split_offsets[:, None] * num_rows + row) * NUM_QUERY_HEADS + head) * HEAD_DIM
+        + dim_offsets[None, :],
+        mask=split_mask[:, None],
+        other=0.0,
+    )
+    merged = tl.sum(partial_output * weights[:, None], axis=0)
+    merged = tl.where(denominator > 0, merged / denominator, 0.0)
+    tl.store(output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
+             merged)
+
+
+@triton.jit
+def _qsa_merge_kernel(
+    dense_output_ptr, dense_lse_ptr, sparse_output_ptr, sparse_lse_ptr, output_ptr,
+    token_to_req_ptr, seq_lens_ptr, query_start_ptr,
+    stride_output_row, stride_output_head, num_rows, num_dense_requests,
+    TOKEN_TOPK: tl.constexpr, GROUP_SIZE: tl.constexpr, DENSE_BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr, NUM_QUERY_HEADS: tl.constexpr,
+    DENSE_SPLITS: tl.constexpr, SPARSE_SPLITS: tl.constexpr,
+) -> None:
+    # One merge for both groups: a dense row folds its DENSE_SPLITS context splits, any
+    # other row vLLM's SPARSE_SPLITS selection splits (a single split wrote the output).
+    BLOCK_DENSE: tl.constexpr = triton.next_power_of_2(DENSE_SPLITS)
+    BLOCK_SPARSE: tl.constexpr = triton.next_power_of_2(SPARSE_SPLITS)
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    request = tl.load(token_to_req_ptr + row)
+    _, _, _, dense = _dense_request(request, seq_lens_ptr, query_start_ptr, num_dense_requests,
+                                    GROUP_SIZE, DENSE_BLOCK_M, TOKEN_TOPK)
+    if dense:
+        if DENSE_SPLITS > 1:
+            _merge_row(dense_output_ptr, dense_lse_ptr, output_ptr, row, head, stride_output_row,
+                       stride_output_head, num_rows, HEAD_DIM, NUM_QUERY_HEADS, DENSE_SPLITS,
+                       BLOCK_DENSE)
+    else:
+        if SPARSE_SPLITS > 1:
+            _merge_row(sparse_output_ptr, sparse_lse_ptr, output_ptr, row, head,
+                       stride_output_row, stride_output_head, num_rows, HEAD_DIM,
+                       NUM_QUERY_HEADS, SPARSE_SPLITS, BLOCK_SPARSE)
+
+
 def qsa_attention(q, k_cache, v_cache, logical_indices, block_table, token_to_req, out,
                   seq_lens, query_start_loc, token_topk, dense=True, dense_config=None):
     """Drop-in for vLLM's qsa_sparse_paged_attention(q, k, v, indices, block_table,
@@ -283,7 +345,8 @@ def qsa_attention(q, k_cache, v_cache, logical_indices, block_table, token_to_re
     group = q.shape[1] // k_cache.shape[2]
     if (not dense or not q.shape[0] or group > DENSE_BLOCK_M or seq_lens is None
             or query_start_loc is None or seq_lens.dtype != torch.int32
-            or query_start_loc.dtype != torch.int32 or not seq_lens.shape[0]
+            or query_start_loc.dtype != torch.int32
+            or seq_lens.shape[0] < DENSE_MIN_REQUESTS
             or query_start_loc.shape != (seq_lens.shape[0] + 1,)):
         return stock.qsa_sparse_paged_attention(
             q, k_cache, v_cache, logical_indices, block_table, token_to_req, out)
@@ -292,9 +355,8 @@ def qsa_attention(q, k_cache, v_cache, logical_indices, block_table, token_to_re
     assert logical_indices.stride(1) == block_table.stride(1) == token_to_req.stride(0) == 1
     assert seq_lens.is_contiguous() and query_start_loc.is_contiguous()
 
-    # vLLM's split profile (qsa_sparse_paged_attention): the sparse rows keep their exact
-    # schedule (bit-identical), the dense requests split their context the same number
-    # of ways so both share the partial buffers and one merge.
+    # Sparse rows: vLLM's split profile (qsa_sparse_paged_attention), so they stay
+    # bit-identical. Dense requests: their own context split, ~target programs.
     block_m = triton.next_power_of_2(group)
     base_programs = q.shape[0] * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
@@ -309,38 +371,47 @@ def qsa_attention(q, k_cache, v_cache, logical_indices, block_table, token_to_re
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
-    num_splits = min(1 << (num_tiles.bit_length() - 1), target_splits)
-    if num_splits == 1:
-        partial_output = partial_lse = out
-    else:
-        partial_output = torch.empty((num_splits, *q.shape), dtype=torch.float32, device=q.device)
-        partial_lse = torch.empty((num_splits, q.shape[0], q.shape[1]), dtype=torch.float32,
-                                  device=q.device)
+    sparse_splits = min(1 << (num_tiles.bit_length() - 1), target_splits)
+    dense_n, dense_warps, dense_stages, dense_target = dense_config or DENSE_CONFIG
+    dense_base = seq_lens.shape[0] * k_cache.shape[2]
+    dense_splits = min(64, triton.next_power_of_2(max(1, dense_target // dense_base)))
+
+    def partials(splits):
+        if splits == 1:
+            return out, out
+        return (torch.empty((splits, *q.shape), dtype=torch.float32, device=q.device),
+                torch.empty((splits, q.shape[0], q.shape[1]), dtype=torch.float32,
+                            device=q.device))
+
+    sparse_output, sparse_lse = partials(sparse_splits)
+    dense_output, dense_lse = partials(dense_splits)
     common = dict(TOKEN_TOPK=token_topk, PAGE_SIZE=k_cache.shape[1],
                   PAGE_TABLE_WIDTH=block_table.shape[1], GROUP_SIZE=group,
-                  HEAD_DIM=q.shape[2], NUM_QUERY_HEADS=q.shape[1], NUM_SPLITS=num_splits)
+                  HEAD_DIM=q.shape[2], NUM_QUERY_HEADS=q.shape[1])
     strides = (q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
                v_cache.stride(0), v_cache.stride(1), v_cache.stride(2))
-    _qsa_sparse_rows_kernel[(q.shape[0], k_cache.shape[2], num_splits)](
+    _qsa_sparse_rows_kernel[(q.shape[0], k_cache.shape[2], sparse_splits)](
         q, k_cache, v_cache, logical_indices, block_table, token_to_req, seq_lens,
-        query_start_loc, partial_output, partial_lse, out, *strides,
+        query_start_loc, sparse_output, sparse_lse, out, *strides,
         logical_indices.stride(0), block_table.stride(0), out.stride(0), out.stride(1),
         q.shape[0], k_cache.shape[0], block_table.shape[0], seq_lens.shape[0],
-        TOPK=logical_indices.shape[1], NUM_TILES=num_tiles, BLOCK_M=block_m, BLOCK_N=block_n,
-        DENSE_BLOCK_M=DENSE_BLOCK_M, num_warps=partial_warps, num_stages=1, **common)
-    dense_n, dense_warps, dense_stages = dense_config or DENSE_CONFIG
-    _qsa_dense_kernel[(seq_lens.shape[0], k_cache.shape[2], num_splits)](
+        TOPK=logical_indices.shape[1], NUM_SPLITS=sparse_splits, NUM_TILES=num_tiles,
+        BLOCK_M=block_m, BLOCK_N=block_n, DENSE_BLOCK_M=DENSE_BLOCK_M,
+        num_warps=partial_warps, num_stages=1, **common)
+    _qsa_dense_kernel[(seq_lens.shape[0], k_cache.shape[2], dense_splits)](
         q, k_cache, v_cache, block_table, seq_lens, query_start_loc,
-        partial_output, partial_lse, out, *strides,
+        dense_output, dense_lse, out, *strides,
         block_table.stride(0), out.stride(0), out.stride(1),
         q.shape[0], k_cache.shape[0], seq_lens.shape[0],
-        BLOCK_M=DENSE_BLOCK_M, BLOCK_N=dense_n, num_warps=dense_warps,
-        num_stages=dense_stages, **common)
-    if num_splits > 1:
-        stock._qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
-            partial_output, partial_lse, out, out.stride(0), out.stride(1), q.shape[0],
-            HEAD_DIM=q.shape[2], NUM_QUERY_HEADS=q.shape[1], NUM_SPLITS=num_splits,
-            BLOCK_SPLITS=triton.next_power_of_2(num_splits), num_warps=2, num_stages=1)
+        NUM_SPLITS=dense_splits, BLOCK_M=DENSE_BLOCK_M, BLOCK_N=dense_n,
+        num_warps=dense_warps, num_stages=dense_stages, **common)
+    if sparse_splits > 1 or dense_splits > 1:
+        _qsa_merge_kernel[(q.shape[0], q.shape[1])](
+            dense_output, dense_lse, sparse_output, sparse_lse, out, token_to_req, seq_lens,
+            query_start_loc, out.stride(0), out.stride(1), q.shape[0], seq_lens.shape[0],
+            TOKEN_TOPK=token_topk, GROUP_SIZE=group, DENSE_BLOCK_M=DENSE_BLOCK_M,
+            HEAD_DIM=q.shape[2], NUM_QUERY_HEADS=q.shape[1], DENSE_SPLITS=dense_splits,
+            SPARSE_SPLITS=sparse_splits, num_warps=2, num_stages=1)
     return out
 
 
@@ -472,16 +543,18 @@ def main() -> int:
             t_new = _graph_us(lambda i: run_new(st, i, outs[i]), layers)[0]
             line += f" | graphed stock {t_stock:.1f} us -> dense {t_new:.1f} us"
             sweep = []
-            for cfg in ((32, 4, 1), (64, 4, 1), (64, 4, 2), (64, 8, 1), (128, 4, 1), (128, 8, 1)):
+            for cfg in ((32, 4, 1, 128), (32, 4, 1, 256), (32, 4, 1, 512), (32, 4, 2, 256),
+                        (32, 8, 1, 256), (64, 4, 1, 256), (64, 4, 2, 256), (64, 4, 2, 512),
+                        (64, 4, 3, 256), (16, 4, 1, 512), (16, 4, 2, 512)):
                 try:
                     good = compare(st, run_stock(st), run_new(st, cfg=cfg))[0]
                     us = _graph_us(lambda i: run_new(st, i, outs[i], cfg), layers)[0]
-                    sweep.append((us, f"{cfg[0]}/{cfg[1]}w/{cfg[2]}s {us:.1f}"
+                    sweep.append((us, f"{cfg[0]}/{cfg[1]}w/{cfg[2]}s/{cfg[3]}p {us:.1f}"
                                       + ("" if good else " MISMATCH")))
                     failed |= not good
                 except Exception as exc:  # noqa: BLE001 - a config that does not build is a datum
                     sweep.append((float("inf"), f"{cfg} {type(exc).__name__}"))
-            line += f" | sweep BLOCK_N/warps/stages us: {' | '.join(s for _, s in sweep)}"
+            line += f" | sweep BLOCK_N/warps/stages/programs us: {' | '.join(s for _, s in sweep)}"
         print(line, flush=True)
 
     # Graph safety: capture on the c32 layout, then replay after rewriting lengths (some

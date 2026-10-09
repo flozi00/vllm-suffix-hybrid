@@ -26,11 +26,15 @@ buffer). Never FlyDSL: no draft_window, so capture-safe Triton only.
 from __future__ import annotations
 
 import math
+import os
 from types import SimpleNamespace
 
 import torch
 
 _Q = None  # vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn, set by install()
+# SUFFIX_ROCM_GDN_DEFER: the verify runs gdn_defer_rocm's deferred-commit kernel instead
+# (rocm_patches applies its metadata + generic-path rewrites).
+_DEFER = os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
 
 
 def install(module) -> None:
@@ -74,6 +78,18 @@ def forward_spec(layer, qkvz, ba, core_attn_out, md) -> bool:
         max_query_len=idx.size(-1),
         validate_data=False,
     )
+    if _DEFER:
+        from suffix_hybrid.kernels.gdn_defer_rocm import gdn_defer
+
+        hv = value_dim // layer.head_v_dim
+        gdn_defer(qkv, ba[:n, hv:], ba[:n, :hv], layer.A_log, layer.dt_bias, layer.kv_cache[1],
+                  md.spec_query_start_loc[: md.num_spec_decodes + 1], idx,
+                  md.num_accepted_tokens, md.suffix_spec_seq_lens, core_attn_out,
+                  key_dim // layer.head_k_dim, layer.head_k_dim, layer.head_v_dim,
+                  md.suffix_zone)
+        if n < core_attn_out.shape[0]:
+            core_attn_out[n:].zero_()
+        return True
     # ponytail: one a/b copy left (the kernel assumes row stride HV); a delta-rule
     # kernel taking the ba row stride drops it (fusion plan F1b).
     b, a = ba[:n].unflatten(-1, (2, value_dim // layer.head_v_dim)).transpose(0, 1).contiguous()

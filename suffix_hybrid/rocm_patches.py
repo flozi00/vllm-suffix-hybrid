@@ -74,6 +74,12 @@ SUFFIX_ROCM_QSA_DENSE=1: Qwen4Exp QSA attention takes a request with seq_len <= 
   0..p, which vLLM's sparse kernel gathers once per query row (179 us per layer at c32).
   Other requests keep vLLM's sparse kernel (copied with a row skip + the all -1 tile
   skip); MTP steps that reuse the step-0 selection (indexer.skip_topk) stay stock.
+SUFFIX_ROCM_GDN_DEFER=1 (needs _GDN_MTP and _GDN_ASYNC_IDX): GDN MTP verify with deferred
+  state commit (suffix_hybrid/kernels/gdn_defer_rocm.py): the state after token 0 goes to
+  slot 0 and tokens 1.. leave only their inputs in slot 1's tile; the next step replays
+  the accepted ones (bit-identical). 1 state write per request and layer instead of 5;
+  steps near a mamba align block boundary keep vLLM's slot contract for its copies. The
+  GDN metadata carries the spec rows' seq_lens and the align block size for that.
 SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non-ASM dense
   MXFP4 path) takes GEMM-AFP4WFP4-N=<N>-K=<K>.json from suffix_hybrid/configs/afp4/ (boot
   gate afp4_tune) before AITER's own tree. AITER keys these JSONs by arch + (N, K) only, so
@@ -448,6 +454,54 @@ PATCHES = {
         Patch("vllm.v1.attention.backends.gdn_attn",
               f"GDN mixed-batch gathers by device row index ({site})", old, new)
         for site, old, new in _GDN_ASYNC_IDX),
+    "SUFFIX_ROCM_GDN_DEFER": (
+        Patch("vllm.v1.attention.backends.gdn_attn", "GDN metadata: spec seq_lens + align zone",
+              _GDN_FIELD, _GDN_FIELD +
+              "    # suffix SUFFIX_ROCM_GDN_DEFER: positions of the spec rows, align block size\n"
+              "    suffix_spec_seq_lens: torch.Tensor | None = None\n"
+              "    suffix_zone: int = 0\n"),
+        Patch("vllm.v1.attention.backends.gdn_attn", "GDN metadata: spec seq_lens (ctor)",
+              _GDN_CTOR, _GDN_CTOR +
+              "            suffix_spec_seq_lens=(  # suffix SUFFIX_ROCM_GDN_DEFER\n"
+              "                None if spec_sequence_masks is None\n"
+              "                else m.seq_lens[:batch_size] if spec_req_idx is None\n"
+              "                else m.seq_lens[spec_req_idx]\n"
+              "            ),\n"
+              "            suffix_zone=(\n"
+              "                self.kv_cache_spec.block_size\n"
+              "                if self.vllm_config.cache_config.mamba_cache_mode == \"align\"\n"
+              "                else 0\n"
+              "            ),\n"),
+        Patch("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
+              "GDN spec verify (generic path) with deferred state commit",
+              "        if spec_sequence_masks is not None:\n"
+              "            core_attn_out_spec, last_recurrent_state = (\n"
+              "                fused_sigmoid_gating_delta_rule_update(\n"
+              "                    A_log=self.A_log,\n"
+              "                    a=a_spec,\n"
+              "                    b=b_spec,\n"
+              "                    dt_bias=self.dt_bias,\n"
+              "                    q=query_spec,\n"
+              "                    k=key_spec,\n"
+              "                    v=value_spec,\n"
+              "                    initial_state=ssm_state,\n"
+              "                    inplace_final_state=True,\n"
+              "                    cu_seqlens=spec_query_start_loc[  # type: ignore[index]\n"
+              "                        : attn_metadata.num_spec_decodes\n"
+              "                        + 1  # type: ignore[attr-defined]\n"
+              "                    ],\n"
+              "                    ssm_state_indices=spec_state_indices_tensor,\n"
+              "                    num_accepted_tokens=num_accepted_tokens,\n"
+              "                    use_qk_l2norm_in_kernel=True,\n"
+              "                )\n"
+              "            )\n",
+              "        if spec_sequence_masks is not None:  # suffix SUFFIX_ROCM_GDN_DEFER\n"
+              "            core_attn_out_spec = _suffix_gdn_defer_spec(\n"
+              "                self, mixed_qkv_spec, a_spec, b_spec, ssm_state, attn_metadata\n"
+              "            )\n"
+              "            last_recurrent_state = None\n",
+              "suffix_hybrid.kernels.gdn_defer_rocm:install"),
+    ),
     "SUFFIX_ROCM_HC_DOWN": (
         Patch(_HC, "HC down projection split-K at small M (mix)",
               "            hidden_states,\n" + _HC_DOWN,

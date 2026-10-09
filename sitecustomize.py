@@ -61,6 +61,8 @@ PYTHONPATH. Each section is independently gated:
                                suffix_hybrid/configs/afp4/ first (boot gate afp4_tune)
   SUFFIX_ROCM_QSA_DENSE=1   -> ROCm: QSA attention runs requests within the token
                                top-k as dense blocks (suffix_hybrid/kernels/qsa_dense_rocm.py)
+  SUFFIX_ROCM_GDN_DEFER=1   -> ROCm: GDN MTP verify writes 1 state + token inputs
+                               instead of 5 states (gdn_defer_rocm.py; needs _GDN_MTP, _ASYNC_IDX)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -291,7 +293,13 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_QSA_SPARSE_SKIP", "SUFFIX_ROCM_GDN_ASYNC_IDX", "SUFFIX_ROCM_HC_DOWN",
                   "SUFFIX_ROCM_AITER_FLYDSL_PAD", "SUFFIX_ROCM_AITER_FLYDSL_ZERO",
                   "SUFFIX_ROCM_AFP4_CONFIGS", "SUFFIX_ROCM_QSA_DENSE",
-                  "SUFFIX_ROCM_AITER_FLYDSL_ZBUF")):
+                  "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER")):
+    if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
+            and not all(os.environ.get(_g, "").strip() == "1"
+                        for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
+        raise SystemExit("[suffix rocm-patch] SUFFIX_ROCM_GDN_DEFER needs SUFFIX_ROCM_GDN_MTP=1 "
+                         "and SUFFIX_ROCM_GDN_ASYNC_IDX=1 (every verify path must keep one "
+                         "slot contract)")
     from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
     _rp_hook()
 # SUFFIX_ROCM_HC_FUSE / _HC_DOWN rewrite Dynamo-traced code. vLLM's AOT-compile artifacts
@@ -542,6 +550,9 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_GDN_MTP vs vLLM's spec branch of _forward_core_rocm: outputs, every
     # state page byte, graph replay with new slots + graphed us/call (MTP-4 verify).
     "gdn_mtp_bench": (["-m", "suffix_hybrid.kernels.gdn_mtp_rocm"], {}),
+    # SUFFIX_ROCM_GDN_DEFER vs AITER's verify over 14 steps of random acceptance with the
+    # align-mode copies emulated: bitwise outputs + boundary slots; graphed us/call.
+    "gdn_defer_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm"], {}),
     # SUFFIX_ROCM_HC_FUSE kernel vs vLLM hc_silu -> F.linear -> hc_gate_mix: bf16
     # bound + bit-exact share, us/call (HIP graphs, cold weights), BMxNG sweep.
     "hc_fuse_bench": (["-m", "suffix_hybrid.kernels.hc_fused_rocm"], {}),
