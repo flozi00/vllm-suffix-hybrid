@@ -162,3 +162,52 @@ def test_worker_profiler_wraps_execute_model_and_passes_results(monkeypatch):
     assert Worker._suffix_worker_prof and Worker().execute_model(21) == 42
     sp._patch_worker(mod)  # idempotent
     assert Worker().execute_model(1) == 2  # not rank 0 here (no vllm): never profiles
+
+
+def test_kernels_split_by_step_signature():
+    """A kernel belongs to the step whose CPU span issued its launch (correlation id),
+    however late it runs on the GPU."""
+    from suffix_hybrid import step_profiler as sp
+
+    def x(name, cat, ts, dur, **args):
+        return {"ph": "X", "name": name, "cat": cat, "ts": ts, "dur": dur, "args": args}
+
+    trace = {"traceEvents": [
+        x(sp.STEP, "user_annotation", 0, 100), x(sp.STEP, "user_annotation", 200, 100),
+        x(sp.STEP, "user_annotation", 400, 100),
+        x("cudaGraphLaunch", "cuda_runtime", 10, 5, correlation=1),
+        x("cudaLaunchKernel", "cuda_runtime", 210, 5, correlation=2),
+        x("cudaLaunchKernel", "cuda_runtime", 220, 5, correlation=3),
+        x("cudaGraphLaunch", "cuda_runtime", 410, 5, correlation=4),
+        x("decode_k", "kernel", 20, 50, correlation=1),
+        x("prefill_k", "kernel", 330, 40, correlation=2),  # runs after its step's CPU span
+        x("prefill_k", "kernel", 380, 20, correlation=3),
+        x("decode_k", "kernel", 420, 30, correlation=4),
+    ]}
+    lines = sp.summarize(trace, {"cg": {}, "sigs": ["FULL", "PW", "FULL"]})
+    full = [ln for ln in lines if ln.startswith("[FULL]")]
+    pw = [ln for ln in lines if ln.startswith("[PW]")]
+    assert full and "2 steps" in full[0] and pw and "1 steps" in pw[0]
+    assert any("decode_k" in ln and "0.040" in ln for ln in lines if ln.startswith("  [FULL]"))
+    assert any("prefill_k" in ln and "2.0 |   0.060" in ln for ln in lines if ln.startswith("  [PW]"))
+    assert not any("prefill_k" in ln for ln in lines if ln.startswith("  [FULL]"))
+
+
+def test_child_summary_from_sidecar(tmp_path, capsys):
+    """stop() hands the trace + a JSON sidecar to a child process; its block is marked."""
+    import json
+
+    from suffix_hybrid import step_profiler as sp
+    trace = tmp_path / "t.json"
+    trace.write_text(json.dumps({"traceEvents": [
+        {"ph": "X", "name": sp.STEP, "cat": "user_annotation", "ts": 0, "dur": 10}]}))
+    side = tmp_path / "t.json.py.json"
+    side.write_text(json.dumps({"reqs": 1, "toks": 5, "emitted": 3, "cg": {"FULL": 1},
+                                "cg_ms": {"FULL": 9.0}, "sigs": ["FULL"],
+                                "head": "BEGIN summary window 1 [c1]",
+                                "end": "END summary window 1"}))
+    assert sp._main(["x", str(trace), str(side)]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"{sp.MARK} BEGIN summary window 1 [c1]"
+    assert out[-1] == f"{sp.MARK} END summary window 1" and all(ln.startswith(sp.MARK) for ln in out)
+    assert any("FULL: 1 @9.0ms" in ln for ln in out)
