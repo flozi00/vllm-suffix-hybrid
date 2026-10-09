@@ -274,7 +274,7 @@ if any(os.environ.get(_g, "").strip() == "1"
        for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS", "SUFFIX_ROCM_QSA_MQA",
                   "SUFFIX_ROCM_MXFP4_A16", "SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_HC_FUSE",
                   "SUFFIX_ROCM_QSA_SPARSE_SKIP", "SUFFIX_ROCM_GDN_ASYNC_IDX", "SUFFIX_ROCM_HC_DOWN",
-                  "SUFFIX_ROCM_AITER_FLYDSL_PAD")):
+                  "SUFFIX_ROCM_AITER_FLYDSL_PAD", "SUFFIX_ROCM_AITER_FLYDSL_ZERO")):
     from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
     _rp_hook()
 # SUFFIX_ROCM_HC_FUSE / _HC_DOWN rewrite Dynamo-traced code. vLLM's AOT-compile artifacts
@@ -515,6 +515,8 @@ _BOOT_GATES = {
     # vLLM-padded MXFP4 weights, with the SUFFIX_ROCM_AITER_FLYDSL_PAD fix active: NaN/cos check.
     "moe_fp4_oracle": (["-m", "suffix_hybrid.tools.moe_fp4_oracle"],
                        {"SUFFIX_ROCM_AITER_FLYDSL_PAD": "1"}),
+    "moe_fp4_oracle_zero": (["-m", "suffix_hybrid.tools.moe_fp4_oracle"],
+                            {"SUFFIX_ROCM_AITER_FLYDSL_ZERO": "1"}),
     # SUFFIX_ROCM_GDN_MTP vs vLLM's spec branch of _forward_core_rocm: outputs, every
     # state page byte, graph replay with new slots + graphed us/call (MTP-4 verify).
     "gdn_mtp_bench": (["-m", "suffix_hybrid.kernels.gdn_mtp_rocm"], {}),

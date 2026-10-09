@@ -29,6 +29,10 @@ SUFFIX_ROCM_AITER_FLYDSL_PAD=1: AITER v0.1.24.post1 bug. A tuned fMoE row that p
   K-pad skip): stale 0xFF scales are NaN -> garbage (GSM8K 0.105 on the MI350P with
   our tuned table). Stage 1 now writes the zero tail for layout stage 2s (boot gate
   moe_fp4_oracle); the default and prefill paths keep the pad.
+SUFFIX_ROCM_AITER_FLYDSL_ZERO=1: the cheaper fix for the same AITER bug (use instead of
+  _FLYDSL_PAD): stage 1 keeps skipping the padded inter tail, but its fp4 output and
+  sorted e8m0 scale buffers are allocated zeroed when inter_dim_pad > 0 (AITER's a16w4
+  stage 1 already does this), so the layout stage 2 reads 0 * 2^-127 = 0 there.
 SUFFIX_ROCM_QSA_SPARSE_SKIP=1: the QSA sparse attention kernel skips selection
   tiles whose slots are all -1 (every context shorter than the 2048-token
   budget pads the 2051-slot selection with -1); such a tile is a no-op in the
@@ -271,6 +275,27 @@ PATCHES = {
         "                inter_dim_pad=0 if is_flydsl2_layout else intermediate_pad,\n"
         "                model_dim_pad=hidden_pad,\n"
         "            )\n"),
+    "SUFFIX_ROCM_AITER_FLYDSL_ZERO": (
+        Patch("aiter.ops.flydsl.moe_kernels",
+              "FlyDSL fp4 stage 1 output zeroed when the inter dim is padded",
+              "            if _need_fp4:\n"
+              "                out = torch.empty(\n"
+              "                    (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev\n"
+              "                )\n",
+              "            if _need_fp4:  # suffix SUFFIX_ROCM_AITER_FLYDSL_ZERO: no stale padded tail\n"
+              "                out = (torch.zeros if inter_dim_pad > 0 else torch.empty)(\n"
+              "                    (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev\n"
+              "                )\n"),
+        Patch("aiter.ops.flydsl.moe_kernels",
+              "FlyDSL fp4 stage 1 scales zeroed when the inter dim is padded",
+              "    out_scale_sorted_flat = (\n"
+              "        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)\n"
+              "        if _need_sort\n",
+              "    out_scale_sorted_flat = (  # suffix SUFFIX_ROCM_AITER_FLYDSL_ZERO\n"
+              "        (torch.zeros if inter_dim_pad > 0 else torch.empty)(\n"
+              "            padded_rows * padded_cols, dtype=torch.uint8, device=dev)\n"
+              "        if _need_sort\n"),
+    ),
     "SUFFIX_ROCM_QSA_SPARSE_SKIP": Patch(
         "vllm.models.qwen4_exp.amd.ops.qsa",
         "QSA sparse attention skips all-padding tiles",
