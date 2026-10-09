@@ -39,6 +39,8 @@ PYTHONPATH. Each section is independently gated:
                                >384-row kernel needs hostcall = PCIe atomics)
   SUFFIX_ROCM_QSA_MQA=1     -> ROCm: QSA indexer scores only visible columns
                                (suffix_hybrid/kernels/qsa_mqa_rocm.py)
+  SUFFIX_ROCM_MXFP4_A16=1   -> ROCm: dense MXFP4 linears at M <= SUFFIX_ROCM_MXFP4_A16_MAX_M
+                               (default 32) as one AITER gemm_a16wfp4 launch
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -255,7 +257,8 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
 # ROCm vLLM source patches (suffix_hybrid/rocm_patches.py): each gate rewrites
 # one module before its first import; any failure is fatal (fail closed).
 if any(os.environ.get(_g, "").strip() == "1"
-       for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS", "SUFFIX_ROCM_QSA_MQA")):
+       for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS", "SUFFIX_ROCM_QSA_MQA",
+                  "SUFFIX_ROCM_MXFP4_A16")):
     from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
     _rp_hook()
 
@@ -490,6 +493,9 @@ _BOOT_GATES = {
     # MXFP4 lm_head (SUFFIX_MXFP4_LMHEAD) at the qwen3.8-flash head: fidelity +
     # us/call of the graphed screen+rescore vs the stock bf16 head, M=1..16.
     "mxfp4_lmhead_bench": (["-m", "suffix_hybrid.kernels.mxfp4_lm_head"], {}),
+    # SUFFIX_ROCM_MXFP4_A16 at the qwen3.8-flash dense MXFP4 shapes, M 1..40: gemm_a16wfp4
+    # vs vLLM's quant + gemm_afp4wfp4 (numerics, graph replay == eager), graphed us/call.
+    "mxfp4_a16_bench": (["-m", "suffix_hybrid.kernels.mxfp4_a16_rocm"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():

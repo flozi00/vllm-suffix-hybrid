@@ -22,6 +22,12 @@ SUFFIX_ROCM_QSA_TOPK_ROWS=1: the Qwen4Exp QSA indexer runs top_k_per_row_decode
 SUFFIX_ROCM_QSA_MQA=1: the QSA indexer scores only each row's visible columns
   (suffix_hybrid/kernels/qsa_mqa_rocm.py) instead of the whole 262k-context
   page-table width: 16.1 of 62.9 ms/step at 32 concurrent MTP-4 requests.
+SUFFIX_ROCM_MXFP4_A16=1: dense MXFP4 linears (non-ASM AITER path) at M <=
+  SUFFIX_ROCM_MXFP4_A16_MAX_M (default 32) run as one AITER gemm_a16wfp4 launch
+  that quantizes the activations in-kernel, instead of dynamic_mxfp4_quant +
+  gemm_afp4wfp4 (+ split-K reduce): ~180 fewer launches per MTP-4 decode step
+  (suffix_hybrid/kernels/mxfp4_a16_rocm.py). Source rewrite, because
+  gemm_with_dynamic_quant is registered as a custom op when the module executes.
 """
 import importlib.util
 import os
@@ -56,6 +62,17 @@ PATCHES = {
         "vllm.models.qwen4_exp.amd.ops.qsa",
         "QSA scores over visible columns only",
         after="suffix_hybrid.kernels.qsa_mqa_rocm:install"),
+    "SUFFIX_ROCM_MXFP4_A16": Patch(
+        "vllm.model_executor.kernels.linear.mxfp4.aiter",
+        "dense MXFP4 small M via AITER gemm_a16wfp4",
+        "            if x_scales is None:\n"
+        "                x_q, x_s = dynamic_mxfp4_quant(x)\n",
+        "            if x_scales is None:  # suffix SUFFIX_ROCM_MXFP4_A16: small M -> gemm_a16wfp4\n"
+        "                from suffix_hybrid.kernels.mxfp4_a16_rocm import gemm_a16\n"
+        "                y = gemm_a16(x, weight, weight_scale, out_dtype)\n"
+        "                if y is not None:\n"
+        "                    return y\n"
+        "                x_q, x_s = dynamic_mxfp4_quant(x)\n"),
 }
 _MARK = "_suffix_rocm_patch"
 
