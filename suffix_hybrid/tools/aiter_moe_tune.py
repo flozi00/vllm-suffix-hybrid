@@ -50,8 +50,9 @@ def main() -> int:
     ap.add_argument("--inter-dim", type=int, default=768)
     ap.add_argument("--expert", type=int, default=512)
     ap.add_argument("--topk", type=int, default=10)
-    ap.add_argument("--tokens", default="1,2,4,8,16,32,64,128,256")
-    ap.add_argument("--timeout", type=int, default=2700)
+    # nextPow2 of the MTP-4 decode M: c1 5 -> 8, c8 40 -> 64, c32 160 -> 256.
+    ap.add_argument("--tokens", default="8,16,32,64,128,256")
+    ap.add_argument("--timeout", type=int, default=3 * 3600)
     a = ap.parse_args()
     tuner = find_tuner()
     if tuner is None:
@@ -66,8 +67,9 @@ def main() -> int:
     say(f"tuner {tuner}; shape d={a.model_dim} i={a.inter_dim} E={a.expert} top{a.topk} "
         f"tokens {a.tokens}")
     try:
-        rc = subprocess.run([sys.executable, tuner, "--untune_file", untuned, "--tune_file", tuned],
-                            cwd=os.path.dirname(tuner), timeout=a.timeout).returncode
+        # --batch 1: the tuner writes the CSV after every shape, so a timeout keeps the finished ones.
+        rc = subprocess.run([sys.executable, tuner, "--untune_file", untuned, "--tune_file", tuned,
+                             "--batch", "1"], cwd=os.path.dirname(tuner), timeout=a.timeout).returncode
     except subprocess.TimeoutExpired:
         rc = "timeout"
     say(f"tuner exit {rc}")
