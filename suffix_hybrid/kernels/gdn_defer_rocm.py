@@ -150,8 +150,11 @@ def _gdn_defer_kernel(
         p_o += stride_o_l
 
 
+CONFIG = (32, 4, 3)  # BV, num_warps, num_stages (AITER's; boot gate gdn_defer_bench sweeps)
+
+
 def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_accepted,
-              seq_lens, out, num_k_heads, head_k_dim, head_v_dim, zone):
+              seq_lens, out, num_k_heads, head_k_dim, head_v_dim, zone, config=None):
     """Spec-verify delta rule over packed post-conv qkv [T, 2 H K + HV V] (row-strided),
     a / b [T, HV] views (row-strided), state [blocks, HV, V, K] fp32 (vLLM's layer
     kv_cache[1]; slot ids <= 0 are NULL), state_indices [N, 1 + num_spec] (block ids),
@@ -159,7 +162,8 @@ def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_a
     mode, else 0."""
     n = cu_seqlens.shape[0] - 1
     hv = a.shape[1]
-    K, V, BV = head_k_dim, head_v_dim, 32
+    BV, warps, stages = config or CONFIG
+    K, V = head_k_dim, head_v_dim
     win = state_indices.shape[1]
     assert K == triton.next_power_of_2(K) and V % BV == 0 and (win - 1) * REC <= BV * K
     assert REC >= K + BV + 2 and state.dtype == torch.float32 and state.stride(-1) == 1
@@ -174,7 +178,7 @@ def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_a
         qkv.stride(0), a.stride(0), b.stride(0), out.stride(0), state.stride(0),
         state_indices.stride(0),
         H=num_k_heads, HV=hv, K=K, V=V, BV=BV, ZONE=zone, ZONE_REACH=2 * win, REC=REC,
-        USE_QK_L2NORM=True, num_warps=4, num_stages=3)
+        USE_QK_L2NORM=True, num_warps=warps, num_stages=stages)
     return out
 
 
@@ -225,9 +229,9 @@ def main() -> int:
                   inplace_final_state=True, cu_seqlens=cu, ssm_state_indices=idx - 1,
                   num_accepted_tokens=acc, use_qk_l2norm_in_kernel=True, core_attn_out=out)
 
-    def run_defer(pool, qkv, ba, cu, idx, acc, seq, out, zone):
+    def run_defer(pool, qkv, ba, cu, idx, acc, seq, out, zone, config=None):
         gdn_defer(qkv, ba[:, HV:], ba[:, :HV], A_log, dt_bias, pool, cu, idx, acc, seq, out,
-                  H, K, V, zone)
+                  H, K, V, zone, config)
 
     for zone, n_req, steps in ((0, 32, 10), (24, 32, 14), (1664, 32, 10), (24, 8, 14)):
         pool_blocks = n_req * win * 4 + 1
@@ -310,8 +314,17 @@ def main() -> int:
         t_s = _graph_us(lambda i: run_stock(pools[i % 4], qkv, ba, cu, idx, acc_t, out), 8)[0]
         t_d = _graph_us(lambda i: run_defer(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t, out,
                                             0), 8)[0]
+        sweep = []
+        for cfg in ((16, 2, 3), (16, 4, 3), (32, 2, 3), (32, 8, 3), (64, 4, 3), (64, 8, 3),
+                    (32, 4, 1), (32, 4, 2)):
+            try:
+                us = _graph_us(lambda i: run_defer(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t,
+                                                   out, 0, cfg), 8)[0]
+                sweep.append(f"{cfg[0]}/{cfg[1]}w/{cfg[2]}s {us:.1f}")
+            except Exception as exc:  # noqa: BLE001 - a config that does not build is a datum
+                sweep.append(f"{cfg} {type(exc).__name__}")
         print(f"{MARK} c{n_req} x mtp5 steady state: graphed stock {t_s:.1f} us -> "
-              f"deferred {t_d:.1f} us", flush=True)
+              f"deferred {t_d:.1f} us | sweep BV/warps/stages: {' | '.join(sweep)}", flush=True)
     return 1 if failed else 0
 
 
