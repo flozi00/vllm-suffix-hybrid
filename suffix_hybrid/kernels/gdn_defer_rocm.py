@@ -381,12 +381,9 @@ def _gdn_defer_mfma_prep_kernel(
     stride_qkv_l, stride_a_l, stride_b_l, stride_state_block, stride_idx_seq,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, WIN: tl.constexpr,
     ZONE: tl.constexpr, ZONE_REACH: tl.constexpr, REC: tl.constexpr, WS: tl.constexpr,
-    PACK: tl.constexpr = False, PK: tl.constexpr = 0,
 ):
     # One program per (request, value head): k / q, bet, G, P, bm to ws[i_nh] for the main
     # kernel. No records here: slot 1 may be the slot the main kernel still reads S0 from.
-    # PACK: kq again at ws[i_nh] + PK in the register order of the Gluon main kernel's
-    # commit B operand (_gl_main_kernel): one 16-byte load per lane and register group.
     i_nh = tl.program_id(0)
     i_n, i_hv = i_nh // HV, i_nh % HV
     bos = tl.load(cu_seqlens + i_n).to(tl.int64)
@@ -415,10 +412,6 @@ def _gdn_defer_mfma_prep_kernel(
     tl.store(w + 16 * K + 256 + sq, bm)
     tl.store(w + 16 * K + 512 + cols, bet)
     tl.store(w + 16 * K + 528 + cols, G)
-    if PACK:  # p = tok // 4 + 4 (k // 16) + 32 (k % 16) + 512 (tok % 4), K = 128
-        t2 = cols[:, None]
-        k2 = tl.arange(0, K)[None, :]
-        tl.store(w + PK + (t2 >> 2) + 4 * (k2 >> 4) + 32 * (k2 & 15) + 512 * (t2 & 3), kq)
 
 
 @triton.jit(do_not_specialize=["stride_qkv_l", "stride_a_l", "stride_b_l", "stride_o_l",
@@ -484,184 +477,6 @@ def _gdn_defer_mfma_main_kernel(
                      slot0, slot1, idx_row, rec_rows, stride_state_block, K, WIN, REC)
         _mfma_rec_kab(slot1_base + (v0 + blk * BV) * K, qkv, a, b, bos, tok, keep, i_h, i_hv,
                       stride_qkv_l, stride_a_l, stride_b_l, BV // 16, H, K, WIN, REC)
-
-
-try:  # Gluon: explicit layouts for the zero-copy main kernel (_gl_main_kernel)
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
-except Exception:  # noqa: BLE001 - CPU CI, or a Triton without Gluon
-    gluon = gl = None
-
-GL_PK = 16 * 128 + 576  # ws offset of the packed kq copy (prep PACK), past G
-
-
-if gluon is not None:
-
-    @gluon.jit
-    def _gl_main_kernel(
-        a, b, qkv, o, state, cu_seqlens, state_indices, num_accepted, seq_lens, ws,
-        stride_qkv_l, stride_a_l, stride_b_l, stride_o_l, stride_state_block, stride_idx_seq,
-        H: gl.constexpr, HV: gl.constexpr, K: gl.constexpr, V: gl.constexpr, W: gl.constexpr,
-        NBLK: gl.constexpr, WIN: gl.constexpr, ZONE: gl.constexpr, ZONE_REACH: gl.constexpr,
-        REC: gl.constexpr, WS: gl.constexpr, PK: gl.constexpr, NNEW: gl.constexpr,
-        TRIV: gl.constexpr,
-    ):
-        # _gdn_defer_mfma_main_kernel's math with every big operand in place. A block is 16
-        # state rows per warp. Its S0 tile comes in once, 16 bytes per load, with k =
-        # 16 kb + 4 a + c (c: 4 consecutive registers, a: lane bits 4-5, rows: lane bits
-        # 0-3 and warps, kb: registers). Read with k' = 16 kb + 4 c + a it IS the fp32
-        # MFMA A operand of S0 kq^T (kq^T loaded with the same permutation, so the sum over k
-        # is unchanged); read with k itself it IS the transposed MFMA accumulator the commit
-        # adds to. Neither view moves data, and the committed state leaves as 16-byte stores.
-        gl.static_assert(K == 128 and V == 128 and (W == 1 or W == 2 or W == 4))
-        NREP: gl.constexpr = WIN - 1
-        R: gl.constexpr = 16 * W
-        mma: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[W, 1])
-        A_OP: gl.constexpr = gl.DotOperandLayout(0, mma, 1)
-        B_OP: gl.constexpr = gl.DotOperandLayout(1, mma, 1)
-        TOK: gl.constexpr = gl.SliceLayout(0, mma)
-        ROW: gl.constexpr = gl.SliceLayout(1, mma)
-        WM: gl.constexpr = [] if W == 1 else [[2048]] if W == 2 else [[2048], [4096]]
-        W0: gl.constexpr = [] if W == 1 else [[0]] if W == 2 else [[0], [0]]
-        TILE: gl.constexpr = gl.DistributedLinearLayout(
-            [[1], [2], [16], [32], [64]], [[128], [256], [512], [1024], [4], [8]], WM, [],
-            [R * 128])
-        KQ: gl.constexpr = gl.DistributedLinearLayout(
-            [[1], [2], [16], [32], [64]], [[128], [256], [512], [1024], [4], [8]], W0, [],
-            [2048])
-        KQC: gl.constexpr = gl.DistributedLinearLayout(
-            [[1], [2], [4], [8], [16]], [[32], [64], [128], [256], [512], [1024]], W0, [],
-            [2048])
-        KR: gl.constexpr = gl.BlockedLayout([1, 1, 4], [1, 2, 32], [W, 1, 1], [2, 1, 0])
-
-        i_g = gl.program_id(0)
-        i_nh = gl.program_id(1)
-        i_n = i_nh // HV
-        i_hv = i_nh % HV
-        i_h = i_hv // (HV // H)
-        bos = gl.load(cu_seqlens + i_n).to(gl.int64)
-        n_tok = gl.load(cu_seqlens + i_n + 1).to(gl.int64) - bos
-        if n_tok <= 0:
-            return
-        acc = gl.load(num_accepted + i_n).to(gl.int64)
-        c_now = gl.load(seq_lens + i_n).to(gl.int64) - n_tok
-        idx_row = state_indices + i_n * stride_idx_seq
-        slot0 = gl.load(idx_row).to(gl.int64)
-        slot1 = gl.load(idx_row + 1).to(gl.int64)
-        if ZONE > 0:
-            cur_zone = (c_now + ZONE_REACH) // ZONE > c_now // ZONE
-            c_prev = c_now - acc
-            prev_zone = (c_prev + ZONE_REACH) // ZONE > c_prev // ZONE
-        else:
-            cur_zone = c_now < 0
-            prev_zone = c_now < 0
-        deferred = (acc >= 2) & (prev_zone == 0)
-        read_slot = gl.where(deferred, slot0, gl.load(idx_row + acc - 1).to(gl.int64))
-        if (read_slot <= 0) | (deferred & (slot1 <= 0)):
-            return
-
-        # the prep kernel's per-head terms
-        w = ws + i_nh * WS
-        kqT = gl.amd.cdna4.buffer_load(w, gl.arange(0, 2048, layout=KQ))
-        kqT = kqT.reshape((16, 8, 4, 4)).permute((1, 3, 2, 0)).reshape((128, 16))
-        kqc = gl.amd.cdna4.buffer_load(w + PK, gl.arange(0, 2048, layout=KQC))
-        kqc = kqc.reshape((4, 16, 8, 4)).permute((3, 0, 2, 1)).reshape((16, 128))
-        if TRIV:
-            kqT = gl.convert_layout(kqT, B_OP, assert_trivial=True)
-            kqc = gl.convert_layout(kqc, B_OP, assert_trivial=True)
-        else:
-            kqT = gl.convert_layout(kqT, B_OP)
-            kqc = gl.convert_layout(kqc, B_OP)
-        kk = gl.arange(0, 16, layout=gl.SliceLayout(1, B_OP))
-        nn = gl.arange(0, 16, layout=gl.SliceLayout(0, B_OP))
-        pT = gl.load(w + 2048 + nn[None, :] * 16 + kk[:, None])  # P^T
-        bm = gl.load(w + 2048 + 256 + kk[:, None] * 16 + nn[None, :])
-        tok = gl.arange(0, 16, layout=TOK)
-        bet = gl.load(w + 2048 + 512 + tok)
-        G = gl.load(w + 2048 + 528 + tok)
-        is_new = (tok >= NREP) & (tok < NREP + WIN)
-        is_q = (tok >= NREP + WIN) & (tok < NREP + 2 * WIN)
-        rep_use = (tok < NREP) & deferred & (tok + 1 < acc)
-        tk = gl.maximum(gl.where(is_q, tok - NREP - WIN, tok - NREP), 0)
-        new_ok = is_new & (tk < n_tok)
-        q_ok = is_q & (tk < n_tok)
-        egq = gl.where(is_q, gl.exp(gl.load(w + 2048 + 528 + gl.maximum(tok - WIN, 0))), 0.0)
-        g0 = gl.load(w + 2048 + 528 + NREP)
-        d0 = gl.where(tok <= NREP, gl.exp(gl.minimum(g0 - G, 0.0)), 0.0)
-        gam = gl.exp(G)
-        keep = is_new & (tok > NREP) & (tk < n_tok) & (slot1 > 0)
-        r_off = gl.maximum(tok - NREP - 1, 0) * REC
-        sw = gl.arange(0, W, layout=gl.SliceLayout(1, gl.SliceLayout(2, KR)))
-        tn = gl.arange(0, NNEW, layout=gl.SliceLayout(0, gl.SliceLayout(2, KR)))
-        k3 = gl.arange(0, K, layout=gl.SliceLayout(0, gl.SliceLayout(1, KR)))
-        okn = (tn < WIN - 1) & (tn + 1 < n_tok) & (slot1 > 0)
-
-        s_head = state + read_slot * stride_state_block + i_hv * V * K
-        d_head = state + slot0 * stride_state_block + i_hv * V * K
-        r_head = state + slot1 * stride_state_block + i_hv * V * K
-        r0 = i_g * (R * NBLK)
-        f = gl.arange(0, R * 128, layout=TILE)
-        kc = gl.arange(0, 128, layout=TOK)
-        x = gl.amd.cdna4.buffer_load(s_head, f + r0 * 128)
-        for blk in gl.static_range(NBLK):
-            rb = r0 + blk * R
-            if blk + 1 < NBLK:  # the next block's S0 in flight during this one
-                x_next = gl.amd.cdna4.buffer_load(s_head, f + (rb + R) * 128)
-            s_op = x.reshape((R, 8, 4, 4)).permute((0, 1, 3, 2)).reshape((R, 128))
-            if TRIV:
-                s_op = gl.convert_layout(s_op, A_OP, assert_trivial=True)
-                s_acc = gl.convert_layout(x.reshape((R, 128)), mma, assert_trivial=True)
-            else:
-                s_op = gl.convert_layout(s_op, A_OP)
-                s_acc = gl.convert_layout(x.reshape((R, 128)), mma)
-            wz = gl.amd.cdna4.mfma(s_op, kqT, gl.zeros((R, 16), gl.float32, mma))
-            rows = rb + gl.arange(0, R, layout=ROW)
-            rec_rows = (rows // 16 * 16) * K + rows % 16
-            vt = gl.load(r_head + rec_rows[:, None] + tok[None, :] * REC + K,
-                         mask=rep_use[None, :], other=0.0)
-            vt += gl.load(qkv + (bos + tk)[None, :] * stride_qkv_l + 2 * H * K + i_hv * V
-                          + rows[:, None], mask=new_ok[None, :], other=0.0).to(gl.float32)
-            u = gl.amd.cdna4.mfma(
-                gl.convert_layout(bet[None, :] * (vt - gam[None, :] * wz), A_OP), pT,
-                gl.zeros((R, 16), gl.float32, mma))
-            out = wz * egq[None, :] + gl.amd.cdna4.mfma(
-                gl.convert_layout(u, A_OP), bm, gl.zeros((R, 16), gl.float32, mma))
-            gl.store(o + (bos + tk)[None, :] * stride_o_l + i_hv * V + rows[:, None],
-                     out.to(o.dtype.element_ty), mask=q_ok[None, :])
-            s_c = gl.amd.cdna4.mfma(gl.convert_layout(u * d0[None, :], A_OP), kqc,
-                                    s_acc * gl.exp(g0))
-            st_off = rows[:, None] * K + kc[None, :]
-            if slot0 > 0:
-                gl.amd.cdna4.buffer_store(s_c, d_head, st_off)
-            if cur_zone:  # vLLM's slot contract near an align boundary
-                for t in gl.static_range(1, WIN):
-                    slot_t = gl.load(idx_row + t).to(gl.int64)
-                    gc = gl.load(w + 2048 + 528 + NREP + t)
-                    dc = gl.where(tok <= NREP + t, gl.exp(gl.minimum(gc - G, 0.0)), 0.0)
-                    s_t = gl.amd.cdna4.mfma(gl.convert_layout(u * dc[None, :], A_OP), kqc,
-                                            s_acc * gl.exp(gc))
-                    if (t < n_tok) & (slot_t > 0):
-                        gl.amd.cdna4.buffer_store(
-                            s_t, state + slot_t * stride_state_block + i_hv * V * K, st_off)
-            else:  # records of the new tokens 1..: v slices per row; raw k, a, b per 16 rows
-                gl.store(r_head + rec_rows[:, None] + r_off[None, :] + K, vt,
-                         mask=keep[None, :])
-                rbase = (rb + sw * 16) * K
-                kraw = gl.load(qkv + (bos + 1 + tn)[None, :, None] * stride_qkv_l + H * K
-                               + i_h * K + k3[None, None, :] + sw[:, None, None] * 0,
-                               mask=okn[None, :, None], other=0.0).to(gl.float32)
-                gl.store(r_head + rbase[:, None, None] + (tn * REC)[None, :, None]
-                         + k3[None, None, :], kraw, mask=okn[None, :, None])
-                ab_ok = okn[None, :] & (sw[:, None] >= 0)
-                ar = gl.load(a + (bos + 1 + tn)[None, :] * stride_a_l + i_hv + sw[:, None] * 0,
-                             mask=ab_ok, other=0.0).to(gl.float32)
-                br = gl.load(b + (bos + 1 + tn)[None, :] * stride_b_l + i_hv + sw[:, None] * 0,
-                             mask=ab_ok, other=0.0).to(gl.float32)
-                gl.store(r_head + rbase[:, None] + (tn * REC)[None, :] + K + 16, ar, mask=ab_ok)
-                gl.store(r_head + rbase[:, None] + (tn * REC)[None, :] + K + 17, br, mask=ab_ok)
-            if blk + 1 < NBLK:
-                x = x_next
 
 
 @triton.jit(do_not_specialize=["stride_x_l", "stride_a_l", "stride_b_l", "stride_o_l"])
@@ -746,40 +561,6 @@ MFMA_CONFIG = (16, 1, True, False, 0)
 # graphed us c1/c8/c32: v1 15.8/53.7/181.0, MFMA_CONFIG 11.7/50.0/162.0, this 13.8/42.8/127.6).
 MFMA_PP_CONFIG = (16, 1, False, False, 1)
 MFMA_PP_MIN_REQ = 4
-# A config ("gl", warps, blocks, trivial) runs the prep kernel (+ a packed kq copy) and the
-# Gluon main kernel (_gl_main_kernel): S0 / kq operands and the committed state with no LDS
-# round trip, 16-byte loads and stores. k34b pp1 main: 128 us/layer at c32 (157 VGPRs,
-# occupancy 3, 271 LDS ops, 72 MFMA executed), state traffic floor ~65-75 us.
-
-
-def _gl_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_accepted,
-              seq_lens, out, num_k_heads, K, V, zone, config):
-    """Prep kernel (+ the packed kq copy) and the Gluon main kernel; config = ("gl", warps,
-    blocks of 16 x warps rows per program, assert the operand views trivial)."""
-    _, warps, nblk, triv = config
-    n, hv, win = cu_seqlens.shape[0] - 1, a.shape[1], state_indices.shape[1]
-    rec = (K + 16 + 2 + 63) // 64 * 64
-    assert gluon is not None and K == V == 128 and V % (16 * warps * nblk) == 0
-    assert state.dtype == torch.float32 and state.shape[1:] == (hv, V, K) and state[0].is_contiguous()
-    assert qkv.stride(1) == a.stride(1) == b.stride(1) == 1 and state_indices.stride(1) == 1
-    assert out.stride(-1) == 1 and out.stride(-2) == V and 3 * win - 1 <= 16
-    if n == 0:
-        return out
-    common = dict(H=num_k_heads, HV=hv, K=K, V=V, WIN=win, ZONE=zone, ZONE_REACH=2 * win,
-                  REC=rec)
-    ws_size = GL_PK + 2048
-    ws = torch.empty(n * hv * ws_size, device=qkv.device, dtype=torch.float32)
-    _gdn_defer_mfma_prep_kernel[(n * hv,)](
-        A_log, a, b, dt_bias, 1.0, 20.0, qkv, state, cu_seqlens, state_indices,
-        num_accepted, seq_lens, K**-0.5, ws,
-        qkv.stride(0), a.stride(0), b.stride(0), state.stride(0), state_indices.stride(0),
-        WS=ws_size, PACK=True, PK=GL_PK, num_warps=1, num_stages=1, **common)
-    _gl_main_kernel[(V // (16 * warps * nblk), n * hv)](
-        a, b, qkv, out, state, cu_seqlens, state_indices, num_accepted, seq_lens, ws,
-        qkv.stride(0), a.stride(0), b.stride(0), out.stride(0), state.stride(0),
-        state_indices.stride(0), W=warps, NBLK=nblk, WS=ws_size, PK=GL_PK,
-        NNEW=triton.next_power_of_2(win - 1), TRIV=triv, num_warps=warps, **common)
-    return out
 
 
 def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_accepted,
@@ -795,11 +576,7 @@ def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_a
     K, V = head_k_dim, head_v_dim
     win = state_indices.shape[1]
     if (MFMA if mfma is None else mfma) and 3 * win - 1 <= 16:
-        config = config or (MFMA_PP_CONFIG if n >= MFMA_PP_MIN_REQ else MFMA_CONFIG)
-        if config[0] == "gl":
-            return _gl_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices,
-                             num_accepted, seq_lens, out, num_k_heads, K, V, zone, config)
-        BV, warps, reload, lean, nb = config
+        BV, warps, reload, lean, nb = config or (MFMA_PP_CONFIG if n >= MFMA_PP_MIN_REQ else MFMA_CONFIG)
         rec = (K + 16 + 2 + 63) // 64 * 64  # v1's record at its BV 16
         assert K == triton.next_power_of_2(K) and BV % 16 == 0 and V % (BV * max(nb, 1)) == 0
         assert (win - 1) * rec <= 16 * K and state.dtype == torch.float32
@@ -870,10 +647,9 @@ def install(module) -> None:
     module._suffix_gdn_defer_spec = defer_spec
 
 
-def _isa_stats(fn, top: int = 0) -> list:
+def _isa_stats(fn) -> list:
     """Compact AMDGCN facts of every compiled variant of a Triton kernel: registers,
-    scratch spill bytes, LDS, occupancy, instruction mix (the oracle prints them); top > 0
-    adds the most frequent opcodes."""
+    scratch spill bytes, LDS, occupancy, instruction mix (the oracle prints them)."""
     import re
     from collections import Counter
 
@@ -904,8 +680,7 @@ def _isa_stats(fn, top: int = 0) -> list:
                         f"scratch {grab('ScratchSize')} lds {grab('LDSByteSize')} occ "
                         f"{grab('Occupancy')} instrs {len(ins)} "
                         + " ".join(f"{k} {v}" for k, v in cls.most_common()) + f" {consts} "
-                        + (" | ops " + " ".join(f"{k} {v}" for k, v in Counter(ins).most_common(top))
-                           if top else "") + f" | key {str(key)[-120:]}")
+                        f"key {str(key)[-120:]}")
     return rows
 
 
@@ -970,35 +745,13 @@ def oracle_mfma() -> int:
         return win if r % 7 else 1 + (step + r) % win
 
     def name(cfg):
-        if cfg[0] == "gl":
-            return f"gl{cfg[1]}w/b{cfg[2]}{'' if cfg[3] else '/nt'}"
         return (f"{cfg[0]}/{cfg[1]}w{'/rl' if cfg[2] else ''}{'/lean' if cfg[3] else ''}"
                 f"{f'/pp{cfg[4]}' if cfg[4] else ''}")
 
-    gl_cfgs = (("gl", 1, 1, True), ("gl", 2, 1, True), ("gl", 4, 1, True), ("gl", 1, 2, True),
-               ("gl", 2, 2, True), ("gl", 4, 2, True), ("gl", 1, 1, False), ("gl", 4, 1, False))
-    cands, built = [(16, 1, True, False, 0), (16, 1, False, False, 1), (32, 2, False, False, 1)], {}
-    for cfg in gl_cfgs:  # Gluon variants: build + run once first, a failure is a datum
-        try:
-            pool = torch.randn(2 * win + 1, HV, V, K, device=dev) * 0.1
-            qkv1 = torch.randn(win, 2 * key_dim + value_dim, device=dev).to(bf16)
-            ba1 = torch.randn(win, 2 * HV, device=dev).to(bf16)
-            run(pool, qkv1, ba1, torch.tensor([0, win], dtype=torch.int32, device=dev),
-                (torch.arange(win, dtype=torch.int32, device=dev) + 1)[None],
-                torch.tensor([2], dtype=torch.int32, device=dev),
-                torch.tensor([50], dtype=torch.int32, device=dev),
-                torch.empty(win, HV, V, device=dev, dtype=bf16), 0, True, cfg)
-            torch.cuda.synchronize()
-            cands.append(cfg)
-            built[name(cfg)] = "ok"
-        except Exception as exc:  # noqa: BLE001
-            built[name(cfg)] = f"{type(exc).__name__}: {str(exc)[:300]!r}"
-    print(f"{mark} gluon builds: " + " | ".join(f"{k} {v}" for k, v in built.items()), flush=True)
-    gl_first = next((c for c in cands if c[0] == "gl"), None)
-    # XG: the single kernel and the first Gluon config alternating (the serving dispatch
-    # switches between them with the request count; they share the record layout)
-    arms = {"S": None, "R": None, "X": None, **({"XG": None} if gl_first else {}),
-            **{name(c): c for c in cands}}
+    cands = ((16, 1, True, False, 0), (16, 1, True, True, 0), (32, 1, True, True, 0),
+             (16, 1, False, False, 1), (16, 1, True, True, 2), (16, 1, False, False, 8),
+             (32, 1, False, False, 4))
+    arms = {"S": None, "R": None, "X": None, **{name(c): c for c in cands}}
     for zone, n_req, steps in ((0, 16, 10), (24, 16, 14), (1664, 16, 8)):
         pool_blocks = n_req * win * 4 + 1
         base = torch.randn(pool_blocks, HV, V, K, device=dev) * 0.1
@@ -1029,9 +782,6 @@ def oracle_mfma() -> int:
             run_stock(pools["S"], qkv, ba, cu, idx, acc_t, outs["S"])
             run(pools["R"], qkv, ba, cu, idx, acc_t, seq_t, outs["R"], 1, True)
             run(pools["X"], qkv, ba, cu, idx, acc_t, seq_t, outs["X"], zone, bool(step % 2))
-            if gl_first:
-                run(pools["XG"], qkv, ba, cu, idx, acc_t, seq_t, outs["XG"], zone, True,
-                    gl_first if step % 2 else MFMA_CONFIG)
             for k, cfg in arms.items():
                 if cfg is not None:
                     run(pools[k], qkv, ba, cu, idx, acc_t, seq_t, outs[k], zone, True, cfg)
@@ -1097,9 +847,13 @@ def oracle_mfma() -> int:
         t_v1 = _graph_us(lambda i: run(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t, out, 0,
                                        False), 8)[0]
         sweep = []
-        for cfg in ((16, 1, True, False, 0), (16, 1, False, False, 1), (32, 2, False, False, 1),
-                    (32, 1, False, False, 1), (16, 1, False, False, 2)) + tuple(
-                        c for c in gl_cfgs if built.get(name(c)) == "ok"):
+        for cfg in ((16, 1, False, False, 0), (16, 1, True, False, 0), (16, 1, False, True, 0),
+                    (16, 1, True, True, 0), (32, 1, True, True, 0), (32, 2, True, True, 0),
+                    (16, 1, False, False, 1), (16, 1, True, True, 1), (16, 1, False, False, 2),
+                    (16, 1, False, True, 2), (16, 1, True, True, 2), (16, 1, False, False, 4),
+                    (16, 1, False, True, 4), (16, 1, False, False, 8), (16, 1, False, True, 8),
+                    (32, 1, False, False, 2), (32, 1, False, False, 4), (32, 2, False, False, 2),
+                    (64, 4, False, False, 2)):
             try:
                 us = _graph_us(lambda i: run(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t,
                                              out, 0, True, cfg), 8)[0]
@@ -1109,11 +863,10 @@ def oracle_mfma() -> int:
         print(f"{mark} c{n_req} deferred steady state graphed: v1 {t_v1:.1f} us | mfma "
               f"{' | '.join(sweep)}", flush=True)
         pools = None  # free the pools before the next size
-    for kname, fn, top in (("v1", _gdn_defer_kernel, 0), ("mfma", _gdn_defer_mfma_kernel, 0),
-                           ("mfma-prep", _gdn_defer_mfma_prep_kernel, 0),
-                           ("mfma-main", _gdn_defer_mfma_main_kernel, 25)) + (
-                               (("gl-main", _gl_main_kernel, 25),) if gluon is not None else ()):
-        for row in _isa_stats(fn, top):
+    for kname, fn in (("v1", _gdn_defer_kernel), ("mfma", _gdn_defer_mfma_kernel),
+                      ("mfma-prep", _gdn_defer_mfma_prep_kernel),
+                      ("mfma-main", _gdn_defer_mfma_main_kernel)):
+        for row in _isa_stats(fn):
             print(f"{mark} isa {kname}: {row}", flush=True)
     return 0 if ok_all else 1
 
