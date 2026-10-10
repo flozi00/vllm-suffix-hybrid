@@ -561,6 +561,9 @@ MFMA_CONFIG = (16, 1, True, False, 0)
 # graphed us c1/c8/c32: v1 15.8/53.7/181.0, MFMA_CONFIG 11.7/50.0/162.0, this 13.8/42.8/127.6).
 MFMA_PP_CONFIG = (16, 1, False, False, 1)
 MFMA_PP_MIN_REQ = 4
+# Tried (gate10): a Gluon main kernel loading each S0 tile once as both the fp32 MFMA operand and
+# the commit accumulator (AITER's gfx950 Gluon GDN layouts): correct, but c8 / c32 51.5-56.5 /
+# 172-201 us vs this pre-pass kernel's 43.1 / 127.3.
 
 
 def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_accepted,

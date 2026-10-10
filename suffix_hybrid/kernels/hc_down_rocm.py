@@ -43,6 +43,8 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from suffix_hybrid.kernels.hc_wq_rocm import mx4_quant, wq_args
+
 TARGET_PROGRAMS = 256  # 2 per CU on the 128-CU MI350P
 # Above MAX_M (c32 verify, prefill) vLLM's rocm_unquantized_gemm stays in charge.
 MAX_M = int(os.environ.get("SUFFIX_ROCM_HC_DOWN_MAX_M", "64"))
@@ -50,24 +52,51 @@ MAX_M = int(os.environ.get("SUFFIX_ROCM_HC_DOWN_MAX_M", "64"))
 
 @triton.jit(do_not_specialize=["M"])
 def _hc_down_kernel(
-    x_ptr, w_ptr, out_ptr, M, N, stride_x, stride_w,
+    x_ptr, w_ptr, out_ptr, M, N, stride_x, stride_w, s_ptr, stride_s,
     K_SPLIT: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    WQ: tl.constexpr,
 ):
     # out[s] = x[:, s K_SPLIT:(s + 1) K_SPLIT] @ w[:, same].T for s = program_id(1): the fp32
-    # partials, or y itself when SPLIT == 1 (the store then rounds to bf16).
+    # partials, or y itself when SPLIT == 1 (the store then rounds to bf16). WQ (hc_wq_rocm):
+    # 0 bf16 w; 1 MXFP4 w ([N, K/2] e2m1 pairs, s [N, K/32] e8m0) on the scaled MFMA with x
+    # quantized per 32 on the fly; 2 FP8 w (e4m3) widened to bf16, s [N] fp32 per column.
     rows = tl.program_id(2) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     ks = tl.program_id(1) * K_SPLIT + tl.arange(0, BLOCK_K)
     row_ok = (rows < M)[:, None]
     col_ok = (cols < N)[None, :]
     x_ptrs = x_ptr + rows[:, None] * stride_x + ks[None, :]
-    w_ptrs = w_ptr + cols[None, :] * stride_w + ks[:, None]  # [BLOCK_K, BLOCK_N] view of w.T
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for _ in range(K_SPLIT // BLOCK_K):
-        acc = tl.dot(tl.load(x_ptrs, mask=row_ok, other=0.0),
-                     tl.load(w_ptrs, mask=col_ok, other=0.0), acc)
-        x_ptrs += BLOCK_K
-        w_ptrs += BLOCK_K
+    if WQ == 1:
+        kq = tl.program_id(1) * (K_SPLIT // 2) + tl.arange(0, BLOCK_K // 2)
+        kb = tl.program_id(1) * (K_SPLIT // 32) + tl.arange(0, BLOCK_K // 32)
+        w_ptrs = w_ptr + cols[None, :] * stride_w + kq[:, None]  # [BLOCK_K / 2, BLOCK_N]
+        s_ptrs = s_ptr + cols[:, None] * stride_s + kb[None, :]  # [BLOCK_N, BLOCK_K / 32]
+        for _ in range(K_SPLIT // BLOCK_K):
+            xq, xs = mx4_quant(tl.load(x_ptrs, mask=row_ok, other=0.0).to(tl.float32),
+                               BLOCK_K, BLOCK_M)
+            # a column past N gets scale 127 (2^0): 0xFF would be e8m0 NaN
+            acc = tl.dot_scaled(xq, xs, "e2m1", tl.load(w_ptrs, mask=col_ok, other=0),
+                                tl.load(s_ptrs, mask=(cols < N)[:, None], other=127), "e2m1",
+                                acc)
+            x_ptrs += BLOCK_K
+            w_ptrs += BLOCK_K // 2
+            s_ptrs += BLOCK_K // 32
+    elif WQ == 2:
+        w_ptrs = w_ptr + cols[None, :] * stride_w + ks[:, None]
+        for _ in range(K_SPLIT // BLOCK_K):
+            acc = tl.dot(tl.load(x_ptrs, mask=row_ok, other=0.0),
+                         tl.load(w_ptrs, mask=col_ok, other=0.0).to(tl.bfloat16), acc)
+            x_ptrs += BLOCK_K
+            w_ptrs += BLOCK_K
+        acc = acc * tl.load(s_ptr + cols, mask=cols < N, other=0.0)[None, :]
+    else:
+        w_ptrs = w_ptr + cols[None, :] * stride_w + ks[:, None]  # [BLOCK_K, BLOCK_N] view of w.T
+        for _ in range(K_SPLIT // BLOCK_K):
+            acc = tl.dot(tl.load(x_ptrs, mask=row_ok, other=0.0),
+                         tl.load(w_ptrs, mask=col_ok, other=0.0), acc)
+            x_ptrs += BLOCK_K
+            w_ptrs += BLOCK_K
     out = out_ptr + (tl.program_id(1) * M + rows)[:, None] * N + cols[None, :]
     tl.store(out, acc, mask=row_ok & col_ok)
 
@@ -98,19 +127,20 @@ def _config(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
     return bm, bn, bk, split, 4
 
 
-def _launch(x, w, config=None):
+def _launch(x, w, config=None, wq=None):
     m, k = x.shape
     n = w.shape[0]
     bm, bn, bk, split, warps = config or _config(m, n, k)
+    wt, st, stride_s, mode = wq_args(w, wq)
     if (w.shape[1] != k or k % (split * bk) or x.stride(1) != 1 or w.stride(1) != 1
-            or x.dtype != w.dtype):
+            or x.dtype != w.dtype or mode == 1 and (bk % 128 or wt.shape != (n, k // 2))):
         raise ValueError(f"[suffix hc-down] unsupported: x {tuple(x.shape)} {x.dtype} w "
-                         f"{tuple(w.shape)} {w.dtype}, K split {split} x {bk}")
+                         f"{tuple(w.shape)} {w.dtype}, K split {split} x {bk}, WQ {mode}")
     y = x.new_empty((m, n))
     out = y if split == 1 else torch.empty((split, m, n), dtype=torch.float32, device=x.device)
     _hc_down_kernel[(triton.cdiv(n, bn), split, triton.cdiv(m, bm))](
-        x, w, out, m, n, x.stride(0), w.stride(0),
-        K_SPLIT=k // split, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk,
+        x, wt, out, m, n, x.stride(0), wt.stride(0), st, stride_s,
+        K_SPLIT=k // split, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, WQ=mode,
         num_warps=warps, num_stages=2, matrix_instr_nonkdim=16)
     if split > 1:
         block = max(64, 8192 // triton.next_power_of_2(split))  # [S_PAD, BLOCK] = 8K fp32

@@ -77,7 +77,7 @@ import os
 # pod spec stays under the console's 30-variable cap. Boot-gate children never see it (SUFFIX_*
 # is stripped from their env). An unknown name refuses to start instead of serving stock.
 _PRESETS = {
-    # MI350P Qwen3.8-Flash-Next, plugin-harness/dossiers/mi350p-qwen-flash-2026-10-08.md (k36).
+    # MI350P Qwen3.8-Flash-Next, plugin-harness/dossiers/mi350p-qwen-flash-2026-10-08.md (k38).
     "mi350p-qwen-flash": {
         "VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_SKINNY_GEMM": "0",
         "VLLM_DISABLE_SHARED_EXPERTS_STREAM": "1", "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "1",
@@ -85,11 +85,16 @@ _PRESETS = {
         "SUFFIX_ROCM_AITER_PAD": "1", "SUFFIX_ROCM_AITER_FLYDSL_ZBUF": "1",
         "SUFFIX_ROCM_AFP4_CONFIGS": "1", "SUFFIX_MXFP4_LMHEAD": "1", "SUFFIX_MXFP4_LMHEAD_MAX_M": "64",
         "SUFFIX_ROCM_QSA_TOPK_ROWS": "1", "SUFFIX_ROCM_QSA_MQA": "1", "SUFFIX_ROCM_QSA_SPARSE_SKIP": "1",
-        "SUFFIX_ROCM_QSA_DENSE": "1", "SUFFIX_ROCM_QK_FUSED": "1",
+        "SUFFIX_ROCM_QSA_DENSE": "1", "SUFFIX_ROCM_QK_FUSED": "1", "SUFFIX_ROCM_QSA_NOSPEC": "1",
         "SUFFIX_ROCM_GDN_MTP": "1", "SUFFIX_ROCM_GDN_ASYNC_IDX": "1", "SUFFIX_ROCM_GDN_DEFER": "1",
         "SUFFIX_ROCM_GDN_MIXED": "1", "SUFFIX_ROCM_GDN_DEFER_MFMA": "1",
+        # not SUFFIX_ROCM_GDN_MIXED_FAST (bitwise, host -40% per mixed layer) yet: c32 TTFT max rose
+        # to 2.3-4.9 s in k39-k41 vs 0.5-0.9 s without it; open.
         "SUFFIX_ROCM_HC_FUSE": "1", "SUFFIX_ROCM_HC_DOWN": "1", "SUFFIX_ROCM_HC_DOWN_MAX_M": "256",
         "SUFFIX_ROCM_HC_BIG": "1", "SUFFIX_ROCM_ACT_QUANT_FUSE": "1", "SUFFIX_ROCM_MOE_ROUTE": "1",
+        # FP8 HC projections (the documented quality fallback: MXFP4 put 10-22% error on the
+        # injection logits); k38 full GSM8K 0.9689, tools 5/5, needle, image.
+        "SUFFIX_ROCM_HC_WQ": "fp8",
     },
 }
 _preset = os.environ.get("SUFFIX_ROCM_PRESET", "").strip()
@@ -326,7 +331,7 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
                   "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG",
                   "SUFFIX_ROCM_QK_FUSED", "SUFFIX_ROCM_ACT_QUANT_FUSE",
-                  "SUFFIX_JIT_LOG")):
+                  "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC")) or os.environ.get("SUFFIX_ROCM_HC_WQ", "").strip() not in ("", "0"):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
             and not all(os.environ.get(_g, "").strip() == "1"
                         for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
@@ -586,6 +591,10 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_GDN_DEFER vs AITER's verify over 14 steps of random acceptance with the
     # align-mode copies emulated: bitwise outputs + boundary slots; graphed us/call.
     "gdn_defer_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm"], {}),
+    # SUFFIX_ROCM_GDN_MIXED_FAST: mixed-step prefill from the per-step launch plan (modes 1 / 2)
+    # vs forward_mixed's stock calls, 36 layers on one step's metadata: every output row and
+    # state byte, host us per layer call, eager wall and graphed GPU us. Lines: [suffix gdn-mixed].
+    "gdn_mixed_bench": (["-m", "suffix_hybrid.kernels.gdn_mixed_fast_rocm"], {}),
     # SUFFIX_ROCM_GDN_DEFER_MFMA (chunk form on the fp32 matrix cores) vs the fp64 recurrence,
     # AITER and v1 (shared records: v1 / MFMA alternating) over multi-step acceptance; graphed
     # us/call v1 vs BV / warps / RELOAD at c1/c8/c32 + AMDGCN facts. Lines: [suffix gdn-mfma].
@@ -613,6 +622,10 @@ _BOOT_GATES = {
     # vLLM's stock chain against fp64, mix / combine_and_mix / final mixer, M 17..256; graphed
     # us/site (cold weights), down / up config sweeps + isa, a paste-able _CFG line.
     "hc_big_bench": (["-m", "suffix_hybrid.kernels.hc_big_rocm"], {}),
+    # SUFFIX_ROCM_HC_WQ: in-kernel MXFP4 activation quant == AITER's, the mxfp4 / fp8 GEMM paths
+    # vs fp64 on the same quantized operands, then per HC site kind and M (1..256) block_input
+    # / injection error vs fp64 for mxfp4 / fp8 / bf16 / stock, graph == eager, graphed us/site.
+    "hc_wq_bench": (["-m", "suffix_hybrid.kernels.hc_wq_rocm"], {}),
     # AITER fused-MoE tuner for this card's CU count (qwen3.8-flash MXFP4 MoE; the
     # _fse variant = shared expert fused as expert 513, top-11); prints the CSV.
     "aiter_moe_tune": (["-m", "suffix_hybrid.tools.aiter_moe_tune"], {}),
