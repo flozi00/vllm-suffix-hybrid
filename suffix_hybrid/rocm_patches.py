@@ -104,13 +104,6 @@ SUFFIX_ROCM_HC_BIG=1: Qwen4Exp GatedResidual.mix / combine_and_mix return throug
   the up GEMM + gate mix without the [M, 10240] gate (6 launches -> 4 at M = 160); at
   M <= MIN_M HC_DOWN's + HC_FUSE's kernels, above MAX_M vLLM's stock chain. The patch
   only inserts the return at the top of each method: composes with HC_FUSE / HC_DOWN.
-SUFFIX_ROCM_HC3=1: at 0 < M <= SUFFIX_ROCM_HC3_MAX_M (default 16) a Qwen4Exp HC site is three
-  launches (suffix_hybrid/kernels/hc3_rocm.py) instead of four: the norm becomes a per-(row,
-  stream) scale after the down GEMM (lora = sum_s r_s * (h_s * (1 + w_s)) @ W_down_s), so one
-  launch combines on the fly, writes hidden_states and the split-K partials of the down GEMM
-  plus sums of squares, one reduces them with r_s, one runs the up GEMM + gate mix with xn
-  rebuilt from h, r, w. Above MAX_M the site runs as without it (HC_BIG's tail when that gate
-  is on). Inserted before HC_BIG's return (PATCHES order), so it wins at small M.
 SUFFIX_ROCM_QK_FUSED=1: the Qwen4Exp QSA layers run vLLM's fused split + QK GemmaRMSNorm +
   partial NeoX RoPE + gate copy (vllm/model_executor/layers/fused_qk_norm_rope.py, Triton)
   instead of the eager chain inductor compiles into ~4-5 launches: the AMD layer allows it
@@ -597,16 +590,6 @@ PATCHES = {
               "suffix_hybrid.kernels.hc_big_rocm:install"),
         Patch(_HC, "HC site tail in one op, 4 launches at decode M (combine_and_mix)", _HC_CAM_DOC,
               _HC_CAM_DOC + "        return hc_big_combine_and_mix(  # suffix rocm-hc-big\n"
-              "            self, hidden_states, prev_block_output, prev_injection\n"
-              "        )\n"),
-    ),
-    # After HC_BIG: both insert a return after the same anchors, the later one runs first.
-    "SUFFIX_ROCM_HC3": (
-        Patch(_HC, "HC site in three launches at small M (mix)", _HC_MIX_SIG,
-              _HC_MIX_SIG + "        return hc3_mix(self, hidden_states)  # suffix rocm-hc3\n",
-              "suffix_hybrid.kernels.hc3_rocm:install"),
-        Patch(_HC, "HC site in three launches at small M (combine_and_mix)", _HC_CAM_DOC,
-              _HC_CAM_DOC + "        return hc3_combine_and_mix(  # suffix rocm-hc3\n"
               "            self, hidden_states, prev_block_output, prev_injection\n"
               "        )\n"),
     ),

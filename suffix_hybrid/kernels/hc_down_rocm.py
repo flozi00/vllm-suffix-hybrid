@@ -28,6 +28,11 @@ bitwise, block_input at stock error), but 22.2-23.1 us per site vs 15.1-16.2 us 
 four launches at M 1-16 (41-42 vs 21.1 / 24.6 us at M 40 / 64): every split program
 recomputes its stream's rms before its GEMM, and the reduce prologue re-reads SPLIT x M x
 336 fp32 per program (up to 256 VGPRs + AGPRs, occupancy 1).
+Also tried: three launches with the norm folded after the down GEMM (lora = sum_s r_s *
+((h_s * (1 + w_s)) @ W_down_s): combine + split-K partials + sums of squares, reduce with r_s,
+up + gate mix rebuilding xn). Accurate (hidden bitwise, block_input at stock error) but no
+faster: M 1/5/16 site 15.3/15.7/16.4 -> 15.4/15.8/16.5 us (best sweep config -1%); the
+on-the-fly combine costs what the dropped launch saved.
 
     python -m suffix_hybrid.kernels.hc_down_rocm   # GPU oracle + us/call (boot gate hc_down_bench)
 """
