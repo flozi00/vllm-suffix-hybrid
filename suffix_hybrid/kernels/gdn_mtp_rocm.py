@@ -35,6 +35,9 @@ _Q = None  # vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn, set by i
 # SUFFIX_ROCM_GDN_DEFER: the verify runs gdn_defer_rocm's deferred-commit kernel instead
 # (rocm_patches applies its metadata + generic-path rewrites).
 _DEFER = os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
+# SUFFIX_ROCM_GDN_MIXED (with _DEFER): mixed verify + prefill batches skip vLLM's generic
+# path (gathers, repacks, index_copy merges: ~30 eager ops per layer in a CPU-bound step).
+_MIXED = _DEFER and os.environ.get("SUFFIX_ROCM_GDN_MIXED", "").strip() == "1"
 
 
 def install(module) -> None:
@@ -58,6 +61,8 @@ def _state_indices_m1(md):
 
 def forward_spec(layer, qkvz, ba, core_attn_out, md) -> bool:
     """_forward_core_rocm for an all-spec (MTP verify) batch; False = not handled."""
+    if _MIXED and md.num_prefills:
+        return forward_mixed(layer, qkvz, ba, core_attn_out, md)
     if (md.spec_sequence_masks is None or md.num_prefills or md.num_decodes
             or layer.gqa_interleaved_layout):
         return False
@@ -106,6 +111,68 @@ def forward_spec(layer, qkvz, ba, core_attn_out, md) -> bool:
     )
     if n < core_attn_out.shape[0]:
         core_attn_out[n:].zero_()  # stock zeroes everything, then overwrites rows < n
+    return True
+
+
+def forward_mixed(layer, qkvz, ba, core_attn_out, md) -> bool:
+    """_forward_core_rocm for spec verifies followed by prefills (vLLM's V2 runner orders
+    verify rows first; checked on the host mask): the verify prefix takes forward_spec's
+    two kernels, the prefill suffix vLLM's own conv / post-conv / chunk kernels on row
+    slices. Same kernels and arguments as _forward_core minus its row gathers, q/k/v
+    repack, z copy and index_copy merges. False = not this layout (stock path runs)."""
+    from suffix_hybrid.kernels.gdn_defer_rocm import gdn_defer
+
+    masks, ns = md.spec_sequence_masks_cpu, md.num_spec_decodes
+    nst, n = md.num_spec_decode_tokens, md.num_actual_tokens
+    if (md.spec_sequence_masks is None or not md.num_prefills or md.num_decodes
+            or layer.gqa_interleaved_layout or masks is None or not ns
+            or not bool(masks[:ns].all()) or bool(masks[ns:].any())
+            or nst + md.num_prefill_tokens != n):
+        return False
+    key_dim, value_dim = layer.key_dim // layer.tp_size, layer.value_dim // layer.tp_size
+    qkv_dim, hv = 2 * key_dim + value_dim, value_dim // layer.head_v_dim
+    idx = md.spec_state_indices_tensor
+    conv_state = layer.kv_cache[0]
+    if not _Q.is_conv_state_dim_first():
+        conv_state = conv_state.transpose(-1, -2)
+    ssm_state = layer.kv_cache[1]
+    w = layer.conv1d.weight
+    w = w.view(w.size(0), w.size(2))
+    # Verify prefix, rows [0, nst): forward_spec's conv + deferred delta rule.
+    qkv = _Q.causal_conv1d_update(
+        qkvz[:nst, :qkv_dim], conv_state, w, layer.conv1d.bias, layer.activation,
+        conv_state_indices=idx[:, 0][:ns], num_accepted_tokens=md.num_accepted_tokens,
+        query_start_loc=md.spec_query_start_loc, max_query_len=idx.size(-1),
+        validate_data=False)
+    gdn_defer(qkv, ba[:nst, hv:], ba[:nst, :hv], layer.A_log, layer.dt_bias, ssm_state,
+              md.spec_query_start_loc[: ns + 1], idx, md.num_accepted_tokens,
+              md.suffix_spec_seq_lens, core_attn_out, key_dim // layer.head_k_dim,
+              layer.head_k_dim, layer.head_v_dim, md.suffix_zone)
+    # Prefill suffix, rows [nst, n): _forward_core's prefill calls (spec present, so the
+    # prefill metadata is the whole non-spec part), dense input like its gather made.
+    x = qkvz[nst:n, :qkv_dim].contiguous()
+    conv = _Q.causal_conv1d_fn(
+        x.transpose(0, 1), w, layer.conv1d.bias, activation=layer.activation,
+        conv_states=conv_state, has_initial_state=md.has_initial_state,
+        cache_indices=md.non_spec_state_indices_tensor,
+        query_start_loc=md.non_spec_query_start_loc, metadata=md).transpose(0, 1)
+    q, k, v, g, beta = _Q.fused_post_conv_prep(
+        conv_output=conv, a=ba[nst:n, hv:], b=ba[nst:n, :hv], A_log=layer.A_log,
+        dt_bias=layer.dt_bias, num_k_heads=layer.num_k_heads // layer.tp_size,
+        head_k_dim=layer.head_k_dim, head_v_dim=layer.head_v_dim, apply_l2norm=True,
+        output_g_exp=False)
+    initial_state = ssm_state[md.prefill_state_indices]
+    initial_state[~md.prefill_has_initial_state, ...] = 0
+    o, last = layer.chunk_gated_delta_rule(
+        q=q.unsqueeze(0), k=k.unsqueeze(0), v=v.unsqueeze(0), g=g.unsqueeze(0),
+        beta=beta.unsqueeze(0), initial_state=initial_state, output_final_state=True,
+        cu_seqlens=md.prefill_query_start_loc, chunk_indices=md.chunk_indices,
+        chunk_offsets=md.chunk_offsets, use_qk_l2norm_in_kernel=False,
+        aiter_prefill_metadata=md.aiter_prefill_metadata)
+    ssm_state[md.prefill_state_indices] = last.to(ssm_state.dtype)
+    core_attn_out[nst:n] = o.squeeze(0)
+    if n < core_attn_out.shape[0]:
+        core_attn_out[n:].zero_()
     return True
 
 

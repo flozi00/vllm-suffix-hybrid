@@ -72,3 +72,72 @@ def test_generic_path_rewrite():
     compile(src, "<t>", "exec")
     assert core.after == "suffix_hybrid.kernels.gdn_defer_rocm:install"
     assert "suffix_spec_seq_lens" in meta.new and "spec_req_idx" in ctor.new
+
+
+def test_forward_mixed_slices_verify_prefix_and_prefill_suffix(monkeypatch):
+    """SUFFIX_ROCM_GDN_MIXED: verify rows [0, nst) through conv update + gdn_defer, prefill
+    rows [nst, n) through vLLM's conv_fn / post-conv / chunk calls on slices, outputs
+    placed by row range, stale tail zeroed; a non-prefix layout falls back to stock."""
+    hv, K, V, qkv_dim, H = 2, 2, 3, 14, 2
+    calls = {}
+
+    def defer(qkv, a, b, A_log, dt, state, cu, idx, acc, seq, out, *rest):
+        calls["defer"] = (qkv, a, b, cu, seq, rest)
+        out[: qkv.shape[0]] = 5.0
+
+    def chunk(**kw):
+        calls["chunk"] = kw
+        t = kw["q"].shape[1]
+        return torch.full((1, t, hv, V), 7.0), torch.full(kw["initial_state"].shape, 3.0)
+
+    monkeypatch.setattr(gdn_defer_rocm, "gdn_defer", defer)
+    monkeypatch.setattr(gdn_mtp_rocm, "_MIXED", True)
+    monkeypatch.setattr(gdn_mtp_rocm, "_Q", SimpleNamespace(
+        is_conv_state_dim_first=lambda: True,
+        causal_conv1d_update=lambda x, *a, **kw: calls.setdefault("upd", (x, kw)) and x,
+        causal_conv1d_fn=lambda x, *a, **kw: calls.setdefault("fn", (x, kw)) and x,
+        fused_post_conv_prep=lambda **kw: calls.setdefault("post", kw) and (
+            torch.zeros(kw["conv_output"].shape[0], H, K), torch.zeros(kw["conv_output"].shape[0], H, K),
+            torch.zeros(kw["conv_output"].shape[0], hv, V), torch.zeros(kw["conv_output"].shape[0], hv),
+            torch.zeros(kw["conv_output"].shape[0], hv))))
+    layer = SimpleNamespace(
+        gqa_interleaved_layout=False, key_dim=4, value_dim=6, tp_size=1, head_k_dim=K,
+        head_v_dim=V, num_k_heads=H, num_v_heads=hv, activation="silu",
+        A_log=torch.zeros(hv), dt_bias=torch.zeros(hv), chunk_gated_delta_rule=chunk,
+        conv1d=SimpleNamespace(weight=torch.randn(qkv_dim, 1, 4), bias=None),
+        kv_cache=(torch.randn(12, qkv_dim, 4), torch.randn(12, hv, V, K)))
+    pre_idx = torch.tensor([8, 9])
+    md = SimpleNamespace(
+        spec_sequence_masks=torch.tensor([True, True, False, False]),
+        spec_sequence_masks_cpu=torch.tensor([True, True, False, False]),
+        num_prefills=2, num_decodes=0, num_spec_decodes=2, num_spec_decode_tokens=10,
+        num_prefill_tokens=7, num_actual_tokens=17,
+        spec_state_indices_tensor=torch.tensor([[1, 2, 3, 4, 5], [6, 7, 10, 11, 0]], dtype=torch.int32),
+        num_accepted_tokens=torch.tensor([2, 1], dtype=torch.int32),
+        spec_query_start_loc=torch.tensor([0, 5, 10], dtype=torch.int32),
+        suffix_spec_seq_lens=torch.tensor([40, 9], dtype=torch.int32), suffix_zone=1664,
+        has_initial_state=torch.tensor([True, False]),
+        non_spec_state_indices_tensor=pre_idx, non_spec_query_start_loc=torch.tensor([0, 3, 7]),
+        prefill_state_indices=pre_idx, prefill_has_initial_state=torch.tensor([True, False]),
+        prefill_query_start_loc=torch.tensor([0, 3, 7]), chunk_indices="ci", chunk_offsets="co",
+        aiter_prefill_metadata=None)
+    qkvz, ba, out = torch.randn(20, qkv_dim + 6), torch.randn(20, 2 * hv), torch.ones(20, hv, V)
+    before = layer.kv_cache[1][8].clone()
+    assert gdn_mtp_rocm.forward_spec(layer, qkvz, ba, out, md) is True
+    upd_x, upd_kw = calls["upd"]
+    assert upd_x.shape == (10, qkv_dim) and upd_x.data_ptr() == qkvz.data_ptr()
+    assert torch.equal(upd_kw["conv_state_indices"], torch.tensor([1, 6], dtype=torch.int32))
+    qkv, a, b, cu, seq, rest = calls["defer"]
+    assert torch.equal(a, ba[:10, hv:]) and torch.equal(b, ba[:10, :hv]) and torch.equal(cu, md.spec_query_start_loc)
+    fn_x, fn_kw = calls["fn"]
+    assert fn_x.shape == (qkv_dim, 7) and torch.equal(fn_x.t(), qkvz[10:17, :qkv_dim])
+    assert fn_kw["cache_indices"] is pre_idx and fn_kw["metadata"] is md
+    assert torch.equal(calls["post"]["a"], ba[10:17, hv:]) and torch.equal(calls["post"]["b"], ba[10:17, :hv])
+    init = calls["chunk"]["initial_state"]
+    assert torch.equal(init[0], before) and not init[1].any()  # no prior state -> zeros
+    assert calls["chunk"]["cu_seqlens"] is md.prefill_query_start_loc
+    assert bool((layer.kv_cache[1][pre_idx] == 3.0).all())
+    assert bool((out[:10] == 5.0).all()) and bool((out[10:17] == 7.0).all()) and not out[17:].any()
+
+    md.spec_sequence_masks_cpu = torch.tensor([True, False, True, False])  # not a verify prefix
+    assert gdn_mtp_rocm.forward_spec(layer, qkvz, ba, out, md) is False

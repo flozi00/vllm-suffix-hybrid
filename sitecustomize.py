@@ -63,6 +63,8 @@ PYTHONPATH. Each section is independently gated:
                                top-k as dense blocks (suffix_hybrid/kernels/qsa_dense_rocm.py)
   SUFFIX_ROCM_GDN_DEFER=1   -> ROCm: GDN MTP verify writes 1 state + token inputs
                                instead of 5 states (gdn_defer_rocm.py; needs _GDN_MTP, _ASYNC_IDX)
+  SUFFIX_ROCM_GDN_MIXED=1   -> with _GDN_DEFER: mixed verify + prefill GDN batches on row
+                               slices (no gathers / repacks / index_copy; gdn_mtp_rocm.forward_mixed)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
