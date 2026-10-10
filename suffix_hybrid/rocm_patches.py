@@ -122,6 +122,8 @@ SUFFIX_ROCM_ACT_QUANT_FUSE=1: the GDN output (RMSNormGated -> out_proj) and the 
   Triton launch, then gemm_afp4wfp4 as vLLM's non-ASM MXFP4 linear calls it; one launch
   fewer per site (52 per MTP-4 step). Only for out_proj / o_proj served by that kernel
   at TP 1; anything else keeps the stock code below the patched branch.
+SUFFIX_JIT_LOG=1: one "[suffix jit]" line per Triton compile (kernel, wall ms): which kernels
+  still JIT-compile while serving (each compile stalls every in-flight request).
 """
 import glob
 import importlib.util
@@ -638,6 +640,8 @@ PATCHES = {
               + _AQ_QSA.split("\n", 1)[1],
               "suffix_hybrid.kernels.act_quant_rocm:install_qsa"),
     ),
+    "SUFFIX_JIT_LOG": Patch("triton.runtime.jit", "log every Triton compile",
+                            after="suffix_hybrid.jit_log:install"),
     # Inside the lru-cached lookup: one file probe per (shape, M) per process; a plugin
     # miss (None) falls through to AITER's own probe unchanged.
     "SUFFIX_ROCM_AFP4_CONFIGS": Patch(
