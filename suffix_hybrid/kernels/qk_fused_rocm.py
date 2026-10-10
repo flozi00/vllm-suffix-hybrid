@@ -37,7 +37,7 @@ def _graph_us(fn, iters: int = 50):
     return a.elapsed_time(b) * 1e3 / iters, out
 
 
-def main() -> int:
+def _run() -> int:
     from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm
     from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -94,6 +94,13 @@ def main() -> int:
               f"eager {eag_us:.1f} -> fused {fus_us:.1f}", flush=True)
     print(f"{MARK} {'PASS' if not failed else 'FAIL'} (<= 2 bf16 ulp vs eager)", flush=True)
     return 1 if failed else 0
+
+
+def main() -> int:
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    with set_current_vllm_config(VllmConfig()):  # GemmaRMSNorm / rope are CustomOps
+        return _run()
 
 
 if __name__ == "__main__":
