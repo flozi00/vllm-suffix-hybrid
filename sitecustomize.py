@@ -552,9 +552,6 @@ _BOOT_GATES = {
                             {"SUFFIX_ROCM_AITER_FLYDSL_ZERO": "1"}),
     "moe_fp4_oracle_zbuf": (["-m", "suffix_hybrid.tools.moe_fp4_oracle"],
                             {"SUFFIX_ROCM_AITER_FLYDSL_ZBUF": "1"}),
-    # AITER's FLAT one-stage asm MoE (in-kernel routing + MXFP4 quant) at 1..16 tokens: per
-    # FLAT kernel, NaN / cosine vs the default path + graphed us next to the shipped table.
-    "moe_flat_probe": (["-m", "suffix_hybrid.tools.moe_flat_probe"], {}),
     # SUFFIX_ROCM_GDN_MTP vs vLLM's spec branch of _forward_core_rocm: outputs, every
     # state page byte, graph replay with new slots + graphed us/call (MTP-4 verify).
     "gdn_mtp_bench": (["-m", "suffix_hybrid.kernels.gdn_mtp_rocm"], {}),
