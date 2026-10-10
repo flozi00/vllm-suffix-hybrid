@@ -103,9 +103,16 @@ SUFFIX_ROCM_HC_BIG=1: Qwen4Exp GatedResidual.mix / combine_and_mix return throug
   the up GEMM + gate mix without the [M, 10240] gate (6 launches -> 4 at M = 160); at
   M <= MIN_M HC_DOWN's + HC_FUSE's kernels, above MAX_M vLLM's stock chain. The patch
   only inserts the return at the top of each method: composes with HC_FUSE / HC_DOWN.
+SUFFIX_ROCM_TOPK_TOPP=1: vLLM's apply_top_k_top_p_triton (Qrita, one program per row) runs,
+  for batches with a top-k, as three launches with each row split across programs
+  (suffix_hybrid/kernels/lm_sample_rocm.py): the statistics / outlier gather and the final
+  mask in parallel, stock's pivot search and top-p code verbatim in between, the same masks
+  by construction. p-only rows keep stock's paths. The hook pins the stock functions'
+  source (sha256) and keeps stock when vLLM differs from 81198e97.
 """
 import glob
 import importlib.util
+import linecache
 import os
 import sys
 import textwrap
@@ -566,6 +573,10 @@ PATCHES = {
               "            self, hidden_states, prev_block_output, prev_injection\n"
               "        )\n"),
     ),
+    "SUFFIX_ROCM_TOPK_TOPP": Patch(
+        "vllm.v1.sample.ops.topk_topp_triton",
+        "top-k / top-p with rows split across programs",
+        after="suffix_hybrid.kernels.lm_sample_rocm:install"),
     # Inside the lru-cached lookup: one file probe per (shape, M) per process; a plugin
     # miss (None) falls through to AITER's own probe unchanged.
     "SUFFIX_ROCM_AFP4_CONFIGS": Patch(
@@ -641,7 +652,12 @@ def install_post_import_hook() -> bool:
                 for p in patches:
                     if p.old:
                         src = patch_source(p, src)
-                exec(compile(src, module.__file__, "exec"), module.__dict__)
+                # Triton's @jit parses inspect.getsource(fn), which reads the file named
+                # by co_filename: without this the patched module's kernels compile from
+                # the unpatched file on disk (wrong lines once a patch shifts them).
+                fname = f"{module.__file__}.suffix-rocm-patch.py"
+                linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)
+                exec(compile(src, fname, "exec"), module.__dict__)
                 for p in patches:
                     if p.after:
                         mod_name, fn = p.after.split(":")

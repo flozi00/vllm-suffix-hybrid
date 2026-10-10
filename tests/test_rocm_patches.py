@@ -62,6 +62,8 @@ def test_hook_rewrites_every_enabled_target(tmp_path, monkeypatch):
         assert moe.pads(100, 384, cfg, "silu") == (100, 384)
         qsa = importlib.import_module("fake_qsa_ops")
         assert qsa.chunk(1024) == 384 and qsa.chunk(1 << 20) == 32  # cap, workspace bound kept
+        import inspect  # Triton's @jit reads kernels through inspect.getsource: patched text
+        assert TOPK.new.strip() in inspect.getsource(qsa.chunk)
         assert qsa.qsa_mqa_paged() == "suffix"  # after hook ran on the rewritten module
         assert getattr(moe, rp._MARK) and getattr(qsa, rp._MARK)
         assert not any(getattr(f, rp._MARK, False) for f in sys.meta_path)  # finder retired

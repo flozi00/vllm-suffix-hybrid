@@ -12,10 +12,12 @@ keeps the BF16 weight resident), so the two gates are mutually exclusive.
 
 Load: the weight is quantized with AITER's dynamic MXFP4 quant (e8m0 per 32);
 scales are stored [K/32, N] as vLLM's AITER Triton linear does. Hot path for
-M <= SUFFIX_MXFP4_LMHEAD_MAX_M rows (default 16): dynamic MXFP4 activation
-quant -> AITER Triton gemm_afp4wfp4 over the vocab -> the top-RESCORE
-candidates per row recomputed EXACTLY from the BF16 rows and scattered back,
-so greedy / top-k picks see stock logits and only the tail keeps W4A4 noise.
+M <= SUFFIX_MXFP4_LMHEAD_MAX_M rows (default 16, at most 256: the c32 MTP-4
+verify is 160): dynamic MXFP4 activation quant -> AITER Triton gemm_afp4wfp4
+over the vocab -> the top-RESCORE candidates per row (lm_sample_rocm.row_topk:
+torch.topk's set, ties to the lowest index, in two split-row launches)
+recomputed EXACTLY from the BF16 rows and scattered back, so greedy / top-k
+picks see stock logits and only the tail keeps W4A4 noise.
 One HIP graph per M is captured at load (``SUFFIX_MXFP4_LMHEAD_GRAPH=0`` =
 eager); graph replay must be bit-identical to eager and greedy picks must
 agree with the stock head on random rows, or startup fails.
@@ -38,7 +40,7 @@ MAX_M_ENV = "SUFFIX_MXFP4_LMHEAD_MAX_M"
 GRAPH_ENV = "SUFFIX_MXFP4_LMHEAD_GRAPH"
 MAX_M = 16
 RESCORE = 64
-ORACLE_MS = (1, 2, 4, 16)
+ORACLE_MS = (1, 2, 4, 16, 64, 160)
 SHAPE = (248320, 2560)  # qwen3.8-flash-next
 _state = {"armed": False, "heads": 0, "stock": 0, "active": False, "hook": None,
           "checked": False}
@@ -55,8 +57,8 @@ def gate_on() -> bool:
 def max_m_env() -> int:
     raw = os.environ.get(MAX_M_ENV, "").strip()
     m = int(raw) if raw else MAX_M
-    if not 1 <= m <= 64:
-        raise ValueError(f"{MAX_M_ENV}={raw!r}: 1..64")
+    if not 1 <= m <= 256:
+        raise ValueError(f"{MAX_M_ENV}={raw!r}: 1..256")
     return m
 
 
@@ -80,18 +82,24 @@ def _ops():
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
+    from suffix_hybrid.kernels.lm_sample_rocm import row_topk
+
     def prepare(w, max_m):
         n, k = w.shape
         wq, ws = dynamic_mxfp4_quant(w)  # [N, K/2] e2m1 pairs, [N, K/32] e8m0
         return dict(n=n, k=k, w=w, wq=wq, ws_t=ws.T.contiguous(), max_m=max_m)
 
-    def run(st, x2, out=None):
-        """x2 bf16 [M, K] -> bf16 [M, N]: MXFP4 screen + exact rescore."""
+    def run(st, x2, out=None, topk=None):
+        """x2 bf16 [M, K] -> bf16 [M, N]: MXFP4 screen + exact rescore (topk(y, r) ->
+        candidate indices, row_topk by default; the oracle passes torch's)."""
         xq, xs = dynamic_mxfp4_quant(x2)
         y = out if out is not None else torch.empty(
             x2.shape[0], st["n"], dtype=torch.bfloat16, device=x2.device)
         gemm_afp4wfp4(xq, st["wq"], xs, st["ws_t"].T, torch.bfloat16, y)
-        top = y.topk(min(RESCORE, st["n"]), dim=-1).indices  # [M, R]
+        r = min(RESCORE, st["n"])
+        if topk is None:
+            topk = row_topk if r == RESCORE else (lambda t, c: t.topk(c, dim=-1).indices)
+        top = topk(y, r)  # [M, R]
         exact = torch.bmm(st["w"][top], x2.unsqueeze(-1)).squeeze(-1)  # [M, R] bf16
         return y.scatter_(1, top, exact)
 
@@ -278,7 +286,7 @@ def main(argv=None) -> int:
         torch.cuda.synchronize()
         return a.elapsed_time(b) * 1e3 / iters
 
-    for m in (1, 2, 4, 8, 16):
+    for m in (1, 2, 4, 8, 16, 32, 64, 128, 160, 256):
         if m > st["max_m"]:
             break
         x = torch.randn(m, k, generator=gen, device="cuda", dtype=torch.bfloat16)
