@@ -33,6 +33,38 @@ PYTHONPATH. Each section is independently gated:
                                ("[suffix-prof]" lines; fail-soft)
   SUFFIX_SAMPLER_WARMUP=0   -> disable the DEFAULT-ON boot JIT of the top-k/
                                top-p sampler kernels (V2 runner; fail-soft)
+  SUFFIX_ROCM_AITER_PAD=1   -> ROCm: pass raw MoE padding to AITER fused_moe
+                               (vllm#46201; TP1 MXFP4 MoE corruption; fail closed)
+  SUFFIX_ROCM_QSA_TOPK_ROWS=1 -> ROCm: QSA indexer top-k in <=384-row chunks (the
+                               >384-row kernel needs hostcall = PCIe atomics)
+  SUFFIX_ROCM_QSA_MQA=1     -> ROCm: QSA indexer scores only visible columns
+                               (suffix_hybrid/kernels/qsa_mqa_rocm.py)
+  SUFFIX_ROCM_QSA_SPARSE_SKIP=1 -> ROCm: QSA sparse attention skips all -1 tiles
+  SUFFIX_ROCM_AITER_FLYDSL_PAD=1 -> AITER fMoE: FlyDSL fp4 stage 1 writes the padded tail
+                               for layout stage 2s (tuned-table NaN bug)
+  SUFFIX_ROCM_AITER_FLYDSL_ZBUF=1 -> same bug: padded stage-1 buffers from persistent
+                               zeroed allocations (no per-call memset; not with _ZERO)
+  SUFFIX_ROCM_MXFP4_A16=1   -> ROCm: dense MXFP4 linears at M <= SUFFIX_ROCM_MXFP4_A16_MAX_M
+                               (default 32) as one AITER gemm_a16wfp4 launch
+  SUFFIX_ROCM_GDN_MTP=1     -> ROCm: GDN MTP-verify core via AITER's strided
+                               gated delta rule (suffix_hybrid/kernels/gdn_mtp_rocm.py)
+  SUFFIX_ROCM_HC_FUSE=1     -> ROCm: Qwen4Exp HC silu + up GEMM + gate mix in one
+                               kernel (suffix_hybrid/kernels/hc_fused_rocm.py);
+                               forces VLLM_USE_AOT_COMPILE=0 (stale-artifact guard)
+  SUFFIX_ROCM_GDN_ASYNC_IDX=1 -> GDN builder: mixed-step row gathers by device index
+                               (no blocking H2D per mask; not ROCm-specific)
+  SUFFIX_ROCM_HC_DOWN=1     -> ROCm: Qwen4Exp HC down projections at M <=
+                               SUFFIX_ROCM_HC_DOWN_MAX_M (default 64) as split-K
+                               Triton + reduce (suffix_hybrid/kernels/hc_down_rocm.py);
+                               forces VLLM_USE_AOT_COMPILE=0 (stale-artifact guard)
+  SUFFIX_ROCM_AFP4_CONFIGS=1 -> AITER gemm_afp4wfp4 takes tuned JSONs from
+                               suffix_hybrid/configs/afp4/ first (boot gate afp4_tune)
+  SUFFIX_ROCM_QSA_DENSE=1   -> ROCm: QSA attention runs requests within the token
+                               top-k as dense blocks (suffix_hybrid/kernels/qsa_dense_rocm.py)
+  SUFFIX_ROCM_GDN_DEFER=1   -> ROCm: GDN MTP verify writes 1 state + token inputs
+                               instead of 5 states (gdn_defer_rocm.py; needs _GDN_MTP, _ASYNC_IDX)
+  SUFFIX_ROCM_GDN_MIXED=1   -> with _GDN_DEFER: mixed verify + prefill GDN batches on row
+                               slices (no gathers / repacks / index_copy; gdn_mtp_rocm.forward_mixed)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -246,6 +278,41 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
         print(f"[suffix mtp-tune] install failed (tuning off): {exc!r}",
               file=sys.stderr, flush=True)
 
+# GPU telemetry (suffix_hybrid/gpu_mon.py): SUFFIX_GPU_MON=<seconds> logs amdgpu hwmon
+# temps / power / clocks from one process per pod. Never fatal.
+if os.environ.get("SUFFIX_GPU_MON", "").strip():
+    try:
+        from suffix_hybrid.gpu_mon import start as _gm_start
+        _gm_start()
+    except Exception:  # noqa: BLE001 - telemetry only
+        pass
+
+# ROCm vLLM source patches (suffix_hybrid/rocm_patches.py): each gate rewrites
+# one module before its first import; any failure is fatal (fail closed).
+if any(os.environ.get(_g, "").strip() == "1"
+       for _g in ("SUFFIX_ROCM_AITER_PAD", "SUFFIX_ROCM_QSA_TOPK_ROWS", "SUFFIX_ROCM_QSA_MQA",
+                  "SUFFIX_ROCM_MXFP4_A16", "SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_HC_FUSE",
+                  "SUFFIX_ROCM_QSA_SPARSE_SKIP", "SUFFIX_ROCM_GDN_ASYNC_IDX", "SUFFIX_ROCM_HC_DOWN",
+                  "SUFFIX_ROCM_AITER_FLYDSL_PAD", "SUFFIX_ROCM_AITER_FLYDSL_ZERO",
+                  "SUFFIX_ROCM_AFP4_CONFIGS", "SUFFIX_ROCM_QSA_DENSE",
+                  "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER")):
+    if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
+            and not all(os.environ.get(_g, "").strip() == "1"
+                        for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
+        raise SystemExit("[suffix rocm-patch] SUFFIX_ROCM_GDN_DEFER needs SUFFIX_ROCM_GDN_MTP=1 "
+                         "and SUFFIX_ROCM_GDN_ASYNC_IDX=1 (every verify path must keep one "
+                         "slot contract)")
+    from suffix_hybrid.rocm_patches import install_post_import_hook as _rp_hook
+    _rp_hook()
+# SUFFIX_ROCM_HC_FUSE / _HC_DOWN rewrite Dynamo-traced code. vLLM's AOT-compile artifacts
+# are keyed without traced sources and verified against the unpatched files on disk, so
+# a gate-off artifact would load into a gate-on pod and serve stock HC silently;
+# the classic compile cache hashes every traced file (hc_fused_rocm.py / hc_down_rocm.py
+# only when on).
+if any(os.environ.get(_g, "").strip() == "1"
+       for _g in ("SUFFIX_ROCM_HC_FUSE", "SUFFIX_ROCM_HC_DOWN")):
+    os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+
 # Sampler warmup (suffix_hybrid/sampler_warmup.py): DEFAULT ON,
 # SUFFIX_SAMPLER_WARMUP=0 disables. Wraps the V2 worker's warmup_kernels to
 # compile vLLM's top-k/top-p Triton variants at boot (the V2 Sampler never
@@ -450,6 +517,68 @@ _BOOT_GATES = {
     # Same + nccl_qar int8/fp8 compressed all-reduce vs best NCCL per size.
     "allreduce_qar_bench": (["-m", "suffix_hybrid.tools.ar_bench", "--qar",
                              "--sizes-kib", "48"], {}),
+    # ROCm card facts: arch/CUs, AITER tuned-config coverage for this CU count,
+    # HBM bandwidth, BF16 vs MXFP4 GEMM at the qwen3.8-flash TP1 decode shapes.
+    "rocm_probe": (["-m", "suffix_hybrid.tools.rocm_probe"], {}),
+    # One MXFP4 GEMM path per process (HIP faults are sticky): Triton, Triton
+    # with a sync after the activation quant, ASM; blocking launches pin the
+    # failing kernel.
+    "rocm_fp4_triton": (["-m", "suffix_hybrid.tools.rocm_probe", "--only", "triton",
+                         "--m", "1,16"], {"HIP_LAUNCH_BLOCKING": "1"}),
+    "rocm_fp4_triton_sync": (["-m", "suffix_hybrid.tools.rocm_probe", "--only", "triton-sync",
+                              "--m", "1"], {"HIP_LAUNCH_BLOCKING": "1"}),
+    "rocm_fp4_asm": (["-m", "suffix_hybrid.tools.rocm_probe", "--only", "asm",
+                      "--m", "1,16"], {"HIP_LAUNCH_BLOCKING": "1"}),
+    # Host/KFD/torch device limits + one Triton matmul per LDS size, each in
+    # its own process: which kernels launch on this card and runtime.
+    "rocm_lds_probe": (["-m", "suffix_hybrid.tools.rocm_lds_probe"], {"AMD_LOG_LEVEL": "1"}),
+    # Same host/KFD facts (incl. io_link atomics flags) without the kernel matrix.
+    "rocm_host_facts": (["-m", "suffix_hybrid.tools.rocm_lds_probe", "--facts"], {}),
+    # SUFFIX_ROCM_QSA_MQA kernel vs vLLM's qsa_mqa_paged: equality on visible columns + us/call.
+    "qsa_mqa_bench": (["-m", "suffix_hybrid.kernels.qsa_mqa_rocm"], {}),
+    # SUFFIX_ROCM_QSA_SPARSE_SKIP: patched vs stock QSA sparse attention, bitwise + us/call.
+    "qsa_sparse_bench": (["-m", "suffix_hybrid.kernels.qsa_sparse_rocm"], {}),
+    # SUFFIX_ROCM_QSA_DENSE vs vLLM's sparse QSA attention on vLLM's own selections: the
+    # selection == 0..p premise, bf16 bound / bitwise sparse rows, graph replay, us/call.
+    "qsa_dense_bench": (["-m", "suffix_hybrid.kernels.qsa_dense_rocm"], {}),
+    # Tuned fMoE table (suffix_hybrid/configs/mi350p_tuned_fmoe.csv) vs AITER's default MoE on
+    # vLLM-padded MXFP4 weights, with the SUFFIX_ROCM_AITER_FLYDSL_PAD fix active: NaN/cos check.
+    "moe_fp4_oracle": (["-m", "suffix_hybrid.tools.moe_fp4_oracle"],
+                       {"SUFFIX_ROCM_AITER_FLYDSL_PAD": "1"}),
+    "moe_fp4_oracle_zero": (["-m", "suffix_hybrid.tools.moe_fp4_oracle"],
+                            {"SUFFIX_ROCM_AITER_FLYDSL_ZERO": "1"}),
+    "moe_fp4_oracle_zbuf": (["-m", "suffix_hybrid.tools.moe_fp4_oracle"],
+                            {"SUFFIX_ROCM_AITER_FLYDSL_ZBUF": "1"}),
+    # SUFFIX_ROCM_GDN_MTP vs vLLM's spec branch of _forward_core_rocm: outputs, every
+    # state page byte, graph replay with new slots + graphed us/call (MTP-4 verify).
+    "gdn_mtp_bench": (["-m", "suffix_hybrid.kernels.gdn_mtp_rocm"], {}),
+    # SUFFIX_ROCM_GDN_DEFER vs AITER's verify over 14 steps of random acceptance with the
+    # align-mode copies emulated: bitwise outputs + boundary slots; graphed us/call.
+    "gdn_defer_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm"], {}),
+    # SUFFIX_ROCM_HC_FUSE kernel vs vLLM hc_silu -> F.linear -> hc_gate_mix: bf16
+    # bound + bit-exact share, us/call (HIP graphs, cold weights), BMxNG sweep.
+    "hc_fuse_bench": (["-m", "suffix_hybrid.kernels.hc_fused_rocm"], {}),
+    # SUFFIX_ROCM_HC_DOWN split-K kernel vs F.linear (hipBLASLt) at N 336/320, M 1..160:
+    # bf16 bound + bit-exact share, determinism, graphed us/call (cold weights), sweep.
+    "hc_down_bench": (["-m", "suffix_hybrid.kernels.hc_down_rocm"], {}),
+    # AITER fused-MoE tuner for this card's CU count (qwen3.8-flash MXFP4 MoE; the
+    # _fse variant = shared expert fused as expert 513, top-11); prints the CSV.
+    "aiter_moe_tune": (["-m", "suffix_hybrid.tools.aiter_moe_tune"], {}),
+    "aiter_moe_tune_fse": (["-m", "suffix_hybrid.tools.aiter_moe_tune", "--expert", "513",
+                            "--topk", "11"], {}),
+    # MXFP4 lm_head (SUFFIX_MXFP4_LMHEAD) at the qwen3.8-flash head: fidelity +
+    # us/call of the graphed screen+rescore vs the stock bf16 head, M=1..16.
+    "mxfp4_lmhead_bench": (["-m", "suffix_hybrid.kernels.mxfp4_lm_head"], {}),
+    # SUFFIX_ROCM_MXFP4_A16 at the qwen3.8-flash dense MXFP4 shapes, M 1..40: gemm_a16wfp4
+    # vs vLLM's quant + gemm_afp4wfp4 (numerics, graph replay == eager), graphed us/call.
+    "mxfp4_a16_bench": (["-m", "suffix_hybrid.kernels.mxfp4_a16_rocm"], {}),
+    # AITER Triton MXFP4 GEMM (gemm_afp4wfp4) tuner for this card's CU count at the
+    # qwen3.8-flash dense shapes, M 1..256: AITER's config vs best us/M + AITER-format JSONs
+    # for suffix_hybrid/configs/afp4/. _shipped: same with SUFFIX_ROCM_AFP4_CONFIGS on, so
+    # the baseline is the shipped JSON ("json" in the table = the loader picked it up).
+    "afp4_tune": (["-m", "suffix_hybrid.tools.afp4_tune"], {}),
+    "afp4_tune_shipped": (["-m", "suffix_hybrid.tools.afp4_tune"],
+                          {"SUFFIX_ROCM_AFP4_CONFIGS": "1"}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():

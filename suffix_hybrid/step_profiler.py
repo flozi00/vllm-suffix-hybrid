@@ -34,12 +34,15 @@ summary from a kept trace. stdlib + torch only.
 """
 from __future__ import annotations
 
+import bisect
 import functools
+import importlib
 import importlib.util
 import inspect
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -48,15 +51,21 @@ from collections import Counter, defaultdict
 ENV = "SUFFIX_PROFILE_STEPS"
 MARK = "[suffix-prof]"
 STEP = "suffix_step"
-TOP_K = 40
+TOP_K = int(os.environ.get("SUFFIX_PROFILE_TOP", "40"))  # kernels listed per window
 _TARGET_MODULE = "vllm.v1.engine.core"
 _FINDER_MARK = "_suffix_step_profiler"
 
 SYNC_APIS = ("cudaStreamSynchronize", "cudaDeviceSynchronize",
              "cudaEventSynchronize", "cudaMemcpy", "cudaMemcpyAsync",
-             "cuStreamSynchronize", "cuCtxSynchronize", "cuMemcpyDtoH")
+             "cuStreamSynchronize", "cuCtxSynchronize", "cuMemcpyDtoH",
+             # ROCm (roctracer names under the same cuda_runtime category)
+             "hipStreamSynchronize", "hipDeviceSynchronize",
+             "hipEventSynchronize", "hipMemcpy", "hipMemcpyAsync",
+             "hipMemcpyWithStream")
 LAUNCH_APIS = ("cudaLaunchKernel", "cudaLaunchKernelExC", "cuLaunchKernel",
-               "cuLaunchKernelEx", "cudaGraphLaunch", "cuGraphLaunch")
+               "cuLaunchKernelEx", "cudaGraphLaunch", "cuGraphLaunch",
+               "hipLaunchKernel", "hipExtLaunchKernel", "hipModuleLaunchKernel",
+               "hipExtModuleLaunchKernel", "hipGraphLaunch")
 
 # Ordered: first match wins. MoE before attention (flashinfer ships both).
 CATEGORIES = [
@@ -70,7 +79,7 @@ CATEGORIES = [
     ("kv-cache write", r"reshape_and_cache|concat_and_cache|cache_kernel"
      r"|kv_cache"),
     ("dense GEMM", r"gemm|gemv|cutlass|cublas|nvjet|xmma|matmul|scaled_mm"
-     r"|splitk|sm\d+_|mma"),
+     r"|splitk|sm\d+_|mma|cijk_|wvsplitk|hipblaslt"),
     ("quant (act/Q)", r"quant|fp4|fp8"),
     ("norm/rope/activation", r"norm|rms|rotary|rope|silu|gelu|act_and_mul"
      r"|softcap|tanh|activation"),
@@ -84,6 +93,17 @@ _CAT_RE = [(n, re.compile(p, re.I)) for n, p in CATEGORIES]
 
 
 MAX_WINDOWS = 12
+# Host-side labels for the work that runs in Python in PIECEWISE / eager steps (a FULL
+# replay never enters these): the splitting ops of Qwen4Exp, the graph pieces, the drafter.
+_EAGER_WRAPS = (
+    ("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn", "QwenGatedDeltaNetAttention",
+     "_forward_core_rocm", "op.gdn_core"),
+    ("vllm.models.qwen4_exp.amd.qsa", "Qwen4ExpQSAAttention", "_run_qsa", "op.qsa"),
+    ("vllm.models.qwen4_exp.amd.ple_layer", "Qwen4ExpPLELayer", "_short_conv", "op.ple_conv"),
+    ("vllm.compilation.cuda_graph", "CUDAGraphWrapper", "__call__", "cg.piece"),
+    ("vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator",
+     "TargetDependentARSpeculator", "propose", "draft.propose"),
+)
 BUCKETS = ((1, "c1"), (6, "c2-6"), (12, "c7-12"), (24, "c13-24"))
 
 
@@ -217,8 +237,10 @@ def summarize(trace: dict, py_stats: dict | None = None) -> list[str]:
             f"{k} {v[0] / n:.1f} {v[1] / n / 1e3:.3f}"
             for k, v in sorted(host.items(), key=lambda kv: -kv[1][1])))
     if py_stats and py_stats.get("cg"):
-        out.append("cudagraph per step (signature: steps): " + " | ".join(
-            f"{sig}: {c}" for sig, c in py_stats["cg"].most_common(8)))
+        ms = py_stats.get("cg_ms") or {}
+        out.append("cudagraph per step (signature: steps, mean wall ms): " + " | ".join(
+            f"{sig}: {c}" + (f" @{ms[sig] / c:.1f}ms" if ms.get(sig) else "")
+            for sig, c in py_stats["cg"].most_common(8)))
     out.append(
         f"note: FULL graph replay = 1 cudaGraphLaunch on CPU; CUPTI kernels "
         f"inside graphs seen: {graph_kernels} of "
@@ -241,6 +263,38 @@ def summarize(trace: dict, py_stats: dict | None = None) -> list[str]:
         out.append(f"  {calls / n:7.1f} | {dur / n / 1e3:7.3f} | "
                    f"{100 * dur / gpu_sum:5.1f} | {category(name)} | "
                    f"{_short(name)}")
+    out.extend(_by_signature(steps, (py_stats or {}).get("sigs") or [], rt, gpu))
+    return out
+
+
+def _by_signature(steps, sigs, rt, gpu, top: int = 30) -> list[str]:
+    """Kernel tables per step signature (FULL decode vs PIECEWISE mixed): a kernel
+    belongs to the step whose CPU span issued its launch (CUPTI correlation id)."""
+    if not steps or len(sigs) != len(steps) or len(set(sigs) - {"idle"}) < 2:
+        return []
+    starts = [st["ts"] for st in steps]
+    corr_step = {}
+    for e in rt:
+        c = (e.get("args") or {}).get("correlation")
+        i = bisect.bisect_right(starts, e["ts"]) - 1
+        if c is not None and i >= 0 and e["ts"] <= steps[i]["ts"] + steps[i]["dur"]:
+            corr_step[c] = i
+    count = Counter(sigs)
+    per = defaultdict(lambda: defaultdict(lambda: [0, 0.0]))
+    for e in gpu:
+        i = corr_step.get((e.get("args") or {}).get("correlation"))
+        if i is not None:
+            row = per[sigs[i]][e.get("name", "?")]
+            row[0] += 1
+            row[1] += e["dur"]
+    out = []
+    for sig, kern in sorted(per.items(), key=lambda kv: -count[kv[0]]):
+        k = count[sig]
+        tot = sum(v[1] for v in kern.values())
+        out.append(f"[{sig}] {k} steps: kernels {sum(v[0] for v in kern.values()) / k:.0f}/step, "
+                   f"{tot / k / 1e3:.3f} ms/step summed; top {top}: calls/step | ms/step | name")
+        for name, (calls, dur) in sorted(kern.items(), key=lambda kv: -kv[1][1])[:top]:
+            out.append(f"  [{sig[:24]}] {calls / k:7.1f} | {dur / k / 1e3:7.3f} | {_short(name, 90)}")
     return out
 
 
@@ -266,6 +320,8 @@ class _Session:
 
     def _reset_window(self) -> None:
         self.cg: Counter = Counter()
+        self.cg_ms: Counter = Counter()  # summed wall ms per signature (mixed vs decode steps)
+        self.sigs: list = []  # one per STEP annotation, in order ("idle" = nothing executed)
         self.reqs = self.toks = self.emitted = self.steps = 0
         self.t_start = 0.0
 
@@ -378,6 +434,11 @@ class _Session:
                         self._wrap(sub, "build", f"attn.build:{sub.__name__}")
         except Exception as exc:  # noqa: BLE001
             _say(f"builder instrumentation skipped: {exc!r}")
+        for mod, cls, meth, label in _EAGER_WRAPS:  # Python only runs outside FULL replays
+            try:
+                self._wrap(getattr(importlib.import_module(mod), cls), meth, label)
+            except Exception:  # noqa: BLE001 - not this model / runner
+                pass
         try:
             from vllm.v1.worker.gpu import cudagraph_utils as cgu
             for k in (getattr(cgu, "CudaGraphManager", None),
@@ -416,12 +477,15 @@ class _Session:
         _say(f"START window {self.windows + 1} [{label}]: {self.n} steps "
              f"after {self.stable} steps in bucket (pid {os.getpid()})")
 
-    def end_step(self, executed: bool) -> None:
+    def end_step(self, executed: bool, dt: float = 0.0) -> None:
+        sig = "idle"
         if getattr(self, "cg_tracked", False) and executed:
             sig = " ".join(f"{k}x{v}" for k, v in sorted(self.cg_step.items()))
             if not any(k.startswith("target:") for k in self.cg_step):
                 sig = ("target:eager " + sig).strip()
             self.cg[sig] += 1
+            self.cg_ms[sig] += dt * 1e3
+        self.sigs.append(sig)
         self.cg_step.clear()
 
     def stop(self) -> None:
@@ -442,25 +506,24 @@ class _Session:
         path = f"/tmp/suffix-prof-{os.getpid()}-{self.windows}.json"
         prof.export_chrome_trace(path)
         py = {"reqs": self.reqs / self.n, "toks": self.toks / self.n,
-              "emitted": self.emitted / self.n, "cg": self.cg}
+              "emitted": self.emitted / self.n, "cg": self.cg, "cg_ms": self.cg_ms,
+              "sigs": list(self.sigs)}
         head = (f"BEGIN summary window {self.windows} [{self.label}] "
                 f"({self.n} steps, trace {path})")
         _say(f"STOP after {wall * 1e3:.0f} ms wall; trace {path}; "
              "summarizing in a background thread")
 
-        def work():
-            try:
-                with open(path) as fh:
-                    lines = summarize(json.load(fh), py)
-                block = "\n".join(f"{MARK} {ln}" for ln in
-                                  [head] + lines + [f"END summary window "
-                                                    f"{self.windows}"])
-                print(block, file=sys.stderr, flush=True)
-            except Exception as exc:  # noqa: BLE001
-                _say(f"summary FAILED (trace kept at {path}): {exc!r}")
-
-        threading.Thread(target=work, name="suffix-prof-summary",
-                         daemon=True).start()
+        # A child process, not a thread: parsing a 100k-event trace holds the GIL for
+        # tens of seconds and stalled the engine loop (k17: c32 ITL p99 347 ms).
+        try:
+            side = path + ".py.json"
+            with open(side, "w") as fh:
+                json.dump({**py, "cg": dict(py["cg"]), "cg_ms": dict(py["cg_ms"]),
+                           "head": head, "end": f"END summary window {self.windows}"}, fh)
+            subprocess.Popen([sys.executable, "-m", "suffix_hybrid.step_profiler", path, side],
+                             stdout=sys.stderr, stderr=sys.stderr, start_new_session=True)
+        except Exception as exc:  # noqa: BLE001
+            _say(f"summary FAILED (trace kept at {path}): {exc!r}")
 
     def abandon(self, where: str, exc: BaseException) -> None:
         self.phase = "done"
@@ -523,7 +586,7 @@ class _PySession(_Session):
         _say(f"START pystack window {self.windows + 1} [{label}]: {self.n} "
              f"steps (pid {os.getpid()})")
 
-    def end_step(self, executed: bool) -> None:
+    def end_step(self, executed: bool, dt: float = 0.0) -> None:
         pass
 
     def stop(self) -> None:
@@ -589,6 +652,7 @@ def wrap_step(orig, sess: _Session):
             rf.__enter__()
         except Exception:  # noqa: BLE001
             rf = None
+        t0 = time.perf_counter()
         try:
             r = orig(self, *a, **kw)
         finally:
@@ -598,7 +662,7 @@ def wrap_step(orig, sess: _Session):
                 except Exception:  # noqa: BLE001
                     pass
         try:
-            sess.end_step(bool(r))
+            sess.end_step(bool(r), time.perf_counter() - t0)
             sess.steps += bool(r)
             if sess.steps >= sess.n:
                 sess.stop()
@@ -775,9 +839,28 @@ def install_worker_hook() -> None:
 
     sys.meta_path.insert(0, _WFinder())
 
+def _main(argv: list) -> int:
+    """<trace.json> [<py-stats.json>]: the summary of a kept trace; with the window's
+    sidecar (written by _Session.stop) the in-pod summary block, every line marked."""
+    if len(argv) not in (2, 3):
+        print("usage: python -m suffix_hybrid.step_profiler <trace.json> [<py-stats.json>]",
+              file=sys.stderr)
+        return 2
+    with open(argv[1]) as fh:
+        trace = json.load(fh)
+    if len(argv) == 2:
+        print("\n".join(summarize(trace)), flush=True)
+        return 0
+    with open(argv[2]) as fh:
+        py = json.load(fh)
+    py["cg"] = Counter(py.get("cg") or {})
+    try:
+        lines = [py["head"]] + summarize(trace, py) + [py["end"]]
+    except Exception as exc:  # noqa: BLE001
+        lines = [f"summary FAILED (trace kept at {argv[1]}): {exc!r}"]
+    print("\n".join(f"{MARK} {ln}" for ln in lines), flush=True)
+    return 0
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: python -m suffix_hybrid.step_profiler <trace.json>")
-    with open(sys.argv[1]) as fh:
-        for line in summarize(json.load(fh)):
-            print(line)
+    sys.exit(_main(sys.argv))
