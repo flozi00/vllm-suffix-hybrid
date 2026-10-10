@@ -65,6 +65,8 @@ PYTHONPATH. Each section is independently gated:
                                instead of 5 states (gdn_defer_rocm.py; needs _GDN_MTP, _ASYNC_IDX)
   SUFFIX_ROCM_GDN_MIXED=1   -> with _GDN_DEFER: mixed verify + prefill GDN batches on row
                                slices (no gathers / repacks / index_copy; gdn_mtp_rocm.forward_mixed)
+  SUFFIX_ROCM_TOPK_GATING=1 -> ROCm: MoE router top-k gating as one Triton program per token
+                               (suffix_hybrid/kernels/topk_gating_rocm.py)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -295,7 +297,8 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_QSA_SPARSE_SKIP", "SUFFIX_ROCM_GDN_ASYNC_IDX", "SUFFIX_ROCM_HC_DOWN",
                   "SUFFIX_ROCM_AITER_FLYDSL_PAD", "SUFFIX_ROCM_AITER_FLYDSL_ZERO",
                   "SUFFIX_ROCM_AFP4_CONFIGS", "SUFFIX_ROCM_QSA_DENSE",
-                  "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER")):
+                  "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
+                  "SUFFIX_ROCM_TOPK_GATING")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
             and not all(os.environ.get(_g, "").strip() == "1"
                         for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
@@ -555,6 +558,8 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_GDN_DEFER vs AITER's verify over 14 steps of random acceptance with the
     # align-mode copies emulated: bitwise outputs + boundary slots; graphed us/call.
     "gdn_defer_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm"], {}),
+    # SUFFIX_ROCM_TOPK_GATING vs aiter.topk_softmax: indices bitwise, weights, graphed us/call.
+    "topk_gating_bench": (["-m", "suffix_hybrid.kernels.topk_gating_rocm"], {}),
     # SUFFIX_ROCM_HC_FUSE kernel vs vLLM hc_silu -> F.linear -> hc_gate_mix: bf16
     # bound + bit-exact share, us/call (HIP graphs, cold weights), BMxNG sweep.
     "hc_fuse_bench": (["-m", "suffix_hybrid.kernels.hc_fused_rocm"], {}),
@@ -579,6 +584,10 @@ _BOOT_GATES = {
     "afp4_tune": (["-m", "suffix_hybrid.tools.afp4_tune"], {}),
     "afp4_tune_shipped": (["-m", "suffix_hybrid.tools.afp4_tune"],
                           {"SUFFIX_ROCM_AFP4_CONFIGS": "1"}),
+    # The MXFP4 lm_head screen (SUFFIX_MXFP4_LMHEAD, vocab 248320 x 2560): draft rows at c1..c32
+    # (k20: M=32 220 us/call vs a ~130 us read floor).
+    "afp4_tune_lmhead": (["-m", "suffix_hybrid.tools.afp4_tune", "--shapes", "248320x2560",
+                          "--ms", "1,5,8,16,32,40,64", "--minutes", "20"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():

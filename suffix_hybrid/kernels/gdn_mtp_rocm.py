@@ -38,6 +38,11 @@ _DEFER = os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
 # SUFFIX_ROCM_GDN_MIXED (with _DEFER): mixed verify + prefill batches skip vLLM's generic
 # path (gathers, repacks, index_copy merges: ~30 eager ops per layer in a CPU-bound step).
 _MIXED = _DEFER and os.environ.get("SUFFIX_ROCM_GDN_MIXED", "").strip() == "1"
+# Opt-in: mixed steps whose longest prefill chunk is at most this many tokens run the
+# prefill token by token (gdn_defer_rocm.gdn_prefill: 1 launch, fp32-exact) instead of
+# FLA's chunk kernels. Off by default: ~1.5 us per token on the GPU (k23 oracle: 60 tokens
+# 89 vs 49 us, 256 tokens 385 vs 75 us), it only pays in CPU-bound mixed steps.
+_PREFILL_MAX = int(os.environ.get("SUFFIX_ROCM_GDN_PREFILL_MAX", "0"))
 
 
 def install(module) -> None:
@@ -120,7 +125,7 @@ def forward_mixed(layer, qkvz, ba, core_attn_out, md) -> bool:
     two kernels, the prefill suffix vLLM's own conv / post-conv / chunk kernels on row
     slices. Same kernels and arguments as _forward_core minus its row gathers, q/k/v
     repack, z copy and index_copy merges. False = not this layout (stock path runs)."""
-    from suffix_hybrid.kernels.gdn_defer_rocm import gdn_defer
+    from suffix_hybrid.kernels.gdn_defer_rocm import gdn_defer, gdn_prefill
 
     masks, ns = md.spec_sequence_masks_cpu, md.num_spec_decodes
     nst, n = md.num_spec_decode_tokens, md.num_actual_tokens
@@ -156,6 +161,14 @@ def forward_mixed(layer, qkvz, ba, core_attn_out, md) -> bool:
         conv_states=conv_state, has_initial_state=md.has_initial_state,
         cache_indices=md.non_spec_state_indices_tensor,
         query_start_loc=md.non_spec_query_start_loc, metadata=md).transpose(0, 1)
+    if md.suffix_max_prefill <= _PREFILL_MAX:  # short chunks: one recurrent launch
+        gdn_prefill(conv, ba[nst:n, hv:], ba[nst:n, :hv], layer.A_log, layer.dt_bias, ssm_state,
+                    md.prefill_query_start_loc, md.prefill_state_indices,
+                    md.prefill_has_initial_state, core_attn_out[nst:n],
+                    layer.num_k_heads // layer.tp_size, layer.head_k_dim, layer.head_v_dim)
+        if n < core_attn_out.shape[0]:
+            core_attn_out[n:].zero_()
+        return True
     q, k, v, g, beta = _Q.fused_post_conv_prep(
         conv_output=conv, a=ba[nst:n, hv:], b=ba[nst:n, :hv], A_log=layer.A_log,
         dt_bias=layer.dt_bias, num_k_heads=layer.num_k_heads // layer.tp_size,

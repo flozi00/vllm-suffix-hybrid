@@ -80,6 +80,9 @@ SUFFIX_ROCM_GDN_DEFER=1 (needs _GDN_MTP and _GDN_ASYNC_IDX): GDN MTP verify with
   the accepted ones (bit-identical). 1 state write per request and layer instead of 5;
   steps near a mamba align block boundary keep vLLM's slot contract for its copies. The
   GDN metadata carries the spec rows' seq_lens and the align block size for that.
+SUFFIX_ROCM_TOPK_GATING=1: the MoE router's aiter.topk_softmax (vllm._aiter_ops) runs as one
+  Triton program per token (suffix_hybrid/kernels/topk_gating_rocm.py): same indices, AITER's
+  weight math; ~12 us per MoE layer in AITER's 16-threads-per-row kernel at c8..c32.
 SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non-ASM dense
   MXFP4 path) takes GEMM-AFP4WFP4-N=<N>-K=<K>.json from suffix_hybrid/configs/afp4/ (boot
   gate afp4_tune) before AITER's own tree. AITER keys these JSONs by arch + (N, K) only, so
@@ -408,6 +411,16 @@ PATCHES = {
         "            dense=not layer.indexer.skip_topk,  # MTP steps > 0 reuse step 0's rows\n"
         "        )\n",
         "suffix_hybrid.kernels.qsa_dense_rocm:install"),
+    "SUFFIX_ROCM_TOPK_GATING": Patch(
+        "vllm._aiter_ops", "MoE top-k gating: one Triton program per token",
+        "    from aiter import topk_softmax\n"
+        "\n"
+        "    topk_softmax(\n"
+        "        topk_weights,\n",
+        "    from suffix_hybrid.kernels.topk_gating_rocm import topk_softmax  # suffix\n"
+        "\n"
+        "    topk_softmax(\n"
+        "        topk_weights,\n"),
     "SUFFIX_ROCM_MXFP4_A16": Patch(
         "vllm.model_executor.kernels.linear.mxfp4.aiter",
         "dense MXFP4 small M via AITER gemm_a16wfp4",
@@ -459,7 +472,8 @@ PATCHES = {
               _GDN_FIELD, _GDN_FIELD +
               "    # suffix SUFFIX_ROCM_GDN_DEFER: positions of the spec rows, align block size\n"
               "    suffix_spec_seq_lens: torch.Tensor | None = None\n"
-              "    suffix_zone: int = 0\n"),
+              "    suffix_zone: int = 0\n"
+              "    suffix_max_prefill: int = 0  # longest prefill chunk (host)\n"),
         Patch("vllm.v1.attention.backends.gdn_attn", "GDN metadata: spec seq_lens (ctor)",
               _GDN_CTOR, _GDN_CTOR +
               "            suffix_spec_seq_lens=(  # suffix SUFFIX_ROCM_GDN_DEFER\n"
@@ -471,6 +485,9 @@ PATCHES = {
               "                self.kv_cache_spec.block_size\n"
               "                if self.vllm_config.cache_config.mamba_cache_mode == \"align\"\n"
               "                else 0\n"
+              "            ),\n"
+              "            suffix_max_prefill=(\n"
+              "                int(prefill_query_start_loc_cpu.diff().max()) if num_prefills > 0 else 0\n"
               "            ),\n"),
         Patch("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
               "GDN spec verify (generic path) with deferred state commit",
