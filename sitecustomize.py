@@ -586,6 +586,10 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_GDN_DEFER vs AITER's verify over 14 steps of random acceptance with the
     # align-mode copies emulated: bitwise outputs + boundary slots; graphed us/call.
     "gdn_defer_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm"], {}),
+    # SUFFIX_ROCM_GDN_MIXED_FAST: mixed-step prefill from the per-step launch plan (modes 1 / 2)
+    # vs forward_mixed's stock calls, 36 layers on one step's metadata: every output row and
+    # state byte, host us per layer call, eager wall and graphed GPU us. Lines: [suffix gdn-mixed].
+    "gdn_mixed_bench": (["-m", "suffix_hybrid.kernels.gdn_mixed_fast_rocm"], {}),
     # SUFFIX_ROCM_GDN_DEFER_MFMA (chunk form on the fp32 matrix cores) vs the fp64 recurrence,
     # AITER and v1 (shared records: v1 / MFMA alternating) over multi-step acceptance; graphed
     # us/call v1 vs BV / warps / RELOAD at c1/c8/c32 + AMDGCN facts. Lines: [suffix gdn-mfma].
