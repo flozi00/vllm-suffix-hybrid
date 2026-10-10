@@ -128,7 +128,8 @@ def _e2m1_pack(qx, N: tl.constexpr, MP: tl.constexpr):
     denormal_x = denormal_x.to(tl.uint8)
     normal_x = qx
     mant_odd = (normal_x >> 22) & 1
-    normal_x += ((1 - 127) << 23) + (1 << 21) - 1
+    normal_x += 3240099839  # ((1 - 127) << 23) + (1 << 21) - 1 mod 2^32: Triton rejects a
+                            # negative scalar on an unsigned tensor; the add wraps the same
     normal_x += mant_odd
     normal_x = (normal_x >> 22).to(tl.uint8)
     e2m1 = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
