@@ -149,6 +149,74 @@ def _gdn_defer_kernel(
             tl.store(r + K + BV + two, tl.where(two == 0, a_raw, b_raw), mask=keep)
 
 
+@triton.jit(do_not_specialize=["stride_x_l", "stride_a_l", "stride_b_l", "stride_o_l"])
+def _gdn_prefill_kernel(
+    A_log, a, b, dt_bias, beta, threshold, x, o, state, cu_seqlens, slots, has_init, scale,
+    stride_x_l, stride_a_l, stride_b_l, stride_o_l, stride_state_block,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BV: tl.constexpr,
+    USE_QK_L2NORM: tl.constexpr,
+):
+    # Short prefill chunks, token by token with _gdn_token: the state comes from the
+    # request's slot (zeros without prior state) and goes back to it after the last token,
+    # which is what vLLM's chunk path does through gather / FLA chunk kernels / scatter.
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    n_tok = tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos
+    if n_tok <= 0:
+        return
+    slot = tl.load(slots + i_n).to(tl.int64)
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+    tile = i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+    A_log_v = tl.load(A_log + i_hv).to(tl.float32)
+    dt_v = tl.load(dt_bias + i_hv).to(tl.float32)
+    b_h = tl.zeros([BV, K], dtype=tl.float32)
+    if (tl.load(has_init + i_n) != 0) & (slot > 0):
+        b_h += tl.load(state + slot * stride_state_block + tile).to(tl.float32)
+    p_q = x + bos * stride_x_l + i_h * K + o_k
+    p_k = x + bos * stride_x_l + H * K + i_h * K + o_k
+    p_v = x + bos * stride_x_l + 2 * H * K + i_hv * V + o_v
+    p_a = a + bos * stride_a_l + i_hv
+    p_b = b + bos * stride_b_l + i_hv
+    p_o = o + bos * stride_o_l + i_hv * V + o_v
+    for _ in range(0, n_tok):
+        b_q = tl.load(p_q).to(tl.float32)
+        if USE_QK_L2NORM:
+            b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_q = b_q * scale
+        b_h = _gdn_token(b_h, tl.load(p_k).to(tl.float32), tl.load(p_v).to(tl.float32),
+                         tl.load(p_a).to(tl.float32), tl.load(p_b).to(tl.float32), A_log_v,
+                         dt_v, beta, threshold, USE_QK_L2NORM)
+        tl.store(p_o, tl.sum(b_h * b_q[None, :], 1).to(p_o.dtype.element_ty))
+        p_q += stride_x_l
+        p_k += stride_x_l
+        p_v += stride_x_l
+        p_a += stride_a_l
+        p_b += stride_b_l
+        p_o += stride_o_l
+    if slot > 0:
+        tl.store(state + slot * stride_state_block + tile, b_h)
+
+
+def gdn_prefill(x, a, b, A_log, dt_bias, state, cu_seqlens, slots, has_init, out, num_k_heads,
+                head_k_dim, head_v_dim, config=None):
+    """Prefill chunks over post-conv packed qkv x [T, 2 H K + HV V] (row-strided), a / b
+    [T, HV] views, the requests' state slots / has-initial-state flags, out [>= T, HV, V]."""
+    BV, warps, _ = config or CONFIG
+    n, hv = cu_seqlens.shape[0] - 1, a.shape[1]
+    K, V = head_k_dim, head_v_dim
+    assert state.dtype == torch.float32 and state.shape[1:] == (hv, V, K) and state[0].is_contiguous()
+    assert x.stride(1) == a.stride(1) == b.stride(1) == 1 and out.stride(-2) == V
+    if n:
+        _gdn_prefill_kernel[(V // BV, n * hv)](
+            A_log, a, b, dt_bias, 1.0, 20.0, x, out, state, cu_seqlens, slots, has_init,
+            K**-0.5, x.stride(0), a.stride(0), b.stride(0), out.stride(0), state.stride(0),
+            H=num_k_heads, HV=hv, K=K, V=V, BV=BV, USE_QK_L2NORM=True, num_warps=warps)
+    return out
+
+
 CONFIG = (16, 1, 1)  # BV, num_warps, num_stages. MI350P k16 oracle, graphed us c1/c8/c32:
 # 16/1w 15.0/52.5/179.1, 32/1w 20.3/54.0/173.8, 32/2w 20.0/56.3/196.2; AITER 19.9/66.4/225.5.
 
@@ -302,6 +370,55 @@ def main() -> int:
               f"{'bitwise' if exact else 'MISMATCH'}, vs AITER worst {worst_rs:.2f} of the "
               f"bf16 bound -> {'MATCH' if ok else 'MISMATCH'} | stock-way steps {stock_way}, "
               f"boundary copies checked {checks}, running-block moves {moves}", flush=True)
+
+    # Short prefills: gdn_prefill vs vLLM's chunk path (fused_post_conv_prep + FLA chunk
+    # kernels + state gather / scatter), same inputs and slots.
+    from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep
+    from vllm.third_party.flash_linear_attention.ops.chunk import chunk_gated_delta_rule
+    from vllm.third_party.flash_linear_attention.ops.index import (prepare_chunk_indices,
+                                                                   prepare_chunk_offsets)
+    from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+
+    for lens, init in (((60,), (True,)), ((3, 61, 17), (True, False, True)), ((256,), (False,)),
+                       ((1, 2, 128, 40), (True, True, False, True))):
+        cu_cpu = torch.tensor([0] + list(lens), dtype=torch.int32).cumsum(0).to(torch.int32)
+        cu = cu_cpu.to(dev)
+        ci = prepare_chunk_indices(cu_cpu, FLA_CHUNK_SIZE).to(dev)  # as the GDN builder does
+        co = prepare_chunk_offsets(cu_cpu, FLA_CHUNK_SIZE).to(dev)
+        T, n = int(cu[-1]), len(lens)
+        x = torch.randn(T, 2 * key_dim + value_dim, device=dev).to(bf16)
+        ba = torch.randn(T, 2 * HV, device=dev).to(bf16)
+        pool = torch.randn(2 * n + 2, HV, V, K, device=dev) * 0.1
+        slots = (torch.randperm(2 * n + 1)[:n] + 1).to(torch.int32).to(dev)
+        has = torch.tensor(init, device=dev)
+        ref_pool = pool.clone()
+        q, k, v, g, beta = fused_post_conv_prep(conv_output=x, a=ba[:, HV:], b=ba[:, :HV],
+                                                A_log=A_log, dt_bias=dt_bias, num_k_heads=H,
+                                                head_k_dim=K, head_v_dim=V, apply_l2norm=True,
+                                                output_g_exp=False)
+        init_state = ref_pool[slots.long()]
+        init_state[~has] = 0
+        o_ref, last = chunk_gated_delta_rule(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), g.unsqueeze(0), beta.unsqueeze(0),
+            initial_state=init_state, output_final_state=True, cu_seqlens=cu, chunk_indices=ci,
+            chunk_offsets=co)
+        ref_pool[slots.long()] = last.to(ref_pool.dtype)
+        out = torch.full((T, HV, V), float("nan"), device=dev, dtype=bf16)
+        gdn_prefill(x, ba[:, HV:], ba[:, :HV], A_log, dt_bias, pool, cu, slots, has, out, H, K, V)
+        do = (out.float() - o_ref.squeeze(0).float()).abs().max().item()
+        ds = (pool - ref_pool).abs().max().item()
+        ok = (torch.allclose(out.float(), o_ref.squeeze(0).float(), rtol=2e-2, atol=2e-2)
+              and torch.allclose(pool, ref_pool, rtol=1e-3, atol=1e-4))
+        failed |= not ok
+        t_ref = _graph_us(lambda i: chunk_gated_delta_rule(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), g.unsqueeze(0), beta.unsqueeze(0),
+            initial_state=init_state, output_final_state=True, cu_seqlens=cu, chunk_indices=ci,
+            chunk_offsets=co), 4)[0]
+        t_new = _graph_us(lambda i: gdn_prefill(x, ba[:, HV:], ba[:, :HV], A_log, dt_bias, pool,
+                                                cu, slots, has, out, H, K, V), 4)[0]
+        print(f"{MARK} prefill lens {lens}: {'MATCH' if ok else 'MISMATCH'} vs vLLM chunk path "
+              f"(max abs diff out {do:.2e}, state {ds:.2e}) | graphed FLA chunk {t_ref:.1f} us "
+              f"(+post-conv, gather, scatter) -> recurrent {t_new:.1f} us", flush=True)
 
     # Steady state (accepted 1..5), graphed: AITER (5 state writes), gdn_defer stock-way
     # (zone 1, 5 writes) and deferred (zone 0: 1 state write + the record).

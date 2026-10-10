@@ -92,6 +92,13 @@ def test_forward_mixed_slices_verify_prefix_and_prefill_suffix(monkeypatch):
 
     monkeypatch.setattr(gdn_defer_rocm, "gdn_defer", defer)
     monkeypatch.setattr(gdn_mtp_rocm, "_MIXED", True)
+    monkeypatch.setattr(gdn_mtp_rocm, "_PREFILL_MAX", 256)
+
+    def prefill(x, a, b, A_log, dt, state, cu, slots, has, out, *rest):
+        calls["prefill"] = (x, a, b, cu, slots, has, rest)
+        out[:] = 9.0
+
+    monkeypatch.setattr(gdn_defer_rocm, "gdn_prefill", prefill)
     monkeypatch.setattr(gdn_mtp_rocm, "_Q", SimpleNamespace(
         is_conv_state_dim_first=lambda: True,
         causal_conv1d_update=lambda x, *a, **kw: calls.setdefault("upd", (x, kw)) and x,
@@ -120,7 +127,7 @@ def test_forward_mixed_slices_verify_prefix_and_prefill_suffix(monkeypatch):
         non_spec_state_indices_tensor=pre_idx, non_spec_query_start_loc=torch.tensor([0, 3, 7]),
         prefill_state_indices=pre_idx, prefill_has_initial_state=torch.tensor([True, False]),
         prefill_query_start_loc=torch.tensor([0, 3, 7]), chunk_indices="ci", chunk_offsets="co",
-        aiter_prefill_metadata=None)
+        aiter_prefill_metadata=None, suffix_max_prefill=4096)
     qkvz, ba, out = torch.randn(20, qkv_dim + 6), torch.randn(20, 2 * hv), torch.ones(20, hv, V)
     before = layer.kv_cache[1][8].clone()
     assert gdn_mtp_rocm.forward_spec(layer, qkvz, ba, out, md) is True
@@ -138,6 +145,14 @@ def test_forward_mixed_slices_verify_prefix_and_prefill_suffix(monkeypatch):
     assert calls["chunk"]["cu_seqlens"] is md.prefill_query_start_loc
     assert bool((layer.kv_cache[1][pre_idx] == 3.0).all())
     assert bool((out[:10] == 5.0).all()) and bool((out[10:17] == 7.0).all()) and not out[17:].any()
+
+    # Short prefill chunks: one recurrent launch over the conv output, rows [nst, n).
+    md.suffix_max_prefill, out[:] = 4, 1.0
+    assert gdn_mtp_rocm.forward_spec(layer, qkvz, ba, out, md) is True
+    x, a, b, cu, slots, has, rest = calls["prefill"]
+    assert x.shape == (7, qkv_dim) and torch.equal(a, ba[10:17, hv:]) and torch.equal(b, ba[10:17, :hv])
+    assert cu is md.prefill_query_start_loc and slots is pre_idx and has is md.prefill_has_initial_state
+    assert bool((out[:10] == 5.0).all()) and bool((out[10:17] == 9.0).all()) and not out[17:].any()
 
     md.spec_sequence_masks_cpu = torch.tensor([True, False, True, False])  # not a verify prefix
     assert gdn_mtp_rocm.forward_spec(layer, qkvz, ba, out, md) is False

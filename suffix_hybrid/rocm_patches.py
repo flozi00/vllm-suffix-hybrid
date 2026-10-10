@@ -472,7 +472,8 @@ PATCHES = {
               _GDN_FIELD, _GDN_FIELD +
               "    # suffix SUFFIX_ROCM_GDN_DEFER: positions of the spec rows, align block size\n"
               "    suffix_spec_seq_lens: torch.Tensor | None = None\n"
-              "    suffix_zone: int = 0\n"),
+              "    suffix_zone: int = 0\n"
+              "    suffix_max_prefill: int = 0  # longest prefill chunk (host)\n"),
         Patch("vllm.v1.attention.backends.gdn_attn", "GDN metadata: spec seq_lens (ctor)",
               _GDN_CTOR, _GDN_CTOR +
               "            suffix_spec_seq_lens=(  # suffix SUFFIX_ROCM_GDN_DEFER\n"
@@ -484,6 +485,9 @@ PATCHES = {
               "                self.kv_cache_spec.block_size\n"
               "                if self.vllm_config.cache_config.mamba_cache_mode == \"align\"\n"
               "                else 0\n"
+              "            ),\n"
+              "            suffix_max_prefill=(\n"
+              "                int(prefill_query_start_loc_cpu.diff().max()) if num_prefills > 0 else 0\n"
               "            ),\n"),
         Patch("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
               "GDN spec verify (generic path) with deferred state commit",
