@@ -565,8 +565,8 @@ _BOOT_GATES = {
     "gdn_defer_mfma_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm", "mfma"], {}),
     # SUFFIX_ROCM_TOPK_GATING vs aiter.topk_softmax: indices bitwise, weights, graphed us/call.
     "topk_gating_bench": (["-m", "suffix_hybrid.kernels.topk_gating_rocm"], {}),
-    # SUFFIX_ROCM_MOE_ROUTE: router top-k + AITER moe_sorting + stage-1 MXFP4 quant-sort in one
-    # launch vs the stock chain, every output bitwise (+ gating-math calibration), whole
+    # SUFFIX_ROCM_MOE_ROUTE: router top-k + AITER moe_sorting + stage-1 MXFP4 quant-sort in two
+    # launches vs the stock chain, every output bitwise (+ gating-math calibration), whole
     # aiter.fused_moe bitwise on the tuned rows, graph replay, graphed us/call.
     "moe_route_bench": (["-m", "suffix_hybrid.kernels.moe_route_rocm"],
                         {"SUFFIX_ROCM_AITER_FLYDSL_ZBUF": "1"}),

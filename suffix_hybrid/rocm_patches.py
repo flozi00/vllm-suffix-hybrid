@@ -93,9 +93,9 @@ SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non
   plugin file resolves exactly as before. vLLM's preshuffle-tuned guard (probes 2x K) only
   gates the ASM path (VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=1), not this one.
 SUFFIX_ROCM_MOE_ROUTE=1: at M <= SUFFIX_ROCM_MOE_ROUTE_MAX_M (64) the MoE router's top-k,
-  AITER's moe_sorting (P0_v2 + P23) and the stage-1 MXFP4 quant-sort run as one Triton
-  launch (suffix_hybrid/kernels/moe_route_rocm.py): ids, sort and quant bit-identical, the
-  gating weights to the last ulp of the calibrated exp (SUFFIX_ROCM_MOE_ROUTE_EXP); the
+  AITER's moe_sorting (P0_v2 + P23) and the stage-1 MXFP4 quant-sort run as two Triton
+  launches (suffix_hybrid/kernels/moe_route_rocm.py): ids, sort and quant bit-identical, the
+  gating weights too with the calibrated exp (SUFFIX_ROCM_MOE_ROUTE_EXP, 0 or 2); the
   AiterSharedRoutedFusedMoERouter defers its topk_softmax call to aiter.fused_moe's sort.
 SUFFIX_ROCM_HC_BIG=1: Qwen4Exp GatedResidual.mix / combine_and_mix return through
   suffix_hybrid/kernels/hc_big_rocm.py: vLLM's norm, then one custom op for the rest of the
@@ -602,7 +602,7 @@ PATCHES = {
         '            f"{cfg_dir}/{config_name}-{suffix}.json", required=False\n'
         "        )\n"),
     "SUFFIX_ROCM_MOE_ROUTE": (
-        Patch("aiter.fused_moe", "MoE top-k + sort + MXFP4 quant-sort in one launch (sort site)",
+        Patch("aiter.fused_moe", "MoE top-k + sort + MXFP4 quant-sort in two launches (sort site)",
               after="suffix_hybrid.kernels.moe_route_rocm:install_aiter"),
         Patch("vllm.model_executor.layers.fused_moe.router.aiter_shared_routed_fused_moe_router",
               "MoE top-k deferred to the fused sort (router)",
