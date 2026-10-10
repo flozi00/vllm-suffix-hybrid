@@ -87,7 +87,9 @@ _PRESETS = {
         "SUFFIX_ROCM_QSA_TOPK_ROWS": "1", "SUFFIX_ROCM_QSA_MQA": "1", "SUFFIX_ROCM_QSA_SPARSE_SKIP": "1",
         "SUFFIX_ROCM_QSA_DENSE": "1", "SUFFIX_ROCM_QK_FUSED": "1", "SUFFIX_ROCM_QSA_NOSPEC": "1",
         "SUFFIX_ROCM_GDN_MTP": "1", "SUFFIX_ROCM_GDN_ASYNC_IDX": "1", "SUFFIX_ROCM_GDN_DEFER": "1",
-        "SUFFIX_ROCM_GDN_MIXED": "1", "SUFFIX_ROCM_GDN_DEFER_MFMA": "1", "SUFFIX_ROCM_GDN_MIXED_FAST": "1",
+        "SUFFIX_ROCM_GDN_MIXED": "1", "SUFFIX_ROCM_GDN_DEFER_MFMA": "1",
+        # not SUFFIX_ROCM_GDN_MIXED_FAST (bitwise, host -40% per mixed layer) yet: c32 TTFT max rose
+        # to 2.3-4.9 s in k39-k41 vs 0.5-0.9 s without it; open.
         "SUFFIX_ROCM_HC_FUSE": "1", "SUFFIX_ROCM_HC_DOWN": "1", "SUFFIX_ROCM_HC_DOWN_MAX_M": "256",
         "SUFFIX_ROCM_HC_BIG": "1", "SUFFIX_ROCM_ACT_QUANT_FUSE": "1", "SUFFIX_ROCM_MOE_ROUTE": "1",
         # FP8 HC projections (the documented quality fallback: MXFP4 put 10-22% error on the
