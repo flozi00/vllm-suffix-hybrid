@@ -124,6 +124,9 @@ SUFFIX_ROCM_ACT_QUANT_FUSE=1: the GDN output (RMSNormGated -> out_proj) and the 
   at TP 1; anything else keeps the stock code below the patched branch.
 SUFFIX_JIT_LOG=1: one "[suffix jit]" line per Triton compile (kernel, wall ms): which kernels
   still JIT-compile while serving (each compile stalls every in-flight request).
+SUFFIX_ROCM_QSA_NOSPEC=1: vLLM's QSA sparse split-K and merge kernels stop specializing their
+  runtime counts (num_rows / num_cache_blocks / num_requests): new ==1 / %16 variants compiled
+  mid-serving (k40 JIT log, 0.1-0.6 s engine stalls). Same code, one compile per shape class.
 """
 import glob
 import importlib.util
@@ -636,6 +639,14 @@ PATCHES = {
     ),
     "SUFFIX_JIT_LOG": Patch("triton.runtime.jit", "log every Triton compile",
                             after="suffix_hybrid.jit_log:install"),
+    "SUFFIX_ROCM_QSA_NOSPEC": tuple(
+        Patch("vllm.models.qwen4_exp.amd.ops.qsa", f"QSA {name}: runtime counts not specialized",
+              f"@triton.jit\ndef {name}(\n",
+              f"@triton.jit(do_not_specialize={args!r})  # suffix SUFFIX_ROCM_QSA_NOSPEC\n"
+              f"def {name}(\n")
+        for name, args in (("_qsa_sparse_paged_gqa_splitk_kernel",
+                            ["num_rows", "num_cache_blocks", "num_requests"]),
+                           ("_qsa_merge_splitk_kernel", ["num_rows"]))),
     # Inside the lru-cached lookup: one file probe per (shape, M) per process; a plugin
     # miss (None) falls through to AITER's own probe unchanged.
     "SUFFIX_ROCM_AFP4_CONFIGS": Patch(

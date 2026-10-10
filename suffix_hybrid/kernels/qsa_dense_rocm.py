@@ -36,6 +36,8 @@ DENSE_BLOCK_M = 64  # query rows x group heads of one dense program
 # BLOCK_N, num_warps, num_stages, target programs (the context split: (requests x KV heads)
 # x splits ~ target). MI350P oracle 2026-10-09 (k13): 32/4w/1s c32 84 us vs 64/4w/1s 146.
 DENSE_CONFIG = (32, 4, 1, 256)
+# Runtime counts are never specialized (k40 JIT log: new ==1 / %16 variants of these kernels
+# compiled mid-serving, 0.1-0.6 s engine stalls each).
 DENSE_MIN_REQUESTS = 4  # c1..c3 graphs keep the stock launch pair (k13: c1 17.8 vs 18.4 us)
 
 
@@ -52,7 +54,7 @@ def _dense_request(request, seq_lens_ptr, query_start_ptr, num_dense_requests,
     return q_start, q_len, seq_len, eligible
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "num_cache_blocks", "num_dense_requests"])
 def _qsa_dense_kernel(
     q_ptr, k_cache_ptr, v_cache_ptr, block_table_ptr, seq_lens_ptr, query_start_ptr,
     partial_output_ptr, partial_lse_ptr, output_ptr,
@@ -157,7 +159,8 @@ def _qsa_dense_kernel(
         tl.store(partial_lse_ptr + slot, partial_lse, mask=row_ok)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "num_cache_blocks", "num_requests",
+                             "num_dense_requests"])
 def _qsa_sparse_rows_kernel(
     q_ptr, k_cache_ptr, v_cache_ptr, indices_ptr, block_table_ptr, token_to_req_ptr,
     seq_lens_ptr, query_start_ptr,
@@ -306,7 +309,7 @@ def _merge_row(partial_output_ptr, partial_lse_ptr, output_ptr, row, head, strid
              merged)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "num_dense_requests"])
 def _qsa_merge_kernel(
     dense_output_ptr, dense_lse_ptr, sparse_output_ptr, sparse_lse_ptr, output_ptr,
     token_to_req_ptr, seq_lens_ptr, query_start_ptr,

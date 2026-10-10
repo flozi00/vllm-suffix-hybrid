@@ -85,7 +85,7 @@ _PRESETS = {
         "SUFFIX_ROCM_AITER_PAD": "1", "SUFFIX_ROCM_AITER_FLYDSL_ZBUF": "1",
         "SUFFIX_ROCM_AFP4_CONFIGS": "1", "SUFFIX_MXFP4_LMHEAD": "1", "SUFFIX_MXFP4_LMHEAD_MAX_M": "64",
         "SUFFIX_ROCM_QSA_TOPK_ROWS": "1", "SUFFIX_ROCM_QSA_MQA": "1", "SUFFIX_ROCM_QSA_SPARSE_SKIP": "1",
-        "SUFFIX_ROCM_QSA_DENSE": "1", "SUFFIX_ROCM_QK_FUSED": "1",
+        "SUFFIX_ROCM_QSA_DENSE": "1", "SUFFIX_ROCM_QK_FUSED": "1", "SUFFIX_ROCM_QSA_NOSPEC": "1",
         "SUFFIX_ROCM_GDN_MTP": "1", "SUFFIX_ROCM_GDN_ASYNC_IDX": "1", "SUFFIX_ROCM_GDN_DEFER": "1",
         "SUFFIX_ROCM_GDN_MIXED": "1", "SUFFIX_ROCM_GDN_DEFER_MFMA": "1",
         "SUFFIX_ROCM_HC_FUSE": "1", "SUFFIX_ROCM_HC_DOWN": "1", "SUFFIX_ROCM_HC_DOWN_MAX_M": "256",
@@ -329,7 +329,7 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
                   "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG",
                   "SUFFIX_ROCM_QK_FUSED", "SUFFIX_ROCM_ACT_QUANT_FUSE",
-                  "SUFFIX_JIT_LOG")) or os.environ.get("SUFFIX_ROCM_HC_WQ", "").strip() not in ("", "0"):
+                  "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC")) or os.environ.get("SUFFIX_ROCM_HC_WQ", "").strip() not in ("", "0"):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
             and not all(os.environ.get(_g, "").strip() == "1"
                         for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
