@@ -558,6 +558,10 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_GDN_DEFER vs AITER's verify over 14 steps of random acceptance with the
     # align-mode copies emulated: bitwise outputs + boundary slots; graphed us/call.
     "gdn_defer_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm"], {}),
+    # SUFFIX_ROCM_GDN_DEFER_MFMA (chunk form on the fp32 matrix cores) vs the fp64 recurrence,
+    # AITER and v1 (shared records: v1 / MFMA alternating) over multi-step acceptance; graphed
+    # us/call v1 vs BV / warps / RELOAD at c1/c8/c32 + AMDGCN facts. Lines: [suffix gdn-mfma].
+    "gdn_defer_mfma_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm", "mfma"], {}),
     # SUFFIX_ROCM_TOPK_GATING vs aiter.topk_softmax: indices bitwise, weights, graphed us/call.
     "topk_gating_bench": (["-m", "suffix_hybrid.kernels.topk_gating_rocm"], {}),
     # SUFFIX_ROCM_HC_FUSE kernel vs vLLM hc_silu -> F.linear -> hc_gate_mix: bf16

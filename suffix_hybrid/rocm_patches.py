@@ -80,6 +80,9 @@ SUFFIX_ROCM_GDN_DEFER=1 (needs _GDN_MTP and _GDN_ASYNC_IDX): GDN MTP verify with
   the accepted ones (bit-identical). 1 state write per request and layer instead of 5;
   steps near a mamba align block boundary keep vLLM's slot contract for its copies. The
   GDN metadata carries the spec rows' seq_lens and the align block size for that.
+  With SUFFIX_ROCM_GDN_DEFER_MFMA=1 the same contract runs in chunk form on the fp32
+  matrix cores (gdn_defer_rocm._gdn_defer_mfma_kernel; fp32-accurate, not bitwise; no
+  source patch, read by gdn_defer).
 SUFFIX_ROCM_TOPK_GATING=1: the MoE router's aiter.topk_softmax (vllm._aiter_ops) runs as one
   Triton program per token (suffix_hybrid/kernels/topk_gating_rocm.py): same indices, AITER's
   weight math; ~12 us per MoE layer in AITER's 16-threads-per-row kernel at c8..c32.
