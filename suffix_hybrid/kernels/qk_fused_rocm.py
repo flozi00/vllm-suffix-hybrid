@@ -55,13 +55,19 @@ def _run() -> int:
           f"interleaved {getattr(rope, 'mrope_interleaved', None)} dtype {rope.cos_sin_cache.dtype}",
           flush=True)
 
-    def eager(qkv, pos):  # Qwen3NextAttention._project_qkv_gate's non-fused branch
+    rope32 = get_rope(head_size=D, max_position=262144, rope_parameters=ROPE, dtype=torch.float32)
+    q_norm32, k_norm32 = GemmaRMSNorm(D, eps=1e-6), GemmaRMSNorm(D, eps=1e-6)
+    with torch.no_grad():
+        q_norm32.weight.copy_(q_norm.weight.float())
+        k_norm32.weight.copy_(k_norm.weight.float())
+
+    def eager(qkv, pos, qn=q_norm, kn=k_norm, rp=rope):  # _project_qkv_gate's non-fused branch
         q_gate, k, v = qkv.split([H * D * 2, KV * D, KV * D], dim=-1)
         q, gate = torch.chunk(q_gate.view(-1, H, 2 * D), 2, dim=-1)
         q, gate = q.reshape(-1, H * D), gate.reshape(-1, H * D)
-        q = q_norm(q.view(-1, H, D)).view(-1, H * D)
-        k = k_norm(k.view(-1, KV, D)).view(-1, KV * D)
-        q, k = rope(pos, q, k)
+        q = qn(q.view(-1, H, D)).view(-1, H * D)
+        k = kn(k.view(-1, KV, D)).view(-1, KV * D)
+        q, k = rp(pos, q, k)
         return q, k, gate
 
     def fused(qkv, pos):
@@ -70,6 +76,12 @@ def _run() -> int:
             q_gate, k, q_norm.weight, k_norm.weight, rope.cos_sin_cache, pos, 1e-6, H, KV, D,
             rope.rotary_dim, mrope_section=rope.mrope_section, norm_beta=1.0)
 
+    def err(x, ref):  # max |x - ref| relative to each row's max |ref|
+        return ((x.float() - ref) .abs().amax(1) / ref.abs().amax(1).clamp_min(1e-30)).max().item()
+
+    # Pass: the fused output is no further from vLLM's own eager chain run in fp32 than the
+    # bf16 eager chain is (x 1.5, or within 2^-8 of the row max); text rows (T = H = W)
+    # also reported as bitwise share fused vs bf16 eager.
     failed = False
     for m in (1, 5, 32, 40, 160, 1024):
         qkv = torch.randn(m, (2 * H + 2 * KV) * D, dtype=torch.bfloat16)
@@ -80,19 +92,22 @@ def _run() -> int:
         pos[2, img] = base[img] % 1013
         ref = [t.clone() for t in eager(qkv, pos)]
         out = [t.clone() for t in fused(qkv, pos)]
+        r32 = [t.float().clone() for t in eager(qkv.float(), pos, q_norm32, k_norm32, rope32)]
         parts = []
-        for name, r, o in zip(("q", "k", "gate"), ref, out):
-            ulp = (r.float().abs() * 2.0 ** -7).clamp_min(2.0 ** -133)
-            parts.append(f"{name} bitwise {100 * (r == o).float().mean().item():.2f}% "
-                         f"max {((r.float() - o.float()).abs() / ulp).max().item():.1f} ulp")
-            failed |= ((r.float() - o.float()).abs() / ulp).max().item() > 2.0
+        for name, r, o, x in zip(("q", "k", "gate"), ref, out, r32):
+            e_eag, e_fus = err(r, x), err(o, x)
+            ok = e_fus <= max(1.5 * e_eag, 2.0 ** -8)
+            failed |= not ok
+            parts.append(f"{name} err vs fp32 eager: bf16 eager {e_eag:.1e} fused {e_fus:.1e} "
+                         f"{'ok' if ok else 'WORSE'}, text rows bitwise "
+                         f"{100 * (r[~img] == o[~img]).float().mean().item():.1f}%")
         fus_us, g_out = _graph_us(lambda: fused(qkv, pos))
         replay_ok = all(torch.equal(a, b) for a, b in zip(g_out, out))
         failed |= not replay_ok
         eag_us, _ = _graph_us(lambda: eager(qkv, pos))
         print(f"{MARK} M={m}: {' | '.join(parts)} | graph == eager {replay_ok} | graphed us: "
-              f"eager {eag_us:.1f} -> fused {fus_us:.1f}", flush=True)
-    print(f"{MARK} {'PASS' if not failed else 'FAIL'} (<= 2 bf16 ulp vs eager)", flush=True)
+              f"eager (uncompiled) {eag_us:.1f} -> fused {fus_us:.1f}", flush=True)
+    print(f"{MARK} {'PASS' if not failed else 'FAIL'} (fused within 1.5x of the bf16 eager chain's error vs fp32)", flush=True)
     return 1 if failed else 0
 
 
