@@ -563,6 +563,10 @@ _BOOT_GATES = {
     # AITER and v1 (shared records: v1 / MFMA alternating) over multi-step acceptance; graphed
     # us/call v1 vs BV / warps / RELOAD at c1/c8/c32 + AMDGCN facts. Lines: [suffix gdn-mfma].
     "gdn_defer_mfma_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm", "mfma"], {}),
+    # SUFFIX_ROCM_ACT_QUANT_FUSE: GDN norm / QSA gate + MXFP4 quant in one launch vs inductor's
+    # producer + dynamic_mxfp4_quant + gemm_afp4wfp4 at M 1..1024: bf16 producer, x_fp4 / E8M0
+    # bytes and the GEMM output bitwise, graph replay, graphed us. Lines: [suffix act-quant].
+    "act_quant_bench": (["-m", "suffix_hybrid.kernels.act_quant_rocm"], {}),
     # SUFFIX_ROCM_TOPK_GATING vs aiter.topk_softmax: indices bitwise, weights, graphed us/call.
     "topk_gating_bench": (["-m", "suffix_hybrid.kernels.topk_gating_rocm"], {}),
     # SUFFIX_ROCM_MOE_ROUTE: router top-k + AITER moe_sorting + stage-1 MXFP4 quant-sort in two

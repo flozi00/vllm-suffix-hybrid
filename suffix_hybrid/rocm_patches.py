@@ -109,6 +109,12 @@ SUFFIX_ROCM_QK_FUSED=1: the Qwen4Exp QSA layers run vLLM's fused split + QK Gemm
   instead of the eager chain inductor compiles into ~4-5 launches: the AMD layer allows it
   on CUDA and text-only; here also ROCm and interleaved mRoPE (multimodal), with
   Qwen3NextAttention's own conditions (oracle: suffix_hybrid/kernels/qk_fused_rocm.py).
+SUFFIX_ROCM_ACT_QUANT_FUSE=1: the GDN output (RMSNormGated -> out_proj) and the QSA output
+  (attn * sigmoid(gate) -> o_proj) quantize their own MXFP4 activations
+  (suffix_hybrid/kernels/act_quant_rocm.py): producer + AITER's _mxfp4_quant_op in one
+  Triton launch, then gemm_afp4wfp4 as vLLM's non-ASM MXFP4 linear calls it; one launch
+  fewer per site (52 per MTP-4 step). Only for out_proj / o_proj served by that kernel
+  at TP 1; anything else keeps the stock code below the patched branch.
 """
 import glob
 import importlib.util
@@ -303,6 +309,18 @@ _AFP4_PROBE = (
     "        specialized_config = load_config_json(\n"
     '            f"{cfg_dir}/{config_name}-{suffix}.json", required=False\n'
     "        )\n")
+
+# ACT_QUANT_FUSE anchors: _output_projection's body (vLLM 81198e97) and QSA forward's tail.
+_AQ_GDN = (
+    "        core_attn_out = self.norm(core_attn_out, z)\n"
+    "        output, _ = self.out_proj(core_attn_out.flatten(-2))\n"
+    "        return output\n")
+_AQ_QSA = (
+    "        flat_output = attn_output.view(num_tokens, -1)\n"
+    "        if gate is not None:\n"
+    "            flat_output = flat_output * torch.sigmoid(gate)\n"
+    "        output, _ = self.o_proj(flat_output)\n"
+    "        return output\n")
 
 # gate -> Patch, or a tuple of Patches the gate applies together.
 PATCHES = {
@@ -587,6 +605,22 @@ PATCHES = {
         "                and len(getattr(self.rotary_emb, \"mrope_section\", None) or ()) == 3\n"
         "                and sum(self.rotary_emb.mrope_section) == self.rotary_emb.rotary_dim // 2))\n"
         "        )\n"),
+    "SUFFIX_ROCM_ACT_QUANT_FUSE": (
+        Patch("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
+              "GDN RMSNormGated + MXFP4 quant in one launch before out_proj",
+              _AQ_GDN,
+              "        if _suffix_aq_gdn_ok(self):  # suffix SUFFIX_ROCM_ACT_QUANT_FUSE\n"
+              "            return _suffix_aq_gdn_out(self, core_attn_out, z)\n" + _AQ_GDN,
+              "suffix_hybrid.kernels.act_quant_rocm:install_gdn"),
+        Patch("vllm.models.qwen4_exp.amd.qsa",
+              "QSA sigmoid gate + MXFP4 quant in one launch before o_proj",
+              _AQ_QSA,
+              "        flat_output = attn_output.view(num_tokens, -1)\n"
+              "        if gate is not None and _suffix_aq_qsa_ok(self):  # suffix SUFFIX_ROCM_ACT_QUANT_FUSE\n"
+              "            return _suffix_aq_qsa_out(self, flat_output, gate, qkv)\n"
+              + _AQ_QSA.split("\n", 1)[1],
+              "suffix_hybrid.kernels.act_quant_rocm:install_qsa"),
+    ),
     # Inside the lru-cached lookup: one file probe per (shape, M) per process; a plugin
     # miss (None) falls through to AITER's own probe unchanged.
     "SUFFIX_ROCM_AFP4_CONFIGS": Patch(
