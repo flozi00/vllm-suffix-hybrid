@@ -946,7 +946,7 @@ def test_oracle_verdict_multi():
 def test_oracle_main_multi_boot_gate_argv(monkeypatch, capsys):
     src = (REPO / "sitecustomize.py").read_text()
     ns = {}
-    exec(src[src.index("_BOOT_GATES = {"):src.index("\n}\n") + 3], ns)
+    exec(src[src.index("_BOOT_GATES = {"):src.index("\n}\n", src.index("_BOOT_GATES = {")) + 3], ns)
     argv, env = ns["_BOOT_GATES"]["glm_stack_multi_oracle"]
     assert argv[:2] == ["-m", "hisparse_mtp_patch.oracle"]
     assert env == {"SUFFIX_SM120": "1", "SUFFIX_SM120_NVP4DSMLA": "1"}
