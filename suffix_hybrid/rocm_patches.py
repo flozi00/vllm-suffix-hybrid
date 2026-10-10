@@ -89,6 +89,10 @@ SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non
   the 128-CU MI350P otherwise runs the 256-CU MI355X DEFAULT.json tiles. A shape without a
   plugin file resolves exactly as before. vLLM's preshuffle-tuned guard (probes 2x K) only
   gates the ASM path (VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=1), not this one.
+SUFFIX_ROCM_MOE_ROUTE=1: at M <= SUFFIX_ROCM_MOE_ROUTE_MAX_M (64) the MoE router's top-k,
+  AITER's moe_sorting (P0_v2 + P23) and the stage-1 MXFP4 quant-sort run as one Triton
+  launch (suffix_hybrid/kernels/moe_route_rocm.py), bit-identical outputs: the
+  AiterSharedRoutedFusedMoERouter defers its topk_softmax call to aiter.fused_moe's sort.
 """
 import glob
 import importlib.util
@@ -547,6 +551,13 @@ PATCHES = {
         "        ) or load_config_json(\n"
         '            f"{cfg_dir}/{config_name}-{suffix}.json", required=False\n'
         "        )\n"),
+    "SUFFIX_ROCM_MOE_ROUTE": (
+        Patch("aiter.fused_moe", "MoE top-k + sort + MXFP4 quant-sort in one launch (sort site)",
+              after="suffix_hybrid.kernels.moe_route_rocm:install_aiter"),
+        Patch("vllm.model_executor.layers.fused_moe.router.aiter_shared_routed_fused_moe_router",
+              "MoE top-k deferred to the fused sort (router)",
+              after="suffix_hybrid.kernels.moe_route_rocm:install_router"),
+    ),
 }
 _MARK = "_suffix_rocm_patch"
 
