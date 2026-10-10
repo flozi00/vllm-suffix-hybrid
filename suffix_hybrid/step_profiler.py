@@ -264,7 +264,43 @@ def summarize(trace: dict, py_stats: dict | None = None) -> list[str]:
                    f"{100 * dur / gpu_sum:5.1f} | {category(name)} | "
                    f"{_short(name)}")
     out.extend(_gaps(gpu, anns, n))
+    out.extend(_owners(evs, rt, gpu, n))
     out.extend(_by_signature(steps, (py_stats or {}).get("sigs") or [], rt, gpu))
+    return out
+
+
+def _owners(evs, rt, gpu, n: int, top: int = 30) -> list[str]:
+    """GPU work by (kernel, innermost CPU op around its launch): who launches the copies,
+    fills and small kernels. Kernels replayed from a graph all map to the graph launch,
+    so this is informative for eager / PIECEWISE steps (e.g. --enforce-eager windows)."""
+    ops = defaultdict(list)
+    for e in evs:
+        if e.get("cat") == "cpu_op":
+            ops[e.get("tid")].append((e["ts"], e["ts"] + e["dur"], e.get("name", "?")))
+    if not ops:
+        return []
+    for v in ops.values():
+        v.sort()
+    starts = {t: [o[0] for o in v] for t, v in ops.items()}
+    launch = {}
+    for e in rt:
+        c = (e.get("args") or {}).get("correlation")
+        if c is None:
+            continue
+        v = ops.get(e.get("tid"), [])
+        i = bisect.bisect_right(starts.get(e.get("tid"), []), e["ts"]) - 1
+        while i >= 0 and v[i][1] < e["ts"] + e["dur"]:  # nested ops: the first enclosing one
+            i -= 1                                       # scanning back is the innermost
+        launch[c] = v[i][2] if i >= 0 else "-"
+    agg = defaultdict(lambda: [0, 0.0])
+    for e in gpu:
+        own = launch.get((e.get("args") or {}).get("correlation"), "?")
+        row = agg[f"{_short(e.get('name', '?'), 60)} <- {own}"]
+        row[0] += 1
+        row[1] += e["dur"]
+    out = [f"gpu work by launching cpu op: top {top}: calls/step | ms/step | kernel <- op"]
+    for k, (c, d) in sorted(agg.items(), key=lambda kv: -kv[1][1])[:top]:
+        out.append(f"  {c / n:7.1f} | {d / n / 1e3:7.3f} | {k}")
     return out
 
 
