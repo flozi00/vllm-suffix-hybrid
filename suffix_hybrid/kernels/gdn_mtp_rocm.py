@@ -43,6 +43,9 @@ _MIXED = _DEFER and os.environ.get("SUFFIX_ROCM_GDN_MIXED", "").strip() == "1"
 # FLA's chunk kernels. Off by default: ~1.5 us per token on the GPU (k23 oracle: 60 tokens
 # 89 vs 49 us, 256 tokens 385 vs 75 us), it only pays in CPU-bound mixed steps.
 _PREFILL_MAX = int(os.environ.get("SUFFIX_ROCM_GDN_PREFILL_MAX", "0"))
+# SUFFIX_ROCM_GDN_MIXED_FAST (with _MIXED): the prefill suffix launches its kernels from a
+# per-step plan (gdn_mixed_fast_rocm), not through vLLM's / FLA's per-call wrappers.
+_FAST = _MIXED and os.environ.get("SUFFIX_ROCM_GDN_MIXED_FAST", "").strip() not in ("", "0")
 
 
 def install(module) -> None:
@@ -173,6 +176,12 @@ def forward_mixed(layer, qkvz, ba, core_attn_out, md) -> bool:
               plan.spec_cu, idx, md.num_accepted_tokens,
               md.suffix_spec_seq_lens, core_attn_out, key_dim // layer.head_k_dim,
               layer.head_k_dim, layer.head_v_dim, md.suffix_zone)
+    if _FAST and md.suffix_max_prefill > _PREFILL_MAX:
+        from suffix_hybrid.kernels.gdn_mixed_fast_rocm import prefill
+
+        if prefill(layer, qkvz, ba, core_attn_out, md, plan, nst, n, qkv_dim, hv, conv_state,
+                   ssm_state, w):
+            return True
     # Prefill suffix, rows [nst, n): _forward_core's prefill calls (spec present, so the
     # prefill metadata is the whole non-spec part), dense input like its gather made.
     x = qkvz[nst:n, :qkv_dim].contiguous()
@@ -206,6 +215,10 @@ def forward_mixed(layer, qkvz, ba, core_attn_out, md) -> bool:
         core_attn_out=core_attn_out[nst:n].reshape(-1),
         aiter_prefill_metadata=md.aiter_prefill_metadata)
     ssm_state.index_copy_(0, plan.pre_idx, last.to(ssm_state.dtype))
+    if _FAST:  # the configs FLA's autotuners just used, for the fast path's launches
+        from suffix_hybrid.kernels.gdn_mixed_fast_rocm import capture
+
+        capture()
     if n < core_attn_out.shape[0]:
         core_attn_out[n:].zero_()
     return True
