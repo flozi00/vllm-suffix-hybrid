@@ -649,6 +649,180 @@ def _gdn_defer4_kernel(
         tl.store(rec + 3 * REC + K + BV, G4 - G0, mask=keep & (4 < n_tok))
 
 
+@triton.jit
+def _v5_tok(p_q, p_k, p_v, p_a, p_b, i_t, n_tok, s_qkv, s_a, s_b, A_log_v, dt_v, beta,
+            threshold, h):
+    # _v4_tok on the 2D tile: raw k [K], v tile, log decay (0 past n_tok), beta, S k, S q.
+    valid = i_t < n_tok
+    b_q = tl.load(p_q + i_t * s_qkv, mask=valid, other=0.0).to(tl.float32)
+    b_k = tl.load(p_k + i_t * s_qkv, mask=valid, other=0.0).to(tl.float32)
+    b_v = tl.load(p_v + i_t * s_qkv, mask=valid, other=0.0).to(tl.float32)
+    a_raw = tl.load(p_a + i_t * s_a, mask=valid, other=0.0).to(tl.float32)
+    b_raw = tl.load(p_b + i_t * s_b, mask=valid, other=0.0).to(tl.float32)
+    x = a_raw + dt_v
+    softplus_x = tl.where(beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x)
+    b_g = tl.where(valid, -tl.exp(A_log_v) * softplus_x, 0.0)
+    return (b_k, b_v, b_g, tl.sigmoid(b_raw), tl.sum(h * b_k[None, :], 1),
+            tl.sum(h * b_q[None, :], 1))
+
+
+@triton.jit(do_not_specialize=["stride_qkv_l", "stride_a_l", "stride_b_l", "stride_o_l",
+                               "stride_idx_seq"])
+def _gdn_defer5_kernel(
+    A_log, a, b, dt_bias, beta, threshold, qkv, o, state, cu_seqlens, state_indices,
+    num_accepted, seq_lens, scale, gram,
+    stride_qkv_l, stride_a_l, stride_b_l, stride_o_l, stride_state_block, stride_idx_seq,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BV: tl.constexpr,
+    NC: tl.constexpr, WIN: tl.constexpr, ZONE: tl.constexpr, ZONE_REACH: tl.constexpr,
+    REC: tl.constexpr, WP: tl.constexpr,
+):
+    # _gdn_defer4_kernel's math on v1's 2D [BV, K] tile (Triton's code for the 3D tile is
+    # ~30% slower even at NC = 1).
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    n_tok = tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos
+    if n_tok <= 0:
+        return
+    o_bv = tl.arange(0, BV)
+    kofs = tl.arange(0, K)
+    tile = i_hv * V * K + (i_v * BV + o_bv)[:, None] * K + kofs[None, :]
+    tile_base = i_hv * V * K + i_v * BV * K
+    A_log_v = tl.load(A_log + i_hv).to(tl.float32)
+    dt_v = tl.load(dt_bias + i_hv).to(tl.float32)
+    acc = tl.load(num_accepted + i_n).to(tl.int64)
+    c_now = tl.load(seq_lens + i_n).to(tl.int64) - n_tok
+    idx_row = state_indices + i_n * stride_idx_seq
+    slot0 = tl.load(idx_row).to(tl.int64)
+    slot1 = tl.load(idx_row + 1).to(tl.int64)
+    if ZONE > 0:
+        cur_zone = (c_now + ZONE_REACH) // ZONE > c_now // ZONE
+        c_prev = c_now - acc
+        prev_zone = (c_prev + ZONE_REACH) // ZONE > c_prev // ZONE
+    else:
+        cur_zone = c_now < 0
+        prev_zone = c_now < 0
+    deferred = (acc >= 2) & (prev_zone == 0)
+    read_slot = tl.where(deferred, slot0, tl.load(idx_row + acc - 1).to(tl.int64))
+    if read_slot <= 0:
+        return
+    if deferred & (slot1 <= 0):
+        return
+    b_h = tl.load(state + read_slot * stride_state_block + tile)
+    rec = state + slot1 * stride_state_block + tile_base
+    if deferred:
+        gr_last = tl.load(rec + (acc - 2) * REC + K + BV)
+        b_h = b_h * tl.exp(gr_last)
+        for j in tl.static_range(1, WIN):
+            if j < acc:
+                r = rec + (j - 1) * REC
+                c_j = tl.exp(gr_last - tl.load(r + K + BV))
+                b_h += (c_j * tl.load(r + K + o_bv))[:, None] * tl.load(r + kofs)[None, :]
+
+    gb = gram + (i_n * H + i_h) * (3 * WP * WP)
+    r0 = tl.rsqrt(_v4_g(gb, 0, 0, WP) + 1e-6)
+    r1 = tl.rsqrt(_v4_g(gb, 1, 1, WP) + 1e-6)
+    r2 = tl.rsqrt(_v4_g(gb, 2, 2, WP) + 1e-6)
+    r3 = tl.rsqrt(_v4_g(gb, 3, 3, WP) + 1e-6)
+    r4 = tl.rsqrt(_v4_g(gb, 4, 4, WP) + 1e-6)
+    p_q = qkv + bos * stride_qkv_l + i_h * K + kofs
+    p_k = qkv + bos * stride_qkv_l + H * K + i_h * K + kofs
+    p_v = qkv + bos * stride_qkv_l + 2 * H * K + i_hv * V + i_v * BV + o_bv
+    p_a = a + bos * stride_a_l + i_hv
+    p_b = b + bos * stride_b_l + i_hv
+    p_o = o + bos * stride_o_l + i_hv * V + i_v * BV + o_bv
+    sq, sa, sb, so = stride_qkv_l, stride_a_l, stride_b_l, stride_o_l
+    ty = p_o.dtype.element_ty
+
+    k0, v0, g0, be0, P0, R0 = _v5_tok(p_q, p_k, p_v, p_a, p_b, 0, n_tok, sq, sa, sb, A_log_v,
+                                      dt_v, beta, threshold, b_h)
+    q0 = tl.rsqrt(tl.load(gb + 2 * WP * WP + 0) + 1e-6) * scale
+    G0 = g0
+    u0 = be0 * (v0 - (tl.exp(G0) * r0) * P0)
+    tl.store(p_o, ((tl.exp(G0) * q0) * R0 + (_v4_b(gb, 0, 0, WP) * r0 * q0) * u0).to(ty))
+
+    k1, v1, g1, be1, P1, R1 = _v5_tok(p_q, p_k, p_v, p_a, p_b, 1, n_tok, sq, sa, sb, A_log_v,
+                                      dt_v, beta, threshold, b_h)
+    q1 = tl.rsqrt(tl.load(gb + 2 * WP * WP + 1) + 1e-6) * scale
+    G1 = G0 + g1
+    d10 = tl.exp(G1 - G0)
+    u1 = be1 * (v1 - ((tl.exp(G1) * r1) * P1 + (d10 * _v4_g(gb, 0, 1, WP) * r0 * r1) * u0))
+    o1 = ((tl.exp(G1) * q1) * R1 + (d10 * _v4_b(gb, 0, 1, WP) * r0 * q1) * u0
+          + (_v4_b(gb, 1, 1, WP) * r1 * q1) * u1)
+    tl.store(p_o + so, o1.to(ty), mask=1 < n_tok)
+
+    k2, v2, g2, be2, P2, R2 = _v5_tok(p_q, p_k, p_v, p_a, p_b, 2, n_tok, sq, sa, sb, A_log_v,
+                                      dt_v, beta, threshold, b_h)
+    q2 = tl.rsqrt(tl.load(gb + 2 * WP * WP + 2) + 1e-6) * scale
+    G2 = G1 + g2
+    d20, d21 = tl.exp(G2 - G0), tl.exp(G2 - G1)
+    u2 = be2 * (v2 - ((tl.exp(G2) * r2) * P2 + (d20 * _v4_g(gb, 0, 2, WP) * r0 * r2) * u0
+                      + (d21 * _v4_g(gb, 1, 2, WP) * r1 * r2) * u1))
+    o2 = ((tl.exp(G2) * q2) * R2 + (d20 * _v4_b(gb, 0, 2, WP) * r0 * q2) * u0
+          + (d21 * _v4_b(gb, 1, 2, WP) * r1 * q2) * u1 + (_v4_b(gb, 2, 2, WP) * r2 * q2) * u2)
+    tl.store(p_o + 2 * so, o2.to(ty), mask=2 < n_tok)
+
+    k3, v3, g3, be3, P3, R3 = _v5_tok(p_q, p_k, p_v, p_a, p_b, 3, n_tok, sq, sa, sb, A_log_v,
+                                      dt_v, beta, threshold, b_h)
+    q3 = tl.rsqrt(tl.load(gb + 2 * WP * WP + 3) + 1e-6) * scale
+    G3 = G2 + g3
+    d30, d31, d32 = tl.exp(G3 - G0), tl.exp(G3 - G1), tl.exp(G3 - G2)
+    u3 = be3 * (v3 - ((tl.exp(G3) * r3) * P3 + (d30 * _v4_g(gb, 0, 3, WP) * r0 * r3) * u0
+                      + (d31 * _v4_g(gb, 1, 3, WP) * r1 * r3) * u1
+                      + (d32 * _v4_g(gb, 2, 3, WP) * r2 * r3) * u2))
+    o3 = ((tl.exp(G3) * q3) * R3 + (d30 * _v4_b(gb, 0, 3, WP) * r0 * q3) * u0
+          + (d31 * _v4_b(gb, 1, 3, WP) * r1 * q3) * u1 + (d32 * _v4_b(gb, 2, 3, WP) * r2 * q3) * u2
+          + (_v4_b(gb, 3, 3, WP) * r3 * q3) * u3)
+    tl.store(p_o + 3 * so, o3.to(ty), mask=3 < n_tok)
+
+    k4, v4, g4, be4, P4, R4 = _v5_tok(p_q, p_k, p_v, p_a, p_b, 4, n_tok, sq, sa, sb, A_log_v,
+                                      dt_v, beta, threshold, b_h)
+    q4 = tl.rsqrt(tl.load(gb + 2 * WP * WP + 4) + 1e-6) * scale
+    G4 = G3 + g4
+    d40, d41, d42, d43 = tl.exp(G4 - G0), tl.exp(G4 - G1), tl.exp(G4 - G2), tl.exp(G4 - G3)
+    u4 = be4 * (v4 - ((tl.exp(G4) * r4) * P4 + (d40 * _v4_g(gb, 0, 4, WP) * r0 * r4) * u0
+                      + (d41 * _v4_g(gb, 1, 4, WP) * r1 * r4) * u1
+                      + (d42 * _v4_g(gb, 2, 4, WP) * r2 * r4) * u2
+                      + (d43 * _v4_g(gb, 3, 4, WP) * r3 * r4) * u3))
+    o4 = ((tl.exp(G4) * q4) * R4 + (d40 * _v4_b(gb, 0, 4, WP) * r0 * q4) * u0
+          + (d41 * _v4_b(gb, 1, 4, WP) * r1 * q4) * u1 + (d42 * _v4_b(gb, 2, 4, WP) * r2 * q4) * u2
+          + (d43 * _v4_b(gb, 3, 4, WP) * r3 * q4) * u3 + (_v4_b(gb, 4, 4, WP) * r4 * q4) * u4)
+    tl.store(p_o + 4 * so, o4.to(ty), mask=4 < n_tok)
+
+    # u' = rk u: the state ops below and the records use raw k.
+    u0, u1, u2, u3, u4 = u0 * r0, u1 * r1, u2 * r2, u3 * r3, u4 * r4
+    h = b_h * tl.exp(g0) + u0[:, None] * k0[None, :]
+    tl.store(state + slot0 * stride_state_block + tile, h, mask=slot0 > 0)
+    if cur_zone:
+        h = h * tl.exp(g1) + u1[:, None] * k1[None, :]
+        s = tl.load(idx_row + 1).to(tl.int64)
+        tl.store(state + s * stride_state_block + tile, h, mask=(1 < n_tok) & (s > 0))
+        h = h * tl.exp(g2) + u2[:, None] * k2[None, :]
+        s = tl.load(idx_row + 2).to(tl.int64)
+        tl.store(state + s * stride_state_block + tile, h, mask=(2 < n_tok) & (s > 0))
+        h = h * tl.exp(g3) + u3[:, None] * k3[None, :]
+        s = tl.load(idx_row + 3).to(tl.int64)
+        tl.store(state + s * stride_state_block + tile, h, mask=(3 < n_tok) & (s > 0))
+        h = h * tl.exp(g4) + u4[:, None] * k4[None, :]
+        s = tl.load(idx_row + 4).to(tl.int64)
+        tl.store(state + s * stride_state_block + tile, h, mask=(4 < n_tok) & (s > 0))
+    else:
+        keep = slot1 > 0
+        tl.store(rec + kofs, k1, mask=keep & (1 < n_tok))
+        tl.store(rec + K + o_bv, u1, mask=keep & (1 < n_tok))
+        tl.store(rec + K + BV, G1 - G0, mask=keep & (1 < n_tok))
+        tl.store(rec + REC + kofs, k2, mask=keep & (2 < n_tok))
+        tl.store(rec + REC + K + o_bv, u2, mask=keep & (2 < n_tok))
+        tl.store(rec + REC + K + BV, G2 - G0, mask=keep & (2 < n_tok))
+        tl.store(rec + 2 * REC + kofs, k3, mask=keep & (3 < n_tok))
+        tl.store(rec + 2 * REC + K + o_bv, u3, mask=keep & (3 < n_tok))
+        tl.store(rec + 2 * REC + K + BV, G3 - G0, mask=keep & (3 < n_tok))
+        tl.store(rec + 3 * REC + kofs, k4, mask=keep & (4 < n_tok))
+        tl.store(rec + 3 * REC + K + o_bv, u4, mask=keep & (4 < n_tok))
+        tl.store(rec + 3 * REC + K + BV, G4 - G0, mask=keep & (4 < n_tok))
+
+
 @triton.jit(do_not_specialize=["stride_x_l", "stride_a_l", "stride_b_l", "stride_o_l"])
 def _gdn_prefill_kernel(
     A_log, a, b, dt_bias, beta, threshold, x, o, state, cu_seqlens, slots, has_init, scale,
@@ -738,6 +912,25 @@ def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_a
     hv = a.shape[1]
     K, V = head_k_dim, head_v_dim
     win = state_indices.shape[1]
+    if v2 == "v5":  # oracle: v4 on the 2D tile
+        BV, warps, stages = (config or CONFIG2)[:3]
+        rec = (K + BV + 1 + 63) // 64 * 64
+        assert win == 5 and (win - 1) * rec <= BV * K
+        if n:
+            wp = triton.next_power_of_2(win)
+            gram = torch.empty(n * num_k_heads * 3 * wp * wp, dtype=torch.float32,
+                               device=qkv.device)
+            _gdn_gram_kernel[(n * num_k_heads,)](qkv, cu_seqlens, gram, qkv.stride(0),
+                                                 H=num_k_heads, K=K, WIN=win, WP=wp,
+                                                 num_warps=1)
+            _gdn_defer5_kernel[(V // BV, n * hv)](
+                A_log, a, b, dt_bias, 1.0, 20.0, qkv, out, state, cu_seqlens, state_indices,
+                num_accepted, seq_lens, K**-0.5, gram,
+                qkv.stride(0), a.stride(0), b.stride(0), out.stride(0), state.stride(0),
+                state_indices.stride(0),
+                H=num_k_heads, HV=hv, K=K, V=V, BV=BV, NC=1, WIN=win, ZONE=zone,
+                ZONE_REACH=2 * win, REC=rec, WP=wp, num_warps=warps, num_stages=stages)
+        return out
     if v2 in ("v4", "v4b"):  # oracle: v2 math with a per-(request, qk head) gram pre-pass
         BV, warps, stages, nc = config or CONFIG2
         rec = (K + BV + 1 + 63) // 64 * 64
@@ -920,8 +1113,9 @@ def _oracle_v2() -> bool:
         return win if r % 7 else 1 + (step + r) % win
 
     for variant, zone, n_req, steps in ((True, 0, 16, 10), (True, 24, 16, 14),
-                                        (True, 1664, 16, 8), ("v4", 24, 16, 14),
-                                        ("v4b", 24, 16, 14)):
+                                        (True, 1664, 16, 8), ("v4b", 24, 16, 14),
+                                        ("v5", 0, 16, 10), ("v5", 24, 16, 14),
+                                        ("v5", 1664, 16, 8)):
         pool_blocks = n_req * win * 4 + 1
         pools = {"S": torch.randn(pool_blocks, HV, V, K, device=dev) * 0.1}
         pools["R"], pools["D"] = pools["S"].clone(), pools["S"].clone()
@@ -1007,16 +1201,17 @@ def _oracle_v2() -> bool:
         t_v1 = _graph_us(lambda i: run_v2(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t, out, 0,
                                           None, False), 8)[0]
         sweep = []
-        for cfg in ((16, 1, 1, 4), (16, 1, 1, 2), (16, 1, 1, 8), (8, 1, 1, 4), (32, 1, 1, 4),
-                    (16, 2, 1, 4), (32, 2, 1, 4), (64, 4, 1, 4), (16, 1, 2, 4)):
+        for cfg in ((16, 1, 1, 4),):
             try:
                 us = _graph_us(lambda i: run_v2(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t,
                                                 out, 0, cfg), 8)[0]
                 sweep.append(f"{cfg[0]}/{cfg[1]}w/{cfg[2]}s/nc{cfg[3]} {us:.1f}")
             except Exception as exc:  # noqa: BLE001 - a config that does not build is a datum
                 sweep.append(f"{cfg[0]}/{cfg[1]}w/{cfg[2]}s/nc{cfg[3]} {type(exc).__name__}")
-        for var in ("v4", "v4b"):
-            for cfg in ((16, 1, 1, 4), (16, 1, 1, 1), (8, 1, 1, 4), (32, 1, 1, 4)):
+        for var, cfgs in (("v4b", ((16, 1, 1, 1),)),
+                          ("v5", ((16, 1, 1, 1), (8, 1, 1, 1), (32, 1, 1, 1), (16, 2, 1, 1),
+                                  (32, 2, 1, 1), (64, 4, 1, 1)))):
+            for cfg in cfgs:
                 try:
                     us = _graph_us(lambda i: run_v2(pools[i % 4], qkv, ba, cu, idx, acc_t,
                                                     seq_t, out, 0, cfg, var), 8)[0]
@@ -1024,7 +1219,7 @@ def _oracle_v2() -> bool:
                 except Exception as exc:  # noqa: BLE001
                     sweep.append(f"{var} {cfg[0]}/{cfg[1]}w/nc{cfg[3]} {type(exc).__name__}")
         probe = []
-        for cfg in ((16, 1, 1, 4), (16, 1, 1, 2), (32, 1, 1, 4), (16, 1, 1, 1)):
+        for cfg in ((16, 1, 1, 1),):
             try:
                 us = _graph_us(lambda i: run_v2(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t,
                                                 out, 0, cfg, "v13"), 8)[0]
@@ -1035,7 +1230,7 @@ def _oracle_v2() -> bool:
               f"{' | '.join(sweep)} | v1 on the 3D tile {' | '.join(probe)}", flush=True)
     for name, fn in (("v1", _gdn_defer_kernel), ("v1-3D", _gdn_defer3_kernel),
                      ("v2", _gdn_defer2_kernel), ("v4", _gdn_defer4_kernel),
-                     ("gram", _gdn_gram_kernel)):
+                     ("v5", _gdn_defer5_kernel), ("gram", _gdn_gram_kernel)):
         for row in _isa_stats(fn):
             print(f"{MARK} isa {name}: {row}", flush=True)
     return ok_all
