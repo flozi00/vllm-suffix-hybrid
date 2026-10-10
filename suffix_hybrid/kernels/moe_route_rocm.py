@@ -86,7 +86,9 @@ MARK = "[suffix moe-route]"
 # MI350P glue graphed us stock -> fused, v5 gate (launch 2 one program per token): M 1 19.8 ->
 # 10.8, 5 21.6 -> 11.2, 8 21.8 -> 11.3, 16 24.7 -> 12.0, 32 28.9 -> 13.1, 40 30.0 -> 13.7,
 # 64 33.1 -> 14.1. Above 64 rows launch 2 places 4 tokens per program; 256 pending the gate.
-MAX_M = min(256, int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_MAX_M", "256")))
+# gate10: fused glue wins up to M 160 (39.5 -> 33.7 us); from 192 AITER's split quant path is faster
+# (28.5 / 29.1 vs 34.3 / 35.5 us at M 192 / 256).
+MAX_M = min(256, int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_MAX_M", "160")))
 EXP = int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_EXP", "2"))
 BLOCKS = (16, 32, 64, 128)
 STATS: Counter = Counter()
