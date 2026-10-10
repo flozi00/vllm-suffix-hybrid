@@ -77,7 +77,7 @@ import os
 # pod spec stays under the console's 30-variable cap. Boot-gate children never see it (SUFFIX_*
 # is stripped from their env). An unknown name refuses to start instead of serving stock.
 _PRESETS = {
-    # MI350P Qwen3.8-Flash-Next, plugin-harness/dossiers/mi350p-qwen-flash-2026-10-08.md (k36).
+    # MI350P Qwen3.8-Flash-Next, plugin-harness/dossiers/mi350p-qwen-flash-2026-10-08.md (k38).
     "mi350p-qwen-flash": {
         "VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_SKINNY_GEMM": "0",
         "VLLM_DISABLE_SHARED_EXPERTS_STREAM": "1", "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "1",
@@ -90,6 +90,9 @@ _PRESETS = {
         "SUFFIX_ROCM_GDN_MIXED": "1", "SUFFIX_ROCM_GDN_DEFER_MFMA": "1",
         "SUFFIX_ROCM_HC_FUSE": "1", "SUFFIX_ROCM_HC_DOWN": "1", "SUFFIX_ROCM_HC_DOWN_MAX_M": "256",
         "SUFFIX_ROCM_HC_BIG": "1", "SUFFIX_ROCM_ACT_QUANT_FUSE": "1", "SUFFIX_ROCM_MOE_ROUTE": "1",
+        # FP8 HC projections (the documented quality fallback: MXFP4 put 10-22% error on the
+        # injection logits); k38 full GSM8K 0.9689, tools 5/5, needle, image.
+        "SUFFIX_ROCM_HC_WQ": "fp8",
     },
 }
 _preset = os.environ.get("SUFFIX_ROCM_PRESET", "").strip()
