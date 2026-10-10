@@ -103,6 +103,10 @@ SUFFIX_ROCM_HC_FUSE2=1: Qwen4Exp GatedResidual.mix / combine_and_mix return thro
   launch, the partials' reduce + silu + up GEMM + gate mix in a second (4 launches before);
   above it the HC_FUSE + HC_DOWN path. The patch only inserts the return at the top of each
   method, so it composes with HC_FUSE / HC_DOWN in any order (their bodies stay, unreached).
+SUFFIX_ROCM_MOE_ROUTE=1: at M <= SUFFIX_ROCM_MOE_ROUTE_MAX_M (64) the MoE router's top-k,
+  AITER's moe_sorting (P0_v2 + P23) and the stage-1 MXFP4 quant-sort run as one Triton
+  launch (suffix_hybrid/kernels/moe_route_rocm.py), bit-identical outputs: the
+  AiterSharedRoutedFusedMoERouter defers its topk_softmax call to aiter.fused_moe's sort.
 """
 import glob
 import importlib.util
@@ -592,6 +596,13 @@ PATCHES = {
         "        ) or load_config_json(\n"
         '            f"{cfg_dir}/{config_name}-{suffix}.json", required=False\n'
         "        )\n"),
+    "SUFFIX_ROCM_MOE_ROUTE": (
+        Patch("aiter.fused_moe", "MoE top-k + sort + MXFP4 quant-sort in one launch (sort site)",
+              after="suffix_hybrid.kernels.moe_route_rocm:install_aiter"),
+        Patch("vllm.model_executor.layers.fused_moe.router.aiter_shared_routed_fused_moe_router",
+              "MoE top-k deferred to the fused sort (router)",
+              after="suffix_hybrid.kernels.moe_route_rocm:install_router"),
+    ),
 }
 _MARK = "_suffix_rocm_patch"
 
