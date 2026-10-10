@@ -6,7 +6,9 @@ expert 512: 10 routed + 1 shared = 11 slots, our tuned FlyDSL fMoE table) the ex
 are preceded by four launches: aiter.topk_softmax (vllm::moe::topkGatingSoftmax,
 ~11 us on the MI350P), AITER's opus moe_sorting (513 experts -> the multi-phase
 P0_v2 + P23 pair, ~8 us) and fused_dynamic_mxfp4_quant_moe_sort (~4 us); ~52 MoE
-layers per MTP-4 step. At M <= MAX_M one program does all of it, bit-for-bit:
+layers per MTP-4 step. At M <= MAX_M one program does all of it with plain loads,
+compares and reductions (no gather / sort / scan / histogram: this Triton asserts on
+tl.gather layouts), bit-for-bit except possibly the last ulp of the gating weights (1.):
 
 1. Gating = AITER's topkGatingSoftmax (csrc/kernels/topk_softmax_kernels.cu @
    v0.1.24.post1, renormalize, shared scoring "sigmoid"): the 10 largest of the 512
@@ -14,9 +16,15 @@ layers per MTP-4 step. At M <= MAX_M one program does all of it, bit-for-bit:
    w_k = expf(l_k - l_max) * (1 / sum_k expf(l_k - l_max)), the sum in k order;
    w_10 = 1 / (1 + expf(-l_512)). Written where the router's call would have written:
    weights[:M, :11] and ids[:M, :10] of vLLM's aiter_topK_meta_data buffers (ids[:, 10]
-   = 512 is vLLM's one-time prefill). Which exp / division Triton must use to hit the
-   HIP kernel's bits is calibrated by the oracle: SUFFIX_ROCM_MOE_ROUTE_MATH="exp,div"
-   (exp 0 = libdevice/ocml expf, 1 = tl.exp; div 0 = div_rn, 1 = Triton's "/").
+   = 512 is vLLM's one-time prefill). AITER builds it with hipcc -O3
+   -fgpu-flush-denormals-to-zero and no fast-math: expf = ocml -> llvm.exp.f32, "/" is the
+   correctly rounded division. Triton's "/" is the same fdiv; its tl.exp is
+   exp2(x * log2e), and FP fusion (on by default) contracts mul + add pairs inside an
+   inlined exp, so this kernel compiles with enable_fp_fusion=False and its exp is
+   SUFFIX_ROCM_MOE_ROUTE_EXP (oracle-calibrated): 0 = libdevice (ocml) exp, 1 = tl.exp,
+   2 = LLVM's AMDGPU llvm.exp.f32 expansion written out (x * log2e split hi + lo with
+   the 0x1.4ae0bep-26 term, rndne, v_exp_f32, ldexp, under/overflow), 3 = the same
+   without the lo term. Top-k ids and everything below do not depend on it.
 
 2. Sorting = aiter.fused_moe.moe_sorting -> moe_sorting_opus.h multi-phase path (513
    experts >= 512 is never "oneshot"; no expert mask, dispatch policy 0), unit B =
@@ -57,6 +65,7 @@ raises at the next MoE layer: a silent stale top-k is not possible.
 from __future__ import annotations
 
 import os
+import re
 from collections import Counter
 from typing import Callable, NamedTuple
 
@@ -72,7 +81,7 @@ except ImportError:
 MARK = "[suffix moe-route]"
 # ponytail: one program does the whole batch; above 64 tokens the stock multi-CU kernels win.
 MAX_M = min(64, int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_MAX_M", "64")))
-MATH = tuple(int(v) for v in os.environ.get("SUFFIX_ROCM_MOE_ROUTE_MATH", "0,0").split(","))
+EXP = int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_EXP", "2"))
 BLOCKS = (16, 32, 64, 128)
 STATS: Counter = Counter()
 _JOBS: dict = {}   # router ids buffer data_ptr -> Job (at most one: layers run in order)
@@ -89,26 +98,70 @@ class Job(NamedTuple):
 
 
 @triton.jit
-def _keyed_add(x, y):
-    # (key << 16 | count) run lengths over keys sorted ascending (triton_kernels routing)
-    kx = x & -65536
-    return tl.where(kx == (y & -65536), x + y - kx, y)
-
-
-@triton.jit
 def _exp(x, MODE: tl.constexpr):
     if MODE == 0:
         return libdevice.exp(x)
-    else:
+    elif MODE == 1:
         return tl.exp(x)
+    else:  # AMDGPU lowering of llvm.exp.f32 (fast-FMA path), fusion off
+        ph = x * 1.4426950216293335  # log2(e) rounded to fp32
+        pl = tl.fma(x, 1.4426950216293335, -ph)
+        if MODE == 2:
+            pl = tl.fma(x, 1.925962855864327e-08, pl)  # 0x1.4ae0bep-26
+        e = libdevice.rint(ph)
+        r = libdevice.ldexp(tl.math.exp2((ph - e) + pl), e.to(tl.int32))
+        r = tl.where(x < -103.2789306640625, 0.0, r)  # -0x1.9d1da0p+6
+        return tl.where(x > 88.72283935546875, float("inf"), r)  # 0x1.62e430p+6
 
 
 @triton.jit
-def _rcp(x, MODE: tl.constexpr):
-    if MODE == 0:
-        return tl.math.div_rn(tl.full(x.shape, 1.0, tl.float32), x)
+def _gate(logits_ptr, w_ptr, ids_ptr, M, stride_l, stride_w, stride_ids,
+          E: tl.constexpr, K: tl.constexpr, MP: tl.constexpr, EXP_MODE: tl.constexpr):
+    """AITER's topkGatingSoftmax for MP rows; stores weights [:, :K+1], ids [:, :K] and returns
+    (w, ids) as [MP, 16] tiles, ids = 1023 where (row, slot) is not an entry."""
+    rows = tl.arange(0, MP)
+    rok = rows < M
+    cols = tl.arange(0, E)
+    kk = tl.arange(0, 16)
+    x = tl.load(logits_ptr + rows[:, None] * stride_l + cols[None, :], mask=rok[:, None],
+                other=float("-inf")).to(tl.float32)
+    top = tl.max(x, axis=1)
+    ids = tl.zeros([MP, 16], dtype=tl.int32) + 1023
+    num = tl.zeros([MP, 16], dtype=tl.float32)
+    den = tl.zeros([MP], dtype=tl.float32)
+    for k in tl.static_range(K):
+        v = tl.max(x, axis=1)
+        e = tl.min(tl.where(x == v[:, None], cols[None, :], E), axis=1)
+        n = _exp(v - top, EXP_MODE)
+        num = tl.where(kk[None, :] == k, n[:, None], num)
+        ids = tl.where(kk[None, :] == k, e[:, None], ids)
+        den += n  # AITER: k ascending
+        x = tl.where(cols[None, :] == e[:, None], float("-inf"), x)
+    inv = tl.where(den != 0.0, 1.0 / den, 1.0)
+    shared = tl.load(logits_ptr + rows * stride_l + E, mask=rok, other=0.0).to(tl.float32)
+    sig = 1.0 / (1.0 + _exp(-shared, EXP_MODE))
+    w = tl.where(kk[None, :] == K, sig[:, None], num * inv[:, None])
+    ok = rok[:, None] & (kk[None, :] <= K)
+    ids = tl.where(ok, tl.where(kk[None, :] == K, E, ids), 1023)
+    tl.store(w_ptr + rows[:, None] * stride_w + kk[None, :], w, mask=ok)
+    tl.store(ids_ptr + rows[:, None] * stride_ids + kk[None, :], ids, mask=ok & (kk[None, :] < K))
+    return w, ids
+
+
+@triton.jit(do_not_specialize=["M"])
+def _gate_kernel(logits_ptr, w_ptr, ids_ptr, M, stride_l, stride_w, stride_ids,
+                 E: tl.constexpr, K: tl.constexpr, MP: tl.constexpr, EXP_MODE: tl.constexpr):
+    _gate(logits_ptr, w_ptr, ids_ptr, M, stride_l, stride_w, stride_ids, E, K, MP, EXP_MODE)
+
+
+@triton.jit
+def _chunk(v, c: tl.constexpr, NC: tl.constexpr, TC: tl.constexpr):
+    # tokens c*TC .. c*TC+TC-1 of a per-token vector (one-hot row pick, no gather)
+    if NC == 1:
+        return v
     else:
-        return 1.0 / x
+        return tl.sum(tl.where(tl.arange(0, NC)[:, None] == c, tl.reshape(v, [NC, TC]), 0),
+                      axis=0)
 
 
 @triton.jit
@@ -146,77 +199,64 @@ def _moe_route_kernel(
     sid_ptr, sw_ptr, seid_ptr, nv_ptr, a1_ptr, a1s_ptr, buf_ptr,
     M, stride_l, stride_h, stride_w, stride_ids, buf_numel,
     E: tl.constexpr, K: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr,
-    MP: tl.constexpr, EXP_MODE: tl.constexpr, DIV_MODE: tl.constexpr,
+    MP: tl.constexpr, TC: tl.constexpr, NC: tl.constexpr, EXP_MODE: tl.constexpr,
     ZERO_BUF: tl.constexpr,
 ):
-    KP: tl.constexpr = 16             # slots per token (K routed + 1 shared)
-    P: tl.constexpr = MP * KP         # (token, slot) entries, row-major
-    NB: tl.constexpr = 1024           # expert bins; the last one collects unused entries
-    SENT: tl.constexpr = NB - 1
-    CW: tl.constexpr = 512            # hidden columns per quant chunk
-    G: tl.constexpr = CW // 32        # MX groups per chunk
+    # TC tokens per compare chunk, NC = MP // TC chunks
+    CW: tl.constexpr = 512                     # hidden columns per quant chunk
+    G: tl.constexpr = CW // 32                 # MX groups per chunk
     SN: tl.constexpr = (H // 32 + 7) // 8 * 8
 
-    # 1. gating
+    # 1. gating; entries are the (token, slot) cells of a [MP, 16] tile
+    w, ids = _gate(logits_ptr, w_ptr, ids_ptr, M, stride_l, stride_w, stride_ids, E, K, MP,
+                   EXP_MODE)
     rows = tl.arange(0, MP)
-    rok = rows < M
-    cols = tl.arange(0, E)
-    x = tl.load(logits_ptr + rows[:, None] * stride_l + cols[None, :], mask=rok[:, None],
-                other=float("-inf")).to(tl.float32)
-    top = tl.max(x, axis=1)
-    kk = tl.arange(0, KP)
-    ids = tl.zeros([MP, KP], dtype=tl.int32) + SENT
-    num = tl.zeros([MP, KP], dtype=tl.float32)
-    den = tl.zeros([MP], dtype=tl.float32)
-    for k in tl.static_range(K):
-        v = tl.max(x, axis=1)
-        e = tl.min(tl.where(x == v[:, None], cols[None, :], E), axis=1)
-        n = _exp(v - top, EXP_MODE)
-        num = tl.where(kk[None, :] == k, n[:, None], num)
-        ids = tl.where(kk[None, :] == k, e[:, None], ids)
-        den += n  # AITER: k ascending
-        x = tl.where(cols[None, :] == e[:, None], float("-inf"), x)
-    inv = tl.where(den != 0.0, _rcp(den, DIV_MODE), 1.0)
-    shared = tl.load(logits_ptr + rows * stride_l + E, mask=rok, other=0.0).to(tl.float32)
-    sig = _rcp(1.0 + _exp(-shared, EXP_MODE), DIV_MODE)
-    w = tl.where(kk[None, :] == K, sig[:, None], num * inv[:, None])
-    ok = rok[:, None] & (kk[None, :] <= K)
-    ids = tl.where(ok, tl.where(kk[None, :] == K, E, ids), SENT)
-    tl.store(w_ptr + rows[:, None] * stride_w + kk[None, :], w, mask=ok)
-    tl.store(ids_ptr + rows[:, None] * stride_ids + kk[None, :], ids, mask=ok & (kk[None, :] < K))
+    kk = tl.arange(0, 16)
+    valid = ids != 1023
 
-    # 2. sort: entries by (expert, token), run-length rank, padded expert starts
-    flat = tl.reshape(ids, [P])
-    skey = tl.sort((flat << 11) | tl.arange(0, P))
-    se = skey >> 11
-    si = skey & 2047
-    sval = se != SENT
-    rank = (tl.associative_scan((se << 16) | 1, 0, _keyed_add) & 65535) - 1
-    cnt = tl.histogram(flat, NB)
-    eid = tl.arange(0, NB)
-    nblk = tl.where(eid != SENT, (cnt + BLOCK - 1) // BLOCK, 0)
-    start = (tl.cumsum(nblk, 0) - nblk) * BLOCK
-    dest = tl.gather(start, se, 0) + rank
-    tok = si // KP
-    tl.store(sid_ptr + dest, tok | ((si % KP) << 24), mask=sval)
-    tl.store(sw_ptr + dest, tl.gather(tl.reshape(w, [P]), si, 0), mask=sval)
-    used = nblk > 0
+    # 2. AITER's sort, per entry: cnt = tokens of its expert, rank = earlier tokens of it,
+    # then the padded start of its expert = BLOCK * blocks of all lower experts.
+    cnt = tl.zeros([MP, 16], dtype=tl.int32)
+    rank = tl.zeros([MP, 16], dtype=tl.int32)
+    for kp in tl.static_range(K + 1):
+        col = tl.sum(tl.where(kk[None, :] == kp, ids, 0), axis=1)  # expert at slot kp, per token
+        for c in tl.static_range(NC):
+            ce = _chunk(col, c, NC, TC)
+            hit = (ce[None, None, :] == ids[:, :, None]) & (ce[None, None, :] != 1023)
+            cnt += tl.sum(hit.to(tl.int32), axis=2)
+            earlier = (c * TC + tl.arange(0, TC))[None, None, :] < rows[:, None, None]
+            rank += tl.sum((hit & earlier).to(tl.int32), axis=2)
+    nblk = tl.where(valid, (cnt + BLOCK - 1) // BLOCK, 0)
+    first = valid & (rank == 0)
+    lead = tl.where(first, nblk, 0)  # each expert's block count, once
+    pre = tl.zeros([MP, 16], dtype=tl.int32)
+    for kp in tl.static_range(K + 1):
+        col = tl.sum(tl.where(kk[None, :] == kp, ids, 0), axis=1)
+        colb = tl.sum(tl.where(kk[None, :] == kp, lead, 0), axis=1)
+        for c in tl.static_range(NC):
+            lower = _chunk(col, c, NC, TC)[None, None, :] < ids[:, :, None]
+            pre += tl.sum(tl.where(lower, _chunk(colb, c, NC, TC)[None, None, :], 0), axis=2)
+    start = pre * BLOCK
+    dest = start + rank
+    tl.store(sid_ptr + dest, rows[:, None] | (kk[None, :] << 24), mask=valid)
+    tl.store(sw_ptr + dest, w, mask=valid)
     for j in tl.static_range(BLOCK):
-        pad = used & (cnt + j < nblk * BLOCK)
+        pad = first & (cnt + j < nblk * BLOCK)
         tl.store(sid_ptr + start + cnt + j, M | ((K + 1) << 24), mask=pad)
         tl.store(sw_ptr + start + cnt + j, 0.0, mask=pad)
     for j in tl.static_range((MP + BLOCK - 1) // BLOCK):
-        tl.store(seid_ptr + start // BLOCK + j, eid, mask=used & (j < nblk))
+        tl.store(seid_ptr + start // BLOCK + j, ids, mask=first & (j < nblk))
     two = tl.arange(0, 2)
-    tl.store(nv_ptr + two, tl.where(two == 0, tl.sum(nblk, 0) * BLOCK, M))
+    tl.store(nv_ptr + two, tl.where(two == 0, tl.sum(tl.sum(lead, axis=1), axis=0) * BLOCK, M))
     if ZERO_BUF:
         zo = tl.arange(0, 2048)
         for z in range(0, buf_numel, 2048):
             tl.store(buf_ptr + z + zo, tl.zeros([2048], dtype=buf_ptr.dtype.element_ty),
                      mask=z + zo < buf_numel)
 
-    # 3. MXFP4 rows per token, E8M0 bytes per sorted slot
-    d = dest[:, None]
+    # 3. MXFP4 rows per token, E8M0 bytes per entry's sorted slot
+    rok = rows < M
+    d = dest[:, :, None]
     for c in tl.static_range(H // CW):
         hc = c * CW + tl.arange(0, CW)
         xg = tl.reshape(tl.load(hidden_ptr + rows[:, None] * stride_h + hc[None, :],
@@ -229,15 +269,23 @@ def _moe_route_kernel(
         bo = c * (CW // 2) + tl.arange(0, CW // 2)
         tl.store(a1_ptr + rows[:, None] * (H // 2) + bo[None, :],
                  _e2m1_pack(tl.reshape(q, [MP, CW]), CW, MP), mask=rok[:, None])
-        sc = tl.gather(ex.to(tl.int32), tl.broadcast_to(tok[:, None], [P, G]), 0)
-        y = (c * G + tl.arange(0, G))[None, :]
+        y = (c * G + tl.arange(0, G))[None, None, :]
         addr = ((d // 32 * SN) * 32 + (y // 8) * 256 + (y % 4) * 64 + (d % 16) * 4
                 + (y % 8) // 4 * 2 + (d % 32) // 16)
-        tl.store(a1s_ptr + addr, sc.to(tl.uint8), mask=sval[:, None])
+        tl.store(a1s_ptr + addr, tl.broadcast_to(ex.to(tl.uint8)[:, None, :], [MP, 16, G]),
+                 mask=valid[:, :, None])
+
+
+def _mp(m: int) -> int:
+    return 8 if m <= 8 else 32 if m <= 32 else 64
+
+
+def _warps(mp: int) -> int:
+    return 4 if mp <= 8 else 8 if mp <= 32 else 16
 
 
 def _route(job: Job, block: int, accumulate: bool, model_dim: int, buf_dtype, output,
-           math: tuple = MATH):
+           exp_mode: int = EXP):
     """moe_sorting's return tuple from one launch; (a1, a1_scale) go to _QUANT."""
     from aiter import dtypes
 
@@ -258,14 +306,15 @@ def _route(job: Job, block: int, accumulate: bool, model_dim: int, buf_dtype, ou
     a1 = torch.empty(m, h // 2, dtype=dtypes.fp4x2, device=dev)
     a1s = torch.empty((n_pad + 31) // 32 * 32, (h // 32 + 7) // 8 * 8, dtype=dtypes.fp8_e8m0,
                       device=dev)
-    mp = 8 if m <= 8 else 32 if m <= 32 else 64
+    mp = _mp(m)
     _moe_route_kernel[(1,)](
         job.logits, job.hidden, job.weights, job.ids, sorted_ids, sorted_w, sorted_e, nvalid,
         a1.view(torch.uint8), a1s.view(torch.uint8), moe_buf,
         m, job.logits.stride(0), job.hidden.stride(0), job.weights.stride(0),
         job.ids.stride(0), moe_buf.numel(),
-        E=e1 - 1, K=slots - 1, H=h, BLOCK=block, MP=mp, EXP_MODE=math[0], DIV_MODE=math[1],
-        ZERO_BUF=bool(accumulate), num_warps=4 if mp <= 8 else 8 if mp <= 32 else 16)
+        E=e1 - 1, K=slots - 1, H=h, BLOCK=block, MP=mp, TC=min(mp, 32), NC=mp // min(mp, 32),
+        EXP_MODE=exp_mode,
+        ZERO_BUF=bool(accumulate), num_warps=_warps(mp), enable_fp_fusion=False)
     _QUANT.clear()
     _QUANT[sorted_ids.data_ptr()] = (job.hidden, a1, a1s)
     return sorted_ids, sorted_w, sorted_e, nvalid, moe_buf
@@ -385,12 +434,81 @@ def _scale_addr(r, y, sn):
             + (y % 8) // 4 * 2 + (r % 32) // 16)
 
 
+_ISA_OPS = ("v_exp_f32", "v_rcp_f32", "v_div_scale_f32", "v_div_fmas_f32", "v_div_fixup_f32",
+            "v_ldexp_f32", "v_rndne_f32", "v_fma_f32", "v_fmac_f32", "v_mul_f32", "v_cvt_i32_f32")
+
+
+def _isa_summary(asm: str) -> str:
+    ins = [ln.split("//")[0].strip() for ln in asm.splitlines()]
+    ins = [ln for ln in ins if ln.startswith(("v_", "s_"))]
+    counts = " ".join(f"{op}={sum(ln.split()[0].startswith(op) for ln in ins)}" for op in _ISA_OPS)
+    i = next((n for n, ln in enumerate(ins) if ln.startswith("v_exp_f32")), None)
+    around = " | ".join(ins[max(0, i - 14): i + 6]) if i is not None else "no v_exp_f32"
+    return f"{counts}\n{MARK}   around the first v_exp_f32: {around}"
+
+
+def _stock_gating_isa() -> str:
+    """Opcode counts + the code around v_exp_f32 of AITER's compiled
+    topkGatingSoftmax<bf16, 32, 512, 2, 64, true, 1, sigmoid> (gating-math diagnostic)."""
+    import glob
+    import subprocess
+    import sys
+    import tempfile
+
+    import aiter
+
+    paths = [getattr(mod, "__file__", None) for name, mod in list(sys.modules.items())
+             if "module_moe_asm" in name]
+    paths = [p for p in paths if p and p.endswith(".so")] or glob.glob(os.path.join(
+        os.path.dirname(aiter.__file__), "jit", "**", "module_moe_asm*.so"), recursive=True)
+    if not paths:
+        return "module_moe_asm*.so not found"
+    tool = "/opt/rocm/llvm/bin/"
+
+    def run(*argv):
+        return subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fat, co = os.path.join(tmp, "fatbin"), os.path.join(tmp, "co")
+        run(tool + "llvm-objcopy", f"--dump-section=.hip_fatbin={fat}", paths[0],
+            os.path.join(tmp, "copy"))
+        target = next(t for t in run(tool + "clang-offload-bundler", "--list", "--type=o",
+                                     f"--input={fat}").split() if "gfx950" in t)
+        run(tool + "clang-offload-bundler", "--unbundle", "--type=o", f"--input={fat}",
+            f"--output={co}", f"--targets={target}")
+        asm = run(tool + "llvm-objdump", "-d", "--no-show-raw-insn", co)
+    funcs, name = {}, None
+    for line in asm.splitlines():
+        hdr = re.match(r"^[0-9a-f]+ <(.+)>:$", line.strip())
+        if hdr:
+            name = hdr.group(1)
+            funcs[name] = []
+        elif name:
+            funcs[name].append(line)
+    cands = [n for n in funcs if "topkGatingSoftmax" in n and "Li512E" in n and "Lb1ELi1E" in n]
+    if not cands:
+        return f"no topkGatingSoftmax<..., 512, ..., true, 1, ...> in {paths[0]}"
+    pick = next((n for n in cands if "DF16b" in n or "bfloat16" in n), cands[0])
+    return f"{pick[:72]}...\n{MARK}   " + _isa_summary("\n".join(funcs[pick]))
+
+
+def _ulps_bf16(a, b):
+    """|a - b| in bf16 ulps of max(|a|, |b|), elementwise."""
+    a, b = a.float(), b.float()
+    _, ex = torch.frexp(torch.maximum(a.abs(), b.abs()))
+    return (a - b).abs() / torch.ldexp(torch.ones_like(a), ex - 8)
+
+
 def main() -> int:
     """Oracle on silicon at Qwen3.8-Flash-Next's router + MXFP4 MoE (512 routed experts +
-    fused shared expert 512, top-10 + 1, hidden 2560, inter 640 padded to 768): every
-    output of aiter.topk_softmax -> moe_sorting -> fused_dynamic_mxfp4_quant_moe_sort vs
-    the fused kernel bitwise; aiter.fused_moe with the router deferral vs stock bitwise;
-    HIP-graph replay with new inputs; graphed us/call of the glue and of a whole MoE layer."""
+    fused shared expert 512, top-10 + 1, hidden 2560, inter 640 padded to 768).
+    Criteria: top-k ids, sort structure (sorted ids / expert ids / num_valid), a1 and the
+    valid a1_scale bytes bitwise vs aiter.topk_softmax -> moe_sorting ->
+    fused_dynamic_mxfp4_quant_moe_sort; sorted weights = the kernel's own top-k weights
+    slot for slot; top-k weights vs stock reported as bit-exact share + max fp32 ulps (the
+    gating exp is calibrated first); aiter.fused_moe with the router deferral vs stock
+    within max(2, stock run-to-run) bf16 ulps per element (bitwise when the weights are);
+    HIP-graph replay on new inputs == eager; graphed us/call of the glue and a MoE layer."""
     os.environ.setdefault("AITER_CONFIG_FMOE", os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs",
         "mi350p_tuned_fmoe.csv"))
@@ -404,14 +522,14 @@ def main() -> int:
 
     install_aiter(fm)
     dev, e1, k1, h, inter, ip = "cuda", 513, 11, 2560, 640, 768
-    torch.manual_seed(0)
     failed = False
 
-    def inputs(m):
-        lg = (torch.randn(m, e1, device=dev) * 2.0).to(torch.bfloat16)
+    def inputs(m, seed):
+        g = torch.Generator(device=dev).manual_seed(seed)
+        lg = (torch.randn(m, e1, device=dev, generator=g) * 2.0).to(torch.bfloat16)
         lg[: (m + 1) // 2, 7] = lg[: (m + 1) // 2, 3]                  # ties
         lg[m // 2:, 9] = lg[m // 2:, : e1 - 1].max(1).values           # tie for the top-1
-        hs = torch.randn(m, h, device=dev).to(torch.bfloat16)
+        hs = torch.randn(m, h, device=dev, generator=g).to(torch.bfloat16)
         hs[:, :32] = 0                                                 # amax floor 1e-10
         hs[:, 64:96] = -hs[:, 64:96].abs() * 1e-3                      # -0 nibbles
         hs[:, 96:128] *= 1e4
@@ -427,6 +545,31 @@ def main() -> int:
         return lambda: topk_softmax(w, ids[:, : k1 - 1], torch.empty(
             lg.shape[0], k1 - 1, dtype=torch.int32, device=dev), lg, True, 1, "sigmoid")
 
+    def ulps32(a, b):
+        return int((a.view(torch.int32).long() - b.view(torch.int32).long()).abs().max())
+
+    # Gating exp calibration on one input set (fusion off, as in the fused kernel).
+    lg, _ = inputs(40, 1)
+    w0, i0 = bufs(40)
+    gate(lg, w0, i0)()
+    asm = {}
+    for mode in (0, 1, 2, 3):
+        w1, i1 = bufs(40)
+        kern = _gate_kernel[(1,)](lg, w1, i1, 40, lg.stride(0), w1.stride(0), i1.stride(0),
+                                  E=e1 - 1, K=k1 - 1, MP=64, EXP_MODE=mode, num_warps=16,
+                                  enable_fp_fusion=False)
+        asm[mode] = getattr(kern, "asm", {}).get("amdgcn", "")
+        torch.cuda.synchronize()
+        exact = (w0.view(torch.int32) == w1.view(torch.int32)).float().mean().item()
+        print(f"{MARK} gating exp mode {mode}: ids {'bitwise' if torch.equal(i0, i1) else 'DIFFER'}, "
+              f"weights bit-exact {100 * exact:.1f}% (max {ulps32(w0, w1)} fp32 ulps)"
+              f"{' <- configured' if mode == EXP else ''}", flush=True)
+    try:
+        print(f"{MARK} stock ISA {_stock_gating_isa()}", flush=True)
+    except Exception as exc:  # diagnostic only
+        print(f"{MARK} stock ISA dump failed: {type(exc).__name__}: {exc}", flush=True)
+    print(f"{MARK} Triton gate ISA (exp mode {EXP}) {_isa_summary(asm[EXP])}", flush=True)
+
     def stock_glue(lg, hs, w, ids, block, acc):
         gate(lg, w, ids)()
         srt = _ORIG["sort"](ids, w, e1, h, torch.bfloat16, block, None, None, 0,
@@ -436,56 +579,57 @@ def main() -> int:
                                  sorted_weights=srt[1], num_experts_upper_bound=e1)
         return srt, a1, a1s
 
-    def fused_glue(lg, hs, w, ids, block, acc, math=MATH):
-        srt = _route(Job(lg, hs, w, ids, None), block, acc, h, torch.bfloat16, None, math)
+    def fused_glue(lg, hs, w, ids, block, acc):
+        srt = _route(Job(lg, hs, w, ids, None), block, acc, h, torch.bfloat16, None)
         return (srt, *_QUANT.pop(srt[0].data_ptr())[1:])
 
-    def compare(m, block, acc, math=MATH):
-        lg, hs = inputs(m)
+    worst_w = 0
+    for case, (m, block, acc) in enumerate(((1, 32, False), (2, 32, False), (4, 32, False),
+                                            (5, 32, False), (5, 16, False), (5, 64, False),
+                                            (8, 32, False), (16, 32, False), (32, 32, True),
+                                            (40, 32, False), (40, 64, True), (64, 32, False))):
+        lg, hs = inputs(m, 100 + case)
         (w0, i0), (w1, i1) = bufs(m), bufs(m)
         s0, q0, qs0 = stock_glue(lg, hs, w0, i0, block, acc)
-        s1, q1, qs1 = fused_glue(lg, hs, w1, i1, block, acc, math)
+        s1, q1, qs1 = fused_glue(lg, hs, w1, i1, block, acc)
         torch.cuda.synchronize()
         nv = int(s0[3][0])
-        rows = torch.nonzero((s0[0][:nv] & 0xFFFFFF) < m).flatten()
+        sid = s0[0][:nv]
+        tok, slot = sid & 0xFFFFFF, sid >> 24
+        real = tok < m
+        rows = torch.nonzero(real).flatten()
         sn = (h // 32 + 7) // 8 * 8
         addr = _scale_addr(rows[:, None], torch.arange(h // 32, device=dev)[None, :], sn)
+        own = torch.where(real, w1[tok.clamp(max=m - 1).long(), slot.clamp(max=k1 - 1).long()],
+                          torch.zeros_like(s1[1][:nv]))
         res = {
             "ids": torch.equal(i0[:, : k1 - 1], i1[:, : k1 - 1]),
             "num_valid": torch.equal(s0[3], s1[3]),
-            "sorted_ids": torch.equal(s0[0][:nv], s1[0][:nv]),
-            "sorted_w": torch.equal(s0[1][:nv].view(torch.int32), s1[1][:nv].view(torch.int32)),
+            "sorted_ids": torch.equal(sid, s1[0][:nv]),
             "expert_ids": torch.equal(s0[2][: nv // block], s1[2][: nv // block]),
+            "sorted_w=own": torch.equal(s1[1][:nv].view(torch.int32), own.view(torch.int32)),
             "a1": torch.equal(q0.view(torch.uint8), q1.view(torch.uint8)),
             "a1_scale": torch.equal(qs0.view(torch.uint8).flatten()[addr],
                                     qs1.view(torch.uint8).flatten()[addr]),
         }
         if acc:
-            res["moe_buf"] = bool((s1[4] == 0).all()) and s1[4].shape == s0[4].shape
-        wexact = (w0.view(torch.int32) == w1.view(torch.int32)).float().mean().item()
-        return res, wexact, nv
-
-    # Which Triton exp / division reproduce the HIP kernel's weights.
-    for math in ((0, 0), (0, 1), (1, 0), (1, 1)):
-        _, wexact, _ = compare(40, 32, False, math)
-        print(f"{MARK} gating math exp={math[0]} div={math[1]}: weights bit-exact "
-              f"{100 * wexact:.1f}%{' <- configured' if math == MATH else ''}", flush=True)
-    for m, block, acc in ((1, 32, False), (2, 32, False), (4, 32, False), (5, 32, False),
-                          (5, 16, False), (5, 64, False), (8, 32, False), (16, 32, False),
-                          (32, 32, True), (40, 32, False), (40, 64, True), (64, 32, False)):
-        res, wexact, nv = compare(m, block, acc)
-        good = all(res.values()) and wexact == 1.0
+            res["moe_buf=0"] = bool((s1[4] == 0).all()) and s1[4].shape == s0[4].shape
+        exact = (w0.view(torch.int32) == w1.view(torch.int32)).float().mean().item()
+        worst_w = max(worst_w, ulps32(w0, w1))
+        good = all(res.values())
         failed |= not good
-        bad = [k for k, v in res.items() if not v] + ([] if wexact == 1.0 else ["weights"])
+        bad = [k for k, v in res.items() if not v]
         print(f"{MARK} M={m} block={block} accumulate={acc}: {'MATCH' if good else 'MISMATCH'} "
-              f"(valid slots {nv}, weights bit-exact {100 * wexact:.1f}%"
-              f"{', differ: ' + ' '.join(bad) if bad else ''})", flush=True)
+              f"(valid slots {nv}; weights vs stock bit-exact {100 * exact:.1f}%, "
+              f"max {ulps32(w0, w1)} ulps{'; differ: ' + ' '.join(bad) if bad else ''})",
+              flush=True)
 
     # Whole MoE layer: tuned FlyDSL rows on vLLM-padded MXFP4 weights (tools/moe_fp4_oracle.py).
-    def quant(w):
-        y, s = per_1x32_f4_quant(w.reshape(-1, w.shape[-1]))
-        return y.view(torch.uint8).view(*w.shape[:2], -1), s.view(torch.uint8).view(*w.shape[:2], -1)
+    def quant(x):
+        y, s = per_1x32_f4_quant(x.reshape(-1, x.shape[-1]))
+        return y.view(torch.uint8).view(*x.shape[:2], -1), s.view(torch.uint8).view(*x.shape[:2], -1)
 
+    torch.manual_seed(0)
     w13 = torch.zeros(e1, 2 * ip, h // 2, dtype=torch.uint8, device=dev)
     w13s = torch.ones(e1, 2 * ip, h // 32, dtype=torch.uint8, device=dev)
     w2 = torch.zeros(e1, h, ip // 2, dtype=torch.uint8, device=dev)
@@ -524,52 +668,61 @@ def main() -> int:
         defer(Job(lg, hs, w, ids, gate(lg, w, ids)))
         return moe(hs, w, ids)
 
-    for m in (1, 2, 5, 8, 32, 40, 64):
-        lg, hs = inputs(m)
+    def bound(m, lg, hs):  # stock's own run-to-run spread, in bf16 ulps
+        (wa, ia), (wb, ib) = bufs(m), bufs(m)
+        return max(2.0, float(_ulps_bf16(stock_layer(lg, hs, wa, ia),
+                                         stock_layer(lg, hs, wb, ib)).max()))
+
+    for case, m in enumerate((1, 2, 5, 8, 32, 40, 64)):
+        lg, hs = inputs(m, 200 + case)
         (w0, i0), (w1, i1) = bufs(m), bufs(m)
         picked.clear()
         ref = stock_layer(lg, hs, w0, i0)
-        before = dict(STATS)
+        fused_before = STATS["fused"]
         out = fused_layer(lg, hs, w1, i1)
         torch.cuda.synchronize()
-        used = "fused" if STATS["fused"] > before.get("fused", 0) else "stock fallback"
-        good = torch.equal(ref, out) and not _JOBS and not _QUANT
+        used = "fused" if STATS["fused"] > fused_before else "stock fallback"
+        ul, lim = _ulps_bf16(out, ref), bound(m, lg, hs)
+        good = (bool(torch.isfinite(out).all()) and float(ul.max()) <= lim
+                and torch.equal(i0[:, :-1], i1[:, :-1]) and not _JOBS and not _QUANT)
         failed |= not good
-        print(f"{MARK} fused_moe M={m} ({used}, row block_m={picked[0][0]} "
-              f"{picked[0][1]}): {'MATCH' if good else 'MISMATCH'} bitwise "
-              f"(max abs diff {(ref.float() - out.float()).abs().max().item():.3e})", flush=True)
+        print(f"{MARK} fused_moe M={m} ({used}, row block_m={picked[0][0]} {picked[0][1]}): "
+              f"{'MATCH' if good else 'MISMATCH'} ({'bitwise' if torch.equal(ref, out) else ''} "
+              f"max {float(ul.max()):.0f} bf16 ulps, {int((ul > 0).sum())} of {ul.numel()} "
+              f"elements differ, bound {lim:.0f})", flush=True)
 
     for m in (5, 40):  # one graph, replayed on new logits / hidden states
-        lg, hs = inputs(m)
+        lg, hs = inputs(m, 300 + m)
         w, ids = bufs(m)
         fused_layer(lg, hs, w, ids)
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             out = fused_layer(lg, hs, w, ids)
-        nlg, nhs = inputs(m)
+        nlg, nhs = inputs(m, 400 + m)
         lg.copy_(nlg)
         hs.copy_(nhs)
         g.replay()
-        w0, i0 = bufs(m)
-        ref = stock_layer(nlg, nhs, w0, i0)
+        we, ie = bufs(m)
+        eager = fused_layer(nlg, nhs, we, ie)
         torch.cuda.synchronize()
-        good = torch.equal(ref, out) and torch.equal(i0[:, :-1], ids[:, :-1])
+        good = torch.equal(eager, out) and torch.equal(ie, ids)
         failed |= not good
-        print(f"{MARK} graph replay M={m} on new inputs vs eager stock: "
+        print(f"{MARK} graph replay M={m} on new inputs == eager fused: "
               f"{'MATCH' if good else 'MISMATCH'}", flush=True)
 
     reps = 50
     for m in (1, 5, 8, 40, 64):
-        data = [inputs(m) + bufs(m) for _ in range(reps)]
+        data = [inputs(m, 500 + i) + bufs(m) for i in range(reps)]
         t_s = _graph_us(lambda i: stock_glue(*data[i], 32, False), reps)[0]
         t_f = _graph_us(lambda i: fused_glue(*data[i], 32, False), reps)[0]
         line = f"{MARK} M={m} glue (top-k + sort + quant-sort) graphed: stock {t_s:.1f} us -> {t_f:.1f} us"
         if m in (1, 5, 40):
-            t_ls = _graph_us(lambda i: stock_layer(*data[i % 20]), 20)[0]
-            t_lf = _graph_us(lambda i: fused_layer(*data[i % 20]), 20)[0]
+            t_ls = _graph_us(lambda i: stock_layer(*data[i]), 20)[0]
+            t_lf = _graph_us(lambda i: fused_layer(*data[i]), 20)[0]
             line += f" | whole MoE layer {t_ls:.1f} -> {t_lf:.1f} us"
         print(line, flush=True)
+    print(f"{MARK} weights vs stock: max {worst_w} fp32 ulps over all cases", flush=True)
     print(f"{MARK} " + ("ALL MATCH" if not failed else "SOME MISMATCH"), flush=True)
     return 1 if failed else 0
 
