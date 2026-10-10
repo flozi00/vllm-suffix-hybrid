@@ -92,7 +92,7 @@ SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non
   the 128-CU MI350P otherwise runs the 256-CU MI355X DEFAULT.json tiles. A shape without a
   plugin file resolves exactly as before. vLLM's preshuffle-tuned guard (probes 2x K) only
   gates the ASM path (VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=1), not this one.
-SUFFIX_ROCM_MOE_ROUTE=1: at M <= SUFFIX_ROCM_MOE_ROUTE_MAX_M (64) the MoE router's top-k,
+SUFFIX_ROCM_MOE_ROUTE=1: at M <= SUFFIX_ROCM_MOE_ROUTE_MAX_M (256) the MoE router's top-k,
   AITER's moe_sorting (P0_v2 + P23) and the stage-1 MXFP4 quant-sort run as two Triton
   launches (suffix_hybrid/kernels/moe_route_rocm.py): ids, sort and quant bit-identical, the
   gating weights too with the calibrated exp (SUFFIX_ROCM_MOE_ROUTE_EXP, 0 or 2); the

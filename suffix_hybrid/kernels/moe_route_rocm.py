@@ -8,9 +8,9 @@ are preceded by four launches: aiter.topk_softmax (vllm::moe::topkGatingSoftmax,
 P0_v2 + P23 pair, ~8 us) and fused_dynamic_mxfp4_quant_moe_sort (~4 us); ~52 MoE
 layers per MTP-4 step. At M <= MAX_M two launches do all of it, bit-for-bit:
 launch 1 (grid M x 2, one wave each) gates token t (+ its 32-word expert bitmap) and,
-in parallel, writes its MXFP4 row and its E8M0 bytes in token order; launch 2 (grid M)
-places token t's slots of AITER's sort, each program recounting every expert's tokens from
-the bitmaps for the padded starts (no gather / sort / scan / histogram: this Triton asserts
+in parallel, writes its MXFP4 row and its E8M0 bytes in token order; launch 2 (grid M, or
+M / 4 above 64 rows) places its tokens' slots of AITER's sort, each program recounting every
+expert's tokens from the bitmaps for the padded starts (no gather / sort / scan / histogram: this Triton asserts
 on tl.gather layouts), and scatters its slots' E8M0 bytes into the shuffled layout. (One
 program for everything was latency-bound: 44 us at M 1 vs stock 20; launch 2 as one program
 lost above 16 rows.)
@@ -83,11 +83,10 @@ except ImportError:
     libdevice = None
 
 MARK = "[suffix moe-route]"
-# ponytail: one program does the whole batch; above 64 tokens the stock multi-CU kernels win.
-# MI350P k33 gate (launch 2 as one program), glue graphed us stock -> fused: M 1 20.1 -> 10.0,
-# 5 21.9 -> 13.0, 8 21.9 -> 15.3, 16 24.9 -> 22.6, 32 28.9 -> 35.7, 40 30.1 -> 53.1, 64 33.1 ->
-# 66.2. Launch 2 is now one program per token (no M-sized serial work): 64 pending the gate.
-MAX_M = min(64, int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_MAX_M", "64")))
+# MI350P glue graphed us stock -> fused, v5 gate (launch 2 one program per token): M 1 19.8 ->
+# 10.8, 5 21.6 -> 11.2, 8 21.8 -> 11.3, 16 24.7 -> 12.0, 32 28.9 -> 13.1, 40 30.0 -> 13.7,
+# 64 33.1 -> 14.1. Above 64 rows launch 2 places 4 tokens per program; 256 pending the gate.
+MAX_M = min(256, int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_MAX_M", "256")))
 EXP = int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_EXP", "2"))
 BLOCKS = (16, 32, 64, 128)
 STATS: Counter = Counter()
@@ -232,40 +231,46 @@ def _route_sort_kernel(
     w_ptr, ids_ptr, map_ptr, stage_ptr, sid_ptr, sw_ptr, seid_ptr, nv_ptr, a1s_ptr,
     M, n_pad, stride_w, stride_ids,
     E: tl.constexpr, K: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr,
-    MP: tl.constexpr,
+    MP: tl.constexpr, TPP: tl.constexpr, TCH: tl.constexpr,
 ):
-    """Launch 2, grid (M,): program t places token t's K + 1 slots of AITER's sort and their
-    E8M0 bytes. Each program recounts every expert's tokens from all bitmaps (256 experts at a
-    time), so the padded expert starts need no third launch and no cross-program sync."""
+    """Launch 2, grid (cdiv(M, TPP),): program p places tokens p*TPP .. p*TPP+TPP-1 (their K + 1
+    slots of AITER's sort and their E8M0 bytes). Each program recounts every expert's tokens
+    from all bitmaps (TCH tokens x 256 experts at a time), so the padded expert starts need no
+    third launch and no cross-program sync."""
     SN: tl.constexpr = (H // 32 + 7) // 8 * 8
-    t = tl.program_id(0)
-    kk = tl.arange(0, 16)
-    valid = kk <= K
-    e = tl.load(ids_ptr + t * stride_ids + kk, mask=kk < K, other=E)  # slot K: shared expert
+    p = tl.program_id(0)
+    i = tl.arange(0, 16 * TPP)  # entry = (token t, slot k)
+    t = p * TPP + i // 16
+    k = i % 16
+    valid = (t < M) & (k <= K)
+    e = tl.load(ids_ptr + t * stride_ids + k, mask=valid & (k < K), other=E)  # slot K: shared
     e = tl.where(valid, e, 1023)
-    # tokens of each own expert: bit e of every token's bitmap; cnt = all, rank = earlier ones
+    # tokens of each entry's expert: bit e of every token's bitmap; cnt = all, rank = earlier
     tp = tl.arange(0, MP)
     has = (tl.load(map_ptr + tp[None, :] * 32 + (e >> 5)[:, None],
                    mask=valid[:, None] & (tp < M)[None, :], other=0) >> (e & 31)[:, None]) & 1
     cnt = tl.sum(has, axis=1)
-    rank = tl.sum(tl.where(tp[None, :] < t, has, 0), axis=1)
+    rank = tl.sum(tl.where(tp[None, :] < t[:, None], has, 0), axis=1)
     # padded start = BLOCK * sum over lower experts of ceil(tokens / BLOCK)
-    pre = tl.zeros([16], dtype=tl.int32)
-    total = tl.zeros([16], dtype=tl.int32)  # all blocks (equal lanes)
+    pre = tl.zeros([16 * TPP], dtype=tl.int32)
+    total = tl.zeros([16 * TPP], dtype=tl.int32)  # all blocks (equal lanes)
     wl = tl.arange(0, 8)
     for c in tl.static_range((E + 256) // 256):
         word = c * 8 + wl
-        words = tl.load(map_ptr + tp[:, None] * 32 + word[None, :],
-                        mask=(tp < M)[:, None] & (word < 32)[None, :], other=0)
-        bits = (words[:, :, None] >> tl.arange(0, 32)[None, None, :]) & 1
-        nb = (tl.reshape(tl.sum(bits, axis=0), [256]) + BLOCK - 1) // BLOCK
+        n = tl.zeros([8, 32], dtype=tl.int32)
+        for r in tl.static_range(MP // TCH):
+            tr = r * TCH + tl.arange(0, TCH)
+            words = tl.load(map_ptr + tr[:, None] * 32 + word[None, :],
+                            mask=(tr < M)[:, None] & (word < 32)[None, :], other=0)
+            n += tl.sum((words[:, :, None] >> tl.arange(0, 32)[None, None, :]) & 1, axis=0)
+        nb = (tl.reshape(n, [256]) + BLOCK - 1) // BLOCK
         lower = (c * 256 + tl.arange(0, 256))[None, :] < e[:, None]
         pre += tl.sum(tl.where(lower, nb[None, :], 0), axis=1)
         total += tl.sum(nb, axis=0)
     dest = pre * BLOCK + rank
     put = valid & (dest < n_pad)  # always true for distinct ids per token; never write past
-    tl.store(sid_ptr + dest, t | (kk << 24), mask=put)
-    tl.store(sw_ptr + dest, tl.load(w_ptr + t * stride_w + kk, mask=valid, other=0.0), mask=put)
+    tl.store(sid_ptr + dest, t | (k << 24), mask=put)
+    tl.store(sw_ptr + dest, tl.load(w_ptr + t * stride_w + k, mask=valid, other=0.0), mask=put)
     tl.store(seid_ptr + dest // BLOCK, e, mask=put & (rank % BLOCK == 0))  # opens a block
     nblk = (cnt + BLOCK - 1) // BLOCK
     last = valid & (rank == cnt - 1)  # the expert's last token pads its last block
@@ -273,19 +278,20 @@ def _route_sort_kernel(
         pad = last & (cnt + j < nblk * BLOCK) & (dest + 1 + j < n_pad)
         tl.store(sid_ptr + dest + 1 + j, M | ((K + 1) << 24), mask=pad)
         tl.store(sw_ptr + dest + 1 + j, 0.0, mask=pad)
-    tl.store(nv_ptr + kk, tl.where(kk == 0, tl.minimum(total * BLOCK, n_pad), M),
-             mask=(kk < 2) & (t == 0))
+    tl.store(nv_ptr + i, tl.where(i == 0, tl.minimum(total * BLOCK, n_pad), M),
+             mask=(i < 2) & (p == 0))
     d = dest[:, None]
     for c in tl.static_range((H // 32 + 31) // 32):
         y = (c * 32 + tl.arange(0, 32))[None, :]
-        sb = tl.load(stage_ptr + t * (H // 32) + y, mask=y < H // 32, other=0)
+        ok = put[:, None] & (y < H // 32)
+        sb = tl.load(stage_ptr + t[:, None] * (H // 32) + y, mask=ok, other=0)
         addr = ((d // 32 * SN) * 32 + (y // 8) * 256 + (y % 4) * 64 + (d % 16) * 4
                 + (y % 8) // 4 * 2 + (d % 32) // 16)
-        tl.store(a1s_ptr + addr, tl.broadcast_to(sb, [16, 32]), mask=put[:, None] & (y < H // 32))
+        tl.store(a1s_ptr + addr, sb, mask=ok)
 
 
 def _mp(m: int) -> int:
-    return 8 if m <= 8 else 16 if m <= 16 else 32 if m <= 32 else 64
+    return max(8, triton.next_power_of_2(m))
 
 
 def _route(job: Job, block: int, accumulate: bool, model_dim: int, buf_dtype, output,
@@ -319,10 +325,11 @@ def _route(job: Job, block: int, accumulate: bool, model_dim: int, buf_dtype, ou
         E=e1 - 1, K=slots - 1, H=h, EXP_MODE=exp_mode, ZERO_BUF=bool(accumulate),
         num_warps=1, enable_fp_fusion=False)
     mp = _mp(m)
-    _route_sort_kernel[(m,)](
+    tpp = 1 if mp <= 64 else 4  # tokens per program: <= 64 programs recount the bitmaps
+    _route_sort_kernel[(triton.cdiv(m, tpp),)](
         job.weights, job.ids, rowmap, stage, sorted_ids, sorted_w, sorted_e, nvalid,
         a1s.view(torch.uint8), m, n_pad, job.weights.stride(0), job.ids.stride(0),
-        E=e1 - 1, K=slots - 1, H=h, BLOCK=block, MP=mp,
+        E=e1 - 1, K=slots - 1, H=h, BLOCK=block, MP=mp, TPP=tpp, TCH=min(mp, 64),
         num_warps=1 if mp <= 16 else 2 if mp <= 32 else 4)
     _QUANT.clear()
     _QUANT[sorted_ids.data_ptr()] = (job.hidden, a1, a1s)
@@ -558,7 +565,9 @@ def main() -> int:
     for case, (m, block, acc) in enumerate(((1, 32, False), (2, 32, False), (4, 32, False),
                                             (5, 32, False), (5, 16, False), (5, 64, False),
                                             (8, 32, False), (16, 32, False), (32, 32, True),
-                                            (40, 32, False), (40, 64, True), (64, 32, False))):
+                                            (40, 32, False), (40, 64, True), (64, 32, False),
+                                            (96, 32, True), (160, 32, True), (192, 32, True),
+                                            (256, 32, True))):
         lg, hs = inputs(m, 100 + case)
         (w0, i0), (w1, i1) = bufs(m), bufs(m)
         s0, q0, qs0 = stock_glue(lg, hs, w0, i0, block, acc)
@@ -644,7 +653,7 @@ def main() -> int:
         return max(2 * _row_rel(stock_layer(lg, hs, wa, ia), stock_layer(lg, hs, wb, ib)),
                    2.0 ** -8)
 
-    for case, m in enumerate((1, 2, 5, 8, 32, 40, 64)):
+    for case, m in enumerate((1, 2, 5, 8, 32, 40, 64, 96, 160, 256)):
         lg, hs = inputs(m, 200 + case)
         (w0, i0), (w1, i1) = bufs(m), bufs(m)
         picked.clear()
@@ -718,8 +727,8 @@ def main() -> int:
     graphs = {}
     fused_before = STATS["fused"]
     global MAX_M
-    max_m, MAX_M = MAX_M, 64  # every captured size routes fused here, whatever the default
-    for m in (64, 40, 32, 16, 8, 5, 4, 2, 1):
+    max_m, MAX_M = MAX_M, 256  # every captured size routes fused here, whatever the default
+    for m in (256, 160, 64, 40, 32, 16, 8, 5, 4, 2, 1):
         lg, hs = inputs(m, 600 + m)
         vllm_fused(lg, hs)
         torch.cuda.synchronize()
@@ -727,7 +736,7 @@ def main() -> int:
         with torch.cuda.graph(g, pool=pool):
             out = vllm_fused(lg, hs)
         graphs[m] = (g, lg, hs, out)
-    for rnd, m in enumerate((1, 64, 16, 5, 40, 8, 2, 32, 4, 16, 64, 1)):
+    for rnd, m in enumerate((1, 256, 64, 16, 160, 5, 40, 8, 2, 32, 4, 16, 256, 64, 1)):
         g, lg, hs, out = graphs[m]
         nlg, nhs = inputs(m, 700 + rnd)
         lg.copy_(nlg)
@@ -743,7 +752,7 @@ def main() -> int:
               f"{'MATCH' if good else 'MISMATCH'} "
               f"({'bitwise' if torch.equal(got, ref) else f'row-relative {rel:.2e}'}, bound {lim:.2e})",
               flush=True)
-    for m in (64, 32, 16, 8, 5, 1):
+    for m in (256, 160, 64, 32, 16, 8, 5, 1):
         g, lg, hs, out = graphs[m]
         bad, _ = inputs(m, 800 + m)
         bad[0] = float("nan")
@@ -769,18 +778,19 @@ def main() -> int:
               f"(distinct ids per token {distinct})", flush=True)
     MAX_M = max_m
     print(f"{MARK} vLLM path warm-up + capture used the fused route in "
-          f"{STATS['fused'] - fused_before} of 18 calls (0 = deferral never engaged)", flush=True)
+          f"{STATS['fused'] - fused_before} of 22 calls (0 = deferral never engaged)", flush=True)
     failed |= STATS["fused"] == fused_before
 
     reps = 50
     wins = []
-    for m in (1, 5, 8, 16, 24, 32, 40, 48, 64):
+    for m in (1, 5, 8, 16, 24, 32, 40, 48, 64, 96, 128, 160, 192, 256):
         data = [inputs(m, 500 + i) + bufs(m) for i in range(reps)]
-        t_s = _graph_us(lambda i: stock_glue(*data[i], 32, False), reps)[0]
-        t_f = _graph_us(lambda i: fused_glue(*data[i], 32, False), reps)[0]
+        acc = 16 < m <= 32 or m > 64  # the tuned rows' atomic stage 2 (moe_buf zeroed)
+        t_s = _graph_us(lambda i: stock_glue(*data[i], 32, acc), reps)[0]
+        t_f = _graph_us(lambda i: fused_glue(*data[i], 32, acc), reps)[0]
         wins.append((m, t_f < t_s))
         line = f"{MARK} M={m} glue (top-k + sort + quant-sort) graphed: stock {t_s:.1f} us -> {t_f:.1f} us"
-        if m in (1, 5, 16, 32, 40, 64):
+        if m in (1, 5, 16, 32, 40, 64, 160):
             t_ls = _graph_us(lambda i: stock_layer(*data[i]), 20)[0]
             t_lf = _graph_us(lambda i: fused_layer(*data[i]), 20)[0]
             line += f" | whole MoE layer {t_ls:.1f} -> {t_lf:.1f} us"
