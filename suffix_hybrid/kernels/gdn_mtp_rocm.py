@@ -119,6 +119,29 @@ def forward_spec(layer, qkvz, ba, core_attn_out, md) -> bool:
     return True
 
 
+def _mixed_plan(md):
+    """The layout check and the slices every GDN layer of a mixed step shares, once per
+    step (md is per step; a replaced host mask means a new batch). None = not a verify
+    prefix + prefill suffix (stock path runs)."""
+    masks = md.spec_sequence_masks_cpu
+    hit = vars(md).get("_suffix_mixed_plan")
+    if hit is not None and hit[0] is masks:
+        return hit[1]
+    ns, nst, n = md.num_spec_decodes, md.num_spec_decode_tokens, md.num_actual_tokens
+    plan = None
+    if (md.spec_sequence_masks is not None and md.num_prefills and not md.num_decodes
+            and masks is not None and ns and bool(masks[:ns].all())
+            and not bool(masks[ns:].any()) and nst + md.num_prefill_tokens == n):
+        plan = SimpleNamespace(
+            ns=ns, nst=nst, n=n, conv_idx=md.spec_state_indices_tensor[:, 0][:ns],
+            spec_cu=md.spec_query_start_loc[: ns + 1],
+            # masked_fill_ instead of boolean-index assignment: no nonzero(), no sync.
+            no_init=~md.prefill_has_initial_state.view(-1, 1, 1, 1),
+            pre_idx=md.prefill_state_indices.long())  # index_select / index_copy_ index
+    vars(md)["_suffix_mixed_plan"] = (masks, plan)
+    return plan
+
+
 def forward_mixed(layer, qkvz, ba, core_attn_out, md) -> bool:
     """_forward_core_rocm for spec verifies followed by prefills (vLLM's V2 runner orders
     verify rows first; checked on the host mask): the verify prefix takes forward_spec's
@@ -127,13 +150,10 @@ def forward_mixed(layer, qkvz, ba, core_attn_out, md) -> bool:
     repack, z copy and index_copy merges. False = not this layout (stock path runs)."""
     from suffix_hybrid.kernels.gdn_defer_rocm import gdn_defer, gdn_prefill
 
-    masks, ns = md.spec_sequence_masks_cpu, md.num_spec_decodes
-    nst, n = md.num_spec_decode_tokens, md.num_actual_tokens
-    if (md.spec_sequence_masks is None or not md.num_prefills or md.num_decodes
-            or layer.gqa_interleaved_layout or masks is None or not ns
-            or not bool(masks[:ns].all()) or bool(masks[ns:].any())
-            or nst + md.num_prefill_tokens != n):
+    plan = None if layer.gqa_interleaved_layout else _mixed_plan(md)
+    if plan is None:
         return False
+    nst, n = plan.nst, plan.n
     key_dim, value_dim = layer.key_dim // layer.tp_size, layer.value_dim // layer.tp_size
     qkv_dim, hv = 2 * key_dim + value_dim, value_dim // layer.head_v_dim
     idx = md.spec_state_indices_tensor
@@ -146,11 +166,11 @@ def forward_mixed(layer, qkvz, ba, core_attn_out, md) -> bool:
     # Verify prefix, rows [0, nst): forward_spec's conv + deferred delta rule.
     qkv = _Q.causal_conv1d_update(
         qkvz[:nst, :qkv_dim], conv_state, w, layer.conv1d.bias, layer.activation,
-        conv_state_indices=idx[:, 0][:ns], num_accepted_tokens=md.num_accepted_tokens,
+        conv_state_indices=plan.conv_idx, num_accepted_tokens=md.num_accepted_tokens,
         query_start_loc=md.spec_query_start_loc, max_query_len=idx.size(-1),
         validate_data=False)
     gdn_defer(qkv, ba[:nst, hv:], ba[:nst, :hv], layer.A_log, layer.dt_bias, ssm_state,
-              md.spec_query_start_loc[: ns + 1], idx, md.num_accepted_tokens,
+              plan.spec_cu, idx, md.num_accepted_tokens,
               md.suffix_spec_seq_lens, core_attn_out, key_dim // layer.head_k_dim,
               layer.head_k_dim, layer.head_v_dim, md.suffix_zone)
     # Prefill suffix, rows [nst, n): _forward_core's prefill calls (spec present, so the
@@ -174,16 +194,18 @@ def forward_mixed(layer, qkvz, ba, core_attn_out, md) -> bool:
         dt_bias=layer.dt_bias, num_k_heads=layer.num_k_heads // layer.tp_size,
         head_k_dim=layer.head_k_dim, head_v_dim=layer.head_v_dim, apply_l2norm=True,
         output_g_exp=False)
-    initial_state = ssm_state[md.prefill_state_indices]
-    initial_state[~md.prefill_has_initial_state, ...] = 0
-    o, last = layer.chunk_gated_delta_rule(
+    initial_state = ssm_state.index_select(0, plan.pre_idx)
+    initial_state.masked_fill_(plan.no_init, 0.0)
+    # Every chunk backend writes its output into core_attn_out (FLA in place, the
+    # others copy), so rows [nst, n) need no copy here.
+    _, last = layer.chunk_gated_delta_rule(
         q=q.unsqueeze(0), k=k.unsqueeze(0), v=v.unsqueeze(0), g=g.unsqueeze(0),
         beta=beta.unsqueeze(0), initial_state=initial_state, output_final_state=True,
         cu_seqlens=md.prefill_query_start_loc, chunk_indices=md.chunk_indices,
         chunk_offsets=md.chunk_offsets, use_qk_l2norm_in_kernel=False,
+        core_attn_out=core_attn_out[nst:n].reshape(-1),
         aiter_prefill_metadata=md.aiter_prefill_metadata)
-    ssm_state[md.prefill_state_indices] = last.to(ssm_state.dtype)
-    core_attn_out[nst:n] = o.squeeze(0)
+    ssm_state.index_copy_(0, plan.pre_idx, last.to(ssm_state.dtype))
     if n < core_attn_out.shape[0]:
         core_attn_out[n:].zero_()
     return True
