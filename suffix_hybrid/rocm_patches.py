@@ -92,17 +92,6 @@ SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non
   the 128-CU MI350P otherwise runs the 256-CU MI355X DEFAULT.json tiles. A shape without a
   plugin file resolves exactly as before. vLLM's preshuffle-tuned guard (probes 2x K) only
   gates the ASM path (VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=1), not this one.
-SUFFIX_PREFILL_CADENCE=1: the single engine core defers new prefills the way vLLM's DP core
-  does for --prefill-schedule-interval: while >= SUFFIX_PREFILL_MIN_RUNNING (default 16)
-  requests run, new ones are admitted on every SUFFIX_PREFILL_INTERVAL-th (default 4)
-  schedule() only, so several share one mixed (PIECEWISE) step. Trades TTFT (up to
-  INTERVAL - 1 decode steps) for fewer mixed steps at high concurrency. Not ROCm-specific.
-SUFFIX_ROCM_HC_FUSE2=1: Qwen4Exp GatedResidual.mix / combine_and_mix return through one custom
-  op per HC site (suffix_hybrid/kernels/hc_fuse2_rocm.py): at M <= SUFFIX_ROCM_HC_FUSE2_MAX_M
-  (default 16) combine + Gemma RMSNorm + the down(+inject) GEMM's split-K partials in one
-  launch, the partials' reduce + silu + up GEMM + gate mix in a second (4 launches before);
-  above it the HC_FUSE + HC_DOWN path. The patch only inserts the return at the top of each
-  method, so it composes with HC_FUSE / HC_DOWN in any order (their bodies stay, unreached).
 SUFFIX_ROCM_MOE_ROUTE=1: at M <= SUFFIX_ROCM_MOE_ROUTE_MAX_M (64) the MoE router's top-k,
   AITER's moe_sorting (P0_v2 + P23) and the stage-1 MXFP4 quant-sort run as one Triton
   launch (suffix_hybrid/kernels/moe_route_rocm.py), bit-identical outputs: the
@@ -163,17 +152,6 @@ _HC_DOWN_NEW = _HC_DOWN.replace(
     "                xn, self.input_mix_weight_down_block_inject.weight\n"
     "            )").replace(
     "self.input_mix_weight_down(xn)", "hc_down(xn, self.input_mix_weight_down.weight)")
-
-# HC_FUSE2 anchors: mix's signature and combine_and_mix's docstring end, which neither
-# HC_FUSE nor HC_DOWN touches.
-_HC_MIX_SIG = (
-    "    def mix(\n"
-    "        self, hidden_states: torch.Tensor\n"
-    "    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:\n")
-_HC_CAM_DOC = (
-    "        block's mix. Its combine with ``block_output`` is fused with this\n"
-    "        module's input RMSNorm.\n"
-    '        """\n')
 
 _QSA_SPARSE_BODY = (  # vllm/models/qwen4_exp/amd/ops/qsa.py @81198e97: tile body of
     # _qsa_sparse_paged_gqa_splitk_kernel's loop, byte-exact
@@ -561,26 +539,6 @@ PATCHES = {
         Patch(_HC, "HC down projection split-K at small M (combine_and_mix)",
               "            prev_injection,\n" + _HC_DOWN,
               "            prev_injection,\n" + _HC_DOWN_NEW),
-    ),
-    "SUFFIX_PREFILL_CADENCE": Patch(
-        "vllm.v1.engine.core",
-        "new prefills next to >= SUFFIX_PREFILL_MIN_RUNNING decodes every SUFFIX_PREFILL_INTERVAL steps",
-        "        Overridden by the DP engine core; never throttles otherwise.\"\"\"\n"
-        "        return False\n",
-        "        Overridden by the DP engine core; never throttles otherwise.\"\"\"\n"
-        "        # suffix SUFFIX_PREFILL_CADENCE: the DP core's cadence on one engine, so the\n"
-        "        # (PIECEWISE) mixed steps batch several new requests at high concurrency\n"
-        "        self._suffix_sched_calls = getattr(self, \"_suffix_sched_calls\", 0) + 1\n"
-        "        return (len(self.scheduler.running) >= int(os.environ.get(\"SUFFIX_PREFILL_MIN_RUNNING\", \"16\"))\n"
-        "                and self._suffix_sched_calls % int(os.environ.get(\"SUFFIX_PREFILL_INTERVAL\", \"4\")) != 0)\n"),
-    "SUFFIX_ROCM_HC_FUSE2": (
-        Patch(_HC, "HC site in two launches at small M (mix)", _HC_MIX_SIG,
-              _HC_MIX_SIG + "        return hc_fuse2_mix(self, hidden_states)  # suffix rocm-hc-fuse2\n",
-              "suffix_hybrid.kernels.hc_fuse2_rocm:install"),
-        Patch(_HC, "HC site in two launches at small M (combine_and_mix)", _HC_CAM_DOC,
-              _HC_CAM_DOC + "        return hc_fuse2_combine_and_mix(  # suffix rocm-hc-fuse2\n"
-              "            self, hidden_states, prev_block_output, prev_injection\n"
-              "        )\n"),
     ),
     # Inside the lru-cached lookup: one file probe per (shape, M) per process; a plugin
     # miss (None) falls through to AITER's own probe unchanged.

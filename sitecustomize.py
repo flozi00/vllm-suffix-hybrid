@@ -298,7 +298,7 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_AITER_FLYDSL_PAD", "SUFFIX_ROCM_AITER_FLYDSL_ZERO",
                   "SUFFIX_ROCM_AFP4_CONFIGS", "SUFFIX_ROCM_QSA_DENSE",
                   "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
-                  "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_HC_FUSE2", "SUFFIX_PREFILL_CADENCE")):
+                  "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
             and not all(os.environ.get(_g, "").strip() == "1"
                         for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
@@ -575,10 +575,6 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_HC_DOWN split-K kernel vs F.linear (hipBLASLt) at N 336/320, M 1..160:
     # bf16 bound + bit-exact share, determinism, graphed us/call (cold weights), sweep.
     "hc_down_bench": (["-m", "suffix_hybrid.kernels.hc_down_rocm"], {}),
-    # SUFFIX_ROCM_HC_FUSE2 site (2 launches) vs the HC_FUSE + HC_DOWN path (4) vs vLLM's stock
-    # chain against an fp64 chain, M 1..64, mix / combine_and_mix / final mixer; graphed
-    # us/site (cold weights), AMDGCN stats, config sweep + a paste-able _CFG line.
-    "hc_fuse2_bench": (["-m", "suffix_hybrid.kernels.hc_fuse2_rocm"], {}),
     # AITER fused-MoE tuner for this card's CU count (qwen3.8-flash MXFP4 MoE; the
     # _fse variant = shared expert fused as expert 513, top-11); prints the CSV.
     "aiter_moe_tune": (["-m", "suffix_hybrid.tools.aiter_moe_tune"], {}),

@@ -372,7 +372,7 @@ CONFIG = (16, 1, 1)  # BV, num_warps, num_stages. MI350P k16 oracle, graphed us 
 # SUFFIX_ROCM_GDN_DEFER_MFMA=1: gdn_defer runs _gdn_defer_mfma_kernel (MFMA_CONFIG = BV,
 # num_warps, RELOAD). Records are shared with v1 at its BV 16 (CONFIG above).
 MFMA = os.environ.get("SUFFIX_ROCM_GDN_DEFER_MFMA", "").strip() == "1"
-MFMA_CONFIG = (32, 2, False)
+MFMA_CONFIG = (16, 1, False)
 
 
 def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_accepted,

@@ -76,18 +76,3 @@ def test_gate_off_is_inert(monkeypatch):
     assert rp.install_post_import_hook() is False
     assert MQA.after == "suffix_hybrid.kernels.qsa_mqa_rocm:install" and not MQA.old
 
-
-def test_prefill_cadence(monkeypatch):
-    p = rp.PATCHES["SUFFIX_PREFILL_CADENCE"]
-    src = ("import os\n"
-           "class EngineCore:\n"
-           "    def _should_throttle_prefills(self) -> bool:\n"
-           "        \"\"\"Whether to defer new prefills this step (DP prefill balancing).\n" + p.old)
-    ns = {}
-    exec(compile(rp.patch_source(p, src), "<t>", "exec"), ns)
-    core = ns["EngineCore"]()
-    core.scheduler = type("S", (), {"running": [0] * 16})()
-    monkeypatch.setenv("SUFFIX_PREFILL_INTERVAL", "4")
-    assert [core._should_throttle_prefills() for _ in range(8)] == [True, True, True, False] * 2
-    core.scheduler.running = [0] * 15  # below SUFFIX_PREFILL_MIN_RUNNING (16): never defer
-    assert not any(core._should_throttle_prefills() for _ in range(8))

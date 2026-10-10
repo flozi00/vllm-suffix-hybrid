@@ -22,7 +22,12 @@ HIP-graph safe: grids and the partials buffer follow from shapes; no host sync.
 Tried (2026-10-10): the last split program of a tile reduces instead of the second launch
 (acq_rel tile counter). Correct, but 24-28 us vs 6.1-6.4 us at M <= 16 and ~66 vs ~8 us at
 M 40-64: device-scope release / acquire on the MI350P's per-XCD L2s costs far more than the
-launch it saves.
+launch it saves. Also tried: the whole HC site in two launches (combine + Gemma RMSNorm +
+these split-K partials; the partials' reduce + silu + up GEMM + gate mix). Exact (hidden
+bitwise, block_input at stock error), but 22.2-23.1 us per site vs 15.1-16.2 us for today's
+four launches at M 1-16 (41-42 vs 21.1 / 24.6 us at M 40 / 64): every split program
+recomputes its stream's rms before its GEMM, and the reduce prologue re-reads SPLIT x M x
+336 fp32 per program (up to 256 VGPRs + AGPRs, occupancy 1).
 
     python -m suffix_hybrid.kernels.hc_down_rocm   # GPU oracle + us/call (boot gate hc_down_bench)
 """
