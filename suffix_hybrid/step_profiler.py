@@ -263,7 +263,32 @@ def summarize(trace: dict, py_stats: dict | None = None) -> list[str]:
         out.append(f"  {calls / n:7.1f} | {dur / n / 1e3:7.3f} | "
                    f"{100 * dur / gpu_sum:5.1f} | {category(name)} | "
                    f"{_short(name)}")
+    out.extend(_gaps(gpu, anns, n))
     out.extend(_by_signature(steps, (py_stats or {}).get("sigs") or [], rt, gpu))
+    return out
+
+
+def _gaps(gpu, anns, n: int, min_us: float = 10.0, top: int = 15) -> list[str]:
+    """GPU idle gaps > min_us, keyed by (kernel before -> kernel after) and the innermost
+    host annotation spanning the gap's end: where the GPU waits on the host."""
+    agg = defaultdict(lambda: [0, 0.0])
+    end, prev = None, "-"
+    for e in sorted(gpu, key=lambda e: e["ts"]):
+        if end is not None and e["ts"] - end > min_us:
+            host = [a for a in anns if a["ts"] <= e["ts"] <= a["ts"] + a["dur"]]
+            own = min(host, key=lambda a: a["dur"])["name"] if host else "-"
+            row = agg[f"{_short(prev, 48)} -> {_short(e.get('name', '?'), 48)} | host {own}"]
+            row[0] += 1
+            row[1] += e["ts"] - end
+        if end is None or e["ts"] + e["dur"] > end:
+            end, prev = e["ts"] + e["dur"], e.get("name", "?")
+    if not agg:
+        return []
+    total = sum(v[1] for v in agg.values())
+    out = [f"gpu idle gaps > {min_us:.0f} us: {total / n / 1e3:.3f} ms/step; top {top}: "
+           "gaps/step | ms/step | kernel before -> kernel after | host"]
+    for k, (c, d) in sorted(agg.items(), key=lambda kv: -kv[1][1])[:top]:
+        out.append(f"  {c / n:6.2f} | {d / n / 1e3:7.3f} | {k}")
     return out
 
 

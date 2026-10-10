@@ -58,6 +58,9 @@ def test_summarize_synthetic_trace():
     assert "D2H copies/step 0.5" in text
     assert "inside graphs seen: 1 of 3" in text
     assert "target:FULLx1: 2" in text
+    # idle gaps: moe end 900 -> memcpy 950, memcpy end 960 -> attn 1300 = 390 us / 2 steps
+    assert "gpu idle gaps > 10 us: 0.195 ms/step" in text
+    assert "Memcpy DtoH (Device -> Pinned) -> nvfp4_attn_partial | host -" in text
     assert "attn K2 own (verify) 0.300" in text
 
 
