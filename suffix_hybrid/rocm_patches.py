@@ -89,6 +89,12 @@ SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non
   the 128-CU MI350P otherwise runs the 256-CU MI355X DEFAULT.json tiles. A shape without a
   plugin file resolves exactly as before. vLLM's preshuffle-tuned guard (probes 2x K) only
   gates the ASM path (VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=1), not this one.
+SUFFIX_ROCM_TOPK_TOPP=1: vLLM's apply_top_k_top_p_triton (Qrita, one program per row) runs,
+  for batches with a top-k, as three launches with each row split across programs
+  (suffix_hybrid/kernels/lm_sample_rocm.py): the statistics / outlier gather and the final
+  mask in parallel, stock's pivot search and top-p code verbatim in between, the same masks
+  by construction. p-only rows keep stock's paths. The hook pins the stock functions'
+  source (sha256) and keeps stock when vLLM differs from 81198e97.
 """
 import glob
 import importlib.util
@@ -533,6 +539,10 @@ PATCHES = {
               "            prev_injection,\n" + _HC_DOWN,
               "            prev_injection,\n" + _HC_DOWN_NEW),
     ),
+    "SUFFIX_ROCM_TOPK_TOPP": Patch(
+        "vllm.v1.sample.ops.topk_topp_triton",
+        "top-k / top-p with rows split across programs",
+        after="suffix_hybrid.kernels.lm_sample_rocm:install"),
     # Inside the lru-cached lookup: one file probe per (shape, M) per process; a plugin
     # miss (None) falls through to AITER's own probe unchanged.
     "SUFFIX_ROCM_AFP4_CONFIGS": Patch(
