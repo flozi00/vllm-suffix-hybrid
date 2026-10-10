@@ -279,19 +279,23 @@ def _owners(evs, rt, gpu, n: int, top: int = 30) -> list[str]:
             ops[e.get("tid")].append((e["ts"], e["ts"] + e["dur"], e.get("name", "?")))
     if not ops:
         return []
-    for v in ops.values():
-        v.sort()
-    starts = {t: [o[0] for o in v] for t, v in ops.items()}
-    launch = {}
+    calls = defaultdict(list)
     for e in rt:
-        c = (e.get("args") or {}).get("correlation")
-        if c is None:
-            continue
-        v = ops.get(e.get("tid"), [])
-        i = bisect.bisect_right(starts.get(e.get("tid"), []), e["ts"]) - 1
-        while i >= 0 and v[i][1] < e["ts"] + e["dur"]:  # nested ops: the first enclosing one
-            i -= 1                                       # scanning back is the innermost
-        launch[c] = v[i][2] if i >= 0 else "-"
+        if (e.get("args") or {}).get("correlation") is not None:
+            calls[e.get("tid")].append(e)
+    launch = {}
+    for tid, v in ops.items():  # one sweep per thread: nested ops on a stack, O(n log n)
+        v.sort()
+        stack, j = [], 0
+        for e in sorted(calls.get(tid, []), key=lambda e: e["ts"]):
+            while j < len(v) and v[j][0] <= e["ts"]:
+                while stack and stack[-1][1] < v[j][0]:
+                    stack.pop()
+                stack.append(v[j])
+                j += 1
+            while stack and stack[-1][1] < e["ts"] + e["dur"]:  # ended: encloses nothing later
+                stack.pop()
+            launch[e["args"]["correlation"]] = stack[-1][2] if stack else "-"
     agg = defaultdict(lambda: [0, 0.0])
     for e in gpu:
         own = launch.get((e.get("args") or {}).get("correlation"), "?")
