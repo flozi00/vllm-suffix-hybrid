@@ -579,6 +579,10 @@ _BOOT_GATES = {
     "afp4_tune": (["-m", "suffix_hybrid.tools.afp4_tune"], {}),
     "afp4_tune_shipped": (["-m", "suffix_hybrid.tools.afp4_tune"],
                           {"SUFFIX_ROCM_AFP4_CONFIGS": "1"}),
+    # The MXFP4 lm_head screen (SUFFIX_MXFP4_LMHEAD, vocab 248320 x 2560): draft rows at c1..c32
+    # (k20: M=32 220 us/call vs a ~130 us read floor).
+    "afp4_tune_lmhead": (["-m", "suffix_hybrid.tools.afp4_tune", "--shapes", "248320x2560",
+                          "--ms", "1,5,8,16,32,40,64", "--minutes", "20"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():
