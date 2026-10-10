@@ -393,7 +393,7 @@ def main() -> int:
         pool = torch.randn(2 * n + 2, HV, V, K, device=dev) * 0.1
         slots = (torch.randperm(2 * n + 1)[:n] + 1).to(torch.int32).to(dev)
         has = torch.tensor(init, device=dev)
-        ref_pool = pool.clone()
+        ref_pool, pool_before = pool.clone(), pool.clone()
         q, k, v, g, beta = fused_post_conv_prep(conv_output=x, a=ba[:, HV:], b=ba[:, :HV],
                                                 A_log=A_log, dt_bias=dt_bias, num_k_heads=H,
                                                 head_k_dim=K, head_v_dim=V, apply_l2norm=True,
@@ -409,6 +409,24 @@ def main() -> int:
         gdn_prefill(x, ba[:, HV:], ba[:, :HV], A_log, dt_bias, pool, cu, slots, has, out, H, K, V)
         do = (out.float() - o_ref.squeeze(0).float()).abs().max().item()
         ds = (pool - ref_pool).abs().max().item()
+        # Exact reference: the same recurrence in fp64 on the bf16 inputs; which path is closer?
+        exact = pool_before.double().clone()
+        xf, af, bf = x.double(), ba[:, HV:].double(), ba[:, :HV].double()
+        g64 = -torch.exp(A_log.double()) * torch.nn.functional.softplus(af + dt_bias.double())
+        b64 = torch.sigmoid(bf)
+        for r in range(n):
+            h = exact[int(slots[r])] if bool(has[r]) else torch.zeros_like(exact[0])
+            for t in range(int(cu[r]), int(cu[r + 1])):
+                kk = xf[t, key_dim:2 * key_dim].view(H, K)
+                kk = kk / torch.sqrt((kk * kk).sum(-1, keepdim=True) + 1e-6)
+                kk = kk.repeat_interleave(HV // H, 0)  # [HV, K]
+                vv = xf[t, 2 * key_dim:].view(HV, V)
+                h = h * torch.exp(g64[t])[:, None, None]
+                u = (vv - torch.einsum("hvk,hk->hv", h, kk)) * b64[t][:, None]
+                h = h + u[:, :, None] * kk[:, None, :]
+            exact[int(slots[r])] = h
+        err_new = (pool.double() - exact).abs().max().item()
+        err_ref = (ref_pool.double() - exact).abs().max().item()
         # The chunk path carries bf16 intermediates (WY / solve_tril), the recurrent one fp32:
         # they agree to bf16 rounding, not to fp32.
         ok = (torch.allclose(out.float(), o_ref.squeeze(0).float(), rtol=2e-2, atol=2e-2)
@@ -426,7 +444,8 @@ def main() -> int:
                                                  cu, slots, has, out, H, K, V, cfg), 4)[0]
             sweep.append(f"{cfg[0]}/{cfg[1]}w/{cfg[2]}s {us:.1f}")
         print(f"{MARK} prefill lens {lens}: {'MATCH' if ok else 'MISMATCH'} vs vLLM chunk path "
-              f"(max abs diff out {do:.2e}, state {ds:.2e}) | graphed FLA chunk {t_ref:.1f} us "
+              f"(max abs diff out {do:.2e}, state {ds:.2e}; vs fp64: recurrent {err_new:.2e}, "
+              f"chunk {err_ref:.2e}) | graphed FLA chunk {t_ref:.1f} us "
               f"(+post-conv, gather, scatter) -> recurrent {t_new:.1f} us | sweep "
               f"{' | '.join(sweep)}", flush=True)
 
