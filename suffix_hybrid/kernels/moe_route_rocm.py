@@ -83,7 +83,9 @@ except ImportError:
 
 MARK = "[suffix moe-route]"
 # ponytail: one program does the whole batch; above 64 tokens the stock multi-CU kernels win.
-MAX_M = min(64, int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_MAX_M", "64")))
+# MI350P k33 gate, glue graphed us stock -> fused: M 1 20.1 -> 10.0, 5 21.9 -> 13.0, 8 21.9 -> 15.3,
+# 16 24.9 -> 22.6, 32 28.9 -> 35.7, 40 30.1 -> 53.1, 64 33.1 -> 66.2: fused up to 16 rows.
+MAX_M = min(64, int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_MAX_M", "16")))
 EXP = int(os.environ.get("SUFFIX_ROCM_MOE_ROUTE_EXP", "2"))
 BLOCKS = (16, 32, 64, 128)
 STATS: Counter = Counter()
