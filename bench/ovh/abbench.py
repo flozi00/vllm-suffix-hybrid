@@ -9,7 +9,8 @@ Prints one JSON line per cell: aggregate tok/s, per-stream decode tok/s
 
   abbench.py --url https://x.pl-ai.net --model x --arm NAME [--conc 1,8,32]
 """
-import argparse, json, random, socket, ssl, statistics, subprocess, threading, time, urllib.request
+import argparse, json, random, socket, ssl, statistics, subprocess, sys, threading, time, urllib.request
+from collections import Counter
 
 _gai = socket.getaddrinfo
 def _gai_fallback(host, *a, **kw):  # macOS negative-caches fresh dev hostnames
@@ -87,6 +88,9 @@ def cell(url, model, c, seconds, gen, temp):
     wall = time.monotonic() - t_start
     ok = [r for r in res if "error" not in r and r["n"]]
     errs = len(res) - len(ok)
+    if errs:  # what failed: client exceptions, or responses without tokens
+        why = Counter(r.get("error", "no tokens")[:160] for r in res if r not in ok)
+        print(f"conc {c}: {errs} errors: {dict(why.most_common(3))}", file=sys.stderr, flush=True)
     toks = sum(r["n"] for r in ok)
     dec = sorted(r["decode"] for r in ok if r["decode"])
     ttfts = sorted(r["ttft"] for r in ok)

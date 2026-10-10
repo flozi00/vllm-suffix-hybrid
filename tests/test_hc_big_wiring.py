@@ -8,7 +8,14 @@ gate hc_big_bench)."""
 import types
 
 import pytest
-from test_hc_down_wiring import FAKE_HC, KERNELS, _calls
+import importlib.util
+import pathlib
+
+_spec = importlib.util.spec_from_file_location(  # CI runs pytest --import-mode=importlib
+    "test_hc_down_wiring", pathlib.Path(__file__).with_name("test_hc_down_wiring.py"))
+_down = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_down)
+FAKE_HC, KERNELS, _calls = _down.FAKE_HC, _down.KERNELS, _down._calls
 
 from suffix_hybrid import rocm_patches as rp
 
