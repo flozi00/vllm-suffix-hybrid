@@ -73,6 +73,32 @@ to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
 """
 import os
 
+# SUFFIX_ROCM_PRESET=<name>: setdefault a validated gate set (explicit env vars still win), so a
+# pod spec stays under the console's 30-variable cap. Boot-gate children never see it (SUFFIX_*
+# is stripped from their env). An unknown name refuses to start instead of serving stock.
+_PRESETS = {
+    # MI350P Qwen3.8-Flash-Next, plugin-harness/dossiers/mi350p-qwen-flash-2026-10-08.md (k34).
+    "mi350p-qwen-flash": {
+        "VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_SKINNY_GEMM": "0",
+        "VLLM_DISABLE_SHARED_EXPERTS_STREAM": "1", "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "1",
+        "AITER_CONFIG_FMOE": "/plugins/suffix_hybrid/configs/mi350p_tuned_fmoe.csv",
+        "SUFFIX_ROCM_AITER_PAD": "1", "SUFFIX_ROCM_AITER_FLYDSL_ZBUF": "1",
+        "SUFFIX_ROCM_AFP4_CONFIGS": "1", "SUFFIX_MXFP4_LMHEAD": "1", "SUFFIX_MXFP4_LMHEAD_MAX_M": "64",
+        "SUFFIX_ROCM_QSA_TOPK_ROWS": "1", "SUFFIX_ROCM_QSA_MQA": "1", "SUFFIX_ROCM_QSA_SPARSE_SKIP": "1",
+        "SUFFIX_ROCM_QSA_DENSE": "1", "SUFFIX_ROCM_QK_FUSED": "1",
+        "SUFFIX_ROCM_GDN_MTP": "1", "SUFFIX_ROCM_GDN_ASYNC_IDX": "1", "SUFFIX_ROCM_GDN_DEFER": "1",
+        "SUFFIX_ROCM_GDN_MIXED": "1", "SUFFIX_ROCM_GDN_DEFER_MFMA": "1",
+        "SUFFIX_ROCM_HC_FUSE": "1", "SUFFIX_ROCM_HC_DOWN": "1", "SUFFIX_ROCM_HC_DOWN_MAX_M": "256",
+        "SUFFIX_ROCM_HC_BIG": "1", "SUFFIX_ROCM_MOE_ROUTE": "1",
+    },
+}
+_preset = os.environ.get("SUFFIX_ROCM_PRESET", "").strip()
+if _preset:
+    if _preset not in _PRESETS:
+        raise SystemExit(f"[suffix] SUFFIX_ROCM_PRESET={_preset!r}: unknown (known: {sorted(_PRESETS)})")
+    for _k, _v in _PRESETS[_preset].items():
+        os.environ.setdefault(_k, _v)
+
 # Kernel provider registration (independent gate). Inert until
 # --kernel-config ir_op_priority names the provider; a registration failure
 # is a logged refusal, never fatal (serving never depended on our ops).
