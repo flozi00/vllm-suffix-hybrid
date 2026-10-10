@@ -38,9 +38,11 @@ _DEFER = os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
 # SUFFIX_ROCM_GDN_MIXED (with _DEFER): mixed verify + prefill batches skip vLLM's generic
 # path (gathers, repacks, index_copy merges: ~30 eager ops per layer in a CPU-bound step).
 _MIXED = _DEFER and os.environ.get("SUFFIX_ROCM_GDN_MIXED", "").strip() == "1"
-# Mixed steps whose longest prefill chunk is at most this many tokens run the prefill
-# token by token (gdn_defer_rocm.gdn_prefill: 1 launch) instead of FLA's chunk kernels.
-_PREFILL_MAX = int(os.environ.get("SUFFIX_ROCM_GDN_PREFILL_MAX", "256"))
+# Opt-in: mixed steps whose longest prefill chunk is at most this many tokens run the
+# prefill token by token (gdn_defer_rocm.gdn_prefill: 1 launch, fp32-exact) instead of
+# FLA's chunk kernels. Off by default: ~1.5 us per token on the GPU (k23 oracle: 60 tokens
+# 89 vs 49 us, 256 tokens 385 vs 75 us), it only pays in CPU-bound mixed steps.
+_PREFILL_MAX = int(os.environ.get("SUFFIX_ROCM_GDN_PREFILL_MAX", "0"))
 
 
 def install(module) -> None:
