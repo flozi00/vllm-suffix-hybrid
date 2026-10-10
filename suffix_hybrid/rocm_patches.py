@@ -103,6 +103,11 @@ SUFFIX_ROCM_HC_BIG=1: Qwen4Exp GatedResidual.mix / combine_and_mix return throug
   the up GEMM + gate mix without the [M, 10240] gate (6 launches -> 4 at M = 160); at
   M <= MIN_M HC_DOWN's + HC_FUSE's kernels, above MAX_M vLLM's stock chain. The patch
   only inserts the return at the top of each method: composes with HC_FUSE / HC_DOWN.
+SUFFIX_ROCM_QK_FUSED=1: the Qwen4Exp QSA layers run vLLM's fused split + QK GemmaRMSNorm +
+  partial NeoX RoPE + gate copy (vllm/model_executor/layers/fused_qk_norm_rope.py, Triton)
+  instead of the eager chain inductor compiles into ~4-5 launches: the AMD layer allows it
+  on CUDA and text-only; here also ROCm and interleaved mRoPE (multimodal), with
+  Qwen3NextAttention's own conditions (oracle: suffix_hybrid/kernels/qk_fused_rocm.py).
 """
 import glob
 import importlib.util
@@ -567,6 +572,20 @@ PATCHES = {
               "            self, hidden_states, prev_block_output, prev_injection\n"
               "        )\n"),
     ),
+    "SUFFIX_ROCM_QK_FUSED": Patch(
+        "vllm.models.qwen4_exp.amd.qsa",
+        "QSA split + QK norm + mRoPE + gate in vLLM's fused Triton kernel on ROCm",
+        "            and current_platform.is_cuda()\n"
+        "            and text_only\n"
+        "        )\n",
+        "            and current_platform.is_cuda_alike()  # suffix SUFFIX_ROCM_QK_FUSED\n"
+        "            and getattr(self.rotary_emb, \"dtype\", None) in (torch.float16, torch.bfloat16)\n"
+        "            and (text_only or (  # Qwen3NextAttention's interleaved-mRoPE condition\n"
+        "                type(self.rotary_emb).__name__ == \"MRotaryEmbedding\"\n"
+        "                and getattr(self.rotary_emb, \"mrope_interleaved\", False)\n"
+        "                and len(getattr(self.rotary_emb, \"mrope_section\", None) or ()) == 3\n"
+        "                and sum(self.rotary_emb.mrope_section) == self.rotary_emb.rotary_dim // 2))\n"
+        "        )\n"),
     # Inside the lru-cached lookup: one file probe per (shape, M) per process; a plugin
     # miss (None) falls through to AITER's own probe unchanged.
     "SUFFIX_ROCM_AFP4_CONFIGS": Patch(

@@ -298,7 +298,8 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_AITER_FLYDSL_PAD", "SUFFIX_ROCM_AITER_FLYDSL_ZERO",
                   "SUFFIX_ROCM_AFP4_CONFIGS", "SUFFIX_ROCM_QSA_DENSE",
                   "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
-                  "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG")):
+                  "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG",
+                  "SUFFIX_ROCM_QK_FUSED")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
             and not all(os.environ.get(_g, "").strip() == "1"
                         for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
@@ -604,6 +605,9 @@ _BOOT_GATES = {
     # lm_sample_rocm.row_topk (the head's top-64 candidates) == torch.topk's set on adversarial
     # bf16 rows; the MXFP4 head with it vs with y.topk, logits bitwise, M 1..256; graphed us.
     "lm_sample_lmhead": (["-m", "suffix_hybrid.kernels.lm_sample_rocm"], {}),
+    # SUFFIX_ROCM_QK_FUSED: vLLM's fused split + QK norm + interleaved mRoPE + gate vs the eager
+    # chain at the QSA shapes, <= 2 bf16 ulp, graph replay, graphed us/call.
+    "qk_fused_bench": (["-m", "suffix_hybrid.kernels.qk_fused_rocm"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():
