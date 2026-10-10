@@ -89,6 +89,13 @@ SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non
   the 128-CU MI350P otherwise runs the 256-CU MI355X DEFAULT.json tiles. A shape without a
   plugin file resolves exactly as before. vLLM's preshuffle-tuned guard (probes 2x K) only
   gates the ASM path (VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=1), not this one.
+SUFFIX_ROCM_HC_BIG=1: Qwen4Exp GatedResidual.mix / combine_and_mix return through
+  suffix_hybrid/kernels/hc_big_rocm.py: vLLM's norm, then one custom op for the rest of the
+  site. At SUFFIX_ROCM_HC_BIG_MIN_M < M <= _MAX_M (16 < M <= 256: c8+ verify, c32 drafts)
+  hc_down's split-K partials at a large-M config, their reduce + silu in one launch and
+  the up GEMM + gate mix without the [M, 10240] gate (6 launches -> 4 at M = 160); at
+  M <= MIN_M HC_DOWN's + HC_FUSE's kernels, above MAX_M vLLM's stock chain. The patch
+  only inserts the return at the top of each method: composes with HC_FUSE / HC_DOWN.
 """
 import glob
 import importlib.util
@@ -123,6 +130,16 @@ _HC_FUSED = (
     "\n"
     "        return hidden_states, block_input, injection\n"
     "\n")
+# HC_BIG anchors: mix's signature and combine_and_mix's docstring end, which neither
+# HC_FUSE nor HC_DOWN touches.
+_HC_MIX_SIG = (
+    "    def mix(\n"
+    "        self, hidden_states: torch.Tensor\n"
+    "    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:\n")
+_HC_CAM_DOC = (
+    "        block's mix. Its combine with ``block_output`` is fused with this\n"
+    "        module's input RMSNorm.\n"
+    '        """\n')
 # Both methods also share the down projection branch; the norm call's argument before
 # self.hc_norm.weight (hidden_states in mix, prev_injection in combine_and_mix) tells the
 # two anchors apart. They end before _HC_TAIL: disjoint from the HC_FUSE anchors.
@@ -532,6 +549,15 @@ PATCHES = {
         Patch(_HC, "HC down projection split-K at small M (combine_and_mix)",
               "            prev_injection,\n" + _HC_DOWN,
               "            prev_injection,\n" + _HC_DOWN_NEW),
+    ),
+    "SUFFIX_ROCM_HC_BIG": (
+        Patch(_HC, "HC site tail in one op, 4 launches at decode M (mix)", _HC_MIX_SIG,
+              _HC_MIX_SIG + "        return hc_big_mix(self, hidden_states)  # suffix rocm-hc-big\n",
+              "suffix_hybrid.kernels.hc_big_rocm:install"),
+        Patch(_HC, "HC site tail in one op, 4 launches at decode M (combine_and_mix)", _HC_CAM_DOC,
+              _HC_CAM_DOC + "        return hc_big_combine_and_mix(  # suffix rocm-hc-big\n"
+              "            self, hidden_states, prev_block_output, prev_injection\n"
+              "        )\n"),
     ),
     # Inside the lru-cached lookup: one file probe per (shape, M) per process; a plugin
     # miss (None) falls through to AITER's own probe unchanged.
