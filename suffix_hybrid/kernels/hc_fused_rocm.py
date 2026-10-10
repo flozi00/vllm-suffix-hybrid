@@ -28,6 +28,8 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from suffix_hybrid.kernels.hc_wq_rocm import mx4_quant, wq_args
+
 BLOCK_N = 16  # columns per stream in one block: HC * BLOCK_N dot columns
 TARGET_PROGRAMS = 128  # one program per CU (MI350P): no CU runs two silu prologues
 # MI350P oracle 2026-10-09 (graphed us/call vs stock silu + hipBLASLt + gate mix):
@@ -39,10 +41,13 @@ MAX_M = int(os.environ.get("SUFFIX_ROCM_HC_FUSE_MAX_M", "64"))
 @triton.jit(do_not_specialize=["M", "col_blocks"])
 def _hc_up_gate_mix_kernel(
     lora_ptr, w_ptr, xn_ptr, out_ptr, M, col_blocks,
-    stride_lora, stride_w, stride_xn, stride_out,
+    stride_lora, stride_w, stride_xn, stride_out, s_ptr, stride_s,
     D: tl.constexpr, HC: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, WQ: tl.constexpr,
 ):
+    # WQ (hc_wq_rocm): 0 bf16 w_up; 1 MXFP4 w_up (K zero-padded to K0 + 128: [D*HC, (K0 +
+    # 128) / 2] e2m1 pairs, s [D*HC, (K0 + 128) / 32] e8m0) on the scaled MFMA, silu(lora)
+    # quantized per 32 here; 2 FP8 w_up (e4m3) widened to bf16, s [D*HC] fp32 per output.
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     row_ok = (rows < M)[:, None]
     k0 = tl.arange(0, K0)
@@ -51,8 +56,16 @@ def _hc_up_gate_mix_kernel(
     lora_rows = lora_ptr + rows[:, None] * stride_lora
     x = tl.load(lora_rows + k0[None, :], mask=row_ok, other=0.0).to(tl.float32) / HC
     a0 = (x * tl.sigmoid(x)).to(lora_ptr.dtype.element_ty)
-    x = tl.load(lora_rows + k1[None, :], mask=row_ok, other=0.0).to(tl.float32) / HC
-    a1 = (x * tl.sigmoid(x)).to(lora_ptr.dtype.element_ty)
+    if WQ == 1:  # the tail padded to 128 columns (silu(0) = 0), then MXFP4
+        k1p = K0 + tl.arange(0, 128)
+        x = tl.load(lora_rows + k1p[None, :], mask=row_ok & (k1p < K0 + K1)[None, :],
+                    other=0.0).to(tl.float32) / HC
+        a1 = (x * tl.sigmoid(x)).to(lora_ptr.dtype.element_ty)
+        a0q, a0s = mx4_quant(a0.to(tl.float32), K0, BLOCK_M)
+        a1q, a1s = mx4_quant(a1.to(tl.float32), 128, BLOCK_M)
+    else:
+        x = tl.load(lora_rows + k1[None, :], mask=row_ok, other=0.0).to(tl.float32) / HC
+        a1 = (x * tl.sigmoid(x)).to(lora_ptr.dtype.element_ty)
     # Dot column j = column j % BLOCK_N of the block in stream j // BLOCK_N, i.e.
     # row s * D + n of W_up and column s * D + n of xn.
     j = tl.arange(0, HC * BLOCK_N)
@@ -60,9 +73,24 @@ def _hc_up_gate_mix_kernel(
     cols = tl.arange(0, BLOCK_N)
     for cb in range(col_blocks):
         n0 = (tl.program_id(1) * col_blocks + cb) * BLOCK_N
-        w_cols = w_ptr + (n0 + stream_col)[None, :] * stride_w
-        acc = tl.dot(a0, tl.load(w_cols + k0[:, None]))
-        acc = tl.dot(a1, tl.load(w_cols + k1[:, None]), acc)
+        if WQ == 1:
+            wq_rows = w_ptr + (n0 + stream_col)[None, :] * stride_w
+            sc_rows = s_ptr + (n0 + stream_col)[:, None] * stride_s
+            acc = tl.dot_scaled(a0q, a0s, "e2m1", tl.load(wq_rows + tl.arange(0, K0 // 2)[:, None]),
+                                tl.load(sc_rows + tl.arange(0, K0 // 32)[None, :]), "e2m1")
+            acc = tl.dot_scaled(a1q, a1s, "e2m1",
+                                tl.load(wq_rows + (K0 // 2 + tl.arange(0, 64))[:, None]),
+                                tl.load(sc_rows + (K0 // 32 + tl.arange(0, 4))[None, :]), "e2m1",
+                                acc)
+        elif WQ == 2:
+            w_cols = w_ptr + (n0 + stream_col)[None, :] * stride_w
+            acc = tl.dot(a0, tl.load(w_cols + k0[:, None]).to(tl.bfloat16))
+            acc = tl.dot(a1, tl.load(w_cols + k1[:, None]).to(tl.bfloat16), acc)
+            acc = acc * tl.load(s_ptr + n0 + stream_col)[None, :]
+        else:
+            w_cols = w_ptr + (n0 + stream_col)[None, :] * stride_w
+            acc = tl.dot(a0, tl.load(w_cols + k0[:, None]))
+            acc = tl.dot(a1, tl.load(w_cols + k1[:, None]), acc)
         # The up GEMM's output is bf16; _hc_gate_mix_kernel then averages
         # sigmoid(gate) * xn over the streams in fp32.
         gate = acc.to(lora_ptr.dtype.element_ty).to(tl.float32)
@@ -120,18 +148,22 @@ def _config(m: int, n_blocks: int) -> tuple[int, int]:
                     if n_blocks % g == 0 and row_blocks * g <= TARGET_PROGRAMS), default=1)
 
 
-def _launch(lora, w_up, xn, hc_count, config=None):
+def _launch(lora, w_up, xn, hc_count, config=None, wq=None):
     m, k = lora.shape
     n = w_up.shape[0]
     d = n // hc_count
     k0 = 1 << ((k - 1).bit_length() - 1)  # K = K0 + K1, powers of two (320 = 256 + 64)
     k1 = k - k0
+    wt, st, stride_s, mode = wq_args(w_up, wq)
     if (w_up.shape[1] != k or xn.shape != (m, n) or d * hc_count != n or d % BLOCK_N
             or k1 < 16 or k1 & (k1 - 1) or hc_count & (hc_count - 1)
             or lora.stride(1) != 1 or w_up.stride(1) != 1 or xn.stride(1) != 1
-            or not lora.dtype == w_up.dtype == xn.dtype):
+            or not lora.dtype == w_up.dtype == xn.dtype
+            or mode == 1 and (k1 > 128 or k0 % 128 or wt.shape != (n, (k0 + 128) // 2))
+            or mode and config and config[0] == "ws"):
         raise ValueError(f"[suffix hc-fuse] unsupported HC shapes: lora {tuple(lora.shape)} "
-                         f"w_up {tuple(w_up.shape)} xn {tuple(xn.shape)} hc_count {hc_count}")
+                         f"w_up {tuple(w_up.shape)} xn {tuple(xn.shape)} hc_count {hc_count} "
+                         f"WQ {mode}")
     out = xn.new_empty((m, d))
     if m and config and config[0] == "ws":
         _, bm, row_groups, block_n = config
@@ -142,9 +174,9 @@ def _launch(lora, w_up, xn, hc_count, config=None):
     elif m:
         bm, groups = config or _config(m, d // BLOCK_N)
         _hc_up_gate_mix_kernel[(triton.cdiv(m, bm), groups)](
-            lora, w_up, xn, out, m, d // BLOCK_N // groups,
-            lora.stride(0), w_up.stride(0), xn.stride(0), out.stride(0),
-            D=d, HC=hc_count, K0=k0, K1=k1, BLOCK_M=bm, BLOCK_N=BLOCK_N,
+            lora, wt, xn, out, m, d // BLOCK_N // groups,
+            lora.stride(0), wt.stride(0), xn.stride(0), out.stride(0), st, stride_s,
+            D=d, HC=hc_count, K0=k0, K1=k1, BLOCK_M=bm, BLOCK_N=BLOCK_N, WQ=mode,
             num_warps=4, num_stages=2,
             matrix_instr_nonkdim=16)  # 16x16 MFMA: 4 warps tile 64 columns at every BLOCK_M
     return out

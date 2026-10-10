@@ -32,6 +32,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from suffix_hybrid.kernels import hc_down_rocm, hc_fused_rocm
+from suffix_hybrid.kernels.hc_wq_rocm import mx4_quant, wq_args
 
 MIN_M = int(os.environ.get("SUFFIX_ROCM_HC_BIG_MIN_M", "16"))
 MAX_M = int(os.environ.get("SUFFIX_ROCM_HC_BIG_MAX_M", "256"))
@@ -82,9 +83,9 @@ def _hc_reduce_silu_kernel(p_ptr, y_ptr, MN, N, R, SPLIT: tl.constexpr, HC: tl.c
 
 @triton.jit(do_not_specialize=["M"])
 def _hc_up_mix_kernel(
-    a_ptr, w_ptr, xn_ptr, out_ptr, M, stride_a, stride_w, stride_xn, stride_out,
+    a_ptr, w_ptr, xn_ptr, out_ptr, M, stride_a, stride_w, stride_xn, stride_out, s_ptr, stride_s,
     D: tl.constexpr, HC: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, ROWS_FIRST: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, ROWS_FIRST: tl.constexpr, WQ: tl.constexpr,
 ):
     # One [BLOCK_M rows, BLOCK_N outputs] tile: a = silu(lora / HC) (bf16) times the HC x
     # BLOCK_N up-weight rows of those outputs (dot column j = stream j // BLOCK_N, column
@@ -101,9 +102,27 @@ def _hc_up_mix_kernel(
     cols = pid_n * BLOCK_N + (j // BLOCK_N) * D + j % BLOCK_N
     a_rows = a_ptr + rows[:, None] * stride_a
     w_cols = w_ptr + cols[None, :] * stride_w
-    acc = tl.dot(tl.load(a_rows + k0[None, :], mask=row_ok, other=0.0), tl.load(w_cols + k0[:, None]))
-    acc = tl.dot(tl.load(a_rows + k1[None, :], mask=row_ok, other=0.0), tl.load(w_cols + k1[:, None]),
-                 acc)
+    if WQ == 1:  # hc_wq_rocm MXFP4: a quantized per 32 here (its tail padded to 128 columns)
+        k1p = K0 + tl.arange(0, 128)
+        a0q, a0s = mx4_quant(tl.load(a_rows + k0[None, :], mask=row_ok, other=0.0).to(tl.float32),
+                             K0, BLOCK_M)
+        a1q, a1s = mx4_quant(tl.load(a_rows + k1p[None, :], mask=row_ok & (k1p < K0 + K1)[None, :],
+                                     other=0.0).to(tl.float32), 128, BLOCK_M)
+        sc_rows = s_ptr + cols[:, None] * stride_s
+        acc = tl.dot_scaled(a0q, a0s, "e2m1", tl.load(w_cols + tl.arange(0, K0 // 2)[:, None]),
+                            tl.load(sc_rows + tl.arange(0, K0 // 32)[None, :]), "e2m1")
+        acc = tl.dot_scaled(a1q, a1s, "e2m1", tl.load(w_cols + (K0 // 2 + tl.arange(0, 64))[:, None]),
+                            tl.load(sc_rows + (K0 // 32 + tl.arange(0, 4))[None, :]), "e2m1", acc)
+    elif WQ == 2:  # hc_wq_rocm FP8: e4m3 widened to bf16, fp32 scale per output column
+        acc = tl.dot(tl.load(a_rows + k0[None, :], mask=row_ok, other=0.0),
+                     tl.load(w_cols + k0[:, None]).to(tl.bfloat16))
+        acc = tl.dot(tl.load(a_rows + k1[None, :], mask=row_ok, other=0.0),
+                     tl.load(w_cols + k1[:, None]).to(tl.bfloat16), acc)
+        acc = acc * tl.load(s_ptr + cols)[None, :]
+    else:
+        acc = tl.dot(tl.load(a_rows + k0[None, :], mask=row_ok, other=0.0), tl.load(w_cols + k0[:, None]))
+        acc = tl.dot(tl.load(a_rows + k1[None, :], mask=row_ok, other=0.0), tl.load(w_cols + k1[:, None]),
+                     acc)
     gate = acc.to(a_ptr.dtype.element_ty).to(tl.float32)
     xn = tl.load(xn_ptr + rows[:, None] * stride_xn + cols[None, :], mask=row_ok, other=0.0)
     mixed = tl.sigmoid(gate) * xn.to(tl.float32)
@@ -112,20 +131,22 @@ def _hc_up_mix_kernel(
              y, mask=row_ok)
 
 
-def down_silu(x, w, hc_count, rank, cfg):
-    """[M, N] bf16: x @ w.T as hc_down's split-K partials at cfg, then one launch for their
-    sum (bf16) with silu(. / HC) applied to the lora columns (< rank)."""
+def down_silu(x, w, hc_count, rank, cfg, wq=None):
+    """[M, N] bf16: x @ w.T as hc_down's split-K partials at cfg (on the SUFFIX_ROCM_HC_WQ
+    copy of w when there is one), then one launch for their sum (bf16) with silu(. / HC)
+    applied to the lora columns (< rank)."""
     m, k = x.shape
     n = w.shape[0]
     bm, bn, bk, split, warps = cfg
+    wt, st, stride_s, mode = wq_args(w, wq)
     if (split < 2 or w.shape[1] != k or k % (split * bk) or x.stride(1) != 1
-            or w.stride(1) != 1 or x.dtype != w.dtype):
+            or w.stride(1) != 1 or x.dtype != w.dtype or mode == 1 and bk % 128):
         raise ValueError(f"{MARK} unsupported down: x {tuple(x.shape)} w {tuple(w.shape)} "
-                         f"cfg {cfg}")
+                         f"cfg {cfg} WQ {mode}")
     part = torch.empty((split, m, n), dtype=torch.float32, device=x.device)
     _LAST["down"] = hc_down_rocm._hc_down_kernel[(triton.cdiv(n, bn), split, triton.cdiv(m, bm))](
-        x, w, part, m, n, x.stride(0), w.stride(0),
-        K_SPLIT=k // split, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk,
+        x, wt, part, m, n, x.stride(0), wt.stride(0), st, stride_s,
+        K_SPLIT=k // split, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, WQ=mode,
         num_warps=warps, num_stages=2, matrix_instr_nonkdim=16)
     y = x.new_empty((m, n))
     block = max(64, 8192 // triton.next_power_of_2(split))  # hc_down_reduce's tiling
@@ -134,23 +155,27 @@ def down_silu(x, w, hc_count, rank, cfg):
     return y
 
 
-def up_mix(a, w_up, xn, hc_count, cfg):
-    """block_input [M, D] from a = silu(lora / HC): up GEMM + hc_gate_mix, no gate tensor."""
+def up_mix(a, w_up, xn, hc_count, cfg, wq=None):
+    """block_input [M, D] from a = silu(lora / HC): up GEMM + hc_gate_mix, no gate tensor
+    (on the SUFFIX_ROCM_HC_WQ copy of w_up when there is one)."""
     m, k = a.shape
     d = w_up.shape[0] // hc_count
     bm, bn, warps, rows_first = cfg
     k0 = 1 << ((k - 1).bit_length() - 1)  # K = K0 + K1, powers of two (320 = 256 + 64)
     k1 = k - k0
+    wt, st, stride_s, mode = wq_args(w_up, wq)
     if (w_up.shape[1] != k or xn.shape != (m, w_up.shape[0]) or d % bn or k1 < 16
-            or k1 & (k1 - 1) or a.stride(1) != 1 or w_up.stride(1) != 1 or xn.stride(1) != 1):
+            or k1 & (k1 - 1) or a.stride(1) != 1 or w_up.stride(1) != 1 or xn.stride(1) != 1
+            or mode == 1 and (k1 > 128 or k0 % 128 or wt.shape[1] != (k0 + 128) // 2)):
         raise ValueError(f"{MARK} unsupported up: a {tuple(a.shape)} w_up {tuple(w_up.shape)} "
-                         f"xn {tuple(xn.shape)} cfg {cfg}")
+                         f"xn {tuple(xn.shape)} cfg {cfg} WQ {mode}")
     out = xn.new_empty((m, d))
     if m:
         rb = triton.cdiv(m, bm)
         _LAST["up"] = _hc_up_mix_kernel[(rb, d // bn) if rows_first else (d // bn, rb)](
-            a, w_up, xn, out, m, a.stride(0), w_up.stride(0), xn.stride(0), out.stride(0),
-            D=d, HC=hc_count, K0=k0, K1=k1, BLOCK_M=bm, BLOCK_N=bn, ROWS_FIRST=bool(rows_first),
+            a, wt, xn, out, m, a.stride(0), wt.stride(0), xn.stride(0), out.stride(0), st,
+            stride_s, D=d, HC=hc_count, K0=k0, K1=k1, BLOCK_M=bm, BLOCK_N=bn,
+            ROWS_FIRST=bool(rows_first), WQ=mode,
             num_warps=warps, num_stages=1, matrix_instr_nonkdim=16)
     return out
 

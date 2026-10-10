@@ -104,6 +104,13 @@ SUFFIX_ROCM_HC_BIG=1: Qwen4Exp GatedResidual.mix / combine_and_mix return throug
   the up GEMM + gate mix without the [M, 10240] gate (6 launches -> 4 at M = 160); at
   M <= MIN_M HC_DOWN's + HC_FUSE's kernels, above MAX_M vLLM's stock chain. The patch
   only inserts the return at the top of each method: composes with HC_FUSE / HC_DOWN.
+SUFFIX_ROCM_HC_WQ=mxfp4|fp8: vLLM keeps every GatedResidual projection BF16 (quant_config=None;
+  13.5 MB a site, ~1.3 GB an MTP-4 step). The HC Linear modules' quant method also keeps a
+  quantized copy of the weight (suffix_hybrid/kernels/hc_wq_rocm.py): mxfp4 = AITER's
+  dynamic_mxfp4_quant, run W4A4 on the gfx950 scaled MFMA with the activations quantized the
+  same way inside the GEMM kernels; fp8 = e4m3 per output channel, W8A16 (the fallback).
+  Used by hc_down_rocm (HC_DOWN, HC_BIG's down), hc_fused_rocm (HC_FUSE) and hc_big_rocm's up
+  + mix; vLLM's stock chain (prefill, large M) keeps the BF16 weight.
 SUFFIX_ROCM_QK_FUSED=1: the Qwen4Exp QSA layers run vLLM's fused split + QK GemmaRMSNorm +
   partial NeoX RoPE + gate copy (vllm/model_executor/layers/fused_qk_norm_rope.py, Triton)
   instead of the eager chain inductor compiles into ~4-5 launches: the AMD layer allows it
@@ -584,6 +591,10 @@ PATCHES = {
               "            prev_injection,\n" + _HC_DOWN,
               "            prev_injection,\n" + _HC_DOWN_NEW),
     ),
+    # No source change: the after hook gives GatedResidual's HC Linear modules a quant method
+    # that keeps an MXFP4 / FP8 copy of the weight for the HC kernels (hc_wq_rocm.lookup).
+    "SUFFIX_ROCM_HC_WQ": Patch(_HC, "HC projections on MXFP4 / FP8 weight copies",
+                               after="suffix_hybrid.kernels.hc_wq_rocm:install"),
     "SUFFIX_ROCM_HC_BIG": (
         Patch(_HC, "HC site tail in one op, 4 launches at decode M (mix)", _HC_MIX_SIG,
               _HC_MIX_SIG + "        return hc_big_mix(self, hidden_states)  # suffix rocm-hc-big\n",
@@ -650,11 +661,18 @@ PATCHES = {
 _MARK = "_suffix_rocm_patch"
 
 
+# Gates that take a value instead of 1 (any other non-empty value refuses to start).
+VALUES = {"SUFFIX_ROCM_HC_WQ": ("mxfp4", "fp8")}
+
+
 def enabled() -> dict:
-    """Target module -> [Patch] for every gate set to 1, in PATCHES order."""
+    """Target module -> [Patch] for every gate set to 1 (or one of its VALUES), in PATCHES order."""
     todo: dict = {}
     for gate, patches in PATCHES.items():
-        if os.environ.get(gate, "").strip() == "1":
+        raw = os.environ.get(gate, "").strip()
+        if gate in VALUES and raw not in ("", "0") + VALUES[gate]:
+            raise SystemExit(f"[suffix rocm-patch] {gate}={raw!r}: one of {VALUES[gate]}")
+        if raw in VALUES.get(gate, ("1",)):
             for p in (patches,) if isinstance(patches, Patch) else patches:
                 todo.setdefault(p.target, []).append(p)
     return todo
