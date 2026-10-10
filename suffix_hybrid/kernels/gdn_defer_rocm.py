@@ -328,6 +328,112 @@ def _gdn_defer2_kernel(
         tl.store(rec + 3 * REC + K + BV, G4 - G0, mask=keep & (4 < n_tok))
 
 
+@triton.jit
+def _gdn_token3(b_h, b_k, b_v, a_raw, b_raw, A_log_v, dt_v, beta, threshold):
+    # _gdn_token on the [NC, BV, KC] tile (b_k [NC, 1, KC], b_v [BV]).
+    x = a_raw + dt_v
+    softplus_x = tl.where(beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x)
+    b_g = -tl.exp(A_log_v) * softplus_x
+    b_beta = tl.sigmoid(b_raw)
+    b_k = b_k * tl.rsqrt(_dot3(b_k, b_k) + 1e-6)
+    b_h *= tl.exp(b_g)
+    b_v -= _rows(b_h, b_k)
+    b_v *= b_beta
+    b_h += b_v[None, :, None] * b_k
+    return b_h
+
+
+@triton.jit(do_not_specialize=["stride_qkv_l", "stride_a_l", "stride_b_l", "stride_o_l",
+                               "stride_idx_seq"])
+def _gdn_defer3_kernel(
+    A_log, a, b, dt_bias, beta, threshold, qkv, o, state, cu_seqlens, state_indices,
+    num_accepted, seq_lens, scale,
+    stride_qkv_l, stride_a_l, stride_b_l, stride_o_l, stride_state_block, stride_idx_seq,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BV: tl.constexpr,
+    NC: tl.constexpr, WIN: tl.constexpr, ZONE: tl.constexpr, ZONE_REACH: tl.constexpr,
+    REC: tl.constexpr,
+):
+    # _gdn_defer_kernel line for line (same records, same sequential per-token math) on a
+    # [NC, BV, KC] tile: the oracle's layout probe (only reduction orders differ).
+    KC: tl.constexpr = K // NC
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    n_tok = tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos
+    if n_tok <= 0:
+        return
+    o_bv = tl.arange(0, BV)
+    kofs = tl.arange(0, NC)[:, None, None] * KC + tl.arange(0, KC)[None, None, :]
+    tile = i_hv * V * K + (i_v * BV + o_bv)[None, :, None] * K + kofs
+    tile_base = i_hv * V * K + i_v * BV * K
+    two = tl.arange(0, 2)
+    rec_v = K + o_bv
+    A_log_v = tl.load(A_log + i_hv).to(tl.float32)
+    dt_v = tl.load(dt_bias + i_hv).to(tl.float32)
+    acc = tl.load(num_accepted + i_n).to(tl.int64)
+    c_now = tl.load(seq_lens + i_n).to(tl.int64) - n_tok
+    idx_row = state_indices + i_n * stride_idx_seq
+    slot0 = tl.load(idx_row).to(tl.int64)
+    slot1 = tl.load(idx_row + 1).to(tl.int64)
+    if ZONE > 0:
+        cur_zone = (c_now + ZONE_REACH) // ZONE > c_now // ZONE
+        c_prev = c_now - acc
+        prev_zone = (c_prev + ZONE_REACH) // ZONE > c_prev // ZONE
+    else:
+        cur_zone = c_now < 0
+        prev_zone = c_now < 0
+    deferred = (acc >= 2) & (prev_zone == 0)
+    read_slot = tl.where(deferred, slot0, tl.load(idx_row + acc - 1).to(tl.int64))
+    if read_slot <= 0:
+        return
+    if deferred & (slot1 <= 0):
+        return
+    b_h = tl.load(state + read_slot * stride_state_block + tile)
+    rec = state + slot1 * stride_state_block + tile_base
+    for t in tl.static_range(1, WIN):
+        use = deferred & (t < acc)
+        r = rec + (t - 1) * REC
+        r_k = tl.load(r + kofs, mask=use, other=0.0)
+        r_v = tl.load(r + rec_v, mask=use, other=0.0)
+        r_ab = tl.load(r + K + BV + two, mask=use, other=0.0)
+        if use:
+            b_h = _gdn_token3(b_h, r_k, r_v, tl.sum(tl.where(two == 0, r_ab, 0.0)),
+                              tl.sum(tl.where(two == 1, r_ab, 0.0)), A_log_v, dt_v, beta,
+                              threshold)
+    p_q = qkv + bos * stride_qkv_l + i_h * K + kofs
+    p_k = qkv + bos * stride_qkv_l + H * K + i_h * K + kofs
+    p_v = qkv + bos * stride_qkv_l + 2 * H * K + i_hv * V + i_v * BV + o_bv
+    p_a = a + bos * stride_a_l + i_hv
+    p_b = b + bos * stride_b_l + i_hv
+    p_o = o + bos * stride_o_l + i_hv * V + i_v * BV + o_bv
+    for i_t in tl.static_range(WIN):
+        valid = i_t < n_tok
+        b_q = tl.load(p_q + i_t * stride_qkv_l, mask=valid, other=0.0).to(tl.float32)
+        b_k = tl.load(p_k + i_t * stride_qkv_l, mask=valid, other=0.0).to(tl.float32)
+        b_v = tl.load(p_v + i_t * stride_qkv_l, mask=valid, other=0.0).to(tl.float32)
+        a_raw = tl.load(p_a + i_t * stride_a_l, mask=valid, other=0.0).to(tl.float32)
+        b_raw = tl.load(p_b + i_t * stride_b_l, mask=valid, other=0.0).to(tl.float32)
+        b_q = b_q * tl.rsqrt(_dot3(b_q, b_q) + 1e-6)
+        b_q = b_q * scale
+        h_new = _gdn_token3(b_h, b_k, b_v, a_raw, b_raw, A_log_v, dt_v, beta, threshold)
+        b_h = tl.where(valid, h_new, b_h)
+        b_o = _rows(b_h, b_q)
+        tl.store(p_o + i_t * stride_o_l, b_o.to(p_o.dtype.element_ty), mask=valid)
+        if i_t == 0:
+            tl.store(state + slot0 * stride_state_block + tile, b_h,
+                     mask=valid & (slot0 > 0))
+        else:
+            slot_t = tl.load(idx_row + i_t).to(tl.int64)
+            tl.store(state + slot_t * stride_state_block + tile, b_h,
+                     mask=valid & cur_zone & (slot_t > 0))
+            r = rec + (i_t - 1) * REC
+            keep = valid & (cur_zone == 0) & (slot1 > 0)
+            tl.store(r + kofs, b_k, mask=keep)
+            tl.store(r + rec_v, b_v, mask=keep)
+            tl.store(r + K + BV + two, tl.where(two == 0, a_raw, b_raw), mask=keep)
+
+
 @triton.jit(do_not_specialize=["stride_x_l", "stride_a_l", "stride_b_l", "stride_o_l"])
 def _gdn_prefill_kernel(
     A_log, a, b, dt_bias, beta, threshold, x, o, state, cu_seqlens, slots, has_init, scale,
@@ -417,6 +523,18 @@ def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_a
     hv = a.shape[1]
     K, V = head_k_dim, head_v_dim
     win = state_indices.shape[1]
+    if v2 == "v13":  # oracle only: v1 on the [NC, BV, KC] tile (v1's records)
+        BV, warps, stages, nc = config
+        rec = (K + BV + 2 + 63) // 64 * 64
+        if n:
+            _gdn_defer3_kernel[(V // BV, n * hv)](
+                A_log, a, b, dt_bias, 1.0, 20.0, qkv, out, state, cu_seqlens, state_indices,
+                num_accepted, seq_lens, K**-0.5,
+                qkv.stride(0), a.stride(0), b.stride(0), out.stride(0), state.stride(0),
+                state_indices.stride(0),
+                H=num_k_heads, HV=hv, K=K, V=V, BV=BV, NC=nc, WIN=win, ZONE=zone,
+                ZONE_REACH=2 * win, REC=rec, num_warps=warps, num_stages=stages)
+        return out
     if _V2 if v2 is None else v2:
         BV, warps, stages, nc = config or CONFIG2
         rec = (K + BV + 1 + 63) // 64 * 64  # floats per recorded token: k, the u tile, Gr
@@ -471,6 +589,43 @@ def install(module) -> None:
     """rocm_patches `after` hook for qwen_gdn_linear_attn: its rewritten _forward_core
     calls _suffix_gdn_defer_spec (forward_spec checks SUFFIX_ROCM_GDN_DEFER itself)."""
     module._suffix_gdn_defer_spec = defer_spec
+
+
+def _isa_stats(fn) -> list:
+    """Compact AMDGCN facts of every compiled variant of a Triton kernel: registers,
+    scratch spill bytes, LDS, occupancy, instruction mix (the oracle prints them)."""
+    import re
+    from collections import Counter
+
+    rows = []
+    for entry in getattr(fn, "device_caches", {}).values():
+        cache = entry[0] if isinstance(entry, tuple) else entry
+        for key, ck in getattr(cache, "items", lambda: [])():
+            asm = (getattr(ck, "asm", {}) or {}).get("amdgcn", "")
+            if not asm:
+                continue
+
+            def grab(tag):
+                m = re.search(rf"; {tag}: (\d+)", asm)
+                return m.group(1) if m else "?"
+
+            ins = [ln.split()[0] for ln in asm.splitlines()
+                   if ln.startswith("\t") and ln.strip() and ln.strip()[0] not in ";."]
+            cls = Counter()
+            for i in ins:
+                cls["mfma" if "mfma" in i else "dpp/perm" if ("dpp" in i or "permlane" in i
+                    or "bpermute" in i or "swizzle" in i or "readlane" in i) else
+                    "lds" if i.startswith("ds_") else "mem" if i.startswith(("global_", "buffer_"))
+                    else "valu" if i.startswith("v_") else "salu" if i.startswith("s_") else "other"] += 1
+            consts = {k: v for k, v in (getattr(ck, "metadata", None)._asdict().items()
+                                        if hasattr(getattr(ck, "metadata", None), "_asdict") else [])
+                      if k in ("num_warps", "num_stages")}
+            rows.append(f"vgpr {grab('NumVgprs')} agpr {grab('NumAgprs')} sgpr {grab('NumSgprs')} "
+                        f"scratch {grab('ScratchSize')} lds {grab('LDSByteSize')} occ "
+                        f"{grab('Occupancy')} instrs {len(ins)} "
+                        + " ".join(f"{k} {v}" for k, v in cls.most_common()) + f" {consts} "
+                        f"key {str(key)[-120:]}")
+    return rows
 
 
 def _oracle_v2() -> bool:
@@ -623,8 +778,20 @@ def _oracle_v2() -> bool:
                 sweep.append(f"{cfg[0]}/{cfg[1]}w/{cfg[2]}s/nc{cfg[3]} {us:.1f}")
             except Exception as exc:  # noqa: BLE001 - a config that does not build is a datum
                 sweep.append(f"{cfg[0]}/{cfg[1]}w/{cfg[2]}s/nc{cfg[3]} {type(exc).__name__}")
+        probe = []
+        for cfg in ((16, 1, 1, 4), (16, 1, 1, 2), (32, 1, 1, 4), (16, 1, 1, 1)):
+            try:
+                us = _graph_us(lambda i: run_v2(pools[i % 4], qkv, ba, cu, idx, acc_t, seq_t,
+                                                out, 0, cfg, "v13"), 8)[0]
+                probe.append(f"{cfg[0]}/{cfg[1]}w/nc{cfg[3]} {us:.1f}")
+            except Exception as exc:  # noqa: BLE001
+                probe.append(f"{cfg[0]}/{cfg[1]}w/nc{cfg[3]} {type(exc).__name__}")
         print(f"{MARK} v2 c{n_req} deferred steady state graphed: v1 {t_v1:.1f} us | v2 "
-              f"{' | '.join(sweep)}", flush=True)
+              f"{' | '.join(sweep)} | v1 on the 3D tile {' | '.join(probe)}", flush=True)
+    for name, fn in (("v1", _gdn_defer_kernel), ("v1-3D", _gdn_defer3_kernel),
+                     ("v2", _gdn_defer2_kernel)):
+        for row in _isa_stats(fn):
+            print(f"{MARK} isa {name}: {row}", flush=True)
     return ok_all
 
 
