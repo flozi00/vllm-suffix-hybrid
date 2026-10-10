@@ -204,7 +204,7 @@ def gdn_prefill(x, a, b, A_log, dt_bias, state, cu_seqlens, slots, has_init, out
                 head_k_dim, head_v_dim, config=None):
     """Prefill chunks over post-conv packed qkv x [T, 2 H K + HV V] (row-strided), a / b
     [T, HV] views, the requests' state slots / has-initial-state flags, out [>= T, HV, V]."""
-    BV, warps, _ = config or CONFIG
+    BV, warps, stages = config or PREFILL_CONFIG
     n, hv = cu_seqlens.shape[0] - 1, a.shape[1]
     K, V = head_k_dim, head_v_dim
     assert state.dtype == torch.float32 and state.shape[1:] == (hv, V, K) and state[0].is_contiguous()
@@ -213,10 +213,12 @@ def gdn_prefill(x, a, b, A_log, dt_bias, state, cu_seqlens, slots, has_init, out
         _gdn_prefill_kernel[(V // BV, n * hv)](
             A_log, a, b, dt_bias, 1.0, 20.0, x, out, state, cu_seqlens, slots, has_init,
             K**-0.5, x.stride(0), a.stride(0), b.stride(0), out.stride(0), state.stride(0),
-            H=num_k_heads, HV=hv, K=K, V=V, BV=BV, USE_QK_L2NORM=True, num_warps=warps)
+            H=num_k_heads, HV=hv, K=K, V=V, BV=BV, USE_QK_L2NORM=True, num_warps=warps,
+            num_stages=stages)
     return out
 
 
+PREFILL_CONFIG = (16, 1, 3)  # BV, num_warps, num_stages of gdn_prefill (pipelined token loop)
 CONFIG = (16, 1, 1)  # BV, num_warps, num_stages. MI350P k16 oracle, graphed us c1/c8/c32:
 # 16/1w 15.0/52.5/179.1, 32/1w 20.3/54.0/173.8, 32/2w 20.0/56.3/196.2; AITER 19.9/66.4/225.5.
 
@@ -407,8 +409,10 @@ def main() -> int:
         gdn_prefill(x, ba[:, HV:], ba[:, :HV], A_log, dt_bias, pool, cu, slots, has, out, H, K, V)
         do = (out.float() - o_ref.squeeze(0).float()).abs().max().item()
         ds = (pool - ref_pool).abs().max().item()
+        # The chunk path carries bf16 intermediates (WY / solve_tril), the recurrent one fp32:
+        # they agree to bf16 rounding, not to fp32.
         ok = (torch.allclose(out.float(), o_ref.squeeze(0).float(), rtol=2e-2, atol=2e-2)
-              and torch.allclose(pool, ref_pool, rtol=1e-3, atol=1e-4))
+              and torch.allclose(pool, ref_pool, rtol=2e-2, atol=2e-2))
         failed |= not ok
         t_ref = _graph_us(lambda i: chunk_gated_delta_rule(
             q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), g.unsqueeze(0), beta.unsqueeze(0),
@@ -416,9 +420,15 @@ def main() -> int:
             chunk_offsets=co), 4)[0]
         t_new = _graph_us(lambda i: gdn_prefill(x, ba[:, HV:], ba[:, :HV], A_log, dt_bias, pool,
                                                 cu, slots, has, out, H, K, V), 4)[0]
+        sweep = []
+        for cfg in ((16, 1, 1), (16, 1, 3), (32, 1, 3), (32, 2, 3), (64, 2, 3), (64, 4, 3)):
+            us = _graph_us(lambda i: gdn_prefill(x, ba[:, HV:], ba[:, :HV], A_log, dt_bias, pool,
+                                                 cu, slots, has, out, H, K, V, cfg), 4)[0]
+            sweep.append(f"{cfg[0]}/{cfg[1]}w/{cfg[2]}s {us:.1f}")
         print(f"{MARK} prefill lens {lens}: {'MATCH' if ok else 'MISMATCH'} vs vLLM chunk path "
               f"(max abs diff out {do:.2e}, state {ds:.2e}) | graphed FLA chunk {t_ref:.1f} us "
-              f"(+post-conv, gather, scatter) -> recurrent {t_new:.1f} us", flush=True)
+              f"(+post-conv, gather, scatter) -> recurrent {t_new:.1f} us | sweep "
+              f"{' | '.join(sweep)}", flush=True)
 
     # Steady state (accepted 1..5), graphed: AITER (5 state writes), gdn_defer stock-way
     # (zone 1, 5 writes) and deferred (zone 0: 1 state write + the record).
