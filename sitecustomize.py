@@ -73,6 +73,32 @@ to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
 """
 import os
 
+# SUFFIX_ROCM_PRESET=<name>: setdefault a validated gate set (explicit env vars still win), so a
+# pod spec stays under the console's 30-variable cap. Boot-gate children never see it (SUFFIX_*
+# is stripped from their env). An unknown name refuses to start instead of serving stock.
+_PRESETS = {
+    # MI350P Qwen3.8-Flash-Next, plugin-harness/dossiers/mi350p-qwen-flash-2026-10-08.md (k36).
+    "mi350p-qwen-flash": {
+        "VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_SKINNY_GEMM": "0",
+        "VLLM_DISABLE_SHARED_EXPERTS_STREAM": "1", "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "1",
+        "AITER_CONFIG_FMOE": "/plugins/suffix_hybrid/configs/mi350p_tuned_fmoe.csv",
+        "SUFFIX_ROCM_AITER_PAD": "1", "SUFFIX_ROCM_AITER_FLYDSL_ZBUF": "1",
+        "SUFFIX_ROCM_AFP4_CONFIGS": "1", "SUFFIX_MXFP4_LMHEAD": "1", "SUFFIX_MXFP4_LMHEAD_MAX_M": "64",
+        "SUFFIX_ROCM_QSA_TOPK_ROWS": "1", "SUFFIX_ROCM_QSA_MQA": "1", "SUFFIX_ROCM_QSA_SPARSE_SKIP": "1",
+        "SUFFIX_ROCM_QSA_DENSE": "1", "SUFFIX_ROCM_QK_FUSED": "1",
+        "SUFFIX_ROCM_GDN_MTP": "1", "SUFFIX_ROCM_GDN_ASYNC_IDX": "1", "SUFFIX_ROCM_GDN_DEFER": "1",
+        "SUFFIX_ROCM_GDN_MIXED": "1", "SUFFIX_ROCM_GDN_DEFER_MFMA": "1",
+        "SUFFIX_ROCM_HC_FUSE": "1", "SUFFIX_ROCM_HC_DOWN": "1", "SUFFIX_ROCM_HC_DOWN_MAX_M": "256",
+        "SUFFIX_ROCM_HC_BIG": "1", "SUFFIX_ROCM_ACT_QUANT_FUSE": "1", "SUFFIX_ROCM_MOE_ROUTE": "1",
+    },
+}
+_preset = os.environ.get("SUFFIX_ROCM_PRESET", "").strip()
+if _preset:
+    if _preset not in _PRESETS:
+        raise SystemExit(f"[suffix] SUFFIX_ROCM_PRESET={_preset!r}: unknown (known: {sorted(_PRESETS)})")
+    for _k, _v in _PRESETS[_preset].items():
+        os.environ.setdefault(_k, _v)
+
 # Kernel provider registration (independent gate). Inert until
 # --kernel-config ir_op_priority names the provider; a registration failure
 # is a logged refusal, never fatal (serving never depended on our ops).
@@ -298,7 +324,9 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_AITER_FLYDSL_PAD", "SUFFIX_ROCM_AITER_FLYDSL_ZERO",
                   "SUFFIX_ROCM_AFP4_CONFIGS", "SUFFIX_ROCM_QSA_DENSE",
                   "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
-                  "SUFFIX_ROCM_TOPK_GATING")):
+                  "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG",
+                  "SUFFIX_ROCM_QK_FUSED", "SUFFIX_ROCM_ACT_QUANT_FUSE",
+                  "SUFFIX_JIT_LOG")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
             and not all(os.environ.get(_g, "").strip() == "1"
                         for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
@@ -558,14 +586,33 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_GDN_DEFER vs AITER's verify over 14 steps of random acceptance with the
     # align-mode copies emulated: bitwise outputs + boundary slots; graphed us/call.
     "gdn_defer_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm"], {}),
+    # SUFFIX_ROCM_GDN_DEFER_MFMA (chunk form on the fp32 matrix cores) vs the fp64 recurrence,
+    # AITER and v1 (shared records: v1 / MFMA alternating) over multi-step acceptance; graphed
+    # us/call v1 vs BV / warps / RELOAD at c1/c8/c32 + AMDGCN facts. Lines: [suffix gdn-mfma].
+    "gdn_defer_mfma_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm", "mfma"], {}),
+    # SUFFIX_ROCM_ACT_QUANT_FUSE: GDN norm / QSA gate + MXFP4 quant in one launch vs inductor's
+    # producer + dynamic_mxfp4_quant + gemm_afp4wfp4 at M 1..1024: bf16 producer, x_fp4 / E8M0
+    # bytes and the GEMM output bitwise, graph replay, graphed us. Lines: [suffix act-quant].
+    "act_quant_bench": (["-m", "suffix_hybrid.kernels.act_quant_rocm"], {}),
     # SUFFIX_ROCM_TOPK_GATING vs aiter.topk_softmax: indices bitwise, weights, graphed us/call.
     "topk_gating_bench": (["-m", "suffix_hybrid.kernels.topk_gating_rocm"], {}),
+    # SUFFIX_ROCM_MOE_ROUTE: router top-k + AITER moe_sorting + stage-1 MXFP4 quant-sort in two
+    # launches vs the stock chain, every output bitwise (+ gating-math calibration), whole
+    # aiter.fused_moe bitwise on the tuned rows, graph replay, vLLM's router + experts captured at
+    # descending sizes in one pool (+ garbage logits), graphed us/call.
+    "moe_route_bench": (["-m", "suffix_hybrid.kernels.moe_route_rocm"],
+                        {"SUFFIX_ROCM_AITER_FLYDSL_ZBUF": "1", "VLLM_ROCM_USE_AITER": "1",
+                         "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "1"}),
     # SUFFIX_ROCM_HC_FUSE kernel vs vLLM hc_silu -> F.linear -> hc_gate_mix: bf16
     # bound + bit-exact share, us/call (HIP graphs, cold weights), BMxNG sweep.
     "hc_fuse_bench": (["-m", "suffix_hybrid.kernels.hc_fused_rocm"], {}),
     # SUFFIX_ROCM_HC_DOWN split-K kernel vs F.linear (hipBLASLt) at N 336/320, M 1..160:
     # bf16 bound + bit-exact share, determinism, graphed us/call (cold weights), sweep.
     "hc_down_bench": (["-m", "suffix_hybrid.kernels.hc_down_rocm"], {}),
+    # SUFFIX_ROCM_HC_BIG site (4 launches at 16 < M <= 256) vs today's HC_DOWN + HC_FUSE path vs
+    # vLLM's stock chain against fp64, mix / combine_and_mix / final mixer, M 17..256; graphed
+    # us/site (cold weights), down / up config sweeps + isa, a paste-able _CFG line.
+    "hc_big_bench": (["-m", "suffix_hybrid.kernels.hc_big_rocm"], {}),
     # AITER fused-MoE tuner for this card's CU count (qwen3.8-flash MXFP4 MoE; the
     # _fse variant = shared expert fused as expert 513, top-11); prints the CSV.
     "aiter_moe_tune": (["-m", "suffix_hybrid.tools.aiter_moe_tune"], {}),
@@ -588,6 +635,12 @@ _BOOT_GATES = {
     # (k20: M=32 220 us/call vs a ~130 us read floor).
     "afp4_tune_lmhead": (["-m", "suffix_hybrid.tools.afp4_tune", "--shapes", "248320x2560",
                           "--ms", "1,5,8,16,32,40,64", "--minutes", "20"], {}),
+    # lm_sample_rocm.row_topk (the head's top-64 candidates) == torch.topk's set on adversarial
+    # bf16 rows; the MXFP4 head with it vs with y.topk, logits bitwise, M 1..256; graphed us.
+    "lm_sample_lmhead": (["-m", "suffix_hybrid.kernels.lm_sample_rocm"], {}),
+    # SUFFIX_ROCM_QK_FUSED: vLLM's fused split + QK norm + interleaved mRoPE + gate vs the eager
+    # chain at the QSA shapes, <= 2 bf16 ulp, graph replay, graphed us/call.
+    "qk_fused_bench": (["-m", "suffix_hybrid.kernels.qk_fused_rocm"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():

@@ -58,6 +58,9 @@ def test_summarize_synthetic_trace():
     assert "D2H copies/step 0.5" in text
     assert "inside graphs seen: 1 of 3" in text
     assert "target:FULLx1: 2" in text
+    # idle gaps: moe end 900 -> memcpy 950, memcpy end 960 -> attn 1300 = 390 us / 2 steps
+    assert "gpu idle gaps > 10 us: 0.195 ms/step" in text
+    assert "Memcpy DtoH (Device -> Pinned) -> nvfp4_attn_partial | host -" in text
     assert "attn K2 own (verify) 0.300" in text
 
 
@@ -211,3 +214,18 @@ def test_child_summary_from_sidecar(tmp_path, capsys):
     assert out[0] == f"{sp.MARK} BEGIN summary window 1 [c1]"
     assert out[-1] == f"{sp.MARK} END summary window 1" and all(ln.startswith(sp.MARK) for ln in out)
     assert any("FULL: 1 @9.0ms" in ln for ln in out)
+
+
+def test_owners_attribute_kernels_to_innermost_cpu_op():
+    ev = [
+        _x(sp.STEP, "user_annotation", 0, 1000),
+        _x("aten::clone", "cpu_op", 10, 100),
+        _x("aten::copy_", "cpu_op", 20, 50),  # nested in clone: innermost
+        _x("hipMemcpyAsync", "cuda_runtime", 30, 5, correlation=7),
+        _x("hipLaunchKernel", "cuda_runtime", 200, 5, correlation=8),  # no op around it
+        _x("__amd_rocclr_copyBuffer", "kernel", 300, 4, tid=7, correlation=7),
+        _x("triton_poi_fused_0", "kernel", 310, 6, tid=7, correlation=8),
+    ]
+    text = "\n".join(sp.summarize({"traceEvents": ev}))
+    assert "__amd_rocclr_copyBuffer <- aten::copy_" in text
+    assert "triton_poi_fused_0 <- -" in text

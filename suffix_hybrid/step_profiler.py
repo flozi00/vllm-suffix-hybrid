@@ -263,7 +263,72 @@ def summarize(trace: dict, py_stats: dict | None = None) -> list[str]:
         out.append(f"  {calls / n:7.1f} | {dur / n / 1e3:7.3f} | "
                    f"{100 * dur / gpu_sum:5.1f} | {category(name)} | "
                    f"{_short(name)}")
+    out.extend(_gaps(gpu, anns, n))
+    out.extend(_owners(evs, rt, gpu, n))
     out.extend(_by_signature(steps, (py_stats or {}).get("sigs") or [], rt, gpu))
+    return out
+
+
+def _owners(evs, rt, gpu, n: int, top: int = 30) -> list[str]:
+    """GPU work by (kernel, innermost CPU op around its launch): who launches the copies,
+    fills and small kernels. Kernels replayed from a graph all map to the graph launch,
+    so this is informative for eager / PIECEWISE steps (e.g. --enforce-eager windows)."""
+    ops = defaultdict(list)
+    for e in evs:
+        if e.get("cat") == "cpu_op":
+            ops[e.get("tid")].append((e["ts"], e["ts"] + e["dur"], e.get("name", "?")))
+    if not ops:
+        return []
+    calls = defaultdict(list)
+    for e in rt:
+        if (e.get("args") or {}).get("correlation") is not None:
+            calls[e.get("tid")].append(e)
+    launch = {}
+    for tid, v in ops.items():  # one sweep per thread: nested ops on a stack, O(n log n)
+        v.sort()
+        stack, j = [], 0
+        for e in sorted(calls.get(tid, []), key=lambda e: e["ts"]):
+            while j < len(v) and v[j][0] <= e["ts"]:
+                while stack and stack[-1][1] < v[j][0]:
+                    stack.pop()
+                stack.append(v[j])
+                j += 1
+            while stack and stack[-1][1] < e["ts"] + e["dur"]:  # ended: encloses nothing later
+                stack.pop()
+            launch[e["args"]["correlation"]] = stack[-1][2] if stack else "-"
+    agg = defaultdict(lambda: [0, 0.0])
+    for e in gpu:
+        own = launch.get((e.get("args") or {}).get("correlation"), "?")
+        row = agg[f"{_short(e.get('name', '?'), 60)} <- {own}"]
+        row[0] += 1
+        row[1] += e["dur"]
+    out = [f"gpu work by launching cpu op: top {top}: calls/step | ms/step | kernel <- op"]
+    for k, (c, d) in sorted(agg.items(), key=lambda kv: -kv[1][1])[:top]:
+        out.append(f"  {c / n:7.1f} | {d / n / 1e3:7.3f} | {k}")
+    return out
+
+
+def _gaps(gpu, anns, n: int, min_us: float = 10.0, top: int = 15) -> list[str]:
+    """GPU idle gaps > min_us, keyed by (kernel before -> kernel after) and the innermost
+    host annotation spanning the gap's end: where the GPU waits on the host."""
+    agg = defaultdict(lambda: [0, 0.0])
+    end, prev = None, "-"
+    for e in sorted(gpu, key=lambda e: e["ts"]):
+        if end is not None and e["ts"] - end > min_us:
+            host = [a for a in anns if a["ts"] <= e["ts"] <= a["ts"] + a["dur"]]
+            own = min(host, key=lambda a: a["dur"])["name"] if host else "-"
+            row = agg[f"{_short(prev, 48)} -> {_short(e.get('name', '?'), 48)} | host {own}"]
+            row[0] += 1
+            row[1] += e["ts"] - end
+        if end is None or e["ts"] + e["dur"] > end:
+            end, prev = e["ts"] + e["dur"], e.get("name", "?")
+    if not agg:
+        return []
+    total = sum(v[1] for v in agg.values())
+    out = [f"gpu idle gaps > {min_us:.0f} us: {total / n / 1e3:.3f} ms/step; top {top}: "
+           "gaps/step | ms/step | kernel before -> kernel after | host"]
+    for k, (c, d) in sorted(agg.items(), key=lambda kv: -kv[1][1])[:top]:
+        out.append(f"  {c / n:6.2f} | {d / n / 1e3:7.3f} | {k}")
     return out
 
 

@@ -80,6 +80,9 @@ SUFFIX_ROCM_GDN_DEFER=1 (needs _GDN_MTP and _GDN_ASYNC_IDX): GDN MTP verify with
   the accepted ones (bit-identical). 1 state write per request and layer instead of 5;
   steps near a mamba align block boundary keep vLLM's slot contract for its copies. The
   GDN metadata carries the spec rows' seq_lens and the align block size for that.
+  With SUFFIX_ROCM_GDN_DEFER_MFMA=1 the same contract runs in chunk form on the fp32
+  matrix cores (gdn_defer_rocm._gdn_defer_mfma_kernel; fp32-accurate, not bitwise; no
+  source patch, read by gdn_defer).
 SUFFIX_ROCM_TOPK_GATING=1: the MoE router's aiter.topk_softmax (vllm._aiter_ops) runs as one
   Triton program per token (suffix_hybrid/kernels/topk_gating_rocm.py): same indices, AITER's
   weight math; ~12 us per MoE layer in AITER's 16-threads-per-row kernel at c8..c32.
@@ -89,9 +92,35 @@ SUFFIX_ROCM_AFP4_CONFIGS=1: AITER's Triton MXFP4 GEMM (gemm_afp4wfp4, vLLM's non
   the 128-CU MI350P otherwise runs the 256-CU MI355X DEFAULT.json tiles. A shape without a
   plugin file resolves exactly as before. vLLM's preshuffle-tuned guard (probes 2x K) only
   gates the ASM path (VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=1), not this one.
+SUFFIX_ROCM_MOE_ROUTE=1: at M <= SUFFIX_ROCM_MOE_ROUTE_MAX_M (16) the MoE router's top-k,
+  AITER's moe_sorting (P0_v2 + P23) and the stage-1 MXFP4 quant-sort run as two Triton
+  launches (suffix_hybrid/kernels/moe_route_rocm.py): ids, sort and quant bit-identical, the
+  gating weights too with the calibrated exp (SUFFIX_ROCM_MOE_ROUTE_EXP, 0 or 2); the
+  AiterSharedRoutedFusedMoERouter defers its topk_softmax call to aiter.fused_moe's sort.
+SUFFIX_ROCM_HC_BIG=1: Qwen4Exp GatedResidual.mix / combine_and_mix return through
+  suffix_hybrid/kernels/hc_big_rocm.py: vLLM's norm, then one custom op for the rest of the
+  site. At SUFFIX_ROCM_HC_BIG_MIN_M < M <= _MAX_M (16 < M <= 256: c8+ verify, c32 drafts)
+  hc_down's split-K partials at a large-M config, their reduce + silu in one launch and
+  the up GEMM + gate mix without the [M, 10240] gate (6 launches -> 4 at M = 160); at
+  M <= MIN_M HC_DOWN's + HC_FUSE's kernels, above MAX_M vLLM's stock chain. The patch
+  only inserts the return at the top of each method: composes with HC_FUSE / HC_DOWN.
+SUFFIX_ROCM_QK_FUSED=1: the Qwen4Exp QSA layers run vLLM's fused split + QK GemmaRMSNorm +
+  partial NeoX RoPE + gate copy (vllm/model_executor/layers/fused_qk_norm_rope.py, Triton)
+  instead of the eager chain inductor compiles into ~4-5 launches: the AMD layer allows it
+  on CUDA and text-only; here also ROCm and interleaved mRoPE (multimodal), with
+  Qwen3NextAttention's own conditions (oracle: suffix_hybrid/kernels/qk_fused_rocm.py).
+SUFFIX_ROCM_ACT_QUANT_FUSE=1: the GDN output (RMSNormGated -> out_proj) and the QSA output
+  (attn * sigmoid(gate) -> o_proj) quantize their own MXFP4 activations
+  (suffix_hybrid/kernels/act_quant_rocm.py): producer + AITER's _mxfp4_quant_op in one
+  Triton launch, then gemm_afp4wfp4 as vLLM's non-ASM MXFP4 linear calls it; one launch
+  fewer per site (52 per MTP-4 step). Only for out_proj / o_proj served by that kernel
+  at TP 1; anything else keeps the stock code below the patched branch.
+SUFFIX_JIT_LOG=1: one "[suffix jit]" line per Triton compile (kernel, wall ms): which kernels
+  still JIT-compile while serving (each compile stalls every in-flight request).
 """
 import glob
 import importlib.util
+import linecache
 import os
 import sys
 import textwrap
@@ -123,6 +152,16 @@ _HC_FUSED = (
     "\n"
     "        return hidden_states, block_input, injection\n"
     "\n")
+# HC_BIG anchors: mix's signature and combine_and_mix's docstring end, which neither
+# HC_FUSE nor HC_DOWN touches.
+_HC_MIX_SIG = (
+    "    def mix(\n"
+    "        self, hidden_states: torch.Tensor\n"
+    "    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:\n")
+_HC_CAM_DOC = (
+    "        block's mix. Its combine with ``block_output`` is fused with this\n"
+    "        module's input RMSNorm.\n"
+    '        """\n')
 # Both methods also share the down projection branch; the norm call's argument before
 # self.hc_norm.weight (hidden_states in mix, prev_injection in combine_and_mix) tells the
 # two anchors apart. They end before _HC_TAIL: disjoint from the HC_FUSE anchors.
@@ -272,6 +311,18 @@ _AFP4_PROBE = (
     "        specialized_config = load_config_json(\n"
     '            f"{cfg_dir}/{config_name}-{suffix}.json", required=False\n'
     "        )\n")
+
+# ACT_QUANT_FUSE anchors: _output_projection's body (vLLM 81198e97) and QSA forward's tail.
+_AQ_GDN = (
+    "        core_attn_out = self.norm(core_attn_out, z)\n"
+    "        output, _ = self.out_proj(core_attn_out.flatten(-2))\n"
+    "        return output\n")
+_AQ_QSA = (
+    "        flat_output = attn_output.view(num_tokens, -1)\n"
+    "        if gate is not None:\n"
+    "            flat_output = flat_output * torch.sigmoid(gate)\n"
+    "        output, _ = self.o_proj(flat_output)\n"
+    "        return output\n")
 
 # gate -> Patch, or a tuple of Patches the gate applies together.
 PATCHES = {
@@ -533,6 +584,47 @@ PATCHES = {
               "            prev_injection,\n" + _HC_DOWN,
               "            prev_injection,\n" + _HC_DOWN_NEW),
     ),
+    "SUFFIX_ROCM_HC_BIG": (
+        Patch(_HC, "HC site tail in one op, 4 launches at decode M (mix)", _HC_MIX_SIG,
+              _HC_MIX_SIG + "        return hc_big_mix(self, hidden_states)  # suffix rocm-hc-big\n",
+              "suffix_hybrid.kernels.hc_big_rocm:install"),
+        Patch(_HC, "HC site tail in one op, 4 launches at decode M (combine_and_mix)", _HC_CAM_DOC,
+              _HC_CAM_DOC + "        return hc_big_combine_and_mix(  # suffix rocm-hc-big\n"
+              "            self, hidden_states, prev_block_output, prev_injection\n"
+              "        )\n"),
+    ),
+    "SUFFIX_ROCM_QK_FUSED": Patch(
+        "vllm.models.qwen4_exp.amd.qsa",
+        "QSA split + QK norm + mRoPE + gate in vLLM's fused Triton kernel on ROCm",
+        "            and current_platform.is_cuda()\n"
+        "            and text_only\n"
+        "        )\n",
+        "            and current_platform.is_cuda_alike()  # suffix SUFFIX_ROCM_QK_FUSED\n"
+        "            and getattr(self.rotary_emb, \"dtype\", None) in (torch.float16, torch.bfloat16)\n"
+        "            and (text_only or (  # Qwen3NextAttention's interleaved-mRoPE condition\n"
+        "                type(self.rotary_emb).__name__ == \"MRotaryEmbedding\"\n"
+        "                and getattr(self.rotary_emb, \"mrope_interleaved\", False)\n"
+        "                and len(getattr(self.rotary_emb, \"mrope_section\", None) or ()) == 3\n"
+        "                and sum(self.rotary_emb.mrope_section) == self.rotary_emb.rotary_dim // 2))\n"
+        "        )\n"),
+    "SUFFIX_ROCM_ACT_QUANT_FUSE": (
+        Patch("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
+              "GDN RMSNormGated + MXFP4 quant in one launch before out_proj",
+              _AQ_GDN,
+              "        if _suffix_aq_gdn_ok(self):  # suffix SUFFIX_ROCM_ACT_QUANT_FUSE\n"
+              "            return _suffix_aq_gdn_out(self, core_attn_out, z)\n" + _AQ_GDN,
+              "suffix_hybrid.kernels.act_quant_rocm:install_gdn"),
+        Patch("vllm.models.qwen4_exp.amd.qsa",
+              "QSA sigmoid gate + MXFP4 quant in one launch before o_proj",
+              _AQ_QSA,
+              "        flat_output = attn_output.view(num_tokens, -1)\n"
+              "        if gate is not None and _suffix_aq_qsa_ok(self):  # suffix SUFFIX_ROCM_ACT_QUANT_FUSE\n"
+              "            return _suffix_aq_qsa_out(self, flat_output, gate, qkv)\n"
+              + _AQ_QSA.split("\n", 1)[1],
+              "suffix_hybrid.kernels.act_quant_rocm:install_qsa"),
+    ),
+    "SUFFIX_JIT_LOG": Patch("triton.runtime.jit", "log every Triton compile",
+                            after="suffix_hybrid.jit_log:install"),
     # Inside the lru-cached lookup: one file probe per (shape, M) per process; a plugin
     # miss (None) falls through to AITER's own probe unchanged.
     "SUFFIX_ROCM_AFP4_CONFIGS": Patch(
@@ -547,6 +639,13 @@ PATCHES = {
         "        ) or load_config_json(\n"
         '            f"{cfg_dir}/{config_name}-{suffix}.json", required=False\n'
         "        )\n"),
+    "SUFFIX_ROCM_MOE_ROUTE": (
+        Patch("aiter.fused_moe", "MoE top-k + sort + MXFP4 quant-sort in two launches (sort site)",
+              after="suffix_hybrid.kernels.moe_route_rocm:install_aiter"),
+        Patch("vllm.model_executor.layers.fused_moe.router.aiter_shared_routed_fused_moe_router",
+              "MoE top-k deferred to the fused sort (router)",
+              after="suffix_hybrid.kernels.moe_route_rocm:install_router"),
+    ),
 }
 _MARK = "_suffix_rocm_patch"
 
@@ -601,7 +700,12 @@ def install_post_import_hook() -> bool:
                 for p in patches:
                     if p.old:
                         src = patch_source(p, src)
-                exec(compile(src, module.__file__, "exec"), module.__dict__)
+                # Triton's @jit parses inspect.getsource(fn), which reads the file named
+                # by co_filename: without this the patched module's kernels compile from
+                # the unpatched file on disk (wrong lines once a patch shifts them).
+                fname = f"{module.__file__}.suffix-rocm-patch.py"
+                linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)
+                exec(compile(src, fname, "exec"), module.__dict__)
                 for p in patches:
                     if p.after:
                         mod_name, fn = p.after.split(":")

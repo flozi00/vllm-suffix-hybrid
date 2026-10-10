@@ -20,7 +20,7 @@ def test_max_m_env(monkeypatch):
     assert m.max_m_env() == m.MAX_M
     monkeypatch.setenv(m.MAX_M_ENV, "4")
     assert m.max_m_env() == 4
-    monkeypatch.setenv(m.MAX_M_ENV, "65")
+    monkeypatch.setenv(m.MAX_M_ENV, "257")
     with pytest.raises(ValueError):
         m.max_m_env()
 
