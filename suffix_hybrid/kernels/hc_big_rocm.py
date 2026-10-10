@@ -36,12 +36,13 @@ from suffix_hybrid.kernels import hc_down_rocm, hc_fused_rocm
 MIN_M = int(os.environ.get("SUFFIX_ROCM_HC_BIG_MIN_M", "16"))
 MAX_M = int(os.environ.get("SUFFIX_ROCM_HC_BIG_MAX_M", "256"))
 # (up to M, down (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT, warps), up (BLOCK_M, BLOCK_N, warps,
-# rows_first)). Guesses until the hc_big_bench sweep; it prints a paste-able
-# SUFFIX_ROCM_HC_BIG_CFG="32:32/64/128/40/4:32/16/4/1,..." that overrides this table.
+# rows_first)): the hc_big_bench sweep's picks on the MI350P (gate6, 2026-10-10; down /
+# up us at M 160: 11.6 / 11.0 vs today's pair 11.4 / up path 15.9).
+# SUFFIX_ROCM_HC_BIG_CFG="32:32/64/128/40/4:32/16/4/1,..." overrides this table.
 CFG = ((32, (32, 64, 128, 40, 4), (32, 16, 4, 1)),
-       (64, (64, 64, 128, 40, 4), (32, 16, 4, 1)),
-       (128, (128, 64, 128, 20, 8), (32, 16, 4, 1)),
-       (256, (128, 64, 128, 20, 8), (64, 16, 4, 1)))  # 128-row down tiles: <= 96 KB LDS
+       (64, (32, 64, 128, 20, 4), (32, 16, 4, 0)),
+       (128, (64, 64, 128, 20, 4), (64, 16, 4, 0)),
+       (256, (64, 64, 128, 10, 4), (32, 16, 4, 0)))
 MARK = "[suffix hc-big]"
 _LAST = {}  # the last compiled kernel per launch kind (the oracle's isa stats)
 

@@ -298,8 +298,7 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_AITER_FLYDSL_PAD", "SUFFIX_ROCM_AITER_FLYDSL_ZERO",
                   "SUFFIX_ROCM_AFP4_CONFIGS", "SUFFIX_ROCM_QSA_DENSE",
                   "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
-                  "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG",
-                  "SUFFIX_ROCM_TOPK_TOPP")):
+                  "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
             and not all(os.environ.get(_g, "").strip() == "1"
                         for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
@@ -602,15 +601,9 @@ _BOOT_GATES = {
     # (k20: M=32 220 us/call vs a ~130 us read floor).
     "afp4_tune_lmhead": (["-m", "suffix_hybrid.tools.afp4_tune", "--shapes", "248320x2560",
                           "--ms", "1,5,8,16,32,40,64", "--minutes", "20"], {}),
-    # Same for the c32 MTP-4 verify rows the head now takes (SUFFIX_MXFP4_LMHEAD_MAX_M 256).
-    "afp4_tune_lmhead256": (["-m", "suffix_hybrid.tools.afp4_tune", "--shapes", "248320x2560",
-                             "--ms", "96,128,160,192,256", "--minutes", "20"], {}),
     # lm_sample_rocm.row_topk (the head's top-64 candidates) == torch.topk's set on adversarial
     # bf16 rows; the MXFP4 head with it vs with y.topk, logits bitwise, M 1..256; graphed us.
-    "lm_sample_lmhead": (["-m", "suffix_hybrid.kernels.lm_sample_rocm", "lmhead"], {}),
-    # SUFFIX_ROCM_TOPK_TOPP vs vLLM's apply_top_k_top_p_triton: masked logits bitwise at batch
-    # 1..256 (LM-like logits, ties, -inf, mixed top-k / p-only rows), graph == eager, us/call.
-    "lm_sample_topk_topp": (["-m", "suffix_hybrid.kernels.lm_sample_rocm", "topktopp"], {}),
+    "lm_sample_lmhead": (["-m", "suffix_hybrid.kernels.lm_sample_rocm"], {}),
 }
 _boot_gates = [g.strip() for g in os.environ.get("SUFFIX_BOOT_GATES", "").split(",") if g.strip()]
 def _boot_gates_claim():

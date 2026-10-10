@@ -557,6 +557,10 @@ CONFIG = (16, 1, 1)  # BV, num_warps, num_stages. MI350P k16 oracle, graphed us 
 # c1/c8/c32: 16/1w/rl 11.9/51.0/158.4 (v1 15.9/53.3/181.0; 232 VGPRs, occupancy 2).
 MFMA = os.environ.get("SUFFIX_ROCM_GDN_DEFER_MFMA", "").strip() == "1"
 MFMA_CONFIG = (16, 1, True, False, 0)
+# From MFMA_PP_MIN_REQ requests on, the per-head pre-pass + main kernel (MI350P gate6,
+# graphed us c1/c8/c32: v1 15.8/53.7/181.0, MFMA_CONFIG 11.7/50.0/162.0, this 13.8/42.8/127.6).
+MFMA_PP_CONFIG = (16, 1, False, False, 1)
+MFMA_PP_MIN_REQ = 4
 
 
 def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_accepted,
@@ -572,7 +576,7 @@ def gdn_defer(qkv, a, b, A_log, dt_bias, state, cu_seqlens, state_indices, num_a
     K, V = head_k_dim, head_v_dim
     win = state_indices.shape[1]
     if (MFMA if mfma is None else mfma) and 3 * win - 1 <= 16:
-        BV, warps, reload, lean, nb = config or MFMA_CONFIG
+        BV, warps, reload, lean, nb = config or (MFMA_PP_CONFIG if n >= MFMA_PP_MIN_REQ else MFMA_CONFIG)
         rec = (K + 16 + 2 + 63) // 64 * 64  # v1's record at its BV 16
         assert K == triton.next_power_of_2(K) and BV % 16 == 0 and V % (BV * max(nb, 1)) == 0
         assert (win - 1) * rec <= 16 * K and state.dtype == torch.float32
