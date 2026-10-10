@@ -19,6 +19,11 @@ rounding to bf16: the stock GEMM's contract, only the fp32 summation order diffe
 Deterministic: split, tiles and the reduce tree are fixed per (M, N, K); no atomics.
 HIP-graph safe: grids and the partials buffer follow from shapes; no host sync.
 
+Tried (2026-10-10): the last split program of a tile reduces instead of the second launch
+(acq_rel tile counter). Correct, but 24-28 us vs 6.1-6.4 us at M <= 16 and ~66 vs ~8 us at
+M 40-64: device-scope release / acquire on the MI350P's per-XCD L2s costs far more than the
+launch it saves.
+
     python -m suffix_hybrid.kernels.hc_down_rocm   # GPU oracle + us/call (boot gate hc_down_bench)
 """
 import os

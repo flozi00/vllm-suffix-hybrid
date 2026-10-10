@@ -85,10 +85,10 @@ def test_forward_mixed_slices_verify_prefix_and_prefill_suffix(monkeypatch):
         calls["defer"] = (qkv, a, b, cu, seq, rest)
         out[: qkv.shape[0]] = 5.0
 
-    def chunk(**kw):
+    def chunk(**kw):  # like FLA: the output goes straight into core_attn_out
         calls["chunk"] = kw
-        t = kw["q"].shape[1]
-        return torch.full((1, t, hv, V), 7.0), torch.full(kw["initial_state"].shape, 3.0)
+        kw["core_attn_out"].fill_(7.0)
+        return kw["core_attn_out"].view(1, -1, hv, V), torch.full(kw["initial_state"].shape, 3.0)
 
     monkeypatch.setattr(gdn_defer_rocm, "gdn_defer", defer)
     monkeypatch.setattr(gdn_mtp_rocm, "_MIXED", True)
@@ -143,6 +143,8 @@ def test_forward_mixed_slices_verify_prefix_and_prefill_suffix(monkeypatch):
     init = calls["chunk"]["initial_state"]
     assert torch.equal(init[0], before) and not init[1].any()  # no prior state -> zeros
     assert calls["chunk"]["cu_seqlens"] is md.prefill_query_start_loc
+    co = calls["chunk"]["core_attn_out"]  # rows [nst, n) of the layer output, flat
+    assert co.data_ptr() == out[10].data_ptr() and co.numel() == 7 * hv * V
     assert bool((layer.kv_cache[1][pre_idx] == 3.0).all())
     assert bool((out[:10] == 5.0).all()) and bool((out[10:17] == 7.0).all()) and not out[17:].any()
 

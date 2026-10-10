@@ -22,6 +22,12 @@ size) writes every slot the stock way, and the step after one reads the stock wa
 those copies see what they always saw. num_accepted == 1 (first step after a prefill,
 after vLLM's align reset) reads slot 0 under both contracts.
 
+Tried and measured slower on the MI350P (Triton 3.8, 2026-10-10, oracle in the history
+of 4f10e0f6): a rank-update replay from stored u / normalized k plus a chunk-form verify
+(10 independent row reductions, k / q dot products from a per-head pre-pass). Fewer
+instructions (4.1k vs 4.8k), but 180 VGPRs -> occupancy 2 instead of 3: c1/c8/c32
+19.2/57.8/204.5 vs 15.0/52.2/177.5 us; a [NC, BV, KC] tile costs Triton ~30% more again.
+
     python -m suffix_hybrid.kernels.gdn_defer_rocm   # multi-step GPU oracle vs AITER + us/call
 """
 from __future__ import annotations
