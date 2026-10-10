@@ -63,6 +63,8 @@ PYTHONPATH. Each section is independently gated:
                                top-k as dense blocks (suffix_hybrid/kernels/qsa_dense_rocm.py)
   SUFFIX_ROCM_GDN_DEFER=1   -> ROCm: GDN MTP verify writes 1 state + token inputs
                                instead of 5 states (gdn_defer_rocm.py; needs _GDN_MTP, _ASYNC_IDX)
+  SUFFIX_ROCM_GDN_DEFER_V2=1 -> with _GDN_DEFER: rank-update replay + chunk-form verify
+                               (gdn_defer_rocm._gdn_defer2_kernel; boot gate gdn_defer2_bench)
   SUFFIX_ROCM_GDN_MIXED=1   -> with _GDN_DEFER: mixed verify + prefill GDN batches on row
                                slices (no gathers / repacks / index_copy; gdn_mtp_rocm.forward_mixed)
   SUFFIX_ROCM_TOPK_GATING=1 -> ROCm: MoE router top-k gating as one Triton program per token
@@ -558,6 +560,9 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_GDN_DEFER vs AITER's verify over 14 steps of random acceptance with the
     # align-mode copies emulated: bitwise outputs + boundary slots; graphed us/call.
     "gdn_defer_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm"], {}),
+    # SUFFIX_ROCM_GDN_DEFER_V2 only: vs the fp64 recurrence (AITER's error as the yardstick),
+    # deferred vs stock-way, boundary copies; graphed us/call v1 vs v2 configs.
+    "gdn_defer2_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm", "--v2"], {}),
     # SUFFIX_ROCM_TOPK_GATING vs aiter.topk_softmax: indices bitwise, weights, graphed us/call.
     "topk_gating_bench": (["-m", "suffix_hybrid.kernels.topk_gating_rocm"], {}),
     # SUFFIX_ROCM_HC_FUSE kernel vs vLLM hc_silu -> F.linear -> hc_gate_mix: bf16
