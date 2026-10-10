@@ -89,7 +89,8 @@ _PRESETS = {
         "SUFFIX_ROCM_GDN_MTP": "1", "SUFFIX_ROCM_GDN_ASYNC_IDX": "1", "SUFFIX_ROCM_GDN_DEFER": "1",
         "SUFFIX_ROCM_GDN_MIXED": "1", "SUFFIX_ROCM_GDN_DEFER_MFMA": "1",
         "SUFFIX_ROCM_HC_FUSE": "1", "SUFFIX_ROCM_HC_DOWN": "1", "SUFFIX_ROCM_HC_DOWN_MAX_M": "256",
-        "SUFFIX_ROCM_HC_BIG": "1", "SUFFIX_ROCM_MOE_ROUTE": "1", "SUFFIX_ROCM_ACT_QUANT_FUSE": "1",
+        "SUFFIX_ROCM_HC_BIG": "1", "SUFFIX_ROCM_ACT_QUANT_FUSE": "1",
+        # not SUFFIX_ROCM_MOE_ROUTE: k34 GPU memory fault in PIECEWISE capture at M=8 (open)
     },
 }
 _preset = os.environ.get("SUFFIX_ROCM_PRESET", "").strip()
