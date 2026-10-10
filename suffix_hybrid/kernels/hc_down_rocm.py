@@ -22,6 +22,7 @@ HIP-graph safe: grids and the partials buffer follow from shapes; no host sync.
     python -m suffix_hybrid.kernels.hc_down_rocm   # GPU oracle + us/call (boot gate hc_down_bench)
 """
 import os
+import sys
 
 import torch
 
@@ -29,6 +30,10 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 TARGET_PROGRAMS = 256  # 2 per CU on the 128-CU MI350P
+# SUFFIX_ROCM_HC_DOWN_FUSED=1: the last split program of each output tile sums the partials
+# (fixed order) and stores bf16, instead of the second launch (one launch per HC site).
+_FUSED = os.environ.get("SUFFIX_ROCM_HC_DOWN_FUSED", "").strip() == "1"
+_COUNTERS: dict = {}  # device -> int32 tile counters, zero between launches
 # Above MAX_M (c32 verify, prefill) vLLM's rocm_unquantized_gemm stays in charge.
 MAX_M = int(os.environ.get("SUFFIX_ROCM_HC_DOWN_MAX_M", "64"))
 
@@ -57,6 +62,44 @@ def _hc_down_kernel(
     tl.store(out, acc, mask=row_ok & col_ok)
 
 
+@triton.jit(do_not_specialize=["M"])
+def _hc_down_fused_kernel(
+    x_ptr, w_ptr, p_ptr, y_ptr, cnt_ptr, M, N, stride_x, stride_w,
+    SPLIT: tl.constexpr, K_SPLIT: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr, SG: tl.constexpr,
+):
+    # _hc_down_kernel's partial, then a per-tile arrival counter (acq_rel: the partials
+    # stored before it are visible to whoever arrives last). The last of the SPLIT programs
+    # sums all partials of the tile in split order, SG at a time (fixed order: the result
+    # does not depend on who arrives last), rounds once to bf16 and resets the counter.
+    rows = tl.program_id(2) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    ks = tl.program_id(1) * K_SPLIT + tl.arange(0, BLOCK_K)
+    row_ok = (rows < M)[:, None]
+    col_ok = (cols < N)[None, :]
+    x_ptrs = x_ptr + rows[:, None] * stride_x + ks[None, :]
+    w_ptrs = w_ptr + cols[None, :] * stride_w + ks[:, None]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(K_SPLIT // BLOCK_K):
+        acc = tl.dot(tl.load(x_ptrs, mask=row_ok, other=0.0),
+                     tl.load(w_ptrs, mask=col_ok, other=0.0), acc)
+        x_ptrs += BLOCK_K
+        w_ptrs += BLOCK_K
+    off = rows[:, None] * N + cols[None, :]
+    ok = row_ok & col_ok
+    tl.store(p_ptr + tl.program_id(1) * M * N + off, acc, mask=ok)
+    tile = tl.program_id(2) * tl.num_programs(0) + tl.program_id(0)
+    if tl.atomic_add(cnt_ptr + tile, 1, sem="acq_rel", scope="gpu") == SPLIT - 1:
+        tot = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        g = tl.arange(0, SG)
+        for s0 in range(0, SPLIT, SG):
+            part = tl.load(p_ptr + (s0 + g)[:, None, None] * M * N + off[None, :, :],
+                           mask=((s0 + g) < SPLIT)[:, None, None] & ok[None, :, :], other=0.0)
+            tot += tl.sum(part, axis=0)
+        tl.store(y_ptr + off, tot.to(y_ptr.dtype.element_ty), mask=ok)
+        tl.atomic_xchg(cnt_ptr + tile, 0)
+
+
 @triton.jit  # MN = M x N stays a multiple of 16 (vector loads), one compile for every M
 def _hc_down_reduce_kernel(p_ptr, y_ptr, MN, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
     # y.flat = bf16(sum over s of p[s].flat): all SPLIT partials in one load (one memory
@@ -83,7 +126,7 @@ def _config(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
     return bm, bn, bk, split, 4
 
 
-def _launch(x, w, config=None):
+def _launch(x, w, config=None, fused=None):
     m, k = x.shape
     n = w.shape[0]
     bm, bn, bk, split, warps = config or _config(m, n, k)
@@ -93,6 +136,18 @@ def _launch(x, w, config=None):
                          f"{tuple(w.shape)} {w.dtype}, K split {split} x {bk}")
     y = x.new_empty((m, n))
     out = y if split == 1 else torch.empty((split, m, n), dtype=torch.float32, device=x.device)
+    if split > 1 and (_FUSED if fused is None else fused):
+        tiles = triton.cdiv(n, bn) * triton.cdiv(m, bm)
+        cnt = _COUNTERS.get(x.device)
+        if cnt is None or cnt.numel() < tiles:
+            cnt = _COUNTERS[x.device] = torch.zeros(max(256, tiles), dtype=torch.int32,
+                                                    device=x.device)
+        _hc_down_fused_kernel[(triton.cdiv(n, bn), split, triton.cdiv(m, bm))](
+            x, w, out, y, cnt, m, n, x.stride(0), w.stride(0),
+            SPLIT=split, K_SPLIT=k // split, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk,
+            SG=min(8, triton.next_power_of_2(split)), num_warps=warps, num_stages=2,
+            matrix_instr_nonkdim=16)
+        return y
     _hc_down_kernel[(triton.cdiv(n, bn), split, triton.cdiv(m, bm))](
         x, w, out, m, n, x.stride(0), w.stride(0),
         K_SPLIT=k // split, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk,
@@ -178,24 +233,32 @@ def main() -> int:
                 exact = (out == ref).float().mean().item()
                 return worst <= 1 and exact >= 0.99, diff.max().item(), worst, exact
 
-            out = _launch(x, w)
+            out = _launch(x, w, fused=False)
             ok, diff, worst, exact = verdict(out)
-            ok &= torch.equal(out, _launch(x, w))  # run-to-run bitwise
+            ok &= torch.equal(out, _launch(x, w, fused=False))  # run-to-run bitwise
             stock_us, _ = _graph_us(lambda i: linear(x, ws[i]), copies)
-            ours_us, graphed = _graph_us(lambda i: _launch(x, ws[i]), copies)
+            ours_us, graphed = _graph_us(lambda i: _launch(x, ws[i], fused=False), copies)
             ok &= torch.equal(graphed, out)  # graph replay == eager, bitwise
+            fz = _launch(x, w, fused=True)  # SUFFIX_ROCM_HC_DOWN_FUSED: last program reduces
+            fok, fdiff, fworst, fexact = verdict(fz)
+            fok &= torch.equal(fz, _launch(x, w, fused=True))
+            fused_us, fgraphed = _graph_us(lambda i: _launch(x, ws[i], fused=True), copies)
+            fok &= torch.equal(fgraphed, fz)
+            failed |= not fok
             # The op the rewrite calls: ours up to MAX_M, vLLM's stock dispatch above.
-            ok &= torch.equal(_hc_down(x, w), out if m <= MAX_M
+            ok &= torch.equal(_hc_down(x, w), (fz if _FUSED else out) if m <= MAX_M
                               else torch.ops.vllm.rocm_unquantized_gemm(x, w))
             failed |= not ok
             bm, bn, bk, split, warps = _config(m, n, k)
             print(f"[suffix hc-down] N={n} M={m}: max abs diff {diff:.2e} rel "
                   f"{diff / ref.float().abs().max().item():.2e} (worst {worst:.2f} of tol, "
                   f"bit-exact {100 * exact:.3f}%) {'MATCH' if ok else 'MISMATCH'} | hipBLASLt "
-                  f"{stock_us:.1f} us -> ours {ours_us:.1f} us [{bn}x{bk}/{split}w{warps}]"
+                  f"{stock_us:.1f} us -> ours {ours_us:.1f} us [{bn}x{bk}/{split}w{warps}] | "
+                  f"fused {fused_us:.1f} us (worst {fworst:.2f}, bit-exact {100 * fexact:.3f}%, "
+                  f"{'MATCH' if fok else 'MISMATCH'})"
                   + ("" if m <= MAX_M else f" (above MAX_M={MAX_M}: stock in serving)"),
                   flush=True)
-            if n != 336:
+            if n != 336 or "--no-sweep" in sys.argv:
                 continue
             sweep = []  # (us, label) per config; one that does not build (LDS) is a datum
             for cfg in _sweep(m, n, k):

@@ -56,15 +56,15 @@ PYTHONPATH. Each section is independently gated:
   SUFFIX_ROCM_HC_DOWN=1     -> ROCm: Qwen4Exp HC down projections at M <=
                                SUFFIX_ROCM_HC_DOWN_MAX_M (default 64) as split-K
                                Triton + reduce (suffix_hybrid/kernels/hc_down_rocm.py);
-                               forces VLLM_USE_AOT_COMPILE=0 (stale-artifact guard)
+                               forces VLLM_USE_AOT_COMPILE=0 (stale-artifact guard);
+                               + SUFFIX_ROCM_HC_DOWN_FUSED=1: the last split program of a
+                               tile reduces (no second launch; boot gate hc_down_fused_bench)
   SUFFIX_ROCM_AFP4_CONFIGS=1 -> AITER gemm_afp4wfp4 takes tuned JSONs from
                                suffix_hybrid/configs/afp4/ first (boot gate afp4_tune)
   SUFFIX_ROCM_QSA_DENSE=1   -> ROCm: QSA attention runs requests within the token
                                top-k as dense blocks (suffix_hybrid/kernels/qsa_dense_rocm.py)
   SUFFIX_ROCM_GDN_DEFER=1   -> ROCm: GDN MTP verify writes 1 state + token inputs
                                instead of 5 states (gdn_defer_rocm.py; needs _GDN_MTP, _ASYNC_IDX)
-  SUFFIX_ROCM_GDN_DEFER_V2=1 -> with _GDN_DEFER: rank-update replay + chunk-form verify
-                               (gdn_defer_rocm._gdn_defer2_kernel; boot gate gdn_defer2_bench)
   SUFFIX_ROCM_GDN_MIXED=1   -> with _GDN_DEFER: mixed verify + prefill GDN batches on row
                                slices (no gathers / repacks / index_copy; gdn_mtp_rocm.forward_mixed)
   SUFFIX_ROCM_TOPK_GATING=1 -> ROCm: MoE router top-k gating as one Triton program per token
@@ -560,9 +560,6 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_GDN_DEFER vs AITER's verify over 14 steps of random acceptance with the
     # align-mode copies emulated: bitwise outputs + boundary slots; graphed us/call.
     "gdn_defer_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm"], {}),
-    # SUFFIX_ROCM_GDN_DEFER_V2 only: vs the fp64 recurrence (AITER's error as the yardstick),
-    # deferred vs stock-way, boundary copies; graphed us/call v1 vs v2 configs.
-    "gdn_defer2_bench": (["-m", "suffix_hybrid.kernels.gdn_defer_rocm", "--v2"], {}),
     # SUFFIX_ROCM_TOPK_GATING vs aiter.topk_softmax: indices bitwise, weights, graphed us/call.
     "topk_gating_bench": (["-m", "suffix_hybrid.kernels.topk_gating_rocm"], {}),
     # SUFFIX_ROCM_HC_FUSE kernel vs vLLM hc_silu -> F.linear -> hc_gate_mix: bf16
@@ -571,6 +568,8 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_HC_DOWN split-K kernel vs F.linear (hipBLASLt) at N 336/320, M 1..160:
     # bf16 bound + bit-exact share, determinism, graphed us/call (cold weights), sweep.
     "hc_down_bench": (["-m", "suffix_hybrid.kernels.hc_down_rocm"], {}),
+    # Same checks without the config sweep: default vs SUFFIX_ROCM_HC_DOWN_FUSED per M.
+    "hc_down_fused_bench": (["-m", "suffix_hybrid.kernels.hc_down_rocm", "--no-sweep"], {}),
     # AITER fused-MoE tuner for this card's CU count (qwen3.8-flash MXFP4 MoE; the
     # _fse variant = shared expert fused as expert 513, top-11); prints the CSV.
     "aiter_moe_tune": (["-m", "suffix_hybrid.tools.aiter_moe_tune"], {}),
