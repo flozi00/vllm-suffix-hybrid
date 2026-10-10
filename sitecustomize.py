@@ -56,9 +56,7 @@ PYTHONPATH. Each section is independently gated:
   SUFFIX_ROCM_HC_DOWN=1     -> ROCm: Qwen4Exp HC down projections at M <=
                                SUFFIX_ROCM_HC_DOWN_MAX_M (default 64) as split-K
                                Triton + reduce (suffix_hybrid/kernels/hc_down_rocm.py);
-                               forces VLLM_USE_AOT_COMPILE=0 (stale-artifact guard);
-                               + SUFFIX_ROCM_HC_DOWN_FUSED=1: the last split program of a
-                               tile reduces (no second launch; boot gate hc_down_fused_bench)
+                               forces VLLM_USE_AOT_COMPILE=0 (stale-artifact guard)
   SUFFIX_ROCM_AFP4_CONFIGS=1 -> AITER gemm_afp4wfp4 takes tuned JSONs from
                                suffix_hybrid/configs/afp4/ first (boot gate afp4_tune)
   SUFFIX_ROCM_QSA_DENSE=1   -> ROCm: QSA attention runs requests within the token
@@ -571,8 +569,6 @@ _BOOT_GATES = {
     # SUFFIX_ROCM_HC_DOWN split-K kernel vs F.linear (hipBLASLt) at N 336/320, M 1..160:
     # bf16 bound + bit-exact share, determinism, graphed us/call (cold weights), sweep.
     "hc_down_bench": (["-m", "suffix_hybrid.kernels.hc_down_rocm"], {}),
-    # Same checks without the config sweep: default vs SUFFIX_ROCM_HC_DOWN_FUSED per M.
-    "hc_down_fused_bench": (["-m", "suffix_hybrid.kernels.hc_down_rocm", "--no-sweep"], {}),
     # AITER fused-MoE tuner for this card's CU count (qwen3.8-flash MXFP4 MoE; the
     # _fse variant = shared expert fused as expert 513, top-11); prints the CSV.
     "aiter_moe_tune": (["-m", "suffix_hybrid.tools.aiter_moe_tune"], {}),
