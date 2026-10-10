@@ -127,6 +127,12 @@ def _gate_row(logits_ptr, w_ptr, ids_ptr, map_ptr, t, stride_l, stride_w, stride
     cols = tl.arange(0, E)
     kk = tl.arange(0, 16)
     x = tl.load(logits_ptr + t * stride_l + cols).to(tl.float32)
+    # Garbage rows (NaN / -inf, e.g. vLLM's warm-up passes over uninitialized state) must still
+    # give K distinct experts: AITER's sort tolerates a repeated id, launch 2 does not (k34
+    # crash). NaN counts as -inf and a tie among -inf takes the lowest free expert; rows with
+    # K finite logits select exactly as before.
+    x = tl.where(x == x, x, float("-inf"))
+    free = cols >= 0
     top = tl.max(x, axis=0)
     ids = tl.zeros([16], dtype=tl.int32) + E  # slot K: the shared expert
     num = tl.zeros([16], dtype=tl.float32)
@@ -134,11 +140,12 @@ def _gate_row(logits_ptr, w_ptr, ids_ptr, map_ptr, t, stride_l, stride_w, stride
     den = lane0                               # gate7's tiles (no extern calls on scalars)
     for k in tl.static_range(K):
         v = tl.max(x, axis=0)
-        e = tl.min(tl.where(x == v, cols, E), axis=0)
+        e = tl.min(tl.where((x == v) & free, cols, E), axis=0)
         n = _exp(lane0 + (v - top), EXP_MODE)
         num = tl.where(kk == k, n, num)
         ids = tl.where(kk == k, e, ids)
         den += n  # AITER: k ascending
+        free = free & (cols != e)
         x = tl.where(cols == e, float("-inf"), x)
     inv = tl.where(den != 0.0, 1.0 / den, 1.0)
     shared = lane0 + tl.load(logits_ptr + t * stride_l + E).to(tl.float32)
@@ -227,10 +234,10 @@ def _route_tok_kernel(
                          mask=z + zo < buf_cols)
 
 
-@triton.jit(do_not_specialize=["M"])
+@triton.jit(do_not_specialize=["M", "n_pad"])
 def _route_sort_kernel(
     w_ptr, ids_ptr, map_ptr, stage_ptr, sid_ptr, sw_ptr, seid_ptr, nv_ptr, a1s_ptr,
-    M, stride_w, stride_ids,
+    M, n_pad, stride_w, stride_ids,
     E: tl.constexpr, K: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr,
     MP: tl.constexpr, MAXB: tl.constexpr,
 ):
@@ -264,21 +271,23 @@ def _route_sort_kernel(
                          tl.where(wsel, m[None, :] & (bit - 1)[:, None], 0))
         pre += tl.sum(_popc(below), axis=1)
     dest = pre * BLOCK + rank
-    tl.store(sid_ptr + dest, t | (k << 24), mask=valid)
-    tl.store(sw_ptr + dest, tl.load(w_ptr + t * stride_w + k, mask=valid, other=0.0), mask=valid)
+    put = valid & (dest < n_pad)  # always true for distinct ids per token; never write past
+    tl.store(sid_ptr + dest, t | (k << 24), mask=put)
+    tl.store(sw_ptr + dest, tl.load(w_ptr + t * stride_w + k, mask=valid, other=0.0), mask=put)
     opens = valid & (rank % BLOCK == 0)  # first slot of one of the expert's blocks
-    tl.store(seid_ptr + dest // BLOCK, e, mask=opens)
+    tl.store(seid_ptr + dest // BLOCK, e, mask=opens & put)
     last = valid & (rank == cnt - 1)
     for j in tl.static_range(BLOCK):
-        pad = last & (cnt + j < nblk * BLOCK)
+        pad = last & (cnt + j < nblk * BLOCK) & (dest + 1 + j < n_pad)
         tl.store(sid_ptr + dest + 1 + j, M | ((K + 1) << 24), mask=pad)
         tl.store(sw_ptr + dest + 1 + j, 0.0, mask=pad)
     two = tl.arange(0, 2)
-    tl.store(nv_ptr + two, tl.where(two == 0, tl.sum(opens.to(tl.int32), axis=0) * BLOCK, M))
+    total = tl.minimum(tl.sum(opens.to(tl.int32), axis=0) * BLOCK, n_pad)
+    tl.store(nv_ptr + two, tl.where(two == 0, total, M))
     d = dest[:, None]
     for c in tl.static_range((H // 32 + 31) // 32):
         y = (c * 32 + tl.arange(0, 32))[None, :]
-        ok = valid[:, None] & (y < H // 32)
+        ok = put[:, None] & (y < H // 32)
         sb = tl.load(stage_ptr + t[:, None] * (H // 32) + y, mask=ok, other=0)
         addr = ((d // 32 * SN) * 32 + (y // 8) * 256 + (y % 4) * 64 + (d % 16) * 4
                 + (y % 8) // 4 * 2 + (d % 32) // 16)
@@ -322,7 +331,7 @@ def _route(job: Job, block: int, accumulate: bool, model_dim: int, buf_dtype, ou
     mp = _mp(m)
     _route_sort_kernel[(1,)](
         job.weights, job.ids, rowmap, stage, sorted_ids, sorted_w, sorted_e, nvalid,
-        a1s.view(torch.uint8), m, job.weights.stride(0), job.ids.stride(0),
+        a1s.view(torch.uint8), m, n_pad, job.weights.stride(0), job.ids.stride(0),
         E=e1 - 1, K=slots - 1, H=h, BLOCK=block, MP=mp, MAXB=triton.cdiv(mp, block),
         num_warps=4 if mp <= 16 else 8 if mp <= 32 else 16)
     _QUANT.clear()
@@ -402,6 +411,7 @@ def _eligible(router, hidden, logits, indices_type) -> bool:
     return (0 < hidden.shape[0] <= MAX_M and router.num_fused_shared_experts == 1
             and router.renormalize and router.scoring_func == "softmax"
             and router.capture_fn is None and router.eplb_state is None
+            and getattr(router, "_routing_replay_out", None) is None  # copies ids on return
             and indices_type in (None, torch.int32) and router.top_k < 16
             and 0 < e < 1023 and e & (e - 1) == 0 and logits.dim() == 2
             and logits.stride(1) == 1 and logits.dtype == torch.bfloat16
@@ -451,6 +461,28 @@ def _row_rel(a, b):
     return float(((a - b).abs().amax(1) / b.abs().amax(1).clamp_min(1e-30)).max())
 
 
+def _sort_ok(srt, ids, m, block, shared):
+    """AITER's sort contract on any routing (incl. garbage rows): num_valid in range, every
+    valid slot's token routes to its block's expert at that slot, every (token, slot) once,
+    padding = M | 11 << 24."""
+    sid, sw, seid, nv = (x.cpu() for x in srt[:4])
+    total, ids = int(nv[0]), ids.cpu().long()
+    if not (0 < total <= sid.numel() and total % block == 0 and int(nv[1]) == m):
+        return False
+    sid, seid = sid[:total].long(), seid[: total // block].long()
+    tok, slot = sid & 0xFFFFFF, sid >> 24
+    real = tok < m
+    exp = seid.repeat_interleave(block)
+    routed = torch.where(slot.clamp(max=ids.shape[1] - 1) < ids.shape[1] - 1,
+                         ids[tok.clamp(max=m - 1), slot.clamp(max=ids.shape[1] - 1)],
+                         torch.full_like(tok, shared))
+    pairs = tok[real] * 16 + slot[real]
+    return (bool((routed[real] == exp[real]).all()) and pairs.numel() == m * ids.shape[1]
+            and pairs.unique().numel() == pairs.numel()
+            and bool(((tok[~real] == m) & (slot[~real] == ids.shape[1])).all())
+            and bool(((seid >= 0) & (seid <= shared)).all()))
+
+
 def main() -> int:
     """Oracle on silicon at Qwen3.8-Flash-Next's router + MXFP4 MoE (512 routed experts +
     fused shared expert 512, top-10 + 1, hidden 2560, inter 640 padded to 768).
@@ -462,6 +494,8 @@ def main() -> int:
     worst-row max |diff| / max |stock| within max(2 x stock-vs-stock, 2^-8) (atomic stage-2
     rows are not deterministic; bitwise reported when equal); HIP-graph replay on new
     inputs == eager; graphed us/call of the glue and of a whole MoE layer."""
+    os.environ.setdefault("VLLM_ROCM_USE_AITER", "1")  # read at vllm._aiter_ops import
+    os.environ.setdefault("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "1")
     os.environ.setdefault("AITER_CONFIG_FMOE", os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs",
         "mi350p_tuned_fmoe.csv"))
@@ -657,6 +691,93 @@ def main() -> int:
         failed |= not good
         print(f"{MARK} graph replay M={m} on new inputs == eager fused: "
               f"{'MATCH' if good else 'MISMATCH'}", flush=True)
+
+    # vLLM's own path, as in serving: the AiterSharedRoutedFusedMoERouter (deferral installed)
+    # and the experts call rocm_aiter_fused_experts makes, each size warmed up eagerly and
+    # captured as a HIP graph, sizes descending into ONE shared pool (PIECEWISE capture),
+    # replayed in mixed order on fresh inputs vs the stock router + experts; then garbage
+    # logits (NaN / -inf / equal rows, as warm-up passes can produce: the k34 crash) through
+    # the graphs and through the fused sort, whose contract must hold.
+    import vllm.model_executor.layers.fused_moe.router.aiter_shared_routed_fused_moe_router as rmod
+    from vllm._aiter_ops import _rocm_aiter_fused_moe_impl
+    from vllm.model_executor.layers.fused_moe.experts import rocm_aiter_moe
+
+    stock_routing = rmod.AiterSharedRoutedFusedMoERouter._compute_routing
+    install_router(rmod)
+    if rocm_aiter_moe.aiter_topK_meta_data is None:
+        rocm_aiter_moe.init_aiter_topK_meta_data(e1 - 1, 1, k1 - 1, 0, 1, 1.0, 8192, False)
+    router = rmod.AiterSharedRoutedFusedMoERouter(
+        top_k=k1 - 1, global_num_experts=e1, num_fused_shared_experts=1, renormalize=True)
+
+    def experts(hs, w, ids):
+        return _rocm_aiter_fused_moe_impl(
+            hs, W1, W2, w, ids, expert_mask=None, activation_method=0, quant_method=3,
+            doweight_stage1=False, w1_scale=S1, w2_scale=S2, output_dtype=torch.bfloat16,
+            hidden_pad=0, intermediate_pad=ip - inter, moe_sorting_dispatch_policy=0,
+            swiglu_limit=0.0)
+
+    def vllm_fused(lg, hs):
+        w, ids = router.select_experts(hs, lg)
+        return experts(hs, w, ids)
+
+    def vllm_stock(lg, hs):
+        w, ids = stock_routing(router, hs, lg, None)
+        return experts(hs, w, ids)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs = {}
+    fused_before = STATS["fused"]
+    for m in (16, 8, 5, 4, 2, 1):
+        lg, hs = inputs(m, 600 + m)
+        vllm_fused(lg, hs)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=pool):
+            out = vllm_fused(lg, hs)
+        graphs[m] = (g, lg, hs, out)
+    for rnd, m in enumerate((1, 16, 5, 8, 2, 4, 16, 8, 1)):
+        g, lg, hs, out = graphs[m]
+        nlg, nhs = inputs(m, 700 + rnd)
+        lg.copy_(nlg)
+        hs.copy_(nhs)
+        g.replay()
+        torch.cuda.synchronize()
+        got = out.clone()
+        ref = vllm_stock(nlg, nhs)
+        rel, lim = _row_rel(got, ref), bound(m, nlg, nhs)
+        good = bool(torch.isfinite(got).all()) and rel <= lim and not _JOBS
+        failed |= not good
+        print(f"{MARK} vLLM path graph M={m} (shared pool, replay {rnd}): "
+              f"{'MATCH' if good else 'MISMATCH'} "
+              f"({'bitwise' if torch.equal(got, ref) else f'row-relative {rel:.2e}'}, bound {lim:.2e})",
+              flush=True)
+    for m in (16, 8, 5, 1):
+        g, lg, hs, out = graphs[m]
+        bad, _ = inputs(m, 800 + m)
+        bad[0] = float("nan")
+        if m > 1:
+            bad[1] = float("-inf")
+            bad[1, 100:103] = 1.0
+        if m > 2:
+            bad[2] = 0.0
+        if m > 3:
+            bad[3, :505] = float("nan")
+        lg.copy_(bad)
+        g.replay()
+        torch.cuda.synchronize()  # a bad sort faults here (as k34 did)
+        w, ids = bufs(m)
+        srt = _route(Job(bad, hs, w, ids, None), 32, False, h, torch.bfloat16, None)
+        _QUANT.clear()
+        torch.cuda.synchronize()
+        distinct = all(len(set(r)) == k1 for r in ids.cpu().tolist())
+        good = _sort_ok(srt, ids, m, 32, e1 - 1) and distinct
+        failed |= not good
+        print(f"{MARK} vLLM path graph M={m} on garbage logits (NaN / -inf / equal rows): "
+              f"replay ok, fused sort contract {'MATCH' if good else 'MISMATCH'} "
+              f"(distinct ids per token {distinct})", flush=True)
+    print(f"{MARK} vLLM path warm-up + capture used the fused route in "
+          f"{STATS['fused'] - fused_before} of 12 calls (0 = deferral never engaged)", flush=True)
+    failed |= STATS["fused"] == fused_before
 
     reps = 50
     for m in (1, 5, 8, 16, 32, 40, 64):
