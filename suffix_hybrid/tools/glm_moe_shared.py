@@ -52,6 +52,9 @@ def main() -> int:
     pf = dict(p, shared=nm.quant_shared(w_gu, w_dn, p["a1g"], p["a2g"], c))
     ws = nm.workspace(dev, max(MS), topk, hdim, idim, 256, ns=1)
     h_buf = torch.empty(max(MS), idim, dtype=torch.bfloat16, device=dev)
+    from vllm.platforms import current_platform
+
+    current_platform.import_kernels()  # registers torch.ops._C (a gate runs before vLLM loads)
     silu_and_mul = torch.ops._C.silu_and_mul  # vLLM's SiluAndMul kernel
 
     def shared_bf16(x):  # DeepseekV2MLP at TP8 (reduce_results=False)
