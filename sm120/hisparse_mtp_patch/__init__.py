@@ -83,7 +83,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-10-11.2"
+PATCH_REVISION = "2026-10-11.3"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
@@ -841,9 +841,11 @@ def enable_split(runtime, rt, pass_rows: int, rows: int, top_k: int) -> int:
     return passes
 
 
-def install_split(runtime) -> None:
+def install_split(runtime, auto: bool = True) -> None:
     """Replace the stock shared-memory check and wrap HiSparseRuntime.__init__ /
-    _resolve_residency / _swap_rows on the live class (see the block comment)."""
+    _resolve_residency / _swap_rows on the live class (see the block comment).
+    auto=False (own-resolver oracle): only the pass wrappers, inert until
+    enable_split() is called on a runtime."""
     import torch
 
     cls = runtime.HiSparseRuntime
@@ -921,9 +923,11 @@ def install_split(runtime) -> None:
             finally:
                 group.shared_topk = shared
 
-    runtime._check_residency_shared_memory = check
-    for name, fn in (("__init__", __init__), ("_resolve_residency", _resolve_residency),
-                     ("_swap_rows", _swap_rows)):
+    wrappers = [("_resolve_residency", _resolve_residency), ("_swap_rows", _swap_rows)]
+    if auto:
+        runtime._check_residency_shared_memory = check
+        wrappers.append(("__init__", __init__))
+    for name, fn in wrappers:
         fn.__qualname__ = f"HiSparseRuntime.{name}"
         setattr(cls, name, fn)
 
@@ -1096,7 +1100,12 @@ def apply(module=None) -> bool:
     if rt_src.count(NATIVE_SWAP_ROWS) == 1:  # upstream swap rows: prove the index_group dispatch
         ig_src = Path(importlib.util.find_spec(INDEX_GROUP_MODULE).origin).read_text()
     rt_new = patch_runtime_source(rt_src, ig_src)
+    from . import own_resolver
+
     split = check_split_source(rt_src)
+    own = None
+    if split and own_resolver.gate_enabled():
+        own = own_resolver.patch_source(rt_new)
     prefetch = patch_prefetch_source(rt_src) if prefetch_gate_enabled() else None
     nostage = patch_nostage_source(rt_src) if nostage_gate_enabled() else None
     layout = importlib.import_module(LAYOUT_MODULE)
@@ -1111,7 +1120,9 @@ def apply(module=None) -> bool:
         mixed = patch_connector_method(Path(connector.__file__).read_text())
     # Every file verified before any changes (fail closed, all or nothing).
     exec_patched_source(runtime, rt_new, rt_path)
-    if split:
+    if own is not None:
+        own_resolver.install(runtime, own, rt_path)
+    elif split:
         install_split(runtime)
     if prefetch is not None:
         install_prefetch(runtime, prefetch, rt_path)
@@ -1141,7 +1152,9 @@ def apply(module=None) -> bool:
              if nostage is not None else "")
           + ("(no mirror staging buffer upstream) "
              if upstream and nostage_gate_enabled() else "")
-          + ("+ residency resolution split into shared-memory-sized passes when "
+          + ("+ own single-pass residency resolver + parallel written-slot invalidation "
+             f"({own_resolver.GATE_ENV}) " if own is not None else
+             "+ residency resolution split into shared-memory-sized passes when "
              "needed " if split else "")
           + f"(rev {PATCH_REVISION}; {', '.join(applied)}; vllm {ver}).",
           file=sys.stderr, flush=True)
