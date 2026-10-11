@@ -123,14 +123,16 @@ def nvfp4_rows(layer, k):
         return None
     from suffix_hybrid.kernels.nvfp4_gemm import E2M1, unswizzle_sf
     sfu = unswizzle_sf(sf, int(n), k // 16)
-    lut = torch.tensor([*E2M1.tolist(), *(-E2M1).tolist()], dtype=torch.float32, device=w.device)
+    nib = torch.tensor([*E2M1.tolist(), *(-E2M1).tolist()], dtype=torch.float32)
+    # byte -> (low, high) e2m1 pair in one gather; e2m1 x e4m3 products are
+    # exact in bf16 (<= 6 significant bits), only the global factor rounds
+    lut = torch.stack([nib.repeat(16), nib.repeat_interleave(16)], -1).to(torch.bfloat16).to(w.device)
     factor = float(alpha) * float(gx)
 
     def rows(r0, r1):
-        p = w[r0:r1]
-        code = torch.stack([p & 15, p >> 4], -1).reshape(r1 - r0, k).int()
-        s = sfu[r0:r1].contiguous().view(torch.float8_e4m3fn).float()
-        return (lut[code].view(r1 - r0, k // 16, 16) * s[..., None]).reshape(r1 - r0, k) * factor
+        v = lut[w[r0:r1].int()].view(r1 - r0, k // 16, 16)
+        s = sfu[r0:r1].contiguous().view(torch.float8_e4m3fn).to(torch.bfloat16)
+        return (v * s[..., None]).reshape(r1 - r0, k) * factor
     return rows
 
 

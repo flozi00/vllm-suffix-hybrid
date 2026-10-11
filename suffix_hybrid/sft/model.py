@@ -205,15 +205,43 @@ def chunk_gated_delta_rule(q, k, v, g, beta, chunk=64):
     return o.transpose(1, 2).to(dt)
 
 
-def _gdn_rule():
+def _fla():
+    """vLLM's bundled FLA chunk kernel (forward only: serving's prefill
+    kernel), None where it is not importable."""
     try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_rule
+        from vllm.third_party.flash_linear_attention.ops import chunk_gated_delta_rule as f
+    except Exception:  # noqa: BLE001
+        try:
+            from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule as f
+        except Exception:  # noqa: BLE001
+            return None
+    return lambda q, k, v, g, beta: f(q, k, v, g=g, beta=beta,
+                                      use_qk_l2norm_in_kernel=True)[0]
 
-        def rule(q, k, v, g, beta):
-            return fla_rule(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)[0]
-        return rule
-    except Exception:  # noqa: BLE001 - optional fast path
-        return chunk_gated_delta_rule
+
+class _FlaRule(torch.autograd.Function):
+    """[T, H, D] gated delta rule: forward = the serving kernel (exact serving
+    numerics, Triton speed); backward = the chunked torch form recomputed
+    once, GDN_HEAD_GROUP heads at a time (bounded fp32 intermediates)."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, g, beta, fwd):
+        ctx.save_for_backward(q, k, v, g, beta)
+        with torch.no_grad():
+            return fwd(q[None], k[None], v[None], g[None], beta[None])[0].to(v.dtype)
+
+    @staticmethod
+    def backward(ctx, do):
+        ins = ctx.saved_tensors
+        grads = [torch.zeros_like(t) for t in ins]
+        for h0 in range(0, ins[0].shape[1], GDN_HEAD_GROUP):
+            sl = slice(h0, h0 + GDN_HEAD_GROUP)
+            with torch.enable_grad():
+                part = [t[:, sl].detach().requires_grad_(True) for t in ins]
+                o = chunk_gated_delta_rule(*(x[None] for x in part))[0]
+                for dst, gr in zip(grads, torch.autograd.grad(o, part, do[:, sl])):
+                    dst[:, sl] = gr
+        return (*grads, None)
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +293,7 @@ class TrainMode(contextlib.ContextDecorator):
         self.cut = []      # modules whose output lost the input's grad (check=True)
         self.g = sft.g
         self.kv = {}
-        self.rule = _gdn_rule()
+        self.fla = _fla()
         self._stack = None
 
     # -- swaps ---------------------------------------------------------------
@@ -454,15 +482,20 @@ class TrainMode(contextlib.ContextDecorator):
         return o
 
     def _rule_grouped(self, q, k, v, g, beta):
-        """The delta rule per group of heads, each checkpointed: the fp32
-        chunk states saved for backward exist for one group at a time."""
+        """[T, H, D] delta rule. With the serving kernel available: its
+        forward + a grouped torch backward (_FlaRule). Without (CPU tests):
+        the torch form per checkpointed head group."""
+        if self.fla is not None:
+            if not torch.is_grad_enabled():
+                return self.fla(q[None], k[None], v[None], g[None], beta[None])[0].to(v.dtype)
+            return _FlaRule.apply(q, k, v, g, beta, self.fla)
         heads = GDN_HEAD_GROUP
         if not torch.is_grad_enabled() or q.shape[1] <= heads:
-            return self.rule(q[None], k[None], v[None], g[None], beta[None])[0]
+            return chunk_gated_delta_rule(q[None], k[None], v[None], g[None], beta[None])[0]
         outs = []
         for h0 in range(0, q.shape[1], heads):
             sl = slice(h0, h0 + heads)
-            outs.append(checkpoint(lambda *t: self.rule(*(x[None] for x in t))[0],
+            outs.append(checkpoint(lambda *t: chunk_gated_delta_rule(*(x[None] for x in t))[0],
                                    q[:, sl], k[:, sl], v[:, sl], g[:, sl], beta[:, sl],
                                    use_reentrant=False))
         return torch.cat(outs, 1)
