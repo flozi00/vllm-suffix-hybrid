@@ -395,11 +395,6 @@ if any(os.environ.get(k, "").strip() for k in ("SUFFIX_NCCL_SMALL_ALGO", "SUFFIX
                                                "SUFFIX_HAR_ALLGATHER")):
     from suffix_hybrid.nccl_split import install_post_import_hook as _ncsplit_hook
     _ncsplit_hook()
-# SUFFIX_HAR_FUSED_NORM=1: fused_allreduce_rms_norm (GLM / DeepSeek-V3.2 layers) through the host
-# all-reduce + add + RMSNorm kernel (suffix_hybrid/har_norm.py); needs the har band above.
-if os.environ.get("SUFFIX_HAR_FUSED_NORM", "").strip() == "1":
-    from suffix_hybrid.har_norm import install_post_import_hook as _har_norm_hook
-    _har_norm_hook()
 
 if os.environ.get("SUFFIX_PROFILE_WORKER", "").strip():
     try:
