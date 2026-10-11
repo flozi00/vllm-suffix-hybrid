@@ -21,21 +21,24 @@ def _stream():
     yield "model.layers.78.eh_proj.weight", w(8, 16)
 
 
-def _convert(stream, n_experts=4, local=lambda e: True):
-    seen = {}
-    calls = []
+def _quant(t, gscale):
+    return torch.zeros(t.shape[0], t.shape[1] // 2, dtype=torch.uint8), \
+        torch.zeros(t.shape[0], t.shape[1] // 16, dtype=torch.float8_e4m3fn)
 
-    def quant(t, gscale):
-        seen.setdefault(id(t), float(gscale))
-        return torch.zeros(t.shape[0], t.shape[1] // 2, dtype=torch.uint8), \
-            torch.zeros(t.shape[0], t.shape[1] // 16, dtype=torch.float8_e4m3fn)
+
+def _reset():
+    mm._state.update(keep={}, scales=None, tensors=0, saved=0, switched={})
+
+
+def _convert(stream, n_experts=4, local=lambda e: True):
+    calls = []
 
     def scales():
         calls.append(1)
         return 0.5, 0.25
 
-    mm._state.update(keep={}, scales=None, tensors=0, saved=0)
-    out = list(mm.convert(stream, 78, n_experts, scales, local, quant=quant,
+    _reset()
+    out = list(mm.convert(stream, 78, n_experts, scales, local, quant=_quant,
                           check=lambda *a: None, device=torch.device("cpu")))
     return out, calls
 
@@ -74,43 +77,188 @@ def test_convert_keeps_only_local_references_and_refuses_an_unpaired_half():
         _convert(iter(bad))
 
 
-def test_mtp_prefix_and_quant_method_only_for_excluded_mtp_experts(monkeypatch):
-    assert mm.is_mtp_experts("model.layers.78.mlp.experts", 78)
-    assert not mm.is_mtp_experts("model.layers.77.mlp.experts", 78)
-    assert not mm.is_mtp_experts("model.layers.78.mlp.gate", 78)
+def _vllm_replica():
+    """vLLM nightly 0.31.1rc1.dev273 (the g10 pool) on the draft's construction path, reduced to
+    what decides the MTP experts' quant method (paths under vllm/):
+      quantization: overrides probed modelopt_fp4 before modelopt_mixed (config/model.py:1384);
+        ModelOptNvFp4Config claims any quant_algo with NVFP4/FP4 (layers/quantization/
+        modelopt.py:768) -> our served copy runs quantization=modelopt_fp4 (run-g10 log)
+      ModelOptQuantConfigBase.get_quant_method, inherited by ModelOptNvFp4Config: excluded ->
+        None, RoutedExperts -> FusedMoEMethodCls(self) (modelopt.py:183-254)
+      ModelOptMixedPrecisionConfig.get_quant_method: excluded or not in quantized_layers ->
+        None (modelopt.py:1796-1849)
+      RoutedExperts.__init__ -> _get_quant_method -> resolve_quant_method -> get_quant_method
+        (layer, prefix); None -> UnquantizedFusedMoEMethod (fused_moe/routed_experts.py:159,
+        221-235; quantization/base_config.py:292)
+      prefixes: DeepseekV32MTP "model" -> MultiTokenPredictor f"{p}.layers.{idx}", idx from
+        num_hidden_layers -> mtp_block (same prefix) -> DeepseekV2MoE f"{p}.mlp" ->
+        FusedMoEFactory f"{p}.experts" -> MoERunner(.routed_experts) (models/deepseek_v32/
+        nvidia/mtp.py:64-100,171-185,274-280; nvidia/model.py:58; deepseek_v2.py:374;
+        fused_moe/layer.py:227,388; runner/moe_runner.py:272), all inside set_current_vllm_config
+        (target config) (model_loader/utils.py:90-95)."""
+    from fnmatch import fnmatch
 
-    class RoutedExperts:
-        moe_config = "cfg"
+    class UnquantizedFusedMoEMethod:
+        pass
 
-    class Nvfp4:
+    class ModelOptNvFp4FusedMoE:
         nvfp4_backend = types.SimpleNamespace(name="FLASHINFER_CUTLASS")
 
         def __init__(self, quant_config, moe_config):
-            self.args = (quant_config, moe_config)
+            self.quant_config, self.moe_config = quant_config, moe_config
 
         def process_weights_after_loading(self, layer):
             pass
 
-    class Mixed:
-        nvfp4_config = "nvfp4-sub"
+    class RoutedExperts:
+        def __init__(self, prefix, quant_config):
+            self.layer_name, self.moe_config = prefix, "moe-config"
+            qm = quant_config.get_quant_method(self, prefix)
+            self.quant_method = UnquantizedFusedMoEMethod() if qm is None else qm
+
+        def _map_global_expert_id_to_local_expert_id(self, e):
+            return e
+
+    class ModelOptQuantConfigBase:
+        FusedMoEMethodCls = None
+
+        def __init__(self, exclude_modules):
+            self.exclude_modules = exclude_modules
 
         def is_layer_excluded(self, prefix):
-            return prefix.startswith("model.layers.78")
+            return any(fnmatch(prefix, p) for p in self.exclude_modules)
 
         def get_quant_method(self, layer, prefix):
-            return "stock"
+            if self.is_layer_excluded(prefix):
+                return None
+            if isinstance(layer, RoutedExperts):
+                return self.FusedMoEMethodCls(quant_config=self, moe_config=layer.moe_config)
+            return None
 
-    module = types.SimpleNamespace(ModelOptMixedPrecisionConfig=Mixed, RoutedExperts=RoutedExperts,
-                                   ModelOptNvFp4FusedMoE=Nvfp4)
-    monkeypatch.setattr(mm, "_num_hidden_layers", lambda: 78)
-    monkeypatch.setattr(mm, "_model_config", lambda: types.SimpleNamespace(model="/models/x"))
-    mm._state["switched"].clear()
-    mm.patch_quant(module)
-    qm = Mixed().get_quant_method(RoutedExperts(), "model.layers.78.mlp.experts")
-    assert isinstance(qm, Nvfp4) and qm.args == ("nvfp4-sub", "cfg")
-    assert mm._state["switched"] == {78: "/models/x"}
-    assert Mixed().get_quant_method(RoutedExperts(), "model.layers.77.mlp.experts") == "stock"
-    assert Mixed().get_quant_method(object(), "model.layers.78.mlp.experts") == "stock"
+    class ModelOptNvFp4Config(ModelOptQuantConfigBase):
+        FusedMoEMethodCls = ModelOptNvFp4FusedMoE
+
+    class ModelOptFp8MoEMethod(ModelOptNvFp4FusedMoE):
+        pass
+
+    class ModelOptFp8Config(ModelOptQuantConfigBase):
+        FusedMoEMethodCls = ModelOptFp8MoEMethod
+
+    class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
+        def __init__(self, exclude_modules, quantized_layers):
+            super().__init__(exclude_modules)
+            self.quantized_layers = quantized_layers
+            self.nvfp4_config = ModelOptNvFp4Config([])
+
+        def get_quant_method(self, layer, prefix):
+            if self.is_layer_excluded(prefix):
+                return None
+            if isinstance(layer, RoutedExperts) and self.quantized_layers.get(prefix) == "NVFP4":
+                return ModelOptNvFp4FusedMoE(quant_config=self.nvfp4_config, moe_config=layer.moe_config)
+            return None
+
+    def quant_config(algo, ignore):
+        if "NVFP4" in algo or "FP4" in algo:
+            return ModelOptNvFp4Config(ignore)
+        assert algo == "MIXED_PRECISION"
+        return ModelOptMixedPrecisionConfig(ignore, {f"model.layers.{i}.mlp.experts": "NVFP4"
+                                                     for i in range(3, 78)})
+
+    class MoERunner:
+        def __init__(self, prefix, qc):
+            self.routed_experts = RoutedExperts(prefix, qc)
+
+    class DeepseekV32MTP:
+        def __init__(self, vllm_config, prefix=""):
+            self.config = cfg = vllm_config.model_config.hf_config
+            pre = f"{prefix}.model" if prefix else "model"
+            first = cfg.num_hidden_layers
+            block = lambda p: types.SimpleNamespace(  # noqa: E731
+                mlp=types.SimpleNamespace(experts=MoERunner(f"{p}.mlp.experts", vllm_config.quant_config)))
+            self.model = types.SimpleNamespace(layers={
+                str(i): types.SimpleNamespace(mtp_block=block(f"{pre}.layers.{i}"))
+                for i in range(first, first + cfg.num_nextn_predict_layers)})
+
+        def load_weights(self, weights):
+            return {n for n, _ in weights}
+
+    modelopt = types.SimpleNamespace(**{c.__name__: c for c in (
+        ModelOptQuantConfigBase, ModelOptFp8Config, ModelOptNvFp4Config, ModelOptMixedPrecisionConfig,
+        RoutedExperts, ModelOptNvFp4FusedMoE)})
+    return types.SimpleNamespace(modelopt=modelopt, quant_config=quant_config, RoutedExperts=RoutedExperts,
+                                 Unquantized=UnquantizedFusedMoEMethod,
+                                 mtp=types.SimpleNamespace(DeepseekV32MTP=DeepseekV32MTP))
+
+
+def _target(qc):
+    hf = types.SimpleNamespace(num_hidden_layers=78, num_nextn_predict_layers=1, n_routed_experts=4)
+    return types.SimpleNamespace(quant_config=qc, model_config=types.SimpleNamespace(
+        model="/models/glm-5.3-nvfp4", hf_config=hf))
+
+
+def _construct(monkeypatch, v, qc):
+    """Target's last MoE layer + the draft, each under the current (target) vLLM config."""
+    current = {}
+    monkeypatch.setattr(mm, "_model_config", lambda: current["vllm"].model_config)
+    current["vllm"] = _target(qc)
+    main = v.RoutedExperts("model.layers.77.mlp.experts", qc)
+    draft = v.mtp.DeepseekV32MTP(current["vllm"])
+    current.clear()  # load_weights runs outside the context, like vLLM's loader
+    return main, draft
+
+
+@pytest.mark.parametrize("algo, ignore", [
+    ("NVFP4", ["model.layers.78*"]),            # /models/glm-5.3-nvfp4 as served: modelopt_fp4
+    ("MIXED_PRECISION", ["model.layers.78*"]),  # HF's current export: modelopt_mixed
+    ("MIXED_PRECISION", []),                    # MTP layer just not in quantized_layers
+])
+def test_real_draft_construction_path_switches_the_mtp_experts(monkeypatch, capsys, algo, ignore):
+    assert mm.is_mtp_experts("model.layers.78.mlp.experts", 78)
+    assert not mm.is_mtp_experts("model.layers.77.mlp.experts", 78)
+    assert not mm.is_mtp_experts("model.layers.78.mlp.gate", 78)
+    v = _vllm_replica()
+    mm.patch_quant(v.modelopt)
+    mm.patch_mtp(v.mtp)
+    qc = v.quant_config(algo, ignore)
+    nv = getattr(qc, "nvfp4_config", qc)
+    _reset()
+    main, draft = _construct(monkeypatch, v, qc)
+    assert type(main.quant_method) is v.modelopt.ModelOptNvFp4FusedMoE and main.quant_method.quant_config is nv
+    ex = draft.model.layers["78"].mtp_block.mlp.experts.routed_experts
+    assert ex.layer_name == "model.layers.78.mlp.experts"
+    assert type(ex.quant_method) is v.modelopt.ModelOptNvFp4FusedMoE and ex.quant_method.quant_config is nv
+    assert mm._state["switched"] == {78: "/models/glm-5.3-nvfp4"}
+    assert (f"model.layers.78.mlp.experts: {type(qc).__name__} leaves it BF16 (excluded={bool(ignore)}) "
+            "-> ModelOptNvFp4FusedMoE") in capsys.readouterr().err
+    monkeypatch.setattr(mm, "input_scales", lambda path, layer: (0.5, 0.25))
+    real = mm.convert
+    monkeypatch.setattr(mm, "convert", lambda *a: real(*a, quant=_quant, check=lambda *x: None,
+                                                        device=torch.device("cpu")))
+    names = draft.load_weights(_stream())
+    assert mm._state["tensors"] == 6 and "model.layers.78.mlp.experts.0.gate_proj.weight_scale_2" in names
+    assert "model.layers.78.mlp.experts.3.down_proj.input_scale" in names
+
+
+def test_gate_on_refuses_to_start_when_nothing_is_switched_or_converted(monkeypatch, capsys):
+    v = _vllm_replica()
+    mm.patch_quant(v.modelopt)
+    mm.patch_mtp(v.mtp)
+    _reset()
+    # a ModelOpt config without an NVFP4 config (FP8): refused while the draft is built
+    with pytest.raises(RuntimeError, match="no NVFP4 config"):
+        _construct(monkeypatch, v, v.modelopt.ModelOptFp8Config(["model.layers.78*"]))
+    # a draft whose quant config is not ModelOpt: nothing switched, refused at load
+    _reset()
+    _, draft = _construct(monkeypatch, v, types.SimpleNamespace(get_quant_method=lambda layer, prefix: None))
+    assert type(draft.model.layers["78"].mtp_block.mlp.experts.routed_experts.quant_method) is v.Unquantized
+    with pytest.raises(RuntimeError, match="no MTP routed-expert layer was switched"):
+        draft.load_weights(_stream())
+    assert "FAIL: SUFFIX_MTP_MOE_NVFP4=1 but no MTP routed-expert layer" in capsys.readouterr().err
+    # switched, but the stream has no BF16 MTP expert weight
+    mm._state["switched"][78] = "/models/glm-5.3-nvfp4"
+    monkeypatch.setattr(mm, "input_scales", lambda path, layer: (0.5, 0.25))
+    with pytest.raises(RuntimeError, match="no BF16 MTP expert weight to convert"):
+        draft.load_weights(iter([("model.layers.78.eh_proj.weight", torch.ones(2, 2))]))
 
 
 def test_input_scales_take_the_max_of_the_last_quantized_layer(tmp_path):
@@ -122,20 +270,6 @@ def test_input_scales_take_the_max_of_the_last_quantized_layer(tmp_path):
     (tmp_path / "model.safetensors.index.json").write_text(
         '{"weight_map": {%s}}' % ", ".join(f'"{n}": "a.safetensors"' for n in t))
     assert mm.input_scales(str(tmp_path), 77) == (4.0, 5.0)
-
-
-def test_load_weights_is_stock_when_no_mtp_layer_was_switched():
-    got = []
-
-    class MTP:
-        def load_weights(self, weights):
-            got.append(list(weights))
-            return "loaded"
-
-    mm._state["switched"].clear()
-    mm.patch_mtp(types.SimpleNamespace(DeepseekV32MTP=MTP))
-    stream = [("model.layers.78.mlp.experts.0.gate_proj.weight", torch.ones(4, 32, dtype=torch.bfloat16))]
-    assert MTP().load_weights(iter(stream)) == "loaded" and got[0][0][0] == stream[0][0]
 
 
 def _layer(tp=2, rank=1, n=4, hdim=64, inter=32):

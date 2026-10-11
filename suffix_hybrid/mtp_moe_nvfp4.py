@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """SUFFIX_MTP_MOE_NVFP4=1: GLM 5.3's MTP draft-layer routed experts as NVFP4 W4A4.
 
-GLM-5.3-NVFP4 (ModelOpt MIXED_PRECISION) quantizes the routed experts of layers 3..77 and
-excludes ``model.layers.78*``, the MTP layer: its 256 BF16 experts run vLLM's unquantized MoE
-on every draft step (2.4-2.9 % of a decode step at c1/c8/c32, nightly profile 2026-10-11).
-A draft only moves acceptance; rejection sampling keeps outputs exact.
+GLM-5.3-NVFP4 quantizes the routed experts of layers 3..77 and excludes ``model.layers.78*``,
+the MTP layer: its 256 BF16 experts run vLLM's unquantized MoE on every draft step (2.4-2.9 %
+of a decode step at c1/c8/c32, nightly profile 2026-10-11). A draft only moves acceptance;
+rejection sampling keeps outputs exact.
 
 Two seams on vLLM's python side (rocm_patches after-hooks, no source anchors; same code in
 0.30.0 and 0.31.1):
-  1. ``ModelOptMixedPrecisionConfig.get_quant_method``: a RoutedExperts the checkpoint excludes
-     at layer >= num_hidden_layers (the MTP layer) gets ``ModelOptNvFp4FusedMoE`` with the
-     checkpoint's own NVFP4 sub-config, so parameters, backend selection (FlashInfer CUTLASS,
-     our SUFFIX_NVFP4_MOE kernel), EP / TP sharding and post-load processing are exactly
-     those of layers 3..77.
+  1. ``get_quant_method`` of every ModelOpt config: ``ModelOptQuantConfigBase``'s (inherited by
+     ``ModelOptNvFp4Config``, quantization=modelopt_fp4: the copy we serve declares quant_algo
+     NVFP4) and ``ModelOptMixedPrecisionConfig``'s own (modelopt_mixed: HF's current export).
+     A RoutedExperts at layer >= num_hidden_layers (the MTP layer) that the checkpoint leaves
+     BF16 (method None: excluded or unlisted) gets ``ModelOptNvFp4FusedMoE`` with the NVFP4
+     config of layers 3..77 (the modelopt_fp4 config itself / the mixed NVFP4 sub-config), so
+     parameters, backend selection (FlashInfer CUTLASS, our SUFFIX_NVFP4_MOE kernel), EP / TP
+     sharding and post-load processing are exactly theirs. One line per decision.
   2. ``DeepseekV32MTP.load_weights``: the layer's BF16 expert tensors are quantized on the way
      in into the checkpoint's NVFP4 tensor set (weight uint8, weight_scale e4m3 in the linear
      layout, weight_scale_2, input_scale) with vLLM's scaled_fp4_quant; gate and up share one
@@ -27,7 +30,8 @@ those an EP weight filter never streams.
 Fail closed: every converted tensor must dequantize to within WEIGHT_REL_BOUND (rel-l2) of its
 BF16 weight, and after vLLM's processing the layer's FlashInfer path (RoutedExperts.forward_
 modular, global routing ids) must match a fp32 BF16-weight reference of this rank's shard for
-M in ORACLE_MS within REL_BOUND; otherwise the pod refuses to start.
+M in ORACLE_MS within REL_BOUND; and with the gate on, a draft load that switched or converted
+nothing is a loud FAIL line + error. Otherwise the pod refuses to start.
 """
 from __future__ import annotations
 
@@ -50,6 +54,11 @@ _state: dict = {"keep": {}, "scales": None, "tensors": 0, "saved": 0, "switched"
 
 def _say(msg: str) -> None:
     print(f"{MARK} {msg}", file=sys.stderr, flush=True)
+
+
+def _fail(why: str):
+    _say(f"FAIL: {GATE}=1 but {why} — refusing to start")
+    raise RuntimeError(f"{MARK} {GATE}=1 but {why}")
 
 
 def _model_config():
@@ -236,34 +245,45 @@ def oracle(layer, layer_idx: int, a13: float, a2: float, ms=ORACLE_MS, forward=N
 
 
 def patch_quant(module) -> None:
-    """after-hook on vllm.model_executor.layers.quantization.modelopt."""
-    cls = module.ModelOptMixedPrecisionConfig
-    orig = cls.get_quant_method
+    """after-hook on vllm.model_executor.layers.quantization.modelopt: wraps every ModelOpt
+    config class that defines get_quant_method (the base, inherited by modelopt_fp4, and
+    modelopt_mixed's override)."""
+    for cls in [c for c in vars(module).values() if isinstance(c, type)
+                and issubclass(c, module.ModelOptQuantConfigBase) and "get_quant_method" in vars(c)]:
+        cls.get_quant_method = _switching(module, cls.get_quant_method)
 
+
+def _switching(module, orig):
     def get_quant_method(self, layer, prefix):
-        if (isinstance(layer, module.RoutedExperts) and getattr(self, "nvfp4_config", None) is not None
-                and self.is_layer_excluded(prefix) and is_mtp_experts(prefix, _num_hidden_layers())):
-            qm = module.ModelOptNvFp4FusedMoE(quant_config=self.nvfp4_config, moe_config=layer.moe_config)
-            layer_idx = int(re.search(r"layers\.(\d+)\.mlp\.experts$", prefix)[1])
-            # load_weights converts only layers switched here (their params are NVFP4 now)
-            _state["switched"][layer_idx] = _model_config().model
-            post = qm.process_weights_after_loading
-
-            def process_weights_after_loading(lay, _post=post):
-                _post(lay)
-                if lay is layer:
-                    rel = oracle(lay, layer_idx, *_state["scales"])
-                    tp = lay.moe_config.moe_parallel_config.tp_size
-                    _say(f"ACTIVE {prefix}: BF16 experts -> NVFP4 W4A4 ({qm.nvfp4_backend.name}), "
-                         f"{_state['tensors']} tensors, {_state['saved'] / tp / 2**30:.2f} GiB saved on "
-                         f"this rank, input scales a13={_state['scales'][0]:.4g} a2={_state['scales'][1]:.4g} "
-                         f"(layer {layer_idx - 1}), oracle max rel-l2 vs BF16 {rel:.3e} (bound {REL_BOUND})")
-
-            qm.process_weights_after_loading = process_weights_after_loading
+        qm = orig(self, layer, prefix)
+        if qm is not None or not isinstance(layer, module.RoutedExperts) \
+                or not is_mtp_experts(prefix, _num_hidden_layers()):
             return qm
-        return orig(self, layer, prefix)
+        nv = self if isinstance(self, module.ModelOptNvFp4Config) else getattr(self, "nvfp4_config", None)
+        seen = f"{prefix}: {type(self).__name__} leaves it BF16 (excluded={self.is_layer_excluded(prefix)})"
+        if nv is None:
+            _fail(f"{seen} and has no NVFP4 config to serve it with")
+        _say(f"{seen} -> ModelOptNvFp4FusedMoE with the NVFP4 config of the main MoE layers")
+        qm = module.ModelOptNvFp4FusedMoE(quant_config=nv, moe_config=layer.moe_config)
+        layer_idx = int(re.search(r"layers\.(\d+)\.mlp\.experts$", prefix)[1])
+        # load_weights converts only layers switched here (their params are NVFP4 now)
+        _state["switched"][layer_idx] = _model_config().model
+        post = qm.process_weights_after_loading
 
-    cls.get_quant_method = get_quant_method
+        def process_weights_after_loading(lay, _post=post):
+            _post(lay)
+            if lay is layer:
+                rel = oracle(lay, layer_idx, *_state["scales"])
+                tp = lay.moe_config.moe_parallel_config.tp_size
+                _say(f"ACTIVE {prefix}: BF16 experts -> NVFP4 W4A4 ({qm.nvfp4_backend.name}), "
+                     f"{_state['tensors']} tensors, {_state['saved'] / tp / 2**30:.2f} GiB saved on "
+                     f"this rank, input scales a13={_state['scales'][0]:.4g} a2={_state['scales'][1]:.4g} "
+                     f"(layer {layer_idx - 1}), oracle max rel-l2 vs BF16 {rel:.3e} (bound {REL_BOUND})")
+
+        qm.process_weights_after_loading = process_weights_after_loading
+        return qm
+
+    return get_quant_method
 
 
 def patch_mtp(module) -> None:
@@ -272,8 +292,10 @@ def patch_mtp(module) -> None:
     orig = cls.load_weights
 
     def load_weights(self, weights):
-        if not _state["switched"]:  # no MTP experts were made NVFP4 (other checkpoint): stock load
-            return orig(self, weights)
+        if not _state["switched"]:
+            _fail("no MTP routed-expert layer was switched to NVFP4 (no decision line above: the "
+                  "draft's quant config is not ModelOpt, the checkpoint already quantizes them, or "
+                  "vLLM moved the get_quant_method seam)")
         first = min(_state["switched"])
         path = _state["switched"][first]
         experts = [getattr(lay.mtp_block.mlp.experts, "routed_experts", lay.mtp_block.mlp.experts)
@@ -288,6 +310,10 @@ def patch_mtp(module) -> None:
         def local(e):
             return all(x._map_global_expert_id_to_local_expert_id(e) >= 0 for x in experts)
 
-        return orig(self, convert(weights, first, int(self.config.n_routed_experts), scales, local))
+        out = orig(self, convert(weights, first, int(self.config.n_routed_experts), scales, local))
+        if not _state["tensors"]:
+            _fail(f"layers {sorted(_state['switched'])} were switched to NVFP4 and the checkpoint "
+                  "stream had no BF16 MTP expert weight to convert")
+        return out
 
     cls.load_weights = load_weights
