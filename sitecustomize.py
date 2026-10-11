@@ -396,6 +396,13 @@ if any(os.environ.get(k, "").strip() for k in ("SUFFIX_NCCL_SMALL_ALGO", "SUFFIX
     from suffix_hybrid.nccl_split import install_post_import_hook as _ncsplit_hook
     _ncsplit_hook()
 
+# L2 weight prefetch while the host all-reduce waits (suffix_hybrid/har_prefetch.py):
+# SUFFIX_HAR_L2_PREFETCH=1 (+ SUFFIX_HAR_L2_PREFETCH_MB, default 32). Needs the "har" spec
+# and the V2 runner; refuses to start if its prefetch all-reduce is not bit-exact.
+if os.environ.get("SUFFIX_HAR_L2_PREFETCH", "").strip() == "1":
+    from suffix_hybrid.har_prefetch import install_post_import_hook as _l2pf_hook
+    _l2pf_hook()
+
 if os.environ.get("SUFFIX_PROFILE_WORKER", "").strip():
     try:
         from suffix_hybrid.step_profiler import install_worker_hook
@@ -585,6 +592,11 @@ _BOOT_GATES = {
     # pinned host buffer, two-shot / one-shot vs NCCL at GLM token sizes, every rank bit-exact
     # vs the fp32 rank-order sum, graphed us, GPU<->host PCIe probes. Lines: [suffix har].
     "host_ar_bench": (["-m", "suffix_hybrid.host_ar", "bench"], {}),
+    # SUFFIX_HAR_L2_PREFETCH (suffix_hybrid/har_prefetch.py), all ranks, GLM TP8 shapes at M 6/48:
+    # FP8 window GEMMs cold vs prefetched vs hot, the all-reduce alone with/without 16/32 MiB of
+    # concurrent prefetch, all-reduce -> norm -> attention / MoE window GEMMs from cold L2 with
+    # 0/16/32/64 MiB prefetched, outputs bit-exact. Lines: [suffix har-l2pf].
+    "har_l2_prefetch_bench": (["-m", "suffix_hybrid.har_prefetch", "bench"], {}),
     # GLM-5.3 routed MoE per rank, one GPU, cold L2: EP8's busiest rank vs TP8 (no EP) at decode
     # M 1..192 for FlashInfer CUTLASS, our NVFP4 kernel and FlashInfer b12x; numerics vs f64; the
     # TP tune table. Lines: [suffix moe-tp].

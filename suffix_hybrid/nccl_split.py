@@ -32,7 +32,8 @@ communicator) or "<NCCL_ALGO>[/<NCCL_PROTO>]", e.g. "allreduce:ring/Simple".
       through to the default communicator. SUFFIX_HAR_Q8_MIN_BYTES (default inf):
       two-shot messages from this size use int8 transport (LOSSY, quality-gate first).
       SUFFIX_HAR_ALLGATHER=1 (tp group): all-gathers of 2/4-byte tensors (the vocab
-      logits) go through the same host buffer (exact bytes).
+      logits) go through the same host buffer (exact bytes). SUFFIX_HAR_L2_PREFETCH=1:
+      suffix_hybrid/har_prefetch.py (L2 weight prefetch while the barrier waits).
   SUFFIX_NCCL_QAR=int8|fp8 (tp group only, default off): bf16/fp16 all-reduces
       in [SUFFIX_NCCL_QAR_MIN_BYTES (4 MiB), SUFFIX_NCCL_QAR_MAX_BYTES (inf))
       go through suffix_hybrid/nccl_qar.py (LOSSY -- quality-gate first).
@@ -306,9 +307,14 @@ def make_comm(spec: str, cpu_group, device):
         from suffix_hybrid.host_ar import HostAllReduce
 
         one = {"har1": INF, "har2": 0}.get(spec, parse_size(_env("SUFFIX_HAR_ONESHOT_MAX_BYTES", "0")))
-        return HostAllReduce(cpu_group, device, oneshot_max_bytes=one,
-                             max_blocks=int(_env("SUFFIX_HAR_BLOCKS", "64")),
-                             q8_min_bytes=parse_size(_env("SUFFIX_HAR_Q8_MIN_BYTES", "inf")))
+        har = HostAllReduce(cpu_group, device, oneshot_max_bytes=one,
+                            max_blocks=int(_env("SUFFIX_HAR_BLOCKS", "64")),
+                            q8_min_bytes=parse_size(_env("SUFFIX_HAR_Q8_MIN_BYTES", "inf")))
+        from suffix_hybrid import har_prefetch
+
+        if har_prefetch.enabled():  # SUFFIX_HAR_L2_PREFETCH: proves itself exact first (raises)
+            har_prefetch.attach(har)
+        return har
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
     env = spec_env(spec)
