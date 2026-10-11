@@ -31,199 +31,219 @@ def _e2m1x2(b):
 
 
 @triton.jit
-def _load_q(q_ptr, row_tok, h, rok, q_st, q_sh, qk_scale_log2):
-    # q rows -> f16 (even dims, odd dims, RoPE) after the per-row
-    # power-of-two prescale; returns the matching log2 logit scale.
-    i256 = tl.arange(0, 256)
-    i64 = tl.arange(0, 64)
-    base = q_ptr + tl.where(rok, row_tok, 0).to(tl.int64) * q_st + h * q_sh
-    m2 = rok[:, None]
-    qe = tl.load(base[:, None] + 2 * i256[None, :], mask=m2, other=0.0).to(tl.float32)
-    qo = tl.load(base[:, None] + 2 * i256[None, :] + 1, mask=m2, other=0.0).to(tl.float32)
-    qp = tl.load(base[:, None] + 512 + i64[None, :], mask=m2, other=0.0).to(tl.float32)
-    amax = tl.maximum(tl.maximum(tl.max(tl.abs(qe), 1), tl.max(tl.abs(qo), 1)),
-                      tl.max(tl.abs(qp), 1))
+def _pf_l2(ptrs, mask):
+    # L2 prefetch hint per address (never writes; masked lanes skip)
+    tl.inline_asm_elementwise(
+        "{ .reg .pred p; setp.ne.b32 p, $2, 0; @p prefetch.global.L2 [$1]; mov.u32 $0, 0; }",
+        "=r,l,r", [ptrs, mask.to(tl.int32)], dtype=tl.uint32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _fence_gpu():
+    # every thread: its own partial stores (release side) / the partial reads that follow
+    # (acquire side) ordered at gpu scope, besides the CTA barrier + thread 0's acq_rel atomic
+    tl.inline_asm_elementwise("fence.acq_rel.gpu;\nmov.u32 $0, 0;", "=r", [],
+                              dtype=tl.uint32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _row_ptrs(kv_ptr, slot, BS, BSTRIDE):
+    # rows are 352 B = 22 x 16 B: with kv_ptr / BSTRIDE specialized 16 B divisible (the
+    # usual cache; a padded view that is not compiles a scalar-load variant), Triton proves
+    # 16 B alignment and the latent / RoPE gathers become cp.async / vector loads
+    sl = tl.where(slot >= 0, slot, 0).to(tl.int64)
+    return kv_ptr + (sl // BS) * BSTRIDE + (sl % BS) * 352
+
+
+@triton.jit
+def _prefetch(kv_ptr, tbase, n0, hi, BS, BSTRIDE, TN: tl.constexpr):
+    # the 352 B rows of list columns [n0, n0 + TN) < hi into L2: one hint per 128 B line
+    cols = n0 + tl.arange(0, TN)
+    slot = tl.load(tbase + cols, mask=cols < hi, other=-1)
+    rowp = _row_ptrs(kv_ptr, slot, BS, BSTRIDE)
+    off = tl.arange(0, 4)
+    off = tl.where(off == 3, 351, off * 128)
+    _pf_l2(rowp[:, None] + off[None, :], (slot >= 0)[:, None] & (off >= 0)[None, :])
+
+
+@triton.jit
+def _tile(rowp, rv, CM: tl.constexpr):
+    # one read of a tile's raw bytes, every load issued before any is used (one memory
+    # latency per tile): (latent chunks 0..3 [TN, 64], RoPE [TN, 64], SF of chunks 0..3
+    # [TN, 8]). Each pass reads its own copy (CM differs: no CSE) so every load has one dot
+    # consumer and Triton stages the raw u8 through shared memory, dequantizing after the
+    # operand load (a shared read feeding both dots is dequantized first: 72 KB of f16).
+    # Triton does not pipeline a gather whose addresses come from a load in the same loop:
+    # the L2 prefetch (_prefetch, PFD tiles ahead) hides the DRAM part instead.
+    j = tl.arange(0, 64)
+    out = ()
+    for c in tl.static_range(4):
+        out = out + (tl.load(rowp[:, None] + c * 64 + j[None, :], mask=rv[:, None], other=0,
+                             cache_modifier=CM),)
+    out = out + (tl.load(rowp[:, None] + 256 + j[None, :], mask=rv[:, None], other=0,
+                         cache_modifier=CM),)
+    for c in tl.static_range(4):
+        # byte j of chunk c: dims 2j / 2j + 1, SF block 8c + j // 8 at 320 + 8 (blk & 3) + blk >> 2
+        blk = c * 8 + tl.arange(0, 8)
+        out = out + (tl.load(rowp[:, None] + 320 + 8 * (blk & 3)[None, :] + (blk >> 2)[None, :],
+                             mask=rv[:, None], other=0, cache_modifier=CM),)
+    return out
+
+
+@triton.jit
+def _kchunk(b, sfb, TN: tl.constexpr, ASM: tl.constexpr):
+    # latent bytes [TN, 64] + their SF bytes [TN, 8] -> (even dims, odd dims) f16 [TN, 64]
+    # = value * 2^-8
+    sf = tl.reshape(tl.broadcast_to(_e4m3(sfb.to(tl.int32))[:, :, None], [TN, 8, 8]), [TN, 64])
+    if ASM:
+        lo, hi = _e2m1x2(b)
+        return lo * sf, hi * sf
+    else:
+        sf = (sf.to(tl.float32) * 16384.0).to(tl.float16)  # e2m1 bits carry 2^-14
+        bi = b.to(tl.int32)
+        return _e2m1(bi) * sf, _e2m1(bi >> 4) * sf
+
+
+@triton.jit
+def _qt(qb, rok, up, off, STEP: tl.constexpr, W: tl.constexpr):
+    # q^T chunk [W, M] f16: dims off + STEP * i (i < W) after the per-row prescale
+    d = off + STEP * tl.arange(0, W)
+    q = tl.load(qb[:, None] + d[None, :], mask=rok[:, None], other=0.0).to(tl.float32)
+    return tl.trans((q * up[:, None]).to(tl.float16))
+
+
+@triton.jit
+def _merge(out_ptr, opart_ptr, lse_ptr, tok, hs, rok, NS, o_st, o_sh, HQ: tl.constexpr,
+           M: tl.constexpr, NSP: tl.constexpr):
+    # the last split of (token, head tile): exp2-domain LSE merge of the NS bf16 partials
+    # in split order (deterministic whoever arrives last), all -inf row -> 0
+    prow = (tok * HQ + hs) * NS
+    ns = tl.arange(0, NSP)
+    lse = tl.load(lse_ptr + prow[:, None] + ns[None, :], mask=rok[:, None] & (ns < NS)[None, :],
+                  other=float("-inf"), cache_modifier=".cg")
+    mx = tl.max(lse, 1)
+    mx = tl.where(mx == float("-inf"), 0.0, mx)
+    den = tl.sum(tl.exp2(lse - mx[:, None]), 1)
+    d = tl.arange(0, 128)
+    o = ()
+    for c in tl.static_range(4):
+        o = o + (tl.zeros([M, 128], tl.float32),)
+    for j in range(NS):
+        lj = tl.load(lse_ptr + prow + j, mask=rok, other=float("-inf"), cache_modifier=".cg")
+        w = tl.exp2(lj - mx)
+        live = rok & (lj != float("-inf"))
+        new = ()
+        for c in tl.static_range(4):
+            part = tl.load(opart_ptr + (prow + j)[:, None] * 512 + c * 128 + d[None, :],
+                           mask=live[:, None], other=0.0, cache_modifier=".cg")
+            new = new + (o[c] + w[:, None] * part.to(tl.float32),)
+        o = new
+    for c in tl.static_range(4):
+        res = tl.where(den[:, None] > 0, o[c] / den[:, None], 0.0)
+        tl.store(out_ptr + tok * o_st + hs[:, None] * o_sh + c * 128 + d[None, :],
+                 res.to(tl.bfloat16), mask=rok[:, None])
+
+
+@triton.jit(do_not_specialize=["T", "NS"])  # strides: fixed per model, specialized (vector loads)
+def _fwd(q_ptr, kv_ptr, topk_ptr, out_ptr, opart_ptr, lse_ptr, sem_ptr,
+         T, C, NS, topk_st, q_st, q_sh, o_st, o_sh, BS, BSTRIDE, qk_scale_log2,
+         HQ: tl.constexpr, HB: tl.constexpr, HQT: tl.constexpr, M: tl.constexpr,
+         TN: tl.constexpr, CP: tl.constexpr, NSP: tl.constexpr, PFD: tl.constexpr,
+         ASM: tl.constexpr, INTERPRET: tl.constexpr = False):
+    # one program = (token, HB-head tile, split s of the token's live list [0, L))
+    pid = tl.program_id(0)
+    s = tl.program_id(1)
+    tok = (pid // HQT).to(tl.int64)
+    r = tl.arange(0, M)
+    h = (pid % HQT) * HB + r
+    rok = (r < HB) & (h < HQ)
+    hs = tl.where(rok, h, 0)
+    qb = q_ptr + tok * q_st + hs * q_sh
+    # the token's list first: its latency overlaps the q staging below
+    tbase = topk_ptr + tok * topk_st
+    oc = tl.arange(0, CP)
+    lst = tl.load(tbase + oc, mask=oc < C, other=-1)
+    # per-row power-of-two prescale (oxide recipe): amax -> [2^14, 2^15), inverse in rs
+    qa = tl.load(qb[:, None] + tl.arange(0, 512)[None, :], mask=rok[:, None], other=0.0)
+    qr = tl.load(qb[:, None] + 512 + tl.arange(0, 64)[None, :], mask=rok[:, None], other=0.0)
+    amax = tl.maximum(tl.max(tl.abs(qa.to(tl.float32)), 1), tl.max(tl.abs(qr.to(tl.float32)), 1))
     e = (amax.to(tl.int32, bitcast=True) >> 23) & 0xFF
     k = tl.minimum(tl.maximum(141 - e, -114), 126)
     up = ((k + 127) << 23).to(tl.float32, bitcast=True)
-    dn = ((127 - k) << 23).to(tl.float32, bitcast=True)
-    return ((qe * up[:, None]).to(tl.float16), (qo * up[:, None]).to(tl.float16),
-            (qp * up[:, None]).to(tl.float16), qk_scale_log2 * dn)
-
-
-@triton.jit
-def _attend(q_e, q_o, q_p, rowscale, kv_ptr, topk_ptr, row_tok, rok, ref_tok,
-            lo, hi, topk_st, BS, BSTRIDE, TN: tl.constexpr, ASM: tl.constexpr):
-    # online softmax over list columns [lo, hi) of token ref_tok; row r
-    # is live at column c iff topk[row_tok[r], c] >= 0 (== the ref slot)
-    M: tl.constexpr = q_e.shape[0]
-    offs = tl.arange(0, TN)
-    i256 = tl.arange(0, 256)
-    i64 = tl.arange(0, 64)
-    j32 = tl.arange(0, 32)
-    sfo = 320 + 8 * (j32 & 3) + (j32 >> 2)  # SF byte of 16-dim block j
-    tok = tl.where(rok, row_tok, 0)
-    m_i = tl.full([M], float("-inf"), tl.float32)
-    l_i = tl.zeros([M], tl.float32)
-    acc_e = tl.zeros([M, 256], tl.float32)
-    acc_o = tl.zeros([M, 256], tl.float32)
-    for n0 in range(lo, hi, TN):
-        cols = n0 + offs
-        cin = cols < hi
-        slot = tl.load(topk_ptr + ref_tok * topk_st + cols, mask=cin, other=-1)
-        live = tl.load(topk_ptr + tok[:, None] * topk_st + cols[None, :],
-                       mask=rok[:, None] & cin[None, :], other=-1) >= 0
-        rv = slot >= 0
-        sl = tl.where(rv, slot, 0).to(tl.int64)
-        rowp = kv_ptr + (sl // BS) * BSTRIDE + (sl % BS) * 352
-        b = tl.load(rowp[:, None] + i256[None, :], mask=rv[:, None], other=0)
-        sf = _e4m3(tl.load(rowp[:, None] + sfo[None, :], mask=rv[:, None], other=0).to(tl.int32))
-        pe = tl.load(rowp[:, None] + 256 + i64[None, :], mask=rv[:, None], other=0).to(tl.int32)
-        k_pe = _e4m3(pe)
-        # byte i holds dims 2i (low nibble) / 2i + 1 (high); its SF is block i // 8
-        if ASM:
-            sf = tl.reshape(tl.broadcast_to(sf[:, :, None], [TN, 32, 8]), [TN, 256])
-            e_lo, e_hi = _e2m1x2(b)
-            k_lo = e_lo * sf
-            k_hi = e_hi * sf
-        else:
-            sf = (sf.to(tl.float32) * 16384.0).to(tl.float16)  # e2m1 bits carry 2^-14
-            sf = tl.reshape(tl.broadcast_to(sf[:, :, None], [TN, 32, 8]), [TN, 256])
-            b = b.to(tl.int32)
-            k_lo = _e2m1(b) * sf
-            k_hi = _e2m1(b >> 4) * sf
-        s = tl.dot(q_e, tl.trans(k_lo))
-        s += tl.dot(q_o, tl.trans(k_hi))
-        s += tl.dot(q_p, tl.trans(k_pe))
-        x = tl.where(live, s * rowscale[:, None], float("-inf"))
-        m_new = tl.maximum(m_i, tl.max(x, 1))
-        m_use = tl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = tl.exp2(m_i - m_use)
-        p = tl.exp2(x - m_use[:, None])
-        l_i = l_i * alpha + tl.sum(p, 1)
-        p16 = p.to(tl.float16)
-        acc_e = acc_e * alpha[:, None] + tl.dot(p16, k_lo)
-        acc_o = acc_o * alpha[:, None] + tl.dot(p16, k_hi)
-        m_i = m_new
-    return m_i, l_i, acc_e, acc_o
-
-
-@triton.jit
-def _finish(out_ptr, opart_ptr, lse_ptr, m_i, l_i, acc_e, acc_o, row_tok, h, rok,
-            s, NS, o_st, o_sh, HQ: tl.constexpr):
-    M: tl.constexpr = acc_e.shape[0]
-    has = l_i > 0
-    inv = tl.where(has, 256.0 / l_i, 0.0)  # SCALE_FIX / l (V carries 2^-8)
-    o = tl.reshape(tl.join(acc_e * inv[:, None], acc_o * inv[:, None]), [M, 512])
-    o = o.to(tl.bfloat16)
-    d = tl.arange(0, 512)
-    tok = tl.where(rok, row_tok, 0).to(tl.int64)
-    if NS == 1:
-        tl.store(out_ptr + tok[:, None] * o_st + h[:, None] * o_sh + d[None, :], o,
-                 mask=rok[:, None])
-    else:
-        # empty rows: lse -inf only (the merge never reads their partial)
-        prow = (tok * HQ + h) * NS + s
-        tl.store(opart_ptr + prow[:, None] * 512 + d[None, :], o, mask=(rok & has)[:, None])
-        tl.store(lse_ptr + prow, tl.where(has, m_i + tl.log2(l_i), float("-inf")),
-                 mask=rok)
-
-
-@triton.jit
-def _rows(t0, t_last, h0, HQ: tl.constexpr, HB: tl.constexpr, G: tl.constexpr,
-          M: tl.constexpr):
-    # q rows r = j * HB + (h - h0) over tokens t0 + j <= t_last
-    r = tl.arange(0, M)
-    j = r // HB
-    h = h0 + r % HB
-    return t0 + j, h, (j < G) & (t0 + j <= t_last) & (h < HQ)
-
-
-@triton.jit
-def _group(q_e, q_o, q_p, rs, row_tok, h, rok, kv_ptr, topk_ptr, out_ptr, opart_ptr,
-           lse_ptr, t_last, L, s, NS, topk_st, o_st, o_sh, BS, BSTRIDE,
-           HQ: tl.constexpr, TN: tl.constexpr, ASM: tl.constexpr):
-    # this split's whole tiles of list columns [0, L) of token t_last
-    M: tl.constexpr = q_e.shape[0]
+    rs = qk_scale_log2 * ((127 - k) << 23).to(tl.float32, bitcast=True)
+    # S^T = K q^T: q^T chunks are the (loop-invariant) B operands
+    qe = ()
+    qo = ()
+    for c in tl.static_range(4):
+        qe = qe + (_qt(qb, rok, up, 128 * c, 2, 64),)
+        qo = qo + (_qt(qb, rok, up, 128 * c + 1, 2, 64),)
+    qp = _qt(qb, rok, up, 512, 1, 64)
+    # live length L = last live column + 1; this split's whole tiles of [0, L)
+    L = tl.max(tl.where(lst >= 0, oc + 1, 0), 0)
     chunk = TN * tl.cdiv(tl.cdiv(L, TN), NS)
     lo = s * chunk
     hi = tl.minimum(lo + chunk, L)
-    if lo < hi:
-        m_i, l_i, acc_e, acc_o = _attend(q_e, q_o, q_p, rs, kv_ptr, topk_ptr, row_tok, rok,
-                                         t_last, lo, hi, topk_st, BS, BSTRIDE, TN, ASM)
-    else:  # past the live list (short contexts): no rows
-        m_i = tl.full([M], float("-inf"), tl.float32)
-        l_i = tl.zeros([M], tl.float32)
-        acc_e = tl.zeros([M, 256], tl.float32)
-        acc_o = tl.zeros([M, 256], tl.float32)
-    _finish(out_ptr, opart_ptr, lse_ptr, m_i, l_i, acc_e, acc_o, row_tok, h, rok, s, NS,
-            o_st, o_sh, HQ)
-
-
-@triton.jit(do_not_specialize=["T", "C", "NS", "topk_st", "q_st", "q_sh", "o_st",
-                               "o_sh", "BS", "BSTRIDE"])
-def _fwd(q_ptr, kv_ptr, topk_ptr, out_ptr, opart_ptr, lse_ptr, stats_ptr,
-         T, C, NS, topk_st, q_st, q_sh, o_st, o_sh, BS, BSTRIDE, qk_scale_log2,
-         HQ: tl.constexpr, HB: tl.constexpr, HQT: tl.constexpr, G: tl.constexpr,
-         M: tl.constexpr, TN: tl.constexpr, CP: tl.constexpr, STATS: tl.constexpr,
-         ASM: tl.constexpr):
-    pid = tl.program_id(0)
-    s = tl.program_id(1)
-    t0 = (pid // HQT) * G
-    h0 = (pid % HQT) * HB
-    t_last = tl.minimum(t0 + G, T) - 1
-    # union-row q first: its loads overlap the list loads below
-    row_tok, h, rok = _rows(t0, t_last, h0, HQ, HB, G, M)
-    q_e, q_o, q_p, rs = _load_q(q_ptr, row_tok, h, rok, q_st, q_sh, qk_scale_log2)
-    offs_c = tl.arange(0, CP)
-    cin = offs_c < C
-    ref = tl.load(topk_ptr + t_last * topk_st + offs_c, mask=cin, other=-1)
-    L = tl.max(tl.where(ref >= 0, offs_c + 1, 0), 0)
-    bad = L * 0
-    for jj in tl.static_range(G - 1):
-        lst = tl.load(topk_ptr + (t0 + jj) * topk_st + offs_c,
-                      mask=cin & (t0 + jj < t_last), other=-1)
-        bad += tl.sum(((lst >= 0) & (lst != ref)).to(tl.int32), 0)
-    if STATS:
-        if s == 0:
-            tl.store(stats_ptr + pid, (bad == 0).to(tl.int32))
-    if G == 1:
-        _group(q_e, q_o, q_p, rs, row_tok, h, rok, kv_ptr, topk_ptr, out_ptr, opart_ptr,
-               lse_ptr, t_last, L, s, NS, topk_st, o_st, o_sh, BS, BSTRIDE, HQ, TN, ASM)
+    for j in tl.static_range(PFD):
+        _prefetch(kv_ptr, tbase, lo + j * TN, hi, BS, BSTRIDE, TN)
+    m_i = tl.full([M], float("-inf"), tl.float32)
+    l_i = tl.zeros([M], tl.float32)
+    acc = ()  # (even, odd) output dims of latent bytes [64c, 64c + 64), c = 0..3
+    for c in tl.static_range(8):
+        acc = acc + (tl.zeros([M, 64], tl.float32),)
+    jt = tl.arange(0, TN)
+    for n0 in range(lo, hi, TN):
+        if PFD > 0:
+            _prefetch(kv_ptr, tbase, n0 + PFD * TN, hi, BS, BSTRIDE, TN)
+        cols = n0 + jt
+        slot = tl.load(tbase + cols, mask=cols < hi, other=-1)
+        rv = slot >= 0
+        rowp = _row_ptrs(kv_ptr, slot, BS, BSTRIDE)
+        cur = _tile(rowp, rv, "")
+        st = tl.zeros([TN, M], tl.float32)
+        for c in tl.static_range(4):
+            klo, khi = _kchunk(cur[c], cur[5 + c], TN, ASM)
+            st = tl.dot(klo, qe[c], st)
+            st = tl.dot(khi, qo[c], st)
+        st = tl.dot(_e4m3(cur[4].to(tl.int32)), qp, st)
+        x = tl.where(rv[:, None], st * rs[None, :], float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(x, 0))
+        m_use = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_use)
+        p = tl.exp2(x - m_use[None, :])
+        l_i = l_i * alpha + tl.sum(p, 0)
+        pt = tl.trans(p.to(tl.float16))  # [M, TN]
+        new = ()
+        cur = _tile(rowp, rv, ".ca")  # L1 hits
+        for c in tl.static_range(4):
+            vlo, vhi = _kchunk(cur[c], cur[5 + c], TN, ASM)
+            new = new + (tl.dot(pt, vlo, acc[2 * c] * alpha[:, None]),
+                         tl.dot(pt, vhi, acc[2 * c + 1] * alpha[:, None]))
+        acc = new
+        m_i = m_new
+    has = l_i > 0
+    inv = tl.where(has, 256.0 / l_i, 0.0)  # SCALE_FIX / l (V carries 2^-8)
+    d = tl.arange(0, 128)
+    if NS == 1:
+        for c in tl.static_range(4):
+            o = tl.reshape(tl.join(acc[2 * c] * inv[:, None], acc[2 * c + 1] * inv[:, None]),
+                           [M, 128])
+            tl.store(out_ptr + tok * o_st + hs[:, None] * o_sh + c * 128 + d[None, :],
+                     o.to(tl.bfloat16), mask=rok[:, None])
     else:
-        if bad == 0:
-            _group(q_e, q_o, q_p, rs, row_tok, h, rok, kv_ptr, topk_ptr, out_ptr, opart_ptr,
-                   lse_ptr, t_last, L, s, NS, topk_st, o_st, o_sh, BS, BSTRIDE, HQ, TN, ASM)
-        else:
-            # per token: the same tile path with one token's rows (M = 16)
-            for jt in range(G):  # not `jj`: the static loop above binds it as a constexpr
-                tj = t0 + jt
-                if tj <= t_last:
-                    rt1, h1, rok1 = _rows(tj, tj, h0, HQ, HB, 1, 16)
-                    q1e, q1o, q1p, rs1 = _load_q(q_ptr, rt1, h1, rok1, q_st, q_sh,
-                                                 qk_scale_log2)
-                    lst = tl.load(topk_ptr + tj * topk_st + offs_c, mask=cin, other=-1)
-                    Lj = tl.max(tl.where(lst >= 0, offs_c + 1, 0), 0)
-                    _group(q1e, q1o, q1p, rs1, rt1, h1, rok1, kv_ptr, topk_ptr, out_ptr,
-                           opart_ptr, lse_ptr, tj, Lj, s, NS, topk_st, o_st, o_sh, BS,
-                           BSTRIDE, HQ, TN, ASM)
-
-
-@triton.jit(do_not_specialize=["NS", "o_st", "o_sh"])
-def _merge(out_ptr, opart_ptr, lse_ptr, NS, o_st, o_sh, HQ: tl.constexpr,
-           NSP: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
-    offs = tl.arange(0, NSP)
-    lse = tl.load(lse_ptr + row * NS + offs, mask=offs < NS, other=float("-inf"))
-    mx = tl.max(lse, 0)
-    mx = tl.where(mx == float("-inf"), 0.0, mx)
-    den = tl.sum(tl.exp2(lse - mx), 0)
-    d = tl.arange(0, 512)
-    acc = tl.zeros([512], tl.float32)
-    for s in range(NS):
-        ls = tl.load(lse_ptr + row * NS + s)
-        if ls != float("-inf"):
-            acc += tl.exp2(ls - mx) * tl.load(opart_ptr + (row * NS + s) * 512 + d).to(tl.float32)
-    o = tl.where(den > 0, acc / den, 0.0)
-    tl.store(out_ptr + (row // HQ) * o_st + (row % HQ) * o_sh + d, o.to(tl.bfloat16))
-
+        # empty rows: lse -inf only (the merge never reads their partial)
+        prow = (tok * HQ + hs) * NS + s
+        for c in tl.static_range(4):
+            o = tl.reshape(tl.join(acc[2 * c] * inv[:, None], acc[2 * c + 1] * inv[:, None]),
+                           [M, 128])
+            tl.store(opart_ptr + prow[:, None] * 512 + c * 128 + d[None, :], o.to(tl.bfloat16),
+                     mask=(rok & has)[:, None])
+        tl.store(lse_ptr + prow, tl.where(has, m_i + tl.log2(l_i), float("-inf")), mask=rok)
+        if not INTERPRET:
+            _fence_gpu()
+        tl.debug_barrier()  # every warp's partial is issued before the release
+        cnt = tl.atomic_add(sem_ptr + pid, 1, sem="acq_rel", scope="gpu")
+        if cnt == NS - 1:
+            if not INTERPRET:
+                _fence_gpu()
+            _merge(out_ptr, opart_ptr, lse_ptr, tok, hs, rok, NS, o_st, o_sh, HQ, M, NSP)
+            tl.atomic_xchg(sem_ptr + pid, 0)

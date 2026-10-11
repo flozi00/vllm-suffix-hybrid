@@ -29,35 +29,35 @@ def _clean(monkeypatch):
     monkeypatch.delenv(ours.TABLE_ENV, raising=False)
     monkeypatch.setattr(ours, "_MODE", "oxide")
     monkeypatch.setattr(ours, "_TABLE", None)
-    monkeypatch.setattr(ours, "CFG", {"asm": True, "stages": 2})
+    monkeypatch.setattr(ours, "CFG", {"asm": True})
     ours._AUTO.clear()
 
 
 # ---- plan --------------------------------------------------------------------
 @pytest.mark.parametrize("hq", [8, 16, 64])
 @pytest.mark.parametrize("c", [2048, 1000, 64, 33])
-def test_plan_covers_capacity_with_canonical_splits(hq, c):
+@pytest.mark.parametrize("cfg", list(ours.CONFIGS))
+def test_plan_one_wave_bounded_splits(hq, c, cfg):
+    k = ours.CONFIGS[cfg]
     for t in (1, 2, 3, 6, 8, 24, 96, 192, 1024, 8192):
-        for g in (1, 2, 3, 4):
-            p = ours.plan(t, hq, c, g, SMS)
-            tiles = -(-c // ours.TN)
-            k = -(-tiles // p["ns"])
-            assert 1 <= p["ns"] <= ours.MAX_NS and -(-tiles // k) == p["ns"]
-            assert p["groups"] == -(-t // p["g"]) and p["hqt"] * p["hb"] >= hq
-            assert p["g"] * p["hb"] <= 32 and p["m"] >= max(16, p["g"] * p["hb"])
-            assert p["m"] & (p["m"] - 1) == 0 and p["cp"] >= c
-            assert p["warps"] == (8 if p["m"] > 16 else 4)
-            assert ours.plan(t, hq, c, g, SMS) == p  # pure: CUDA-graph stable
+        p = ours.plan(t, hq, c, SMS, cfg)
+        assert 1 <= p["ns"] <= min(ours.NS_MAX, -(-c // k["tn"])) and ours.NS_MAX <= ours.NSP
+        assert p["ns"] == 1 or t * p["hqt"] * p["ns"] <= SMS * k["occ"]  # one wave
+        assert p["hqt"] * p["hb"] >= hq and p["hb"] <= p["m"] == ours.M_ROWS
+        assert p["cp"] >= c and p["cp"] & (p["cp"] - 1) == 0 and p["tn"] == k["tn"]
+        assert ours.plan(t, hq, c, SMS, cfg) == p  # pure: CUDA-graph stable
 
 
 def test_plan_glm_shapes():
-    got = {(t, g): ours.plan(t, 8, 2048, g, SMS)["ns"]
-           for t, g in [(1, 1), (8, 1), (32, 1), (6, 3), (24, 3), (96, 3), (12, 4), (8192, 4)]}
-    assert got == {(1, 1): 64, (8, 1): 22, (32, 1): 5, (6, 3): 64, (24, 3): 22,
-                   (96, 3): 5, (12, 4): 32, (8192, 4): 1}
-    assert ours.plan(2, 64, 2048, 3, SMS)["g"] == 2  # HB 16: M <= 32
+    got = {(t, cfg): ours.plan(t, 8, 2048, SMS, cfg)["ns"]
+           for t in (1, 6, 24, 96, 192) for cfg in ("t32", "t64")}
+    assert got == {(1, "t32"): 16, (6, "t32"): 16, (24, "t32"): 15, (96, "t32"): 3,
+                   (192, "t32"): 1, (1, "t64"): 16, (6, "t64"): 16, (24, "t64"): 7,
+                   (96, "t64"): 1, (192, "t64"): 1}
+    assert ours.plan(4, 64, 2048, SMS)["hqt"] == 4
+    assert ours.plan(70000, 8, 2048, SMS)["ns"] == 1  # beyond the merge counters
     with pytest.raises(ValueError):
-        ours.plan(0, 8, 2048, 1, SMS)
+        ours.plan(0, 8, 2048, SMS)
 
 
 def test_q_group_never_straddles_requests():
@@ -119,14 +119,13 @@ def test_union_rule_edge_cases():
     assert not ours.union_ok(extra, 0, 1) and not ours.union_ok(moved, 0, 1)
 
 
-@pytest.mark.parametrize("q_len,n_req,regime,hq,c,group", [
-    (6, 1, "short", 8, 2048, None), (1, 2, "short", 8, 2048, None),
-    (3, 4, "short", 8, 2048, None), (4, 2, "short", 8, 2048, None),
-    (6, 1, "long", 8, 2048, None), (3, 2, "long", 8, 1000, None),
-    (1, 2, "short", 64, 2048, None), (2, 2, "long", 64, 2048, None),
-    (3, 4, "short", 8, 2048, 4),  # G 4 over q-len 3: groups straddle requests
+@pytest.mark.parametrize("q_len,n_req,regime,hq,c", [
+    (6, 1, "short", 8, 2048), (1, 2, "short", 8, 2048), (3, 4, "short", 8, 2048),
+    (4, 2, "short", 8, 2048), (6, 1, "long", 8, 2048), (3, 2, "long", 8, 1000),
+    (1, 2, "short", 64, 2048), (2, 2, "long", 64, 2048),
 ])
-def test_emulation_matches_f64_reference(q_len, n_req, regime, hq, c, group):
+@pytest.mark.parametrize("cfg", ["t32", "t64"])
+def test_emulation_matches_f64_reference(q_len, n_req, regime, hq, c, cfg):
     import torch
 
     cache, lat, rope = _cache()
@@ -134,26 +133,15 @@ def test_emulation_matches_f64_reference(q_len, n_req, regime, hq, c, group):
     topk = ours.make_lists(n_req, q_len, 4096, gen, regime, topk=c, ctx=(40, 300))
     t = topk.shape[0]
     if t > 2:
-        topk[1, 3::5] = -1  # holes: that group falls back to per token
+        topk[1, 3::5] = -1  # holes
         topk[-2] = -1       # an all -1 token
     q = (torch.randn(t, hq, 576, generator=gen) * 2).bfloat16()
-    g = group or ours.q_group(q_len)
-    union = []
-    out = ours.emulate(q, cache, topk, O.SCALE, g, SMS, union=union)
+    out = ours.emulate(q, cache, topk, O.SCALE, SMS, cfg)
     ref = O.attention_ref(q.double(), lat, rope, topk, O.SCALE)
     valid = (topk >= 0).any(-1)
     keep = valid[:, None].expand(t, hq)
     assert O.row_rel_l2(out, ref, keep) <= 1e-2
     assert bool((out[~valid] == 0).all()) and bool(torch.isfinite(out).all())
-    pg = ours.plan(t, hq, c, g, SMS)["g"]
-    want = [ours.union_ok(topk, t0, min(t0 + pg, t) - 1) for t0 in range(0, t, pg)]
-    assert union == want
-    if regime == "short" and t <= 2:
-        assert all(union)
-    if regime == "long" and q_len > 1:
-        assert not union[0]  # (a group whose other token is all -1 is a trivial union)
-    if group == 4:
-        assert union[0] is False or ours.live_len(topk[0]) <= ours.live_len(topk[3])
 
 
 def test_emulation_direct_and_split_paths_agree():
@@ -163,9 +151,9 @@ def test_emulation_direct_and_split_paths_agree():
     gen = torch.Generator().manual_seed(5)
     topk = ours.make_lists(2, 3, 4096, gen, "short", ctx=(100, 300))
     q = torch.randn(6, 8, 576, generator=gen).bfloat16()
-    a = ours.emulate(q, cache, topk, O.SCALE, 3, 1)      # 1 SM: ns 1, no merge
-    b = ours.emulate(q, cache, topk, O.SCALE, 3, SMS)    # ns 64 + merge
-    assert ours.plan(6, 8, 2048, 3, 1)["ns"] == 1
+    a = ours.emulate(q, cache, topk, O.SCALE, 1)      # 1 SM: ns 1, no merge
+    b = ours.emulate(q, cache, topk, O.SCALE, SMS)    # ns 16 + merge
+    assert ours.plan(6, 8, 2048, 1)["ns"] == 1 and ours.plan(6, 8, 2048, SMS)["ns"] == 16
     assert O.rel_l2(a, b) <= 5e-3
 
 
@@ -177,8 +165,8 @@ def _table(tmp_path, monkeypatch, tbl):
     return path
 
 
-ROWS = [{"T": 6, "G": 3, "ours": True}, {"T": 96, "G": 3, "ours": False},
-        {"T": 1, "G": 1, "ours": True}]
+ROWS = [{"T": 6, "ours": True, "cfg": "t32"}, {"T": 96, "ours": False, "cfg": "t64"},
+        {"T": 1, "ours": True, "cfg": "t32s1"}]
 
 
 def test_mode_oxide_default_and_bad_value(monkeypatch):
@@ -196,8 +184,8 @@ def test_mode_ours_fails_closed(monkeypatch, tmp_path):
     _table(tmp_path, monkeypatch, {"pass": False, "rows": [], "failed": ["x"]})
     with pytest.raises(RuntimeError, match="FAILED"):
         ours.init()
-    _table(tmp_path, monkeypatch, {"pass": True, "rows": ROWS, "asm": False, "stages": 1})
-    assert "oracle pass" in ours.init() and ours.CFG == {"asm": False, "stages": 1}
+    _table(tmp_path, monkeypatch, {"pass": True, "rows": ROWS, "asm": False})
+    assert "oracle pass" in ours.init() and ours.CFG == {"asm": False}
     assert ours.use_ours(96, 3) and ours.use_ours(5, 2)  # ours: everywhere
 
 
@@ -209,9 +197,17 @@ def test_mode_auto_follows_the_table(monkeypatch, tmp_path):
     assert "1/3" not in ours.init()
     assert ours.use_ours(6, 3) and ours.use_ours(12, 3)          # nearest T: 6
     assert not ours.use_ours(96, 3) and not ours.use_ours(48, 3)  # nearest T: 96
-    assert ours.use_ours(1, 1) and not ours.use_ours(8, 4)        # G 4 never measured
+    assert ours.use_ours(1, 1) and ours.use_ours(2)               # nearest T: 1 (then 6)
+    assert [ours.config_for(t) for t in (1, 2, 6, 24, 96, 8192)] == [
+        "t32s1", "t32s1", "t32", "t64", "t64", "t64"]
     _table(tmp_path, monkeypatch, {"pass": False, "rows": ROWS})
     assert "oxide everywhere" in ours.init() and not ours.use_ours(6, 3)
+
+
+def test_config_for_defaults_without_a_table(monkeypatch):
+    assert ours.config_for(6) == ours.DEFAULT
+    monkeypatch.setattr(ours, "_TABLE", {"pass": True, "rows": [{"T": 6, "cfg": "gone"}]})
+    assert ours.config_for(6) == ours.DEFAULT  # a config this build no longer has
 
 
 def test_use_asm(monkeypatch):
@@ -332,29 +328,27 @@ kv_c, k_pe = O.make_kv(4096, "cpu", gen, special=True)
 rows = O.quant_rows_ref(kv_c, k_pe)
 cache = rows.view(64, 64, O.ROW).clone()
 lat, rope = (x.double() for x in O.dequant_rows_ref(rows))
-for q_len, n_req, regime, hq, sms in [(6, 1, "short", 8, 188), (3, 2, "long", 8, 188),
-                                      (1, 2, "short", 64, 188), (4, 2, "short", 8, 1)]:
+for q_len, n_req, regime, hq, sms, cfg in [(6, 1, "short", 8, 188, "t32"), (3, 2, "long", 8, 188, "t64"),
+                                           (1, 2, "short", 64, 188, "t32"), (4, 2, "short", 8, 1, "t64")]:
     topk = ours.make_lists(n_req, q_len, 4096, gen, regime, ctx=(40, 200))
     t = topk.shape[0]
     if t > 2:
         topk[1, 3::5] = -1
         topk[-2] = -1
     q = (torch.randn(t, hq, 576, generator=gen) * 2).bfloat16()
-    g = ours.q_group(q_len)
-    p = ours.plan(t, hq, 2048, g, sms)
-    stats = torch.full((p["groups"] * p["hqt"],), -1, dtype=torch.int32)
     out = ours.decode(q, cache, topk, torch.empty(t, hq, 512, dtype=torch.bfloat16),
-                      O.SCALE, g, sms, stats=stats)
-    union = []
-    emu = ours.emulate(q, cache, topk, O.SCALE, g, sms, union=union)
+                      O.SCALE, 1, sms, cfg=cfg)
+    out2 = ours.decode(q, cache, topk, torch.empty(t, hq, 512, dtype=torch.bfloat16),
+                       O.SCALE, 1, sms, cfg=cfg)  # the merge counters came back rearmed
+    emu = ours.emulate(q, cache, topk, O.SCALE, sms, cfg)
     ref = O.attention_ref(q.double(), lat, rope, topk, O.SCALE)
     valid = (topk >= 0).any(-1)
     e_ref = O.row_rel_l2(out, ref, valid[:, None].expand(t, hq))
     e_emu = O.rel_l2(out[valid], emu[valid])
-    want = [int(u) for u in union for _ in range(p["hqt"])]
-    assert stats.tolist() == want, (stats.tolist(), want)
+    assert torch.equal(out, out2) and bool((ours._SEMS[-1] == 0).all())
     assert bool((out[~valid] == 0).all()) and e_ref <= 2e-2 and e_emu <= 1.5e-2, (e_ref, e_emu)
-    print("ok", q_len, n_req, regime, hq, sms, f"{e_ref:.2e} {e_emu:.2e}", union)
+    print("ok", q_len, n_req, regime, hq, sms, cfg, ours.plan(t, hq, 2048, sms, cfg)["ns"],
+          f"{e_ref:.2e} {e_emu:.2e}")
 """
 
 
@@ -394,13 +388,8 @@ def _ref_into(out, q, cache, topk):
     out.copy_(O.attention_ref(q.float(), lat, rope, topk, O.SCALE))
 
 
-def _fake_decode(q, cache, topk, out, scale, group, sms, stats=None, asm=None):
-    p = ours.plan(q.shape[0], q.shape[1], topk.shape[1], group, sms)
-    if stats is not None:
-        t = q.shape[0]
-        for i, t0 in enumerate(range(0, t, p["g"])):
-            for h in range(p["hqt"]):
-                stats[i * p["hqt"] + h] = int(ours.union_ok(topk, t0, min(t0 + p["g"], t) - 1))
+def _fake_decode(q, cache, topk, out, scale, group, sms, asm=None, cfg=None):
+    ours.plan(q.shape[0], q.shape[1], topk.shape[1], sms, cfg or ours.DEFAULT)
     _captured(lambda: _ref_into(out, q, cache, topk))
     return out
 
@@ -449,7 +438,7 @@ def test_helpers_and_harness_under_bf16_default_dtype(monkeypatch, tmp_path):
     topk = ours.make_lists(2, 3, 4096, gen, "short", ctx=(40, 200))
     q = (torch.randn(6, 8, 576, generator=gen, dtype=torch.float32) * 2).bfloat16()
     ref = O.attention_ref(q.double(), lat, rope, topk, O.SCALE)
-    emu = ours.emulate(q, cache, topk, O.SCALE, 3, SMS)
+    emu = ours.emulate(q, cache, topk, O.SCALE, SMS)
     rows16 = ours._f16_rows(cache.view(-1, O.ROW))
     prev = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
@@ -460,7 +449,7 @@ def test_helpers_and_harness_under_bf16_default_dtype(monkeypatch, tmp_path):
         gen_b = torch.Generator().manual_seed(9)
         assert torch.equal(ours.make_lists(2, 3, 4096, gen_b, "short", ctx=(40, 200)), topk)
         assert torch.equal(O.attention_ref(q.double(), lat, rope, topk, O.SCALE), ref)
-        assert torch.equal(ours.emulate(q, cache, topk, O.SCALE, 3, SMS), emu)
+        assert torch.equal(ours.emulate(q, cache, topk, O.SCALE, SMS), emu)
         assert all(torch.equal(a, b) for a, b in zip(ours._f16_rows(cache.view(-1, O.ROW)),
                                                       rows16))
         assert ours.init() == "oxide"
@@ -494,7 +483,7 @@ def _harness(monkeypatch, tmp_path):
         _captured(lambda: _ref_into(out, q, cache, topk)) or out))
     monkeypatch.setattr(O, "Stock", lambda dev: _FakeStock())
     monkeypatch.setattr(O, "PREFILL_T", 96)
-    monkeypatch.setattr(ours, "ORACLE_SHAPES", [(6, 1), (3, 4), (1, 3), (3, 4, 4)])
+    monkeypatch.setattr(ours, "ORACLE_SHAPES", [(6, 1), (3, 4), (1, 3)])
     monkeypatch.setattr(ours, "BENCH_SHAPES", [(1, 2), (6, 1), (3, 4)])
     monkeypatch.setattr(ours, "FLUSH_BYTES", 1024)
     results = []
@@ -502,29 +491,30 @@ def _harness(monkeypatch, tmp_path):
     def report(name, ok, detail):
         results.append((name, ok, detail))
 
-    ours.run_oracle(_FakeBase(), "cpu", report, nslots=1 << 14)
+    configs = ours.run_oracle(_FakeBase(), "cpu", report, nslots=1 << 14)
     names = [r[0] for r in results]
     assert all(ok for _n, ok, _d in results), [r for r in results if not r[1]]
-    assert {"ours_short_q6x1_G3", "ours_long_q3x4_G3", "ours_short_q3x4_G4",
-            "ours_cuda_graph_replay_long",
-            "ours_cuda_graph_replay_short", "reader_cuda_graph_replay",
+    assert configs == list(ours.CONFIGS)
+    assert {"ours_short_q6x1", "ours_long_q3x4", "ours_short_q1x3", "reader_cuda_graph_replay",
             "adversarial_prefill_T96"} <= set(names)
-    assert names.count("reader_padded_block_stride") == 2  # G 1 and G 3
-    assert ours.CFG == {"asm": True, "stages": 2}
-    rows = ours.run_bench(_FakeBase(), "cpu", reps=2, nslots=1 << 14)
-    assert [(r["T"], r["G"]) for r in rows] == [(2, 1), (6, 3), (12, 3)]
-    assert all(r["ours_short"] == 5.0 and r["ours"] for r in rows)
+    assert {f"ours_cuda_graph_replay_{c}" for c in ours.CONFIGS} <= set(names)
+    assert names.count("reader_padded_block_stride") == 1
+    assert ours.CFG == {"asm": True}
+    rows = ours.run_bench(_FakeBase(), "cpu", reps=2, nslots=1 << 14, configs=configs)
+    assert [r["T"] for r in rows] == [2, 6, 12]
+    assert all(r["ours_short"] == 5.0 and r["ours"] and r["cfg"] == ours.DEFAULT for r in rows)
     # main(): verdict -> table -> exit code
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (12, 0))
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(O, "Ours", lambda idx: _FakeBase())
-    monkeypatch.setattr(ours, "run_oracle", lambda b, d, rep: rep("x", True, "ok"))
-    monkeypatch.setattr(ours, "run_bench", lambda b, d, reps: rows)
+    monkeypatch.setattr(ours, "run_oracle", lambda b, d, rep: rep("x", True, "ok") or ["t32"])
+    monkeypatch.setattr(ours, "run_bench", lambda b, d, reps, configs=None: rows)
     path = tmp_path / "t.json"
     assert ours.main(["oracle", "--table", str(path)]) == 0
     tbl = json.loads(path.read_text())
-    assert tbl["pass"] and tbl["rows"] == rows and tbl["stages"] == 2 and tbl["failed"] == []
+    assert tbl["pass"] and tbl["rows"] == rows and tbl["configs"] == ["t32"]
+    assert tbl["failed"] == [] and "kernels" in tbl
     monkeypatch.setattr(ours, "run_oracle", lambda b, d, rep: rep("y", False, "bad"))
     assert ours.main(["oracle", "--table", str(path)]) == 1
     assert ours.main(["bench", "--table", str(path)]) == 0

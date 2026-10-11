@@ -227,9 +227,9 @@ INDEX_GROUP_EDITS = [
     ),
 ]
 
-# Our Triton decode (ours.py) unions a request's MTP verify tokens: record the
-# decode slice's q-len group per forward (an attribute, read by the decode
-# helper; correctness never depends on it).
+# Our Triton decode (ours.py) rev 1 unioned a request's MTP verify tokens by
+# this q-len group; rev 2 runs per token and ignores it (the hook stays: an
+# attribute, read by the decode helper; correctness never depends on it).
 IMPL_EDITS.append((
     "forward_mqa_q_group",
     "        num_actual_toks = q.shape[0]\n"
