@@ -506,7 +506,12 @@ def _make_head_cls(native):
 
 def _first_forward_check(module, args):
     """Engagement check at the first module call after load (before graph
-    capture): gate on but no head converted -> fail startup, loud."""
+    capture): gate on but no head converted -> fail startup, loud. A load-time
+    layer oracle that calls modules mid-load (nvfp4_moe's shared-expert oracle)
+    is not that first call: wait for the next one."""
+    moe = sys.modules.get("suffix_hybrid.kernels.nvfp4_moe")
+    if moe is not None and moe._state.get("in_oracle"):
+        return
     h = _state.pop("hook", None)
     if h is not None:
         h.remove()
