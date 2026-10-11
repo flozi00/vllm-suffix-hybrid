@@ -1,0 +1,1 @@
+Tuned AITER gemm_afp4wfp4 JSONs for the 128-CU MI350P from boot gate afp4_tune, named as AITER names them (GEMM-AFP4WFP4-N=<N>-K=<K>.json, K logical); SUFFIX_ROCM_AFP4_CONFIGS=1 loads them before AITER's own.
