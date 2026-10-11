@@ -395,11 +395,6 @@ if any(os.environ.get(k, "").strip() for k in ("SUFFIX_NCCL_SMALL_ALGO", "SUFFIX
                                                "SUFFIX_HAR_ALLGATHER")):
     from suffix_hybrid.nccl_split import install_post_import_hook as _ncsplit_hook
     _ncsplit_hook()
-# SUFFIX_HAR_FUSED_NORM=1: fused_allreduce_rms_norm (GLM / DeepSeek-V3.2 layers) through the host
-# all-reduce + add + RMSNorm kernel (suffix_hybrid/har_norm.py); needs the har band above.
-if os.environ.get("SUFFIX_HAR_FUSED_NORM", "").strip() == "1":
-    from suffix_hybrid.har_norm import install_post_import_hook as _har_norm_hook
-    _har_norm_hook()
 
 if os.environ.get("SUFFIX_PROFILE_WORKER", "").strip():
     try:
@@ -506,6 +501,10 @@ _BOOT_GATES = {
     # (k=5, CUDA graph). Also runs fail-closed before serving (below). Lines:
     # [suffix sm120-hisparse-mtp] split oracle.
     "hisparse_resolver_oracle": (["-m", "hisparse_mtp_patch.split_oracle"], {}),
+    # Our single-pass resolver (SUFFIX_SM120_HISPARSE_OWN_RESOLVER): bit-identical to
+    # upstream where upstream fits, == reference at k=5, CUDA graph, invalidation,
+    # us vs split / upstream. Lines: [suffix sm120-hisparse-mtp] own resolver oracle.
+    "hisparse_own_resolver_oracle": (["-m", "hisparse_mtp_patch.own_resolver"], {}),
     # Full GLM stack inside a real vLLM engine (what prod runs, minus TP=8):
     # nvfp4_ds_mla KV + HiSparse + MTP k=5, ref vs patched greedy parity.
     "glm_stack_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "5",
@@ -590,6 +589,11 @@ _BOOT_GATES = {
     # M 1..192 for FlashInfer CUTLASS, our NVFP4 kernel and FlashInfer b12x; numerics vs f64; the
     # TP tune table. Lines: [suffix moe-tp].
     "glm_moe_tp_bench": (["-m", "suffix_hybrid.tools.glm_moe_tp"], {}),
+    # Same TP8 rank + its shared expert: our routed kernel + vLLM's BF16 shared MLP (serial and
+    # on a second stream, + the runner's add) vs the fused shared slot
+    # (SUFFIX_NVFP4_MOE_FUSE_SHARED), best tune each, numerics vs f64 / stock / the BF16 MLP,
+    # fused tune table, per-step saving. Lines: [suffix moe-shared].
+    "glm_moe_shared_bench": (["-m", "suffix_hybrid.tools.glm_moe_shared"], {}),
     # Our TP-sharded NVFP4 MoE in Triton (suffix_hybrid/kernels/nvfp4_moe_tp.py), GLM-5.3 TP8 shard,
     # one GPU, cold L2, CUDA graphs: oracle of every plan (f64 + oxide, graph replay), then us/layer
     # per M vs oxide (g10 table) and FlashInfer + % of the weight roofline + the paste-able
@@ -762,20 +766,25 @@ if (os.environ.get("SUFFIX_SM120_NVP4KV_ORACLE", "").strip() == "1"
 # HiSparse residency split (hisparse_mtp_patch.split_oracle): with the HiSparse MTP
 # patch on, the nightly's union resolver runs in passes on SM120 (k > 3 does not fit
 # 101,376 B of shared memory); the passes must prove byte-exact on this GPU before
-# vLLM loads. Once per pod, child process, SUFFIX_* stripped. Exit 3 = not
+# vLLM loads. With SUFFIX_SM120_HISPARSE_OWN_RESOLVER=1 our single-pass resolver
+# replaces the split and its oracle (hisparse_mtp_patch.own_resolver) gates instead.
+# Once per pod, child process, SUFFIX_* stripped. Exit 3 = not
 # applicable (vLLM 0.30.0 / not SM120); anything else but 0 refuses to serve.
 if (os.environ.get("SUFFIX_SM120_HISPARSE_MTP", "").strip() == "1"
         and not os.environ.get("SUFFIX_SM120_HISPARSE_SPLIT_ORACLE_DONE")):
     import subprocess
     import sys
     os.environ["SUFFIX_SM120_HISPARSE_SPLIT_ORACLE_DONE"] = "1"
+    _which = ("own resolver" if os.environ.get("SUFFIX_SM120_HISPARSE_OWN_RESOLVER", "").strip() == "1"
+              else "split")
     _rc = subprocess.run(
-        [sys.executable, "-m", "hisparse_mtp_patch.split_oracle"],
+        [sys.executable, "-m", {"split": "hisparse_mtp_patch.split_oracle",
+                                "own resolver": "hisparse_mtp_patch.own_resolver"}[_which]],
         env={k: v for k, v in os.environ.items()
              if not k.startswith("SUFFIX_") or k.endswith("_DONE")}).returncode
-    print(f"[suffix sm120-hisparse-mtp] split oracle: exit {_rc}", file=sys.stderr, flush=True)
+    print(f"[suffix sm120-hisparse-mtp] {_which} oracle: exit {_rc}", file=sys.stderr, flush=True)
     if _rc not in (0, 3):
-        raise SystemExit("suffix sm120 hisparse-mtp: residency split oracle did not pass "
+        raise SystemExit(f"suffix sm120 hisparse-mtp: residency {_which} oracle did not pass "
                          f"(exit {_rc}); refusing to serve HiSparse")
 
 # NOTE: the WARM-START debug endpoint is NO LONGER armed here. The old

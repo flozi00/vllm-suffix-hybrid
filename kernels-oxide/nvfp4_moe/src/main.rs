@@ -31,6 +31,12 @@
 //!   pf2         fc1 CTAs prefetch their share of the expert's w2 (+ scales)
 //!               into L2 after their k loop, for the fc2 launch
 //! moe_route_quant routes with `route_par` (same outputs as `route_cta`).
+//! Shared expert (`shared_e` = E, host `shared=`; NO_SHARED = none): one
+//! always-active extra slot appended after the routed slots, expert id E =
+//! the host's separate shared tensors (same [2I, H/2] / [H, I/2] layouts,
+//! own scalars g1 (gate), g1u (up), g2), rows = pair ids P + t for token t
+//! (P = M*topk), weight 1. fc1/fc2 run it like any slot; combine adds its
+//! row after the routed k: out[t] = bf16(sum_k y[t*topk + k] + y[P + t]).
 //! Layouts = vLLM FLASHINFER_CUTLASS after process_weights_after_loading
 //! (quantization/utils/flashinfer_fp4_moe.py:309-420): w13 uint8
 //! [E, 2I, H/2] ordered [w3(up); w1(gate)]; w13_sf e4m3 per-expert 128x4
@@ -216,6 +222,30 @@ macro_rules! route_par {
     }};
 }
 
+/// The shared expert's slot (`nsh` > 0 = its rows = M; 0 = none), run by
+/// both route kernels after their routing: slot `max_slots` (one past the
+/// routed slots, which never store it) = expert `num_experts` over
+/// pair_list[P, P + nsh) = pair ids P + t. Static in M: no routing.
+macro_rules! shared_slot {
+    ($tid:expr, $pairs:expr, $nsh:expr, $num_experts:expr, $max_slots:expr, $slot_expert:expr,
+     $slot_off:expr, $slot_cnt:expr, $pair_list:expr) => {{
+        if $nsh > 0 {
+            if $tid == 0 {
+                unsafe {
+                    *$slot_expert.add($max_slots as usize) = $num_experts as i32;
+                    *$slot_off.add($max_slots as usize) = $pairs as i32;
+                    *$slot_cnt.add($max_slots as usize) = $nsh as i32;
+                }
+            }
+            let mut t = $tid;
+            while t < $nsh {
+                unsafe { *$pair_list.add(($pairs + t) as usize) = ($pairs + t) as i32 };
+                t += 256;
+            }
+        }
+    }};
+}
+
 /// NVFP4 quant of ONE 16-element block, vLLM scaled_fp4_quant math:
 /// sf = e4m3(amax16 * (g / 6)), q = e2m1_rne(x * (g / sf)) (IEEE div).
 /// `|i| load` = element i (bf16/f32 global row, or the fused fc1's f32 smem
@@ -265,6 +295,36 @@ pub mod kernels {
     const WARPS: u32 = 4;
     /// moe_route_quant block size (route_par's warp-total layout).
     const RT: u32 = 256;
+    /// `shared_e` of a call without a shared expert (matches no slot).
+    const NO_SHARED: u32 = 0xFFFF_FFFF;
+
+    /// Route slot of this CTA row (grid y = the route's slots): blockIdx.y,
+    /// except with a shared expert y = 0 takes its slot (the last one) and
+    /// y = s + 1 routed slot s — its CTAs walk all M rows, so they start
+    /// first instead of trailing the launch. Values never depend on it.
+    #[inline(always)]
+    fn slot_of(shared_e: u32) -> usize {
+        let y = thread::blockIdx_y();
+        let s = if shared_e == NO_SHARED {
+            y
+        } else if y == 0 {
+            thread::gridDim_y() - 1
+        } else {
+            y - 1
+        };
+        s as usize
+    }
+
+    /// A-row (token) of pair p: p / topk; in the shared slot (sh) its pair
+    /// ids are P + t (sbase = P), a masked row's p = 0 -> token 0.
+    #[inline(always)]
+    fn tok_of(p: u32, sh: bool, sbase: u32, topk: u32) -> u32 {
+        if sh {
+            if p >= sbase { p - sbase } else { 0 }
+        } else {
+            p / topk
+        }
+    }
 
     #[inline(always)]
     fn ld32(p: *const u8, off: usize) -> u32 {
@@ -628,7 +688,7 @@ pub mod kernels {
     }
 
     /// [legacy launch 1] single CTA of 256 threads, dynamic smem 2*E i32:
-    /// route_cta.
+    /// route_cta, then the shared slot (nsh > 0).
     #[kernel]
     #[launch_bounds(256)]
     pub unsafe fn moe_route(
@@ -642,6 +702,7 @@ pub mod kernels {
         slot_off: *mut i32,
         slot_cnt: *mut i32,
         pair_list: *mut i32,
+        nsh: u32,
     ) {
         let sh: *mut i32 = DynamicSharedArray::<i32>::get();
         let tid = thread::threadIdx_x();
@@ -659,6 +720,8 @@ pub mod kernels {
             slot_cnt,
             pair_list
         );
+        shared_slot!(tid, pairs, nsh, num_experts, max_slots, slot_expert, slot_off, slot_cnt,
+                     pair_list);
     }
 
     /// [legacy launches 2, 4] one thread per (row, 16-block): quant16,
@@ -692,7 +755,8 @@ pub mod kernels {
     }
 
     /// [fused launch 1] route + quant x in ONE launch: block 0 = route_par
-    /// (dynamic smem 64 + 2*round2(P) B), blocks 1.. = one thread per (token, 16-block)
+    /// (dynamic smem 64 + 2*round2(P) B) + the shared slot (nsh > 0),
+    /// blocks 1.. = one thread per (token, 16-block)
     /// of x -> aq/asf (quant16, a1 gscale). Independent (quant reads only
     /// x), so no inter-block dependency. grid 1 + ceil(M*H/16 / 256), 256
     /// threads.
@@ -716,6 +780,7 @@ pub mod kernels {
         hdim: u32,
         x_stride: u32,
         gscale: f32,
+        nsh: u32,
     ) {
         let sh: *mut i32 = DynamicSharedArray::<i32>::get();
         let tid = thread::threadIdx_x();
@@ -735,6 +800,8 @@ pub mod kernels {
                 slot_cnt,
                 pair_list
             );
+            shared_slot!(tid, pairs, nsh, num_experts, max_slots, slot_expert, slot_off, slot_cnt,
+                         pair_list);
             return; // CTA-uniform
         }
         let nkb = hdim / 16;
@@ -778,15 +845,24 @@ pub mod kernels {
         pf2: u32,
         w2: *const u8,
         w2_sf: *const u8,
+        shared_e: u32,
+        w13_sh: *const u8,
+        w13_sf_sh: *const u8,
+        g1_sh: f32,
+        g1u_sh: f32,
+        w2_sh: *const u8,
+        w2_sf_sh: *const u8,
     ) {
-        let slot = thread::blockIdx_y() as usize;
+        let slot = slot_of(shared_e);
         let e = unsafe { *slot_expert.add(slot) };
         if e < 0 {
             return; // CTA-uniform
         }
         let e = e as u32;
+        let sh = e == shared_e; // the shared expert's slot (CTA-uniform)
         let off = unsafe { *slot_off.add(slot) } as u32;
         let cnt = unsafe { *slot_cnt.add(slot) } as u32;
+        let sbase = if sh { cnt * topk } else { 0 }; // P: the shared slot holds all M tokens
         let tid = thread::threadIdx_x();
         let warp = tid / 32;
         let lane = tid % 32;
@@ -800,13 +876,18 @@ pub mod kernels {
         let nkb = hdim / 16;
         let kb_pad = (nkb + 3) / 4 * 4;
         let rows_pad = (2 * idim + 127) / 128 * 128;
-        let w_e = unsafe { w13.add(e as usize * (2 * idim * kh) as usize) };
-        let sf_e = unsafe { w13_sf.add(e as usize * (rows_pad * kb_pad) as usize) };
+        let w_e = if sh { w13_sh } else { unsafe { w13.add(e as usize * (2 * idim * kh) as usize) } };
+        let sf_e = if sh {
+            w13_sf_sh
+        } else {
+            unsafe { w13_sf.add(e as usize * (rows_pad * kb_pad) as usize) }
+        };
         let up_row = j0 + g;
         let gate_row = idim + j0 + g;
         let w_up = unsafe { w_e.add((up_row * kh) as usize) };
         let w_gate = unsafe { w_e.add((gate_row * kh) as usize) };
-        let alpha = unsafe { *g1_alpha.add(e as usize) };
+        let alpha = if sh { g1_sh } else { unsafe { *g1_alpha.add(e as usize) } };
+        let alpha_u = if sh { g1u_sh } else { alpha }; // up's own alpha: shared slot only
         pf_head(la, hdim / 64, t, lane, w_up, sf_e, j0, kb_pad);
         pf_head(la, hdim / 64, t, lane, w_gate, sf_e, idim + j0, kb_pad);
         let sfa_row = 8 * (lane & 1) + lane / 4;
@@ -819,30 +900,34 @@ pub mod kernels {
             let p0 = if ok0 { (unsafe { *pair_list.add((off + r0 + g) as usize) }) as u32 } else { 0 };
             let p1 = if ok1 { (unsafe { *pair_list.add((off + r0 + g + 8) as usize) }) as u32 } else { 0 };
             let ps = if oks { (unsafe { *pair_list.add((off + r0 + sfa_row) as usize) }) as u32 } else { 0 };
-            let a_row0 = unsafe { aq.add(((p0 / topk) * kh) as usize) };
-            let a_row1 = unsafe { aq.add(((p1 / topk) * kh) as usize) };
-            let sfa_base = unsafe { asf.add(((ps / topk) * nkb) as usize) };
+            let a_row0 = unsafe { aq.add((tok_of(p0, sh, sbase, topk) * kh) as usize) };
+            let a_row1 = unsafe { aq.add((tok_of(p1, sh, sbase, topk) * kh) as usize) };
+            let sfa_base = unsafe { asf.add((tok_of(ps, sh, sbase, topk) * nkb) as usize) };
             let (cu, cg) =
                 fc1_dot(t, a_row0, a_row1, ok0, ok1, sfa_base, oks, w_up, w_gate, sf_e, up_row, gate_row, kb_pad, hdim, lane, la);
             let col = (j0 + 2 * t) as usize;
             if ok0 {
                 let dst = unsafe { inter.add(p0 as usize * idim as usize + col) };
                 unsafe {
-                    *dst = act(alpha * cg[0], act_kind) * (alpha * cu[0]);
-                    *dst.add(1) = act(alpha * cg[1], act_kind) * (alpha * cu[1]);
+                    *dst = act(alpha * cg[0], act_kind) * (alpha_u * cu[0]);
+                    *dst.add(1) = act(alpha * cg[1], act_kind) * (alpha_u * cu[1]);
                 }
             }
             if ok1 {
                 let dst = unsafe { inter.add(p1 as usize * idim as usize + col) };
                 unsafe {
-                    *dst = act(alpha * cg[2], act_kind) * (alpha * cu[2]);
-                    *dst.add(1) = act(alpha * cg[3], act_kind) * (alpha * cu[3]);
+                    *dst = act(alpha * cg[2], act_kind) * (alpha_u * cu[2]);
+                    *dst.add(1) = act(alpha * cg[3], act_kind) * (alpha_u * cu[3]);
                 }
             }
             r0 += 16;
         }
         if pf2 != 0 {
-            pf_w2(w2, w2_sf, e, hdim, idim);
+            if sh {
+                pf_w2(w2_sh, w2_sf_sh, 0, hdim, idim);
+            } else {
+                pf_w2(w2, w2_sf, e, hdim, idim);
+            }
         }
     }
 
@@ -878,16 +963,25 @@ pub mod kernels {
         pf2: u32,
         w2: *const u8,
         w2_sf: *const u8,
+        shared_e: u32,
+        w13_sh: *const u8,
+        w13_sf_sh: *const u8,
+        g1_sh: f32,
+        g1u_sh: f32,
+        w2_sh: *const u8,
+        w2_sf_sh: *const u8,
     ) {
         let tile: *mut f32 = DynamicSharedArray::<f32>::get();
-        let slot = thread::blockIdx_y() as usize;
+        let slot = slot_of(shared_e);
         let e = unsafe { *slot_expert.add(slot) };
         if e < 0 {
             return; // CTA-uniform
         }
         let e = e as u32;
+        let sh = e == shared_e; // the shared expert's slot (CTA-uniform)
         let off = unsafe { *slot_off.add(slot) } as u32;
         let cnt = unsafe { *slot_cnt.add(slot) } as u32;
+        let sbase = if sh { cnt * topk } else { 0 }; // P: the shared slot holds all M tokens
         let tid = thread::threadIdx_x();
         let warp = tid / 32;
         let lane = tid % 32;
@@ -899,13 +993,18 @@ pub mod kernels {
         let nkb = hdim / 16;
         let kb_pad = (nkb + 3) / 4 * 4;
         let rows_pad = (2 * idim + 127) / 128 * 128;
-        let w_e = unsafe { w13.add(e as usize * (2 * idim * kh) as usize) };
-        let sf_e = unsafe { w13_sf.add(e as usize * (rows_pad * kb_pad) as usize) };
+        let w_e = if sh { w13_sh } else { unsafe { w13.add(e as usize * (2 * idim * kh) as usize) } };
+        let sf_e = if sh {
+            w13_sf_sh
+        } else {
+            unsafe { w13_sf.add(e as usize * (rows_pad * kb_pad) as usize) }
+        };
         let up_row = j0 + g;
         let gate_row = idim + j0 + g;
         let w_up = unsafe { w_e.add((up_row * kh) as usize) };
         let w_gate = unsafe { w_e.add((gate_row * kh) as usize) };
-        let alpha = unsafe { *g1_alpha.add(e as usize) };
+        let alpha = if sh { g1_sh } else { unsafe { *g1_alpha.add(e as usize) } };
+        let alpha_u = if sh { g1u_sh } else { alpha }; // up's own alpha: shared slot only
         pf_head(la, hdim / 64, t, lane, w_up, sf_e, j0, kb_pad);
         pf_head(la, hdim / 64, t, lane, w_gate, sf_e, idim + j0, kb_pad);
         let sfa_row = 8 * (lane & 1) + lane / 4;
@@ -918,17 +1017,17 @@ pub mod kernels {
             let p0 = if ok0 { (unsafe { *pair_list.add((off + r0 + g) as usize) }) as u32 } else { 0 };
             let p1 = if ok1 { (unsafe { *pair_list.add((off + r0 + g + 8) as usize) }) as u32 } else { 0 };
             let ps = if oks { (unsafe { *pair_list.add((off + r0 + sfa_row) as usize) }) as u32 } else { 0 };
-            let a_row0 = unsafe { aq.add(((p0 / topk) * kh) as usize) };
-            let a_row1 = unsafe { aq.add(((p1 / topk) * kh) as usize) };
-            let sfa_base = unsafe { asf.add(((ps / topk) * nkb) as usize) };
+            let a_row0 = unsafe { aq.add((tok_of(p0, sh, sbase, topk) * kh) as usize) };
+            let a_row1 = unsafe { aq.add((tok_of(p1, sh, sbase, topk) * kh) as usize) };
+            let sfa_base = unsafe { asf.add((tok_of(ps, sh, sbase, topk) * nkb) as usize) };
             let (cu, cg) =
                 fc1_dot(t, a_row0, a_row1, ok0, ok1, sfa_base, oks, w_up, w_gate, sf_e, up_row, gate_row, kb_pad, hdim, lane, la);
             // masked rows hold finite garbage (0-fragments); never quantized out
             unsafe {
-                *tile.add(g as usize * 32 + tcol) = act(alpha * cg[0], act_kind) * (alpha * cu[0]);
-                *tile.add(g as usize * 32 + tcol + 1) = act(alpha * cg[1], act_kind) * (alpha * cu[1]);
-                *tile.add((g + 8) as usize * 32 + tcol) = act(alpha * cg[2], act_kind) * (alpha * cu[2]);
-                *tile.add((g + 8) as usize * 32 + tcol + 1) = act(alpha * cg[3], act_kind) * (alpha * cu[3]);
+                *tile.add(g as usize * 32 + tcol) = act(alpha * cg[0], act_kind) * (alpha_u * cu[0]);
+                *tile.add(g as usize * 32 + tcol + 1) = act(alpha * cg[1], act_kind) * (alpha_u * cu[1]);
+                *tile.add((g + 8) as usize * 32 + tcol) = act(alpha * cg[2], act_kind) * (alpha_u * cu[2]);
+                *tile.add((g + 8) as usize * 32 + tcol + 1) = act(alpha * cg[3], act_kind) * (alpha_u * cu[3]);
             }
             thread::sync_threads();
             let row = tid / 2;
@@ -948,12 +1047,17 @@ pub mod kernels {
             r0 += 16;
         }
         if pf2 != 0 {
-            pf_w2(w2, w2_sf, e, hdim, idim);
+            if sh {
+                pf_w2(w2_sh, w2_sf_sh, 0, hdim, idim);
+            } else {
+                pf_w2(w2, w2_sf, e, hdim, idim);
+            }
         }
     }
 
     /// [legacy launch 5, front launch 3] fc2. grid (H/32,
-    /// slots). y[p, h] = g2[e] * topk_w[p] * (hq[p] . w2[e, h]). la: w2 row
+    /// slots). y[p, h] = g2[e] * topk_w[p] * (hq[p] . w2[e, h]); the shared
+    /// slot: g2_sh * (hq[p] . w2_sh[h]), weight 1. la: w2 row
     /// prefetch lookahead (as moe_fc1).
     #[kernel]
     #[launch_bounds(128)]
@@ -972,13 +1076,18 @@ pub mod kernels {
         hdim: u32,
         idim: u32,
         la: u32,
+        shared_e: u32,
+        w2_sh: *const u8,
+        w2_sf_sh: *const u8,
+        g2_sh: f32,
     ) {
-        let slot = thread::blockIdx_y() as usize;
+        let slot = slot_of(shared_e);
         let e = unsafe { *slot_expert.add(slot) };
         if e < 0 {
             return;
         }
         let e = e as u32;
+        let sh = e == shared_e; // CTA-uniform
         let off = unsafe { *slot_off.add(slot) } as u32;
         let cnt = unsafe { *slot_cnt.add(slot) } as u32;
         let tid = thread::threadIdx_x();
@@ -994,9 +1103,13 @@ pub mod kernels {
         let nkb = idim / 16;
         let kb_pad = (nkb + 3) / 4 * 4;
         let rows_pad = (hdim + 127) / 128 * 128;
-        let w_row = unsafe { w2.add(e as usize * (hdim * kh) as usize + ((h0 + g) * kh) as usize) };
-        let sf_e = unsafe { w2_sf.add(e as usize * (rows_pad * kb_pad) as usize) };
-        let alpha = unsafe { *g2_alpha.add(e as usize) };
+        let w_row = if sh {
+            unsafe { w2_sh.add(((h0 + g) * kh) as usize) }
+        } else {
+            unsafe { w2.add(e as usize * (hdim * kh) as usize + ((h0 + g) * kh) as usize) }
+        };
+        let sf_e = if sh { w2_sf_sh } else { unsafe { w2_sf.add(e as usize * (rows_pad * kb_pad) as usize) } };
+        let alpha = if sh { g2_sh } else { unsafe { *g2_alpha.add(e as usize) } };
         pf_head(la, idim / 64, t, lane, w_row, sf_e, h0, kb_pad);
         let sfa_row = 8 * (lane & 1) + lane / 4;
         let mut r0 = 0;
@@ -1014,7 +1127,7 @@ pub mod kernels {
                             la);
             let col = (h0 + 2 * t) as usize;
             if ok0 {
-                let s = alpha * unsafe { *topk_w.add(p0 as usize) };
+                let s = if sh { alpha } else { alpha * unsafe { *topk_w.add(p0 as usize) } };
                 let dst = unsafe { y.add(p0 as usize * hdim as usize + col) };
                 unsafe {
                     *dst = c[0] * s;
@@ -1022,7 +1135,7 @@ pub mod kernels {
                 }
             }
             if ok1 {
-                let s = alpha * unsafe { *topk_w.add(p1 as usize) };
+                let s = if sh { alpha } else { alpha * unsafe { *topk_w.add(p1 as usize) } };
                 let dst = unsafe { y.add(p1 as usize * hdim as usize + col) };
                 unsafe {
                     *dst = c[2] * s;
@@ -1035,8 +1148,8 @@ pub mod kernels {
 
     /// [legacy launch 6, front launch 4] out[t, h] =
     /// bf16(sum_k y[t*topk + k, h]) over local expert ids, k ascending
-    /// (deterministic); 0 for a token with no local expert. One thread per
-    /// (t, h).
+    /// (deterministic), + the shared row y[P + t, h] last; 0 for a token
+    /// with no local expert (and no shared expert). One thread per (t, h).
     #[kernel]
     #[launch_bounds(256)]
     pub unsafe fn moe_combine(
@@ -1050,6 +1163,7 @@ pub mod kernels {
         hdim: u32,
         num_experts: u32,
         out_stride: u32,
+        shared_e: u32,
     ) {
         let i = thread::blockIdx_x() * 256 + thread::threadIdx_x();
         if i >= m * hdim {
@@ -1067,6 +1181,9 @@ pub mod kernels {
             }
             k += 1;
         }
+        if shared_e != NO_SHARED {
+            acc += unsafe { *y.add(((m * topk + tok) * hdim + h) as usize) };
+        }
         unsafe { *out.add((tok * out_stride + h) as usize) = f32_to_bf16(acc) as u16 };
     }
 
@@ -1081,6 +1198,9 @@ pub mod kernels {
     /// sum ys over k ASCENDING for local k (moe_combine's loop) and store
     /// bf16 once: no y workspace, no combine launch, bit-identical output.
     /// A token with no local expert sums nothing -> exact 0 (EP contract).
+    /// Shared expert: one more virtual slot k = topk (row P + tok, w2_sh,
+    /// g2_sh, weight 1; host nw = min(topk + 1, 16)), summed after the
+    /// routed k like moe_combine.
     /// Tokens sharing an expert each re-read its w2 rows (mostly L2 hits
     /// within one launch): fine at decode M, which is why the host keeps
     /// the expert-major moe_fc2 + moe_combine as the per-M alternative (TUNE).
@@ -1103,6 +1223,10 @@ pub mod kernels {
         num_experts: u32,
         out_stride: u32,
         la: u32,
+        shared_e: u32,
+        w2_sh: *const u8,
+        w2_sf_sh: *const u8,
+        g2_sh: f32,
     ) {
         let ys: *mut f32 = DynamicSharedArray::<f32>::get();
         let tok = thread::blockIdx_y();
@@ -1121,22 +1245,32 @@ pub mod kernels {
         // moe_fc2's masks for a 1-row chunk (cnt = 1, r0 = 0)
         let ok0 = g < 1;
         let oks = sfa_row < 1;
+        let kt = if shared_e != NO_SHARED { topk + 1 } else { topk };
         let mut k = warp;
-        while k < topk {
-            let p = tok * topk + k;
-            let id = local_id(topk_ids, ids_i64, id_base, p);
-            if id >= 0 && (id as u32) < num_experts {
+        while k < kt {
+            let sh = k == topk; // the shared expert's virtual slot
+            let p = if sh { thread::gridDim_y() * topk + tok } else { tok * topk + k };
+            let id = if sh { 0 } else { local_id(topk_ids, ids_i64, id_base, p) };
+            if sh || (id >= 0 && (id as u32) < num_experts) {
                 // warp-uniform
                 let e = id as u32;
-                let w_row = unsafe { w2.add(e as usize * (hdim * kh) as usize + ((h0 + g) * kh) as usize) };
-                let sf_e = unsafe { w2_sf.add(e as usize * (rows_pad * kb_pad) as usize) };
+                let w_row = if sh {
+                    unsafe { w2_sh.add(((h0 + g) * kh) as usize) }
+                } else {
+                    unsafe { w2.add(e as usize * (hdim * kh) as usize + ((h0 + g) * kh) as usize) }
+                };
+                let sf_e = if sh { w2_sf_sh } else { unsafe { w2_sf.add(e as usize * (rows_pad * kb_pad) as usize) } };
                 let a_row = unsafe { hq.add((p * kh) as usize) };
                 let sfa_base = unsafe { hsf.add((p * nkb) as usize) };
                 pf_head(la, idim / 64, t, lane, w_row, sf_e, h0, kb_pad);
                 let c = fc2_dot(t, a_row, a_row, ok0, false, sfa_base, oks, w_row, sf_e, h0 + g, kb_pad, idim,
                                 lane, la);
                 if ok0 {
-                    let s = unsafe { *g2_alpha.add(e as usize) } * unsafe { *topk_w.add(p as usize) };
+                    let s = if sh {
+                        g2_sh
+                    } else {
+                        (unsafe { *g2_alpha.add(e as usize) }) * unsafe { *topk_w.add(p as usize) }
+                    };
                     unsafe {
                         *ys.add((k * 8 + 2 * t) as usize) = c[0] * s;
                         *ys.add((k * 8 + 2 * t + 1) as usize) = c[1] * s;
@@ -1155,6 +1289,9 @@ pub mod kernels {
                     acc += unsafe { *ys.add((k * 8 + tid) as usize) };
                 }
                 k += 1;
+            }
+            if kt > topk {
+                acc += unsafe { *ys.add((topk * 8 + tid) as usize) };
             }
             unsafe { *out.add((tok * out_stride + h0 + tid) as usize) = f32_to_bf16(acc) as u16 };
         }

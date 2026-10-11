@@ -47,13 +47,23 @@ def prob():
     return p
 
 
+@pytest.fixture(scope="module")
+def prob_sh(prob):
+    """+ a fused shared slot (nvfp4_moe.quant_shared, SUFFIX_NVFP4_MOE_FUSE_SHARED): its own
+    tensors, g1 != g1u (c = 1/4) and g2 carrying 1/rsf (2.5)."""
+    gen = torch.Generator().manual_seed(11)
+    w_gu = (torch.randn(2 * I, H, generator=gen, dtype=torch.float32) * 0.05).bfloat16()
+    w_dn = (torch.randn(H, I, generator=gen, dtype=torch.float32) * 0.05).bfloat16()
+    return dict(prob, shared=nm.quant_shared(w_gu, w_dn, prob["a1g"], prob["a2g"], 0.25, 2.5))
+
+
 def _state(tp, p):
     return tp.layer_state(p, dict(E=E, H=H, I=I, ep=1))
 
 
 def _batch(m, seed, hot=False):
     gen = torch.Generator().manual_seed(seed)
-    x = (torch.randn(m, H, generator=gen) * 1.3).bfloat16()
+    x = (torch.randn(m, H, generator=gen, dtype=torch.float32) * 1.3).bfloat16()
     ids, tw = nm.rand_routing(m, E, TOPK, "cpu", seed=seed)
     if hot:
         ids = ids[:1].expand(m, -1).contiguous()
@@ -125,6 +135,22 @@ def test_plan_matches_f64_spec_and_oxide_twin(tp, prob, plan, m, hot):
     assert r_twin <= 1.05 * (r_ref + twin_ref) + 1e-6
 
 
+@pytest.mark.parametrize("plan", ["f1", "f1s", "f1n", "f2", "m64", "m128", "m128w"])
+@pytest.mark.parametrize("m,hot", [(2, False), (6, True)])
+def test_plan_runs_the_fused_shared_slot(tp, prob, prob_sh, plan, m, hot):
+    st = _state(tp, prob_sh)
+    assert st["sh"] is not None and st["sh"]["g1"] != st["sh"]["g1u"]
+    x, ids, tw = _batch(m, 60 + m, hot)
+    out = tp.run(st, x, ids, tw, plan)
+    assert torch.equal(out.view(torch.int16), tp.run(st, x, ids, tw, plan).view(torch.int16))
+    ref = nm.moe_ref(prob_sh, x, ids, tw)  # routed k sum + the shared slot (shared_ref)
+    shared = nm.shared_ref(prob_sh, x)
+    assert nm._rel(shared, ref) > 0.05  # the slot is a real part of the output
+    assert nm._rel(out.float(), ref) <= nm.REF_TOL
+    routed_only = tp.run(_state(tp, prob), x, ids, tw, plan).float()
+    assert nm._rel(out.float() - routed_only, shared) < 0.05
+
+
 def test_pair_list_is_route_twin_order(tp, prob):
     st = _state(tp, prob)
     x, ids, tw = _batch(9, 77)
@@ -178,7 +204,8 @@ def test_impl_env(tp, monkeypatch):
 
 @pytest.mark.parametrize("change,needle", [
     ({"cfg": {"kind": "fp8"}}, "FP8"),
-    ({"cfg": {"shared": object()}}, "shared expert"),
+    ({"cfg": {"shared": {"w13": torch.empty(512, 3072), "w2": torch.empty(6144, 1024)}}},
+     "fused shared slot"),
     ({"info": {"ep": 8}}, "expert parallel"),
     ({"cfg": {"id_base": 32}}, "expert parallel"),
     ({"info": {"E": 48}, "cfg": {"E_global": 48}}, "E=48"),
@@ -191,6 +218,8 @@ def test_eligibility(tp, change, needle):
     cfg = dict(topk=8, act=0, id_base=0, E_global=256)
     info = dict(E=256, H=6144, I=256, ep=1)
     assert tp.eligibility(cfg, info) is None
+    ok_shared = {"w13": torch.empty(512, 3072), "w2": torch.empty(6144, 128)}
+    assert tp.eligibility(dict(cfg, shared=ok_shared), info) is None  # TP8 shared slot fits
     cfg.update(change.get("cfg", {}))
     info.update(change.get("info", {}))
     assert needle in tp.eligibility(cfg, info)
@@ -239,6 +268,24 @@ def test_prepare_tp_with_pasted_table_dispatches_per_m(tp, prob, monkeypatch):
     x, ids, tw = _batch(2, 1)
     out = layer(x, ids.long(), tw)  # int64 ids are narrowed, not recompiled
     assert nm._rel(out.float(), nm.moe_ref(prob, x, ids, tw)) <= nm.REF_TOL
+
+
+def test_prepare_under_vllms_bf16_default_dtype(tp, prob_sh, monkeypatch):
+    # vLLM loads weights under torch.set_default_dtype(bf16): every load-time tensor must be explicit
+    monkeypatch.setenv(tp.IMPL_ENV, "tp")
+    monkeypatch.setenv(tp.TABLE_ENV, "4:f1,8:m128")
+    cfg = _cfg(prob_sh)
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        tp.prepare(SimpleNamespace(layer_name="model.layers.5.mlp.experts"), cfg,
+                   dict(E=E, H=H, I=I, ep=1), lambda x, i, w: nm.moe_ref(prob_sh, x, i, w).bfloat16())
+        x, ids, tw = tp._batch(cfg["tp_impl"].st, 3, torch.device("cpu"), 5)
+        assert x.dtype == torch.bfloat16 and tw.dtype == torch.float32
+        out = cfg["tp_impl"](x, ids, tw)
+    finally:
+        torch.set_default_dtype(old)
+    assert nm._rel(out.float(), nm.moe_ref(prob_sh, x, ids, tw)) <= nm.REF_TOL
 
 
 def test_prepare_tp_refuses_oxide_buckets_and_ineligible_layers(tp, prob, monkeypatch):

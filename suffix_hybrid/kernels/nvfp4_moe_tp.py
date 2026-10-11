@@ -30,6 +30,10 @@ M=192 595 us for ~680 MB). These kernels are built for exactly this layout:
   PDL      (SUFFIX_NVFP4_MOE_TP_PDL, default on) K1/K2 call griddepcontrol.launch_dependents at
            start; K2/K3 launch programmatically dependent and prefetch their weights before
            griddepcontrol.wait: the w2 stream overlaps fc1's tail instead of following it.
+  shared   SUFFIX_NVFP4_MOE_FUSE_SHARED (nvfp4_moe.quant_shared's slot, under TP8 exactly one
+           routed expert's shape): one more K1 / K2-exp grid row with its own tensors and
+           g1 / g1u / g2, rows P + t for every token, weight 1, added after the routed k-sum
+           (oxide's contract: out[t] = bf16(sum_k y[t*topk + k] + y[P + t])).
 
 Numerics: the NVFP4 spec of nvfp4_moe.moe_ref (x and h quantized exactly like vLLM / oxide,
 e2m1 x e4m3 products exact, fp32 accumulation, y = (h.w2) * (g2 * topk_w), out = bf16(sum_k y)).
@@ -45,14 +49,17 @@ custom op: torch.compile never sees the branch; a function of M only, so CUDA-gr
     (plan names below or "oxide"; a bucket serves every M <= its key); unset = time at load:
     cold L2, CUDA graphs, real weights of the first layer, every PLANS candidate vs oxide.
   SUFFIX_NVFP4_MOE_TP_PDL=0  plain launches.
-Fail-closed load oracle per layer (real weights, M 1/6/32/96/192 <= max_m + a hot-expert batch):
-ours vs the f64 reference <= nvfp4_moe.REF_TOL, vs the oxide kernel within the triangle bound,
-bitwise deterministic, CUDA-graph replay == eager; any miss refuses to serve.
+Fail-closed load oracle per layer (real weights incl. a fused shared slot, M 1/6/32/96/192
+<= max_m + a hot-expert batch): ours vs the f64 reference <= nvfp4_moe.REF_TOL, vs the oxide
+kernel within the triangle bound, bitwise deterministic; once per process every plan's
+CUDA-graph replay == eager. Any miss refuses to serve. Load-time tensors carry explicit dtypes:
+vLLM loads under a bf16 default dtype.
 
 CLI / boot gate glm_moe_tp_kernel_bench (one GPU, synthetic GLM TP8 shard, cold L2, CUDA graphs):
-  python -m suffix_hybrid.kernels.nvfp4_moe_tp bench   # oracle, then us/layer per M: every plan,
-      oxide (g10 table), FlashInfer CUTLASS; weight roofline and % of bandwidth; the paste-able
-      SUFFIX_NVFP4_MOE_TP_TABLE / SUFFIX_NVFP4_MOE_IMPL. Lines: [suffix moe-tp-kernel].
+  python -m suffix_hybrid.kernels.nvfp4_moe_tp bench   # [routed] and [shared slot] problems:
+      oracle, then us/layer per M: every plan, oxide (g10 table), FlashInfer CUTLASS (routed);
+      weight roofline and % of bandwidth; the paste-able SUFFIX_NVFP4_MOE_TP_TABLE /
+      SUFFIX_NVFP4_MOE_IMPL per problem. Lines: [suffix moe-tp-kernel].
   python -m suffix_hybrid.kernels.nvfp4_moe_tp oracle
 """
 from __future__ import annotations
@@ -163,9 +170,12 @@ def eligibility(cfg: dict, info: dict) -> str | None:
     """Why this NVFP4 layer cannot use the TP family (None = it can). Pure for CPU tests."""
     if cfg.get("kind") == "fp8":
         return "FP8 block layer"
-    if cfg.get("shared") is not None:
-        return "shared expert fused into the oxide kernel (SUFFIX_NVFP4_MOE_FUSE_SHARED)"
     e, h, i, topk = info.get("E", 0), info.get("H", 0), info.get("I", 0), cfg.get("topk", 0)
+    sp = cfg.get("shared")
+    if sp is not None and (tuple(sp["w13"].shape) != (2 * i, h // 2)
+                           or tuple(sp["w2"].shape) != (h, i // 2)):
+        return (f"fused shared slot {tuple(sp['w13'].shape)}/{tuple(sp['w2'].shape)} is not the "
+                f"routed per-rank expert shape ({2 * i}, {h // 2})/({h}, {i // 2})")
     if info.get("ep", 1) != 1 or cfg.get("id_base", 0) != 0 or e != cfg.get("E_global", e):
         return "expert parallel (this family is the TP-sharded layout: all experts local)"
     if e < 1 or e & (e - 1) or e > 1024:
@@ -310,23 +320,50 @@ if triton is not None:
         return e, n_e, tl.sum(tl.where(ev < e, cnt, 0), 0)
 
     @triton.jit
-    def _pairs(ids_ptr, pair_ptr, P, e, off, CHUNK: tl.constexpr):
-        """pair_list[off ..] = expert e's pairs (p = token * topk + k) ascending. Every CTA of the
-        slot writes the same values; the caller's barrier publishes them inside the CTA."""
+    def _pairs(ids_ptr, pair_ptr, P, e, off, routed, CHUNK: tl.constexpr):
+        """pair_list[off ..] = expert e's pairs (p = token * topk + k) ascending (nothing for the
+        shared slot: routed False). Every CTA of the slot writes the same values; the caller's
+        barrier publishes them inside the CTA."""
         base = off
         for c0 in range(0, P, CHUNK):
             o = c0 + tl.arange(0, CHUNK)
             v = tl.load(ids_ptr + o, mask=o < P, other=-1).to(tl.int32)
-            me = ((v == e) & (o < P)).to(tl.int32)
+            me = ((v == e) & (o < P) & routed).to(tl.int32)
             tl.store(pair_ptr + base + tl.cumsum(me, 0) - me, o, mask=me > 0)
             base = base + tl.sum(me, 0)
 
     @triton.jit
-    def _fc1_out(u, g, alpha, p, rv, hq_ptr, hs_ptr, j0, a2g, g6h, I: tl.constexpr,
+    def _fc1_slot(ids_ptr, w_ptr, s_ptr, g1_ptr, sw_ptr, ss_ptr, sg1, sg1u, M, slot,
+                  H: tl.constexpr, I: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
+                  KB_PAD: tl.constexpr, SH: tl.constexpr, CHUNK: tl.constexpr):
+        """K1's slot -> (shared?, expert, rows, pair-list offset, w13 / scale base, gate / up
+        alpha). Routed slots: the in-kernel route. SH: the extra last grid row is the shared
+        expert (oxide shared_slot!): all M tokens as rows P + t, its own tensors, g1 / g1u."""
+        P = M * TOPK
+        e, n_e, off = _route(ids_ptr, P, slot, E, CHUNK)
+        w_e = w_ptr + e.to(tl.int64) * (2 * I * (H // 2))
+        s_e = s_ptr + e.to(tl.int64) * (((2 * I + 127) // 128 * 128) * KB_PAD)
+        a_g = tl.load(g1_ptr + e)
+        a_u = a_g
+        is_sh = slot < 0
+        if SH:
+            is_sh = slot >= tl.minimum(P, E)
+            if is_sh:
+                n_e = M
+                off = off * 0
+                w_e = sw_ptr
+                s_e = ss_ptr
+                a_g = sg1
+                a_u = sg1u
+        return is_sh, e, n_e, off, w_e, s_e, a_g, a_u
+
+    @triton.jit
+    def _fc1_out(u, g, a_u, a_g, p, rv, hq_ptr, hs_ptr, j0, a2g, g6h, I: tl.constexpr,
                  BM: tl.constexpr, HN: tl.constexpr, ACT: tl.constexpr):
-        """[BM, HN] fp32 up / gate dots -> h = act(g1 * gate) * (g1 * up) -> NVFP4 (a2 gscale):
-        packed bytes + e4m3 scales at hq / hsf row p (valid rows rv)."""
-        h = _act(g * alpha, ACT) * (u * alpha)
+        """[BM, HN] fp32 up / gate dots -> h = act(a_g * gate) * (a_u * up) -> NVFP4 (a2 gscale):
+        packed bytes + e4m3 scales at hq / hsf row p (valid rows rv). a_u == a_g = g1[e] except
+        in the shared slot (g1u carries its power-of-two c)."""
+        h = _act(g * a_g, ACT) * (u * a_u)
         s, q, _, sf8 = _quant(tl.reshape(h, (BM, HN // 16, 16)), a2g, g6h, 2)
         code = tl.reshape(_code(q) | tl.where(s < 0.0, 8, 0), (BM, HN // 2, 2))
         lo, hi = tl.split(code)
@@ -336,30 +373,31 @@ if triton is not None:
                  tl.cast(sf8, tl.uint8, bitcast=True), mask=rv[:, None])
 
     @triton.jit(do_not_specialize=["M"])
-    def _fc1_fma(x_ptr, ids_ptr, w_ptr, s_ptr, g1_ptr, hq_ptr, hs_ptr, pair_ptr, M, a1g, a2g,
+    def _fc1_fma(x_ptr, ids_ptr, w_ptr, s_ptr, g1_ptr, sw_ptr, ss_ptr, hq_ptr, hs_ptr, pair_ptr,
+                 M, a1g, a2g, sg1, sg1u,
                  H: tl.constexpr, I: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
                  KB_PAD: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, R: tl.constexpr,
-                 PF: tl.constexpr, LN: tl.constexpr, ACT: tl.constexpr, PDL: tl.constexpr,
-                 CHUNK: tl.constexpr):
+                 PF: tl.constexpr, LN: tl.constexpr, ACT: tl.constexpr, SH: tl.constexpr,
+                 PDL: tl.constexpr, CHUNK: tl.constexpr):
         HN: tl.constexpr = BN // 2
         BKH: tl.constexpr = BK // 2
         NBK: tl.constexpr = BK // 16
         if PDL:
             gdc_launch_dependents()
         P = M * TOPK
-        e, n_e, off = _route(ids_ptr, P, tl.program_id(1), E, CHUNK)
+        is_sh, e, n_e, off, w_e, s_e, a_g, a_u = _fc1_slot(
+            ids_ptr, w_ptr, s_ptr, g1_ptr, sw_ptr, ss_ptr, sg1, sg1u, M, tl.program_id(1), H, I,
+            E, TOPK, KB_PAD, SH, CHUNK)
         if n_e == 0:
             return
         j0 = tl.program_id(0) * HN
         rows = j0 + tl.arange(0, HN)
-        w_e = w_ptr + e.to(tl.int64) * (2 * I * (H // 2))
         if PF:  # the CTA's whole weight tile -> L2 now: every DRAM request in flight at once
             ln = tl.minimum(tl.arange(0, LN) * 128, H // 2 - 128)
             _pf_l2(w_e + rows[:, None] * (H // 2) + ln[None, :])
             _pf_l2(w_e + (I + rows)[:, None] * (H // 2) + ln[None, :])
         wu_ptr = w_e + rows[:, None] * (H // 2) + tl.arange(0, BKH)[None, :]
         wg_ptr = wu_ptr + I * (H // 2)
-        s_e = s_ptr + e.to(tl.int64) * (((2 * I + 127) // 128 * 128) * KB_PAD)
         kcol = _sf_col(tl.arange(0, NBK))[None, :]
         su_ptr = s_e + _sf_row(rows, KB_PAD)[:, None] + kcol
         sg_ptr = s_e + _sf_row(I + rows, KB_PAD)[:, None] + kcol
@@ -367,22 +405,25 @@ if triton is not None:
         wg_0 = tl.load(wg_ptr)
         su_0 = tl.load(su_ptr)
         sg_0 = tl.load(sg_ptr)
-        _pairs(ids_ptr, pair_ptr, P, e, off, CHUNK)
+        _pairs(ids_ptr, pair_ptr, P, e, off, is_sh == 0, CHUNK)
         tl.debug_barrier()
-        alpha = tl.load(g1_ptr + e)
         g6x = tl.math.div_rn(a1g, 6.0)
         g6h = tl.math.div_rn(a2g, 6.0)
         kx = tl.arange(0, BK)
         for r0 in range(0, n_e, R):
             p0 = tl.load(pair_ptr + off + r0, cache_modifier=".cg")
-            x0_ptr = x_ptr + (p0 // TOPK).to(tl.int64) * H + kx
+            if SH:  # shared slot: row r is token r, pair id P + r
+                p0 = tl.where(is_sh, P + r0, p0)
+            x0_ptr = x_ptr + tl.where(p0 >= P, p0 - P, p0 // TOPK).to(tl.int64) * H + kx
             acc_u0 = tl.zeros([HN, BKH], dtype=tl.float32)
             acc_g0 = tl.zeros([HN, BKH], dtype=tl.float32)
             x0_n = tl.load(x0_ptr)
             if R == 2:
                 v1 = r0 + 1 < n_e
                 p1 = tl.load(pair_ptr + off + r0 + 1, mask=v1, other=0, cache_modifier=".cg")
-                x1_ptr = x_ptr + (p1 // TOPK).to(tl.int64) * H + kx
+                if SH:
+                    p1 = tl.where(is_sh, P + r0 + 1, p1)
+                x1_ptr = x_ptr + tl.where(p1 >= P, p1 - P, p1 // TOPK).to(tl.int64) * H + kx
                 acc_u1 = tl.zeros([HN, BKH], dtype=tl.float32)
                 acc_g1 = tl.zeros([HN, BKH], dtype=tl.float32)
                 x1_n = tl.load(x1_ptr, mask=v1, other=0.0)
@@ -415,46 +456,51 @@ if triton is not None:
                     acc_g1 = acc_g1 + gl * xe1[None, :] + gh * xo1[None, :]
             one = tl.zeros([1], dtype=tl.int32)
             _fc1_out(tl.reshape(tl.sum(acc_u0, 1), (1, HN)), tl.reshape(tl.sum(acc_g0, 1), (1, HN)),
-                     alpha, one + p0, (one + r0) < n_e, hq_ptr, hs_ptr, j0, a2g, g6h, I, 1, HN, ACT)
+                     a_u, a_g, one + p0, (one + r0) < n_e, hq_ptr, hs_ptr, j0, a2g, g6h, I, 1, HN,
+                     ACT)
             if R == 2:
                 _fc1_out(tl.reshape(tl.sum(acc_u1, 1), (1, HN)),
                          tl.reshape(tl.sum(acc_g1, 1), (1, HN)),
-                         alpha, one + p1, (one + r0 + 1) < n_e, hq_ptr, hs_ptr, j0, a2g, g6h, I, 1,
-                         HN, ACT)
+                         a_u, a_g, one + p1, (one + r0 + 1) < n_e, hq_ptr, hs_ptr, j0, a2g, g6h, I,
+                         1, HN, ACT)
 
     @triton.jit(do_not_specialize=["M"])
-    def _fc1_mma(x_ptr, ids_ptr, w_ptr, s_ptr, g1_ptr, hq_ptr, hs_ptr, pair_ptr, M, a1g, a2g,
+    def _fc1_mma(x_ptr, ids_ptr, w_ptr, s_ptr, g1_ptr, sw_ptr, ss_ptr, hq_ptr, hs_ptr, pair_ptr,
+                 M, a1g, a2g, sg1, sg1u,
                  H: tl.constexpr, I: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
                  KB_PAD: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                 STAGES: tl.constexpr, ACT: tl.constexpr, PDL: tl.constexpr, CHUNK: tl.constexpr):
+                 STAGES: tl.constexpr, ACT: tl.constexpr, SH: tl.constexpr, PDL: tl.constexpr,
+                 CHUNK: tl.constexpr):
         HN: tl.constexpr = BN // 2
         BKH: tl.constexpr = BK // 2
         NBK: tl.constexpr = BK // 16
         if PDL:
             gdc_launch_dependents()
         P = M * TOPK
-        e, n_e, off = _route(ids_ptr, P, tl.program_id(1), E, CHUNK)
+        is_sh, e, n_e, off, w_e, s_e, a_g, a_u = _fc1_slot(
+            ids_ptr, w_ptr, s_ptr, g1_ptr, sw_ptr, ss_ptr, sg1, sg1u, M, tl.program_id(1), H, I,
+            E, TOPK, KB_PAD, SH, CHUNK)
         if n_e == 0:
             return
         j0 = tl.program_id(0) * HN
         rows = j0 + tl.arange(0, HN)
-        w_e = w_ptr + e.to(tl.int64) * (2 * I * (H // 2))
         wu_ptr = w_e + rows[:, None] * (H // 2) + tl.arange(0, BKH)[None, :]
         wg_ptr = wu_ptr + I * (H // 2)
-        s_e = s_ptr + e.to(tl.int64) * (((2 * I + 127) // 128 * 128) * KB_PAD)
         kcol = _sf_col(tl.arange(0, NBK))[None, :]
         su_ptr = s_e + _sf_row(rows, KB_PAD)[:, None] + kcol
         sg_ptr = s_e + _sf_row(I + rows, KB_PAD)[:, None] + kcol
-        _pairs(ids_ptr, pair_ptr, P, e, off, CHUNK)
+        _pairs(ids_ptr, pair_ptr, P, e, off, is_sh == 0, CHUNK)
         tl.debug_barrier()
-        alpha = tl.load(g1_ptr + e)
         g6x = tl.math.div_rn(a1g, 6.0)
         g6h = tl.math.div_rn(a2g, 6.0)
         for r0 in range(0, n_e, BM):
             rr = r0 + tl.arange(0, BM)
             rv = rr < n_e
             p = tl.load(pair_ptr + off + rr, mask=rv, other=0, cache_modifier=".cg")
-            x_rows = x_ptr + (p // TOPK).to(tl.int64)[:, None] * H + tl.arange(0, BK)[None, :]
+            if SH:  # shared slot: row r is token r, pair id P + r
+                p = tl.where(is_sh, P + rr, p)
+            tok = tl.where(p >= P, p - P, p // TOPK)
+            x_rows = x_ptr + tok.to(tl.int64)[:, None] * H + tl.arange(0, BK)[None, :]
             acc_u = tl.zeros([BM, HN], dtype=tl.float32)
             acc_g = tl.zeros([BM, HN], dtype=tl.float32)
             for k0 in tl.range(0, H, BK, num_stages=STAGES):
@@ -470,13 +516,13 @@ if triton is not None:
                 acc_u = tl.dot(xo, tl.trans(uh), acc_u)
                 acc_g = tl.dot(xe, tl.trans(gl), acc_g)
                 acc_g = tl.dot(xo, tl.trans(gh), acc_g)
-            _fc1_out(acc_u, acc_g, alpha, p, rv, hq_ptr, hs_ptr, j0, a2g, g6h, I, BM, HN, ACT)
+            _fc1_out(acc_u, acc_g, a_u, a_g, p, rv, hq_ptr, hs_ptr, j0, a2g, g6h, I, BM, HN, ACT)
 
     @triton.jit
-    def _fc2_tok(out_ptr, hq_ptr, hs_ptr, ids_ptr, tw_ptr, w_ptr, s_ptr, g2_ptr,
-                 H: tl.constexpr, I: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
+    def _fc2_tok(out_ptr, hq_ptr, hs_ptr, ids_ptr, tw_ptr, w_ptr, s_ptr, g2_ptr, sw_ptr, ss_ptr,
+                 sg2, H: tl.constexpr, I: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
                  TKP: tl.constexpr, KB_PAD: tl.constexpr, BH: tl.constexpr, LNI: tl.constexpr,
-                 PDL: tl.constexpr):
+                 SH: tl.constexpr, PDL: tl.constexpr):
         IH: tl.constexpr = I // 2
         NBI: tl.constexpr = I // 16
         SE: tl.constexpr = ((H + 127) // 128 * 128) * KB_PAD
@@ -493,6 +539,8 @@ if triton is not None:
         for k in tl.static_range(TOPK):  # every expert tile -> L2 before waiting on fc1
             ek = tl.sum(tl.where(kk == k, ev, 0), 0).to(tl.int64)
             _pf_l2(w_ptr + ek * (H * IH) + rows[:, None] * IH + (tl.arange(0, LNI) * 128)[None, :])
+        if SH:  # the shared expert's tile: one more expert, weight 1, added after the routed k
+            _pf_l2(sw_ptr + rows[:, None] * IH + (tl.arange(0, LNI) * 128)[None, :])
         e0 = tl.sum(tl.where(kk == 0, ev, 0), 0).to(tl.int64)
         w_n = tl.load(w_ptr + e0 * (H * IH) + wrow)
         s_n = tl.load(s_ptr + e0 * SE + srow)
@@ -515,27 +563,46 @@ if triton is not None:
             ok = tl.sum(tl.where(kk == k, okv.to(tl.int32), 0), 0) > 0
             sc = tl.sum(tl.where(kk == k, scv, 0.0), 0)
             acc = tl.where(ok, acc + y * sc, acc)
+        if SH:  # oxide: out[t] = bf16(sum_k y[t * topk + k] + y[P + t])
+            p = tl.num_programs(0) * TOPK + t
+            hl, hh = _deq32(tl.load(hq_ptr + p * IH + tl.arange(0, IH), cache_modifier=".cg")[None, :],
+                            tl.load(hs_ptr + p * NBI + tl.arange(0, NBI), cache_modifier=".cg")[None, :],
+                            1, NBI)
+            wl, wh = _deq32(tl.load(sw_ptr + wrow), tl.load(ss_ptr + srow), BH, NBI)
+            acc = acc + tl.sum(wl * hl + wh * hh, 1) * sg2
         tl.store(out_ptr + t * H + rows, acc.to(tl.bfloat16))
 
     @triton.jit(do_not_specialize=["M"])
-    def _fc2_exp(y_ptr, hq_ptr, hs_ptr, ids_ptr, tw_ptr, pair_ptr, w_ptr, s_ptr, g2_ptr, M,
+    def _fc2_exp(y_ptr, hq_ptr, hs_ptr, ids_ptr, tw_ptr, pair_ptr, w_ptr, s_ptr, g2_ptr, sw_ptr,
+                 ss_ptr, M, sg2,
                  H: tl.constexpr, I: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
                  KB_PAD: tl.constexpr, BM: tl.constexpr, BH: tl.constexpr, BHC: tl.constexpr,
-                 STAGES: tl.constexpr, LNI: tl.constexpr, PDL: tl.constexpr,
+                 STAGES: tl.constexpr, LNI: tl.constexpr, SH: tl.constexpr, PDL: tl.constexpr,
                  CHUNK: tl.constexpr):
         IH: tl.constexpr = I // 2
         NBI: tl.constexpr = I // 16
         SE: tl.constexpr = ((H + 127) // 128 * 128) * KB_PAD
         if PDL:
             gdc_launch_dependents()
-        e, n_e, off = _route(ids_ptr, M * TOPK, tl.program_id(1), E, CHUNK)
+        P = M * TOPK
+        slot = tl.program_id(1)
+        e, n_e, off = _route(ids_ptr, P, slot, E, CHUNK)
+        w_e = w_ptr + e.to(tl.int64) * (H * IH)
+        s_e = s_ptr + e.to(tl.int64) * SE
+        alpha = tl.load(g2_ptr + e)
+        is_sh = slot < 0
+        if SH:  # the extra last grid row: the shared expert, rows P + t, weight 1
+            is_sh = slot >= tl.minimum(P, E)
+            if is_sh:
+                n_e = M
+                off = off * 0
+                w_e = sw_ptr
+                s_e = ss_ptr
+                alpha = sg2
         if n_e == 0:
             return
         h_lo = tl.program_id(0) * BHC
-        w_e = w_ptr + e.to(tl.int64) * (H * IH)
-        s_e = s_ptr + e.to(tl.int64) * SE
         _pf_l2(w_e + (h_lo + tl.arange(0, BHC))[:, None] * IH + (tl.arange(0, LNI) * 128)[None, :])
-        alpha = tl.load(g2_ptr + e)
         cb = tl.arange(0, IH)
         nb = tl.arange(0, NBI)
         if PDL:
@@ -544,12 +611,14 @@ if triton is not None:
             rr = r0 + tl.arange(0, BM)
             rv = rr < n_e
             p = tl.load(pair_ptr + off + rr, mask=rv, other=0, cache_modifier=".cg")
+            if SH:
+                p = tl.where(is_sh, P + rr, p)
             he, ho = _deq16(tl.load(hq_ptr + p[:, None] * IH + cb[None, :], mask=rv[:, None], other=0,
                                     cache_modifier=".cg"),
                             tl.load(hs_ptr + p[:, None] * NBI + nb[None, :], mask=rv[:, None], other=0,
                                     cache_modifier=".cg"),
                             BM, NBI)
-            sc = alpha * tl.load(tw_ptr + p, mask=rv, other=0.0)
+            sc = alpha * tl.load(tw_ptr + p, mask=rv & (p < P), other=1.0)  # shared rows: 1
             for h0 in tl.range(0, BHC, BH, num_stages=STAGES):
                 rows = h_lo + h0 + tl.arange(0, BH)
                 wl, wh = _deq16(tl.load(w_e + rows[:, None] * IH + cb[None, :]),
@@ -562,8 +631,9 @@ if triton is not None:
 
     @triton.jit
     def _combine(out_ptr, y_ptr, ids_ptr, H: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
-                 BCOL: tl.constexpr, PDL: tl.constexpr):
-        """out[t] = bf16(sum_k y[t * topk + k]) over valid ids, ascending k (oxide moe_combine)."""
+                 BCOL: tl.constexpr, SH: tl.constexpr, PDL: tl.constexpr):
+        """out[t] = bf16(sum_k y[t * topk + k] (+ y[P + t])) over valid ids, ascending k, the
+        shared row last (oxide moe_combine)."""
         t = tl.program_id(0)
         cols = tl.program_id(1) * BCOL + tl.arange(0, BCOL)
         if PDL:
@@ -575,6 +645,9 @@ if triton is not None:
             ok = (ek >= 0) & (ek < E)
             acc = tl.where(ok, acc + tl.load(y_ptr + p.to(tl.int64) * H + cols, mask=ok, other=0.0,
                                              cache_modifier=".cg"), acc)
+        if SH:
+            p = tl.num_programs(0) * TOPK + t
+            acc = acc + tl.load(y_ptr + p.to(tl.int64) * H + cols, cache_modifier=".cg")
         tl.store(out_ptr + t * H + cols, acc.to(tl.bfloat16))
 
 
@@ -596,6 +669,17 @@ def layer_state(cfg: dict, info: dict) -> dict:
     if (st["s13"].numel() != e * -(-2 * i // 128) * 128 * st["kb13"]
             or st["s2"].numel() != e * -(-h // 128) * 128 * st["kb2"]):
         raise RuntimeError(f"{MARK} block scales not in the per-expert padded swizzled layout")
+    sp, st["sh"] = cfg.get("shared"), None
+    if sp is not None:  # SUFFIX_NVFP4_MOE_FUSE_SHARED: nvfp4_moe.quant_shared's slot
+        sh = dict(w13=sp["w13"].contiguous(), w2=sp["w2"].contiguous(),
+                  s13=sp["w13_sf"].contiguous().view(torch.uint8).reshape(-1),
+                  s2=sp["w2_sf"].contiguous().view(torch.uint8).reshape(-1),
+                  g1=float(sp["g1"]), g1u=float(sp["g1u"]), g2=float(sp["g2"]))
+        if (sh["w13"].dtype != torch.uint8 or sh["w2"].dtype != torch.uint8
+                or sh["s13"].numel() != st["s13"].numel() // e
+                or sh["s2"].numel() != st["s2"].numel() // e):
+            raise RuntimeError(f"{MARK} fused shared slot is not one routed expert's layout")
+        st["sh"] = sh
     return st
 
 
@@ -624,39 +708,44 @@ def run(st: dict, x, ids, tw, plan: str, pdl: bool | None = None, out=None):
     m = x.shape[0]
     e, h, i, topk = st["E"], st["H"], st["I"], st["topk"]
     p = m * topk
-    ws = workspace(x.device, p, h, i, k2[0] == "exp")
+    sh = st.get("sh")
+    nsh = 1 if sh is not None else 0  # the shared slot: one more K1 / K2-exp grid row, M more rows
+    ws = workspace(x.device, p + nsh * m, h, i, k2[0] == "exp")
     if out is None:
         out = torch.empty(m, h, dtype=torch.bfloat16, device=x.device)
-    slots = min(e, p)
-    shape = dict(H=h, I=i, E=e, TOPK=topk)
+    slots = min(e, p) + nsh
+    sw13, ss13, sw2, ss2 = ((sh["w13"], sh["s13"], sh["w2"], sh["s2"]) if nsh else
+                            (st["w13"], st["s13"], st["w2"], st["s2"]))
+    sg1, sg1u, sg2 = (sh["g1"], sh["g1u"], sh["g2"]) if nsh else (1.0, 1.0, 1.0)
+    shape = dict(H=h, I=i, E=e, TOPK=topk, SH=nsh)
     dep = {"launch_pdl": True} if pdl else {}
     lni = max(1, i // 256)  # 128 B lines per w2 row
     if k1[0] == "fma":
         _, r, bn, bk, warps, pf = k1
         _fc1_fma[(i // (bn // 2), slots)](
-            x, ids, st["w13"], st["s13"], st["g1"], ws["hq"], ws["hs"], ws["pairs"], m,
-            st["a1g"], st["a2g"], KB_PAD=st["kb13"], BN=bn, BK=bk, R=r, PF=pf,
+            x, ids, st["w13"], st["s13"], st["g1"], sw13, ss13, ws["hq"], ws["hs"], ws["pairs"],
+            m, st["a1g"], st["a2g"], sg1, sg1u, KB_PAD=st["kb13"], BN=bn, BK=bk, R=r, PF=pf,
             LN=_p2(h // 256), ACT=st["act"], PDL=pdl, CHUNK=CH, num_warps=warps, **shape)
     else:
         _, bm, bn, bk, warps, stages = k1
         _fc1_mma[(i // (bn // 2), slots)](
-            x, ids, st["w13"], st["s13"], st["g1"], ws["hq"], ws["hs"], ws["pairs"], m,
-            st["a1g"], st["a2g"], KB_PAD=st["kb13"], BM=bm, BN=bn, BK=bk, STAGES=stages,
-            ACT=st["act"], PDL=pdl, CHUNK=CH, num_warps=warps, **shape)
+            x, ids, st["w13"], st["s13"], st["g1"], sw13, ss13, ws["hq"], ws["hs"], ws["pairs"],
+            m, st["a1g"], st["a2g"], sg1, sg1u, KB_PAD=st["kb13"], BM=bm, BN=bn, BK=bk,
+            STAGES=stages, ACT=st["act"], PDL=pdl, CHUNK=CH, num_warps=warps, **shape)
     if k2[0] == "tok":
         _, bh, warps = k2
         _fc2_tok[(m, h // bh)](out, ws["hq"], ws["hs"], ids, tw, st["w2"], st["s2"], st["g2"],
-                               TKP=_p2(topk), KB_PAD=st["kb2"], BH=bh, LNI=lni, PDL=pdl,
-                               num_warps=warps, **dep, **shape)
+                               sw2, ss2, sg2, TKP=_p2(topk), KB_PAD=st["kb2"], BH=bh, LNI=lni,
+                               PDL=pdl, num_warps=warps, **dep, **shape)
     else:
         _, bm, bh, bhc, warps, stages = k2
         bhc = min(bhc, h)
         _fc2_exp[(h // bhc, slots)](ws["y"], ws["hq"], ws["hs"], ids, tw, ws["pairs"], st["w2"],
-                                    st["s2"], st["g2"], m, KB_PAD=st["kb2"], BM=bm, BH=bh,
-                                    BHC=bhc, STAGES=stages, LNI=lni, PDL=pdl, CHUNK=CH,
+                                    st["s2"], st["g2"], sw2, ss2, m, sg2, KB_PAD=st["kb2"], BM=bm,
+                                    BH=bh, BHC=bhc, STAGES=stages, LNI=lni, PDL=pdl, CHUNK=CH,
                                     num_warps=warps, **dep, **shape)
         bc = min(BC, h)
-        _combine[(m, h // bc)](out, ws["y"], ids, H=h, E=e, TOPK=topk, BCOL=bc, PDL=pdl,
+        _combine[(m, h // bc)](out, ws["y"], ids, H=h, E=e, TOPK=topk, BCOL=bc, SH=nsh, PDL=pdl,
                                num_warps=4, **dep)
     return out
 
@@ -689,7 +778,9 @@ def _batch(st, m, dev, seed, hot=False):
     on the first token's experts, so n_e = M drives the multi-pass row loops)."""
     from suffix_hybrid.kernels import nvfp4_moe as nm
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    x = (torch.randn(m, st["H"], generator=gen) * (2688.0 / st["a1g"] / 4.5)).to(dev, torch.bfloat16)
+    # explicit fp32: vLLM loads under a bf16 default dtype
+    x = (torch.randn(m, st["H"], generator=gen, dtype=torch.float32)
+         * (2688.0 / st["a1g"] / 4.5)).to(dev, torch.bfloat16)
     ids, tw = nm.rand_routing(m, st["E"], st["topk"], dev, seed=seed)
     if hot:
         ids = ids[:1].expand(m, -1)
@@ -858,7 +949,7 @@ def prepare(layer, cfg: dict, info: dict, oxide) -> None:
         _log(f"routing table ({mode}, PDL {'on' if _ST['pdl'] else 'off'}): "
              f"{TABLE_ENV}={format_table(table)}")
     plans = by_m(_ST["table"], max_m)
-    workspace(dev, max_m * st["topk"], st["H"], st["I"],
+    workspace(dev, max_m * (st["topk"] + (st["sh"] is not None)), st["H"], st["I"],
               any(PLANS[p][1][0] == "exp" for p in plans[1:] if p))
     oracle_layer(layer, st, cfg, plans, oxide, dev, max_m)
     cfg["tp_impl"] = TPLayer(st, plans)
@@ -888,22 +979,40 @@ def oracle_layer(layer, st, cfg, plans, oxide, dev, max_m: int) -> None:
 # ---------------------------------------------------------------------------
 # boot gate glm_moe_tp_kernel_bench (synthetic GLM-5.3 TP8 shard, one GPU)
 # ---------------------------------------------------------------------------
-def _gate_problem(dev):
+def _gate_problem(dev, shared: bool):
+    """Synthetic GLM-5.3 TP8 shard (nvfp4_moe._dev_problem) [+ a fused shared slot built like
+    tools/glm_moe_shared.py: BF16 MLP -> quant_shared with the probed power-of-two c]."""
     from suffix_hybrid.kernels import nvfp4_moe as nm
     p = nm._dev_problem(dev, nm.GLM_TP8, seed=1)
     e, two_i, kh = p["w13"].shape
-    info = dict(E=e, H=kh * 2, I=two_i // 2, ep=1)
+    hdim, idim = kh * 2, two_i // 2
+    info = dict(E=e, H=hdim, I=idim, ep=1)
     p.update(topk=nm.GLM_TP8[3], E_global=e, id_base=0)
+    if shared:
+        gen = torch.Generator().manual_seed(7)
+        w_gu = (torch.randn(2 * idim, hdim, generator=gen, dtype=torch.float32) * 0.05).bfloat16().to(dev)
+        w_dn = (torch.randn(hdim, idim, generator=gen, dtype=torch.float32) * 0.05).bfloat16().to(dev)
+        xp = (torch.randn(256, hdim, generator=gen, dtype=torch.float32)
+              * (2688.0 / p["a1g"] / 4.5)).to(dev).bfloat16().float()
+        gu = xp @ w_gu.float().T
+        h_sh = float((nm.act_ref(gu[:, :idim], p["act"]) * gu[:, idim:]).abs().max())
+        c = nm.shared_c(nm.probe_h_routed(p, xp), h_sh, nm.shared_headroom())
+        p["shared"] = nm.quant_shared(w_gu, w_dn, p["a1g"], p["a2g"], c)
     return p, layer_state(p, info)
 
 
-def gate_oracle(dev, p, st, native, max_m: int) -> dict:
-    """{plan: passed} — every plan at ORACLE_MS + a hot batch vs f64 and oxide, graph at M=6."""
+def _oxide(native, p, st, dev, max_m):
     from suffix_hybrid.kernels import nvfp4_moe as nm
-    ws = nm.workspace(dev, max_m, st["topk"], st["H"], st["I"], st["E"])
+    ws = nm.workspace(dev, max_m, st["topk"], st["H"], st["I"], st["E"],
+                      ns=int(p.get("shared") is not None))
     p["tune"] = nm.parse_tune(G10_TUNE)
-    oxide = lambda x, i, w: nm.run_ours(native, p, x, i, w, ws,  # noqa: E731
-                                        torch.cuda.current_stream(dev).cuda_stream)
+    return lambda x, i, w, o=None: nm.run_ours(native, p, x, i, w, ws,  # noqa: E731
+                                               torch.cuda.current_stream(dev).cuda_stream, o)
+
+
+def gate_oracle(dev, p, st, native, max_m: int, label: str) -> dict:
+    """{plan: passed} — every plan at ORACLE_MS + a hot batch vs f64 and oxide, graph at M=6."""
+    oxide = _oxide(native, p, st, dev, max_m)
     cache, res = {}, {}
     for plan in PLANS:
         res[plan] = True
@@ -913,23 +1022,22 @@ def gate_oracle(dev, p, st, native, max_m: int) -> dict:
                                    hot=m < 0, cache=cache)
                 if ok and m == 6:
                     ok = graph_check(st, plan, 6, dev)
-                    msg = msg + f" graph_replay_bitwise={ok}"
+                    msg += f" graph_replay_bitwise={ok}"
             except Exception as exc:  # noqa: BLE001
                 ok, msg = False, f"{type(exc).__name__}: {exc}"[:400]
             res[plan] = res[plan] and ok
-            _log(f"oracle plan {plan} M={abs(m)}{' hot' if m < 0 else ''}: {msg} "
+            _log(f"oracle [{label}] plan {plan} M={abs(m)}{' hot' if m < 0 else ''}: {msg} "
                  f"{'OK' if ok else 'FAIL'}")
     return res
 
 
-def gate_bench(dev, p, st, native, max_m: int, plans, iters: int = 30):
+def gate_bench(dev, p, st, native, max_m: int, plans, label: str, iters: int = 30):
     """us/layer per M (cold L2, graphed): every oracle-passing plan, the winner with PDL off, oxide
-    at the g10 table, FlashInfer CUTLASS; % of the weight roofline; the paste-able table."""
+    at the g10 table, FlashInfer CUTLASS (routed only); % of the weight roofline; the paste-able
+    table."""
     from suffix_hybrid.kernels import nvfp4_moe as nm
-    ws = nm.workspace(dev, max_m, st["topk"], st["H"], st["I"], st["E"])
-    p["tune"] = nm.parse_tune(G10_TUNE)
-    oxide = lambda x, i, w, o=None: nm.run_ours(native, p, x, i, w, ws,  # noqa: E731
-                                                torch.cuda.current_stream(dev).cuda_stream, o)
+    oxide = _oxide(native, p, st, dev, max_m)
+    sh = p.get("shared") is not None
     l2 = int(getattr(torch.cuda.get_device_properties(dev), "L2_cache_size", 128 << 20)) or (128 << 20)
     buf = torch.zeros(2 * l2 // 4, dtype=torch.float32, device=dev)
     flush = lambda: buf.sum()  # noqa: E731
@@ -943,29 +1051,34 @@ def gate_bench(dev, p, st, native, max_m: int, plans, iters: int = 30):
             try:
                 t[plan] = us(lambda s, plan=plan: run(st, x, ids, tw, plan, out=out))
             except Exception as exc:  # noqa: BLE001
-                _log(f"bench M={m} plan {plan} FAILED: {type(exc).__name__}: {exc}"[:300])
+                _log(f"bench [{label}] M={m} plan {plan} FAILED: {type(exc).__name__}: {exc}"[:300])
         best = min(t, key=t.get) if t else None
         t_nopdl = us(lambda s: run(st, x, ids, tw, best, pdl=False, out=out)) if best else float("nan")
         t_ox = us(lambda s: oxide(x, ids, tw, out))
-        try:
-            t_fi = us(lambda s: nm._fi_call(p, x, ids, tw, out))
-        except Exception as exc:  # noqa: BLE001
-            t_fi = float("nan")
-            _log(f"bench M={m} flashinfer FAILED: {type(exc).__name__}: {exc}"[:200])
-        hit = int(torch.unique(ids).numel())
-        roof = roofline_bytes(hit, st["H"], st["I"]) / nm.HBM_BPS * 1e6
+        t_fi = float("nan")
+        if not sh:
+            try:
+                t_fi = us(lambda s: nm._fi_call(p, x, ids, tw, out))
+            except Exception as exc:  # noqa: BLE001
+                _log(f"bench M={m} flashinfer FAILED: {type(exc).__name__}: {exc}"[:200])
+        hit = int(torch.unique(ids).numel()) + sh
+        mb = roofline_bytes(hit, st["H"], st["I"])
+        roof = mb / nm.HBM_BPS * 1e6
         tb = t[best] if best else float("nan")
         picks_tp.append((m, best))
         picks.append((m, best if best and tb < t_ox else OXIDE))
-        _log(f"bench M={m:3d} experts_hit={hit:3d} weights {roofline_bytes(hit, st['H'], st['I']) / 1e6:6.1f} MB "
-             f"roofline {roof:6.1f} us | ours {best} {tb:7.1f} us ({100 * roof / tb:3.0f}% BW; "
-             f"PDL off {t_nopdl:7.1f}) | oxide g10 {t_ox:7.1f} | flashinfer {t_fi:7.1f} | "
-             f"x{t_ox / tb:4.2f} vs oxide | plans " + " ".join(f"{k} {v:.1f}" for k, v in t.items()))
+        _log(f"bench [{label}] M={m:3d} experts={hit:3d} weights {mb / 1e6:6.1f} MB roofline "
+             f"{roof:6.1f} us | ours {best} {tb:7.1f} us ({100 * roof / tb:3.0f}% BW; PDL off "
+             f"{t_nopdl:7.1f}) | oxide g10 {t_ox:7.1f} | flashinfer {t_fi:7.1f} | x{t_ox / tb:4.2f} "
+             "vs oxide | plans " + " ".join(f"{k} {v:.1f}" for k, v in t.items()))
+    del buf
+    torch.cuda.empty_cache()
     table = merge_table(picks)
     mode = "tp" if all(p_ != OXIDE for _, p_ in table) else "auto"
-    _log(f"routing table: {TABLE_ENV}={format_table(table)} {IMPL_ENV}={mode}")
+    _log(f"routing table [{label}]: {TABLE_ENV}={format_table(table)} {IMPL_ENV}={mode}")
     if mode == "auto":
-        _log(f"ours everywhere: {TABLE_ENV}={format_table(merge_table(picks_tp))} {IMPL_ENV}=tp")
+        _log(f"ours everywhere [{label}]: {TABLE_ENV}={format_table(merge_table(picks_tp))} "
+             f"{IMPL_ENV}=tp")
     return table
 
 
@@ -978,18 +1091,24 @@ def main(argv=None) -> int:
         native = nm._native_ready()
         dev = torch.device("cuda", torch.cuda.current_device())
         _ST["pdl"] = pdl_on()
-        max_m = 192
-        p, st = _gate_problem(dev)
-        _log(f"GLM-5.3 TP8 shard: E={st['E']} H={st['H']} I={st['I']} top{st['topk']}, "
-             f"{torch.cuda.get_device_name(dev)}, PDL {'on' if _ST['pdl'] else 'off'}")
-        res = gate_oracle(dev, p, st, native, max_m)
-        good = [k for k, v in res.items() if v]
-        _log(f"ORACLE {'PASS' if len(good) == len(res) else 'FAIL'}: plans passing {good}, failing "
-             f"{[k for k, v in res.items() if not v]} (vs f64 reference + oxide, deterministic, "
-             "graph replay)")
-        if mode == "bench" and good:
-            gate_bench(dev, p, st, native, max_m, good)
-        return 0 if len(good) == len(res) else 1
+        max_m, all_ok = 192, True
+        for label, shared in (("routed", False), ("shared slot", True)):
+            p, st = _gate_problem(dev, shared)
+            _log(f"[{label}] GLM-5.3 TP8 shard: E={st['E']} H={st['H']} I={st['I']} top{st['topk']}"
+                 f"{' + fused shared slot' if shared else ''}, {torch.cuda.get_device_name(dev)}, "
+                 f"PDL {'on' if _ST['pdl'] else 'off'}")
+            res = gate_oracle(dev, p, st, native, max_m, label)
+            good = [k for k, v in res.items() if v]
+            all_ok = all_ok and len(good) == len(res)
+            _log(f"ORACLE [{label}] {'PASS' if len(good) == len(res) else 'FAIL'}: plans passing "
+                 f"{good}, failing {[k for k, v in res.items() if not v]} (vs f64 reference + "
+                 "oxide, deterministic, graph replay)")
+            if mode == "bench" and good:
+                gate_bench(dev, p, st, native, max_m, good, label)
+            del p, st
+            _ST["ws"].clear()
+            torch.cuda.empty_cache()
+        return 0 if all_ok else 1
     except Exception as exc:  # noqa: BLE001
         _log(f"{mode.upper()} FAIL: {type(exc).__name__}: {exc}")
         return 1
