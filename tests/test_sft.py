@@ -518,7 +518,9 @@ def test_frozen_linear_nvfp4_dequant_dx_or_probe_fallback(scrambled):
     x = torch.randn(7, 96, requires_grad=True)
     dy = torch.randn(7, 160)
     FrozenLinear.apply(x, layer).backward(dy)
-    torch.testing.assert_close(x.grad, dy @ w_eff, rtol=1e-4, atol=1e-5)
+    # dequant path: bf16 weights (the probe fallback is exact)
+    tol = dict(rtol=1e-4, atol=1e-5) if scrambled else dict(rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(x.grad, dy @ w_eff, **tol)
     assert _NVFP4_OK[id(layer)] is (not scrambled)      # fast path only when verified
 
 
@@ -546,9 +548,13 @@ def test_adapters_zero_noop_isinstance_and_delta():
 # ---------------------------------------------------------------------------
 # (c) training forward == oracle
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("head_group", [8, 1])
-def test_trainmode_matches_oracle_and_restores(head_group, monkeypatch):
+@pytest.mark.parametrize("head_group,fla", [(8, False), (1, False), (1, True)])
+def test_trainmode_matches_oracle_and_restores(head_group, fla, monkeypatch):
+    """fla=True: forward through an injected 'serving kernel' (_FlaRule), backward
+    through the grouped torch recompute."""
     monkeypatch.setattr(M, "GDN_HEAD_GROUP", head_group)
+    if fla:
+        monkeypatch.setattr(M, "_fla", lambda: M.chunk_gated_delta_rule)
     lm = build()
     sft = sft_for(lm)
     set_adapters(sft)
