@@ -884,3 +884,30 @@ def test_pack_schedule_encode():
     assert mask == [0] * len(prompt) + [1] * (len(ids) - len(prompt)) and sum(mask) == len("answer 0!|")
     ids, mask = A.encode(Tok(), {"prompt": "ab", "completion": "c"})
     assert ids[0] == 2 and ids[-1] == Tok.eos_token_id and mask == [0, 0, 0, 1, 1]
+
+
+def test_routes_on_a_real_fastapi_app(tmp_path, monkeypatch):
+    """The routes bind `request` as the Request (not a query parameter),
+    accept the gateway carrier keys, and wait=false answers 202 at once."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("SUFFIX_SFT", "1")
+    app = FastAPI()
+    A.SftEndpointPlugin().attach_router(app)
+    s = _state(tmp_path, sft_for(build()))
+    A._S = s
+    try:
+        with TestClient(app) as cl:
+            r = cl.post("/v1/sft/train", json=dict(model="m", prompt="sft", examples=CHATS, steps=2,
+                                                    batch_size=3, wait=False))
+            assert r.status_code == 202, r.text
+            for _ in range(200):
+                st = cl.get("/v1/sft/status").json()
+                if st["state"] != "training":
+                    break
+                import time
+                time.sleep(0.05)
+            assert st["state"] == "idle" and st["last_run"]["steps"] == 2, st
+            assert cl.post("/v1/sft/load", json=dict(prompt="x", run_id="base")).status_code == 200
+    finally:
+        W.SFT, A._S = None, None

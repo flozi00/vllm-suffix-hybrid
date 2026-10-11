@@ -10,7 +10,11 @@ Routes (API-key protected like every /v1 route when --api-key is set):
   POST /v1/sft/load    {"run_id": "<published run>" | "base"} -> serves it
                         and moves latest.json to it (durable rollback)
   GET  /v1/sft/status
-An optional "model" field is accepted and ignored (unified-proxy routing).
+Optional "model" and "prompt" fields are accepted and ignored: the pool
+gateway (EPP) routes on them and rejects POST bodies without "prompt".
+"wait": false returns 202 at once and the run continues (poll status);
+a waiting client of a long run hits the gateway's route timeout, but the
+run still finishes and publishes.
 
 Loss: chat examples train on the FINAL assistant message only (prompt =
 history rendered with the generation prompt, exactly what serving renders;
@@ -470,6 +474,9 @@ async def _exclusive(request, run):
         raise _http(409, "an SFT run or load is already in progress")
     _S.running = asyncio.ensure_future(run(body))
     _S.running.add_done_callback(lambda t: t.cancelled() or t.exception())
+    if body.get("wait", True) is False:   # long runs vs the gateway's route timeout
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"accepted": True, "poll": "GET /v1/sft/status"}, status_code=202)
     return await asyncio.shield(_S.running)
 
 
@@ -497,11 +504,15 @@ class SftEndpointPlugin:
             _log("routes skipped (SUFFIX_SFT != 1)")
             return
 
-        async def train(request: Request):
+        async def train(request):
             return await train_route(request)
 
-        async def load(request: Request):
+        async def load(request):
             return await load_route(request)
+
+        # real classes, not strings: this module uses postponed annotations
+        # and FastAPI would otherwise read `request` as a query parameter
+        train.__annotations__ = load.__annotations__ = {"request": Request}
 
         app.add_api_route("/v1/sft/train", train, methods=["POST"], name="suffix_sft_train")
         app.add_api_route("/v1/sft/load", load, methods=["POST"], name="suffix_sft_load")
