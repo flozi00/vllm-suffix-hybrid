@@ -58,6 +58,8 @@ BLOCK = 1024             # bf16 per program step (16 B per thread at 4 warps)
 ELEMS_PER_PROGRAM = 1024  # grid = clamp(first round / this, 1, max_blocks)
 MAX_BLOCKS = 128
 Q8_GROUP = 128           # int8 transport: one fp32 absmax scale per 128 elements
+LL_MAX_BYTES = 128 << 10  # largest bf16 message the low-latency (flag-in-data) path serves
+LL_BLOCK = 512            # 8-byte units per program step
 TIMEOUT_SPINS = 1 << 30  # minutes of polling: survives profiler exports and JIT stalls on one rank
 WORLDS = (2, 4, 8)
 
@@ -298,6 +300,114 @@ if triton is not None:
                                  _dequant8(qj, sj, G, BLOCK).to(out_ptr.dtype.element_ty), mask=m)
 
     @triton.jit
+    def _bf16x2_to_f32(v):
+        """uint32 holding two bf16 (element 0 in the low half) -> (lo, hi) fp32."""
+        lo = (v << 16).to(tl.float32, bitcast=True)
+        hi = ((v >> 16) << 16).to(tl.float32, bitcast=True)
+        return lo, hi
+
+    @triton.jit
+    def _f32_to_bf16x2(lo, hi):
+        lo16 = lo.to(tl.bfloat16).to(tl.uint16, bitcast=True).to(tl.uint32)
+        hi16 = hi.to(tl.bfloat16).to(tl.uint16, bitcast=True).to(tl.uint32)
+        return lo16 | (hi16 << 16)
+
+    @triton.jit
+    def _ll_wait(ptrs, m, epoch, TIMEOUT: tl.constexpr):
+        """Volatile-load 8-byte LL units until every masked lane carries this round's epoch."""
+        w = tl.load(ptrs, mask=m, other=0, volatile=True)
+        ok = tl.min((((w >> 32).to(tl.uint32) == epoch) | ~m).to(tl.int32), axis=0)
+        spins = tl.zeros([], dtype=tl.int32)
+        while ok == 0:
+            w = tl.load(ptrs, mask=m, other=0, volatile=True)
+            ok = tl.min((((w >> 32).to(tl.uint32) == epoch) | ~m).to(tl.int32), axis=0)
+            spins += 1
+            if spins > TIMEOUT:
+                _trap()
+        return (w & 0xFFFFFFFF).to(tl.uint32)
+
+    @triton.jit
+    def _har_ll_kernel(x_ptr, out_ptr, dll_ptr, rll_ptr, ctr_ptr, arr_ptr, nu,
+                       RANK: tl.constexpr, WORLD: tl.constexpr, LLU: tl.constexpr,
+                       ONESHOT: tl.constexpr, BLOCK: tl.constexpr, TIMEOUT: tl.constexpr):
+        """Low-latency all-reduce for one round of nu bf16 PAIRS (x/out viewed as uint32): every
+        8-byte unit stores (epoch << 32 | payload), so readers spin on the data itself -- no
+        fence, no flag line, no barrier. A unit of a peer's round e+1 proves that peer finished
+        round e (kernels on a stream serialize), which is what parity reuse needs."""
+        RLU: tl.constexpr = LLU // WORLD
+        pid = tl.program_id(0)
+        step = tl.num_programs(0) * BLOCK
+        ar = tl.arange(0, BLOCK)
+        ctr0 = tl.load(ctr_ptr).to(tl.uint32)
+        epoch = ctr0 + 1
+        par = (epoch & 1).to(tl.int32)
+        tag = epoch.to(tl.uint64) << 32
+        dll = dll_ptr + par * (WORLD * LLU)
+        rll = rll_ptr + par * (WORLD * RLU)
+        if ONESHOT:
+            for s in range(pid * BLOCK, nu, step):
+                o = s + ar
+                m = o < nu
+                v = tl.load(x_ptr + o, mask=m).to(tl.uint32)
+                tl.store(dll + RANK * LLU + o, (v.to(tl.uint64) | tag).to(tl.int64), mask=m,
+                         cache_modifier=".wt")
+            for s in range(pid * BLOCK, nu, step):
+                o = s + ar
+                m = o < nu
+                a_lo = tl.zeros([BLOCK], dtype=tl.float32)
+                a_hi = tl.zeros([BLOCK], dtype=tl.float32)
+                for j in tl.static_range(WORLD):
+                    if j == RANK:
+                        v = tl.load(x_ptr + o, mask=m, other=0).to(tl.uint32)
+                    else:
+                        v = _ll_wait(dll + j * LLU + o, m, epoch, TIMEOUT)
+                    lo, hi = _bf16x2_to_f32(v)
+                    a_lo += lo
+                    a_hi += hi
+                tl.store(out_ptr + o, _f32_to_bf16x2(a_lo, a_hi).to(tl.int32, bitcast=True), mask=m)
+        else:
+            ch = tl.cdiv(nu, WORLD)
+            lo_u = RANK * ch
+            hi_u = tl.minimum(lo_u + ch, nu)
+            for s in range(pid * BLOCK, nu, step):  # phase 1: own partial of the others' chunks
+                o = s + ar
+                m = (o < nu) & ((o < lo_u) | (o >= hi_u))
+                v = tl.load(x_ptr + o, mask=m).to(tl.uint32)
+                tl.store(dll + RANK * LLU + o, (v.to(tl.uint64) | tag).to(tl.int64), mask=m,
+                         cache_modifier=".wt")
+            for s in range(lo_u + pid * BLOCK, hi_u, step):  # phase 2: reduce own chunk
+                o = s + ar
+                m = o < hi_u
+                a_lo = tl.zeros([BLOCK], dtype=tl.float32)
+                a_hi = tl.zeros([BLOCK], dtype=tl.float32)
+                for j in tl.static_range(WORLD):
+                    if j == RANK:
+                        v = tl.load(x_ptr + o, mask=m, other=0).to(tl.uint32)
+                    else:
+                        v = _ll_wait(dll + j * LLU + o, m, epoch, TIMEOUT)
+                    lo, hi = _bf16x2_to_f32(v)
+                    a_lo += lo
+                    a_hi += hi
+                r = _f32_to_bf16x2(a_lo, a_hi)
+                tl.store(out_ptr + o, r.to(tl.int32, bitcast=True), mask=m)
+                tl.store(rll + RANK * RLU + (o - lo_u), (r.to(tl.uint64) | tag).to(tl.int64), mask=m,
+                         cache_modifier=".wt")
+            for j in tl.static_range(WORLD):  # phase 3: the others' reduced chunks
+                if j != RANK:
+                    jl = j * ch
+                    jh = tl.minimum(jl + ch, nu)
+                    for s in range(jl + pid * BLOCK, jh, step):
+                        o = s + ar
+                        m = o < jh
+                        v = _ll_wait(rll + j * RLU + (o - jl), m, epoch, TIMEOUT)
+                        tl.store(out_ptr + o, v.to(tl.int32, bitcast=True), mask=m)
+        # every program read ctr0; the last one to finish advances the epoch counter
+        old = tl.atomic_add(arr_ptr + 4, 1, sem="acq_rel", scope="gpu")
+        if old == tl.num_programs(0) - 1:
+            tl.store(arr_ptr + 4, 0)
+            tl.store(ctr_ptr, epoch.to(tl.int32))
+
+    @triton.jit
     def _hag_kernel(x_ptr, out_ptr, data_ptr, flag_ptr, ctr_ptr, arr_ptr, n,
                     RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
                     FLAG_STRIDE: tl.constexpr, BLOCK: tl.constexpr, TIMEOUT: tl.constexpr,
@@ -405,7 +515,8 @@ class HostAllReduce:
     def __init__(self, cpu_group, device, oneshot_max_bytes: int = 0, max_blocks: int = 64,
                  round_bytes: int = ROUND_BYTES, timeout_spins: int = TIMEOUT_SPINS,
                  numa: str = "owner", elems_per_program: int = ELEMS_PER_PROGRAM,
-                 lean: bool = True, q8_min_bytes: int = 1 << 62, q8_group: int = Q8_GROUP):
+                 lean: bool = True, q8_min_bytes: int = 1 << 62, q8_group: int = Q8_GROUP,
+                 ll_max_bytes: int = 0):
         import torch
         import torch.distributed as dist
 
@@ -426,7 +537,10 @@ class HostAllReduce:
         self.lean, self.q8_min, self.q8_group = lean, q8_min_bytes, q8_group
         rch = self.round // self.world
         data_bytes = 2 * self.world * self.round * 2
-        self.size = FLAG_BYTES + data_bytes + 2 * self.world * rch * 2
+        self.ll_max = min(ll_max_bytes, LL_MAX_BYTES)
+        self.llu = LL_MAX_BYTES // 4  # 8-byte units per partial slot (4 payload bytes each)
+        ll_bytes = 2 * self.world * self.llu * 8 + 2 * self.world * (self.llu // self.world) * 8
+        self.size = FLAG_BYTES + data_bytes + 2 * self.world * rch * 2 + ll_bytes
         name = [f"/dev/shm/suffix-har-{uuid.uuid4().hex}" if self.rank == 0 else None]
         if self.rank == 0:
             fd = os.open(name[0], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
@@ -469,10 +583,13 @@ class HostAllReduce:
         self.data = _Ptr(self.addr + FLAG_BYTES, torch.bfloat16)
         self.red = _Ptr(self.addr + FLAG_BYTES + data_bytes, torch.bfloat16)
         # int8-transport views of the same slots (codes, then fp32 scales; see _har_q8_kernel)
+        ll0 = FLAG_BYTES + data_bytes + 2 * self.world * rch * 2
+        self.dll = _Ptr(self.addr + ll0, torch.int64)
+        self.rll = _Ptr(self.addr + ll0 + 2 * self.world * self.llu * 8, torch.int64)
         self.data_q, self.data_s = _Ptr(self.data.addr, torch.int8), _Ptr(self.data.addr, torch.float32)
         self.red_q, self.red_s = _Ptr(self.red.addr, torch.int8), _Ptr(self.red.addr, torch.float32)
         self.ctr = torch.zeros(1, dtype=torch.int32, device=self.device)
-        self.arr = torch.zeros(4, dtype=torch.int32, device=self.device)  # arrive x2, go x2
+        self.arr = torch.zeros(8, dtype=torch.int32, device=self.device)  # arrive x2, go x2, LL end
         self.disabled = False
 
     def _touch(self, regions) -> None:
@@ -496,7 +613,7 @@ class HostAllReduce:
         return max(1, min(self.max_blocks, -(-min(n, self.round) // self.per_program)))
 
     def all_reduce(self, x, oneshot: bool | None = None, grid: int | None = None,
-                   q8: bool | None = None):
+                   q8: bool | None = None, ll: bool | None = None):
         import torch
 
         out = torch.empty_like(x)
@@ -505,6 +622,15 @@ class HostAllReduce:
             return out
         if oneshot is None:
             oneshot = n * 2 <= self.oneshot_max
+        if ll is None:
+            ll = n * 2 <= self.ll_max
+        if ll and n * 2 <= LL_MAX_BYTES:
+            nu = n // 2
+            _har_ll_kernel[(grid or max(1, min(self.max_blocks, -(-nu // LL_BLOCK))),)](
+                x.view(torch.int32), out.view(torch.int32), self.dll, self.rll, self.ctr, self.arr, nu,
+                RANK=self.rank, WORLD=self.world, LLU=self.llu, ONESHOT=bool(oneshot), BLOCK=LL_BLOCK,
+                TIMEOUT=self.timeout, num_warps=4)
+            return out
         if q8 is None:
             q8 = not oneshot and n * 2 >= self.q8_min
         if q8 and n % self.q8_group == 0:
@@ -602,6 +728,7 @@ VARIANTS = (
     ("lean", {}, (1, 6, 12, 24, 48, 96, 192, 384, 1024, 8192), (None,)),
     ("fenced", {"lean": False}, (1, 6, 48, 192, 1024), (None,)),
     ("lean-grid", {}, (6, 48, 192), (16, 64)),
+    ("ll", {"ll_max_bytes": 128 << 10}, (1, 6, 10), (None,)),
     ("q8", {"q8_min_bytes": 0}, (24, 48, 96, 192, 384, 1024, 8192), (None,)),
     ("q8g32", {"q8_min_bytes": 0, "q8_group": 32}, (48, 192, 1024), (None,)),
 )
@@ -727,6 +854,14 @@ def _bench_worker(rank, world, port, q, hidden) -> None:
         nccl_us = {}
         for vname, kw, toks, grids in VARIANTS:
             har = HostAllReduce(cpu, dev, timeout_spins=1 << 23, **kw)
+            if vname == "ll":  # LL interleaved with the flag-barrier kernels (shared epochs)
+                for t in (1, 6):
+                    pairs = [_inputs(rank, world, t * hidden + 8 * k, dev) for k in range(4)]
+                    ys = [har.all_reduce(pairs[i % 4][0], oneshot=bool(i % 3 == 0), ll=bool(i % 2 == 0))
+                          for i in range(64)]
+                    torch.cuda.synchronize()
+                    out["stress"].append((t, "ll-mix", all(torch.equal(y, pairs[i % 4][1])
+                                                          for i, y in enumerate(ys))))
             if vname == "lean":  # back-to-back calls, 4 rotating inputs, both modes, every output
                 for t in STRESS_TOKENS:
                     pairs = [_inputs(rank, world, t * hidden + 8 * k, dev) for k in range(4)]
@@ -832,7 +967,8 @@ def bench(hidden: int = 6144) -> int:
     gather_ok = all(rr["exact"] for r in res for rr in r["gather"])
     stress = [all(r["stress"][i][2] for r in res) for i in range(len(res[0]["stress"]))]
     print(f"{MARK} stress (64 back-to-back calls, 4 rotating inputs, every output exact): "
-          + ", ".join(f"{t}tok {'one' if one else 'two'} {ok}" for (t, one, _), ok in
+          + ", ".join(f"{t}tok {one if isinstance(one, str) else 'one' if one else 'two'} {ok}"
+                      for (t, one, _), ok in
                       zip(res[0]["stress"], stress)), flush=True)
     ok = all(stress) and gather_ok
     for i, row in enumerate(res[0]["rows"]):
