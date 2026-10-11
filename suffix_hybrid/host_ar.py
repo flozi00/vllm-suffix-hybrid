@@ -56,7 +56,10 @@ except ImportError:  # CPU CI: the Python side stays importable
 MARK = "[suffix har]"
 ROUND_BYTES = 4 << 20    # one round's partial per rank
 FLAG_STRIDE = 16         # int32 per flag (one 64 B line per rank: no false sharing)
-FLAG_BYTES = 64 << 10    # 2 parities x 2 phases x world lines
+FLAG_BYTES = 128 << 10   # [0, 64K): 2 parities x 2 phases x world lines; [64K, 128K): per-program lines
+PP_OFFSET = 64 << 10
+PP_MAXP = 32              # programs of the per-program-flag kernel
+PP_LINE = 16              # int32 per (rank, program) flag: one 64 B line each
 BLOCK = 1024             # bf16 per program step (16 B per thread at 4 warps)
 ELEMS_PER_PROGRAM = 1024  # grid = clamp(first round / this, 1, max_blocks)
 MAX_BLOCKS = 128
@@ -301,6 +304,85 @@ if triton is not None:
                                  _dequant8(qj, sj, G, BLOCK).to(out_ptr.dtype.element_ty), mask=m)
 
     @triton.jit
+    def _pp_publish_wait(lines, epoch, RANK: tl.constexpr, WORLD: tl.constexpr,
+                         LINE: tl.constexpr, TIMEOUT: tl.constexpr):
+        """Program-level barrier over the same program of every rank: each (rank, program) flag
+        owns a 64 B host line, so 8 writers never share a line."""
+        tl.debug_barrier()
+        _st_release(lines + RANK * LINE, epoch, True)
+        ranks = tl.arange(0, WORLD)
+        done = tl.zeros([], dtype=tl.int32)
+        spins = tl.zeros([], dtype=tl.int32)
+        while done == 0:
+            f = _ld_acquire(lines + ranks * LINE, True)
+            done = tl.min(((f == epoch) | (ranks == RANK)).to(tl.int32), axis=0)
+            spins += 1
+            if spins > TIMEOUT:
+                _trap()
+
+    @triton.jit
+    def _har_pp_kernel(x_ptr, out_ptr, data_ptr, red_ptr, ppf_ptr, ctr_ptr, arr_ptr, n,
+                       RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
+                       MAXP: tl.constexpr, LINE: tl.constexpr, BLOCK: tl.constexpr,
+                       TIMEOUT: tl.constexpr):
+        """Two-shot, one round (n <= ROUND), synchronized per program: program b of every rank owns
+        sub-slice b of every chunk, so no grid barrier and no device go-word hop."""
+        RCH: tl.constexpr = ROUND // WORLD
+        b = tl.program_id(0)
+        nb = tl.num_programs(0)
+        ar = tl.arange(0, BLOCK)
+        ctr0 = tl.load(ctr_ptr).to(tl.uint32)
+        epoch = ctr0 + 1
+        par = (epoch & 1).to(tl.int32)
+        dat = data_ptr + par * (WORLD * ROUND)
+        red = red_ptr + par * (WORLD * RCH)
+        ch = tl.cdiv(tl.cdiv(n, WORLD), 8) * 8
+        sub = tl.cdiv(tl.cdiv(ch, nb), 8) * 8
+        s0 = tl.multiple_of(b * sub, 8)
+        s1 = tl.multiple_of(tl.minimum(s0 + sub, ch), 8)
+        f1 = ppf_ptr + ((par * 2) * MAXP + b) * WORLD * LINE
+        f2 = ppf_ptr + ((par * 2 + 1) * MAXP + b) * WORLD * LINE
+        for c in tl.static_range(WORLD):
+            if c != RANK:
+                lo = tl.multiple_of(c * ch + s0, 8)
+                hi = tl.multiple_of(tl.minimum(c * ch + s1, n), 8)
+                for s in range(lo, hi, BLOCK):
+                    o = s + ar
+                    m = o < hi
+                    v = tl.load(x_ptr + o, mask=m)
+                    tl.store(dat + RANK * ROUND + o, v, mask=m, cache_modifier=".wt")
+        _pp_publish_wait(f1, epoch, RANK, WORLD, LINE, TIMEOUT)
+        lo = tl.multiple_of(RANK * ch + s0, 8)
+        hi = tl.multiple_of(tl.minimum(RANK * ch + s1, n), 8)
+        for s in range(lo, hi, BLOCK):
+            o = s + ar
+            m = o < hi
+            acc = tl.zeros([BLOCK], dtype=tl.float32)
+            for j in tl.static_range(WORLD):
+                if j == RANK:
+                    v = tl.load(x_ptr + o, mask=m, other=0.0)
+                else:
+                    v = tl.load(dat + j * ROUND + o, mask=m, other=0.0, cache_modifier=".cv")
+                acc += v.to(tl.float32)
+            r = acc.to(out_ptr.dtype.element_ty)
+            tl.store(out_ptr + o, r, mask=m)
+            tl.store(red + RANK * RCH + (o - RANK * ch), r, mask=m, cache_modifier=".wt")
+        _pp_publish_wait(f2, epoch, RANK, WORLD, LINE, TIMEOUT)
+        for c in tl.static_range(WORLD):
+            if c != RANK:
+                lo = tl.multiple_of(c * ch + s0, 8)
+                hi = tl.multiple_of(tl.minimum(c * ch + s1, n), 8)
+                for s in range(lo, hi, BLOCK):
+                    o = s + ar
+                    m = o < hi
+                    v = tl.load(red + c * RCH + (o - c * ch), mask=m, cache_modifier=".cv")
+                    tl.store(out_ptr + o, v, mask=m)
+        old = tl.atomic_add(arr_ptr + 4, 1, sem="acq_rel", scope="gpu")
+        if old == nb - 1:
+            tl.store(arr_ptr + 4, 0)
+            tl.store(ctr_ptr, epoch.to(tl.int32))
+
+    @triton.jit
     def _hag_kernel(x_ptr, out_ptr, data_ptr, flag_ptr, ctr_ptr, arr_ptr, n,
                     RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
                     FLAG_STRIDE: tl.constexpr, BLOCK: tl.constexpr, TIMEOUT: tl.constexpr,
@@ -408,7 +490,8 @@ class HostAllReduce:
     def __init__(self, cpu_group, device, oneshot_max_bytes: int = 0, max_blocks: int = 64,
                  round_bytes: int = ROUND_BYTES, timeout_spins: int = TIMEOUT_SPINS,
                  numa: str = "owner", elems_per_program: int = ELEMS_PER_PROGRAM,
-                 lean: bool = True, q8_min_bytes: int = 1 << 62, q8_group: int = Q8_GROUP):
+                 lean: bool = True, q8_min_bytes: int = 1 << 62, q8_group: int = Q8_GROUP,
+                 pp_max_bytes: int = 0, pp_grid: int = 8):
         import torch
         import torch.distributed as dist
 
@@ -427,6 +510,7 @@ class HostAllReduce:
         self.oneshot_max, self.timeout = oneshot_max_bytes, timeout_spins
         self.max_blocks, self.per_program = min(max_blocks, MAX_BLOCKS), elems_per_program
         self.lean, self.q8_min, self.q8_group = lean, q8_min_bytes, q8_group
+        self.pp_max, self.pp_grid = pp_max_bytes, min(pp_grid, PP_MAXP)
         rch = self.round // self.world
         data_bytes = 2 * self.world * self.round * 2
         self.size = FLAG_BYTES + data_bytes + 2 * self.world * rch * 2
@@ -469,13 +553,14 @@ class HostAllReduce:
             raise RuntimeError(f"cudaHostRegister failed (rank {self.rank}: error {err})")
         self.pages = numa_pages(self.addr)
         self.flags = _Ptr(self.addr, torch.int32)
+        self.ppf = _Ptr(self.addr + PP_OFFSET, torch.int32)
         self.data = _Ptr(self.addr + FLAG_BYTES, torch.bfloat16)
         self.red = _Ptr(self.addr + FLAG_BYTES + data_bytes, torch.bfloat16)
         # int8-transport views of the same slots (codes, then fp32 scales; see _har_q8_kernel)
         self.data_q, self.data_s = _Ptr(self.data.addr, torch.int8), _Ptr(self.data.addr, torch.float32)
         self.red_q, self.red_s = _Ptr(self.red.addr, torch.int8), _Ptr(self.red.addr, torch.float32)
         self.ctr = torch.zeros(1, dtype=torch.int32, device=self.device)
-        self.arr = torch.zeros(4, dtype=torch.int32, device=self.device)  # arrive x2, go x2
+        self.arr = torch.zeros(8, dtype=torch.int32, device=self.device)  # arrive x2, go x2, pp end
         self.disabled = False
 
     def _touch(self, regions) -> None:
@@ -499,7 +584,7 @@ class HostAllReduce:
         return max(1, min(self.max_blocks, -(-min(n, self.round) // self.per_program)))
 
     def all_reduce(self, x, oneshot: bool | None = None, grid: int | None = None,
-                   q8: bool | None = None):
+                   q8: bool | None = None, pp: bool | None = None):
         import torch
 
         out = torch.empty_like(x)
@@ -508,6 +593,14 @@ class HostAllReduce:
             return out
         if oneshot is None:
             oneshot = n * 2 <= self.oneshot_max
+        if pp is None:
+            pp = not oneshot and n * 2 <= self.pp_max
+        if pp and n <= self.round:
+            _har_pp_kernel[(grid or self.pp_grid,)](
+                x, out, self.data, self.red, self.ppf, self.ctr, self.arr, n,
+                RANK=self.rank, WORLD=self.world, ROUND=self.round, MAXP=PP_MAXP, LINE=PP_LINE,
+                BLOCK=BLOCK, TIMEOUT=self.timeout, num_warps=4)
+            return out
         if q8 is None:
             q8 = not oneshot and n * 2 >= self.q8_min
         if q8 and n % self.q8_group == 0:
@@ -605,6 +698,7 @@ VARIANTS = (
     ("lean", {}, (1, 6, 12, 24, 48, 96, 192, 384, 1024, 8192), (None,)),
     ("fenced", {"lean": False}, (1, 6, 48, 192, 1024), (None,)),
     ("lean-grid", {}, (6, 48, 192), (16, 64)),
+    ("pp", {"pp_max_bytes": 1 << 30}, (1, 6, 12, 24, 48), (4, 8, 16, 32)),
     ("q8", {"q8_min_bytes": 0}, (24, 48, 96, 192, 384, 1024, 8192), (None,)),
     ("q8g32", {"q8_min_bytes": 0, "q8_group": 32}, (48, 192, 1024), (None,)),
 )
@@ -730,6 +824,14 @@ def _bench_worker(rank, world, port, q, hidden) -> None:
         nccl_us = {}
         for vname, kw, toks, grids in VARIANTS:
             har = HostAllReduce(cpu, dev, timeout_spins=1 << 23, **kw)
+            if vname == "pp":  # per-program barrier interleaved with the grid-barrier kernels
+                for t in (1, 6, 24):
+                    pairs = [_inputs(rank, world, t * hidden + 8 * k, dev) for k in range(4)]
+                    ys = [har.all_reduce(pairs[i % 4][0], oneshot=False, pp=bool(i % 2 == 0))
+                          for i in range(64)]
+                    torch.cuda.synchronize()
+                    out["stress"].append((t, "pp-mix", all(torch.equal(y, pairs[i % 4][1])
+                                                          for i, y in enumerate(ys))))
             if vname == "lean":  # back-to-back calls, 4 rotating inputs, both modes, every output
                 for t in STRESS_TOKENS:
                     pairs = [_inputs(rank, world, t * hidden + 8 * k, dev) for k in range(4)]

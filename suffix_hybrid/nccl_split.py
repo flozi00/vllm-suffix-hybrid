@@ -31,6 +31,9 @@ communicator) or "<NCCL_ALGO>[/<NCCL_PROTO>]", e.g. "allreduce:ring/Simple".
       default 0); "har1" / "har2" force one-shot / two-shot. Other dtypes fall
       through to the default communicator. SUFFIX_HAR_Q8_MIN_BYTES (default inf):
       two-shot messages from this size use int8 transport (LOSSY, quality-gate first).
+      SUFFIX_HAR_PP_MAX_BYTES (default 0) / _PP_GRID (8): two-shot messages up to this size
+      synchronize per program (one 64 B host line per rank and program) instead of the grid
+      barrier.
       SUFFIX_HAR_ALLGATHER=1 (tp group): all-gathers of 2/4-byte tensors (the vocab
       logits) go through the same host buffer (exact bytes).
   SUFFIX_NCCL_QAR=int8|fp8 (tp group only, default off): bf16/fp16 all-reduces
@@ -308,7 +311,9 @@ def make_comm(spec: str, cpu_group, device):
         one = {"har1": INF, "har2": 0}.get(spec, parse_size(_env("SUFFIX_HAR_ONESHOT_MAX_BYTES", "0")))
         return HostAllReduce(cpu_group, device, oneshot_max_bytes=one,
                              max_blocks=int(_env("SUFFIX_HAR_BLOCKS", "64")),
-                             q8_min_bytes=parse_size(_env("SUFFIX_HAR_Q8_MIN_BYTES", "inf")))
+                             q8_min_bytes=parse_size(_env("SUFFIX_HAR_Q8_MIN_BYTES", "inf")),
+                             pp_max_bytes=parse_size(_env("SUFFIX_HAR_PP_MAX_BYTES", "0")),
+                             pp_grid=int(_env("SUFFIX_HAR_PP_GRID", "8")))
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
     env = spec_env(spec)
