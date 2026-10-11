@@ -377,6 +377,10 @@ class HostAllReduce:
         self.rank, self.world = dist.get_rank(cpu_group), dist.get_world_size(cpu_group)
         if self.world not in WORLDS:
             raise ValueError(f"host all-reduce supports world {WORLDS}, not {self.world}")
+        hosts = [None] * self.world
+        dist.all_gather_object(hosts, os.uname().nodename, group=cpu_group)
+        if len(set(hosts)) != 1:
+            raise ValueError(f"host all-reduce needs every rank on one node, got {sorted(set(hosts))}")
         self.device = torch.device(device)
         self.round = round_bytes // 2
         if self.round % (self.world * BLOCK):
