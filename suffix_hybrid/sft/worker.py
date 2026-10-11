@@ -1,0 +1,337 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Worker side of SFT: adapters on the served model, the trainer, shard IO.
+
+Every op is one ``collective_rpc("suffix_sft", op, payload)`` and runs on
+all TP ranks in lockstep between engine steps (RPCs and execute_model share
+the worker's queue, so serving never runs concurrently with an op). Ops
+never raise into vLLM: they return ``{"error": ...}`` and drop the run.
+
+Memory (per rank, adapters of P params): live adapters 2P bytes (bf16,
+resident, read by serving); during a run only +2P working copy +2P grad on
+the GPU, the fp32 master and both AdamW moments (12P) live in pinned host
+memory and the optimizer step runs on the CPU. Activations are bounded by
+the micro-batch token cap (checkpointed + host-offloaded layer inputs,
+chunked vocab-parallel CE). Between micro-steps the run holds only the
+working copy + grad; ``torch.cuda.empty_cache`` returns everything when a
+run ends.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import time
+import traceback
+
+import torch
+
+from suffix_hybrid.mtp_tune.lora import SingleGroup
+from suffix_hybrid.sft import model as M
+
+MARK = "[suffix sft]"
+SFT = None          # this worker's WorkerSFT (set by the load_model hook)
+INSTALL_ERROR = "not installed"
+
+
+def _log(msg):
+    print(f"{MARK} {msg}", file=sys.stderr, flush=True)
+
+
+class Run:
+    """One training run: flat bf16 working params on the GPU (views per
+    adapter, replicated TP factors first so their grads all-reduce as one
+    slice), fp32 master + AdamW on the host."""
+
+    def __init__(self, sft, lr, weight_decay=0.0, clip=1.0):
+        self.s, self.clip = sft, clip
+        spans, off = {}, 0
+        for want_rep in (True, False):
+            for name, (_, lora) in sft.adapters.items():
+                for f in ("A", "B"):
+                    if (lora.replicated_factor() == f) == want_rep:
+                        t = getattr(lora, f)
+                        spans[(name, f)] = (off, tuple(t.shape))
+                        off += t.numel()
+            if want_rep:
+                self.n_rep = off
+        self.spans = spans
+        dev, dt = sft.device, sft.dtype
+        with torch.no_grad():
+            self.flat = torch.empty(off, dtype=dt, device=dev)
+            for (name, f), (o, shp) in spans.items():
+                self.flat[o:o + _numel(shp)].copy_(getattr(sft.adapters[name][1], f).reshape(-1))
+        self.flat.requires_grad_(True)
+        self.master = self.flat.detach().float().cpu()
+        if torch.cuda.is_available():
+            self.master = self.master.pin_memory()
+        self.opt = torch.optim.AdamW([self.master], lr=lr, weight_decay=weight_decay)
+        self.steps = 0
+
+    def view(self, name, f):
+        o, shp = self.spans[(name, f)]
+        return self.flat[o:o + _numel(shp)].view(shp)
+
+    def params(self):
+        return {id(layer): (self.view(n, "A"), self.view(n, "B"), lora.scale)
+                for n, (layer, lora) in self.s.adapters.items()}
+
+    def grad_of(self, name):
+        g = self.flat.grad
+        if g is None:
+            return None
+        o, shp = self.spans[(name, "B")]
+        return g[o:o + _numel(shp)]
+
+    def reduce_grads(self):
+        """Sum the replicated factors' partial grads over TP (in place) ->
+        the global grad norm (identical on every rank)."""
+        g, grp = self.flat.grad, self.s.g
+        if g is None:
+            raise RuntimeError("step without gradients")
+        with torch.no_grad():
+            if grp.world_size > 1 and self.n_rep:
+                g[:self.n_rep] = grp.all_reduce(g[:self.n_rep].contiguous())
+            rep = g[:self.n_rep].float().square().sum()
+            shard = g[self.n_rep:].float().square().sum()
+            if grp.world_size > 1:
+                shard = grp.all_reduce(shard.reshape(1))[0]
+            return float((rep + shard).sqrt())
+
+    def step(self):
+        """Clip by the global grad norm, AdamW on the host, copy back.
+        Bit-identical on every rank for the replicated slice."""
+        norm = self.reduce_grads()
+        if not torch.isfinite(torch.tensor(norm)):
+            raise FloatingPointError(f"non-finite grad norm {norm}")
+        g = self.flat.grad
+        with torch.no_grad():
+            self.master.grad = g.float().cpu() * min(1.0, self.clip / (norm + 1e-6))
+            self.opt.step()
+            self.opt.zero_grad(set_to_none=True)
+            self.flat.grad = None
+            self.flat.copy_(self.master)
+        self.steps += 1
+        return norm
+
+    def tensors(self):
+        return {(n, f): self.view(n, f).detach() for (n, f) in self.spans}
+
+
+def _numel(shp):
+    n = 1
+    for d in shp:
+        n *= d
+    return n
+
+
+class WorkerSFT:
+    def __init__(self, model, vllm_config, cfg, group=None):
+        self.cfg, self.vllm_config = cfg, vllm_config
+        self.g = group if group is not None and group.world_size > 1 else SingleGroup()
+        self.lm, self.inner, self.head, self.lp = M.language_model(model)
+        M.check_supported(self.lm, vllm_config)
+        mc = getattr(vllm_config, "model_config", None)
+        self.mrope = bool(getattr(mc, "uses_mrope", False))
+        self.adapters = M.install_adapters(self.lm, cfg.targets, cfg.rank, cfg.alpha,
+                                           self.g.rank_in_group)
+        if not self.adapters:
+            raise RuntimeError(f"no linear matched {cfg.targets}")
+        first = next(iter(self.adapters.values()))[1]
+        self.device, self.dtype = first.A.device, first.A.dtype
+        self.run = None
+        # basename: the same weights staged at /models/x or s3://.../x match
+        self.model_id = os.path.basename(str(getattr(mc, "model", "?")).rstrip("/"))
+        self.fingerprint = hashlib.sha256(json.dumps(
+            dict(model=self.model_id, tp=self.g.world_size, rank=cfg.rank, alpha=cfg.alpha,
+                 shapes={n: [list(lo.A.shape), list(lo.B.shape)]
+                         for n, (_, lo) in self.adapters.items()}),
+            sort_keys=True).encode()).hexdigest()[:16]
+
+    # ------------------------------------------------------------------ ops
+    def info(self, _p=None):
+        n = sum(lo.A.numel() + lo.B.numel() for _, lo in self.adapters.values())
+        return dict(adapters=len(self.adapters), params=n * self.g.world_size, rank=self.cfg.rank,
+                    alpha=self.cfg.alpha, tp=self.g.world_size, fingerprint=self.fingerprint,
+                    model=self.model_id, targets=list(self.cfg.targets),
+                    run=self.run is not None)
+
+    def begin(self, p):
+        self.run = Run(self, float(p["lr"]), float(p.get("weight_decay", 0.0)),
+                       float(p.get("clip", 1.0)))
+        return dict(ok=True)
+
+    def _batch(self, p):
+        ids = torch.as_tensor(p["ids"], dtype=torch.long, device=self.device)
+        segs, rows, tgt = M.batch_rows(p["seg_lens"], p["mask"], self.device)
+        return ids, segs, rows, tgt
+
+    def micro(self, p):
+        if self.run is None:
+            raise RuntimeError("micro without begin")
+        self._mem_vote()
+        ids, segs, rows, tgt = self._batch(p)
+        if not tgt.numel():
+            raise ValueError("micro-batch without completion tokens")
+        with M.TrainMode(self, self.run.params(), segs, grad=True, offload=self.cfg.offload) as tm:
+            loss = tm.nll(ids, rows, tgt)
+            (loss / float(p["norm"])).backward()
+        out = dict(loss_sum=float(loss.detach()), tokens=int(tgt.numel()))
+        if p.get("check"):
+            bad = M.grad_reach(self.adapters, self.run.grad_of)
+            flag = torch.tensor([float(len(bad))], device=self.device)
+            if self.g.world_size > 1:
+                flag = self.g.all_reduce(flag)
+            if float(flag[0]):
+                raise RuntimeError(f"gradient does not reach {len(bad)} adapters (an op in the "
+                                   f"training forward has no autograd), e.g. {bad[:3]}")
+        return out
+
+    def step(self, _p=None):
+        return dict(grad_norm=self.run.step(), steps=self.run.steps)
+
+    def eval(self, p):
+        """Summed NLL with the LIVE adapters (what serving computes)."""
+        ids, segs, rows, tgt = self._batch(p)
+        live = {id(layer): (lo.A, lo.B, lo.scale) for layer, lo in self.adapters.values()}
+        with M.TrainMode(self, live, segs, grad=False) as tm:
+            loss = tm.nll(ids, rows, tgt)
+        return dict(loss_sum=float(loss), tokens=int(tgt.numel()))
+
+    def save(self, p):
+        """This rank's shard of the run (or the live adapters) as
+        <dir>/adapter-tp<r>-of-<n>.safetensors."""
+        from safetensors.torch import save_file
+        src = (self.run.tensors() if self.run is not None else
+               {(n, f): getattr(lo, f) for n, (_, lo) in self.adapters.items() for f in "AB"})
+        path = os.path.join(p["dir"], shard_name(self.g.rank_in_group, self.g.world_size))
+        tmp = path + ".pending"
+        save_file({f"{n}.{f}": t.detach().cpu().contiguous() for (n, f), t in src.items()}, tmp,
+                  metadata={"fingerprint": self.fingerprint})
+        os.replace(tmp, path)
+        return dict(file=os.path.basename(path), fingerprint=self.fingerprint)
+
+    def commit(self, _p=None):
+        """Trained values -> the live (served) adapters, in place."""
+        _sync()
+        with torch.no_grad():
+            for (n, f), t in self.run.tensors().items():
+                getattr(self.adapters[n][1], f).copy_(t)
+        self.abort()
+        return dict(ok=True)
+
+    def abort(self, _p=None):
+        self.run = None
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        return dict(ok=True)
+
+    def load(self, p):
+        from safetensors import safe_open
+        path = os.path.join(p["dir"], shard_name(self.g.rank_in_group, self.g.world_size))
+        with safe_open(path, framework="pt", device="cpu") as f:
+            if (f.metadata() or {}).get("fingerprint") != self.fingerprint:
+                raise ValueError(f"checkpoint fingerprint {(f.metadata() or {}).get('fingerprint')} "
+                                 f"!= served {self.fingerprint} (model / TP / rank / targets differ)")
+            want = {f"{n}.{x}" for n in self.adapters for x in "AB"}
+            if set(f.keys()) != want:
+                raise ValueError("checkpoint adapter names differ from the served model")
+            _sync()
+            with torch.no_grad():
+                for n, (_, lo) in self.adapters.items():
+                    lo.load_(f.get_tensor(f"{n}.A"), f.get_tensor(f"{n}.B"))
+        return dict(ok=True)
+
+    def reset(self, _p=None):
+        _sync()
+        for _, lo in self.adapters.values():
+            lo.zero_()
+        return dict(ok=True)
+
+    def _mem_vote(self):
+        """Uniform refusal (no rank enters a collective-heavy forward alone)
+        when any rank has less than min_free_gib free (driver free + cached)."""
+        ok = 1.0
+        if self.device.type == "cuda":
+            free, _ = torch.cuda.mem_get_info(self.device)
+            free += torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
+            ok = float(free >= self.cfg.min_free_gib * 2**30)
+        flag = torch.tensor([1.0 - ok], device=self.device)
+        if self.g.world_size > 1:
+            flag = self.g.all_reduce(flag)
+        if float(flag[0]):
+            raise MemoryError(f"less than {self.cfg.min_free_gib} GiB free VRAM on a rank")
+
+
+def _sync():
+    """An async-scheduled serving step may still be reading the adapters."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def shard_name(rank, world):
+    return f"adapter-tp{rank}-of-{world}.safetensors"
+
+
+OPS = ("info", "begin", "micro", "step", "eval", "save", "commit", "abort", "load", "reset")
+
+
+def rpc(op, payload=None):
+    """collective_rpc target (Worker.suffix_sft). Rank-uniform liveness vote
+    first, so a rank without SFT never leaves the others in a collective."""
+    group = SFT.g if SFT is not None else _tp_group()
+    ok = SFT is not None and op in OPS
+    if group is not None and group.world_size > 1:
+        dev = SFT.device if SFT is not None else torch.device("cuda", torch.cuda.current_device())
+        if float(group.all_reduce(torch.tensor([0.0 if ok else 1.0], device=dev))[0]):
+            return {"error": f"SFT unavailable on a TP rank ({INSTALL_ERROR if SFT is None else op})"}
+    if not ok:
+        return {"error": INSTALL_ERROR if SFT is None else f"unknown op {op}"}
+    t0 = time.perf_counter()
+    try:
+        out = getattr(SFT, op)(payload or {})
+    except Exception as exc:  # noqa: BLE001 - never raise into the engine
+        oom = isinstance(exc, (torch.OutOfMemoryError, MemoryError))
+        if op not in ("info", "eval", "save"):
+            SFT.abort()
+        _log(f"{op} failed: {type(exc).__name__}: {exc}\n{traceback.format_exc(limit=6)}")
+        return {"error": f"{type(exc).__name__}: {exc}", "oom": oom}
+    out["ms"] = round((time.perf_counter() - t0) * 1e3, 1)
+    return out
+
+
+def _tp_group():
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+        return get_tp_group()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def patch_worker(mod, cfg):
+    """Worker.load_model hook (adapters BEFORE compile / graph capture) and
+    the ``suffix_sft`` RPC method."""
+    import functools
+    W = mod.Worker
+    if getattr(W.load_model, "_suffix_sft", False):
+        return
+    orig = W.load_model
+
+    @functools.wraps(orig)
+    def load_model(self, *args, **kwargs):
+        out = orig(self, *args, **kwargs)
+        global SFT, INSTALL_ERROR
+        try:
+            SFT = WorkerSFT(self.get_model(), self.vllm_config, cfg, _tp_group())
+            info = SFT.info()
+            _log(f"installed: {info['adapters']} adapters, {info['params'] / 1e6:.1f}M params, "
+                 f"r={cfg.rank} tp={info['tp']} fingerprint={info['fingerprint']}")
+        except Exception as exc:  # noqa: BLE001 - optional feature, serving unaffected
+            SFT, INSTALL_ERROR = None, f"{type(exc).__name__}: {exc}"
+            _log(f"not installed (serving unaffected): {INSTALL_ERROR}")
+        return out
+
+    load_model._suffix_sft = True
+    W.load_model = load_model
+    W.suffix_sft = lambda self, op, payload=None: rpc(op, payload)

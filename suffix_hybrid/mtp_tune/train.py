@@ -71,6 +71,19 @@ class FrozenLinear(torch.autograd.Function):
         if not ctx.needs_input_grad[0]:
             return None, None
         k = ctx.k
+        w = dense_weight(ctx.layer, k)
+        if w is not None:   # plain float weight (bf16 head, unquantized): no probe
+            with torch.no_grad():
+                return dy @ w[:dy.shape[-1]].to(dy.dtype), None
+        rows = nvfp4_rows(ctx.layer, k)
+        if rows is not None and nvfp4_verified(ctx.layer, k, rows, dy.dtype):
+            n, step = dy.shape[-1], max(1, (1 << 24) // k)
+            dx = torch.zeros(*dy.shape[:-1], k, dtype=torch.float32, device=dy.device)
+            with torch.no_grad():
+                for r0 in range(0, n, step):
+                    r1 = min(n, r0 + step)
+                    dx += (dy[..., r0:r1] @ rows(r0, r1).to(dy.dtype)).float()
+            return dx.to(dy.dtype), None
         dx = dy.new_empty(*dy.shape[:-1], k)
         with torch.no_grad():
             for k0 in range(0, k, PROBE_CHUNK):
@@ -80,6 +93,66 @@ class FrozenLinear(torch.autograd.Function):
                 wt = base_apply(ctx.layer, eye)          # [c, N] = W_eff^T rows
                 dx[..., k0:k1] = dy @ wt.to(dy.dtype).T
         return dx, None
+
+
+def dense_weight(layer, k):
+    """The layer's weight when it is a plain float [>=N, K] matrix the GEMM
+    reads as is (unquantized linears, the bf16 lm_head our NVFP4 head keeps
+    resident); None for packed / quantized weights (-> probe)."""
+    w = getattr(layer, "weight", None)
+    qm = getattr(layer, "quant_method", None)
+    qm = getattr(type(qm), "_sft_base", type(qm)).__name__ if qm is not None else ""
+    if (w is None or w.dim() != 2 or not w.dtype.is_floating_point or w.element_size() < 2
+            or int(w.shape[1]) != k or not qm.startswith(("Unquantized", "SuffixNvFp4LMHead"))):
+        return None
+    return w
+
+
+def nvfp4_rows(layer, k):
+    """fn(r0, r1) -> effective weight rows [r1 - r0, K] f32 of a vLLM NVFP4
+    linear (packed e2m1 [N, K/2] low nibble = even k, 128x4-swizzled e4m3
+    block scales, y = alpha * deq(quant(x * input_global_scale_inv)) @
+    deq(w)^T -> W_eff = deq(w) * alpha * input_global_scale_inv); None when
+    the layer does not carry that layout. Trusted only after
+    ``nvfp4_verified`` (other backends repack, e.g. Marlin)."""
+    w, sf = getattr(layer, "weight", None), getattr(layer, "weight_scale", None)
+    alpha, gx = getattr(layer, "alpha", None), getattr(layer, "input_global_scale_inv", None)
+    n = getattr(layer, "output_size_per_partition", None)
+    if (w is None or sf is None or alpha is None or gx is None or n is None
+            or w.dtype != torch.uint8 or w.dim() != 2 or 2 * int(w.shape[1]) != k):
+        return None
+    from suffix_hybrid.kernels.nvfp4_gemm import E2M1, unswizzle_sf
+    sfu = unswizzle_sf(sf, int(n), k // 16)
+    lut = torch.tensor([*E2M1.tolist(), *(-E2M1).tolist()], dtype=torch.float32, device=w.device)
+    factor = float(alpha) * float(gx)
+
+    def rows(r0, r1):
+        p = w[r0:r1]
+        code = torch.stack([p & 15, p >> 4], -1).reshape(r1 - r0, k).int()
+        s = sfu[r0:r1].contiguous().view(torch.float8_e4m3fn).float()
+        return (lut[code].view(r1 - r0, k // 16, 16) * s[..., None]).reshape(r1 - r0, k) * factor
+    return rows
+
+
+_NVFP4_OK: dict = {}
+
+
+def nvfp4_verified(layer, k, rows, dtype, cols=64):
+    """Once per layer: dequantized W_eff[:, :cols] vs the probe through the
+    layer's own kernel. The probe's identity rows quantize with one uniform
+    e4m3 scale error (<= ~6 %); a wrong layout is uncorrelated (~100 %)."""
+    key = id(layer)
+    if key not in _NVFP4_OK:
+        c = min(k, cols)
+        with torch.no_grad():
+            eye = torch.zeros(c, k, dtype=dtype, device=layer.weight.device)
+            eye[:, :c].fill_diagonal_(1.0)
+            probe = base_apply(layer, eye).float()            # [c, N]
+            n = probe.shape[-1]
+            deq = torch.cat([rows(r0, min(n, r0 + 4096))[:, :c] for r0 in range(0, n, 4096)]).T
+            err = float((probe - deq).norm() / probe.norm().clamp_min(1e-30))
+        _NVFP4_OK[key] = err < 0.15
+    return _NVFP4_OK[key]
 
 
 def expert_weights(handle, e):

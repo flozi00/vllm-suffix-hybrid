@@ -29,6 +29,9 @@ PYTHONPATH. Each section is independently gated:
                                (inert otherwise, degrades on failure)
   SUFFIX_MTP_TUNE=1         -> online idle-time MTP draft-head LoRA tuning
                                (suffix_hybrid/mtp_tune/; logged refusal)
+  SUFFIX_SFT=1              -> in-place LoRA SFT of the served model + /v1/sft/*
+                               (suffix_hybrid/sft/; VLLM_PLUGINS must list
+                               suffix_sft; logged refusal)
   SUFFIX_PROFILE_STEPS=<N>:<skip>[:<per>] -> in-pod torch.profiler summary
                                ("[suffix-prof]" lines; fail-soft)
   SUFFIX_SAMPLER_WARMUP=0   -> disable the DEFAULT-ON boot JIT of the top-k/
@@ -310,6 +313,17 @@ if os.environ.get("SUFFIX_MTP_TUNE", "").strip() == "1":
         import sys
         print(f"[suffix mtp-tune] install failed (tuning off): {exc!r}",
               file=sys.stderr, flush=True)
+
+# In-place LoRA SFT of the served model (suffix_hybrid/sft/): GPU Worker hook
+# (adapters before compile / graph capture) + suffix_sft RPC; the HTTP routes
+# come from the suffix_sft endpoint plugin. Optional: failure = logged refusal.
+if os.environ.get("SUFFIX_SFT", "").strip() == "1":
+    try:
+        from suffix_hybrid.sft import install as _sft_install
+        _sft_install()
+    except Exception as exc:  # noqa: BLE001 - optional feature
+        import sys
+        print(f"[suffix sft] install failed (SFT off): {exc!r}", file=sys.stderr, flush=True)
 
 # GPU telemetry (suffix_hybrid/gpu_mon.py): SUFFIX_GPU_MON=<seconds> logs amdgpu hwmon
 # temps / power / clocks from one process per pod. Never fatal.
