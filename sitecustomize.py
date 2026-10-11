@@ -347,7 +347,9 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
                   "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG",
                   "SUFFIX_ROCM_QK_FUSED", "SUFFIX_ROCM_ACT_QUANT_FUSE",
-                  "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC")) or os.environ.get("SUFFIX_ROCM_HC_WQ", "").strip() not in ("", "0"):
+                  "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC")) or any(
+        os.environ.get(_g, "").strip() not in ("", "0")
+        for _g in ("SUFFIX_ROCM_HC_WQ", "SUFFIX_NVFP4_MOE_BACKEND")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
             and not all(os.environ.get(_g, "").strip() == "1"
                         for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
@@ -578,6 +580,10 @@ _BOOT_GATES = {
     # pinned host buffer, two-shot / one-shot vs NCCL at GLM token sizes, every rank bit-exact
     # vs the fp32 rank-order sum, graphed us, GPU<->host PCIe probes. Lines: [suffix har].
     "host_ar_bench": (["-m", "suffix_hybrid.host_ar", "bench"], {}),
+    # GLM-5.3 routed MoE per rank, one GPU, cold L2: EP8's busiest rank vs TP8 (no EP) at decode
+    # M 1..192 for FlashInfer CUTLASS, our NVFP4 kernel and FlashInfer b12x; numerics vs f64; the
+    # TP tune table. Lines: [suffix moe-tp].
+    "glm_moe_tp_bench": (["-m", "suffix_hybrid.tools.glm_moe_tp"], {}),
     # ROCm card facts: arch/CUs, AITER tuned-config coverage for this CU count,
     # HBM bandwidth, BF16 vs MXFP4 GEMM at the qwen3.8-flash TP1 decode shapes.
     "rocm_probe": (["-m", "suffix_hybrid.tools.rocm_probe"], {}),

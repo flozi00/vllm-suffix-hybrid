@@ -985,6 +985,21 @@ def arm():
     return _state
 
 
+def scope_backend(module) -> None:
+    """rocm_patches after-hook for SUFFIX_NVFP4_MOE_BACKEND=<moe_backend>: the compressed-tensors
+    NVFP4 MoE method selects that backend while --moe-backend stays auto elsewhere."""
+    import dataclasses
+
+    want, orig = os.environ["SUFFIX_NVFP4_MOE_BACKEND"].strip(), module.select_nvfp4_moe_backend
+
+    def select(config, *a, **kw):
+        if config.moe_backend == "auto":
+            config = dataclasses.replace(config, moe_backend=want)
+        return orig(config, *a, **kw)
+
+    module.select_nvfp4_moe_backend = select
+
+
 def summary() -> str:
     worst = max(_state["oracle"], default=0.0)
     return (f"NVFP4-MOE ACTIVE: {_state['layers_ours']} layers on our decode MoE, "
