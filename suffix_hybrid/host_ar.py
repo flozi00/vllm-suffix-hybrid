@@ -298,6 +298,42 @@ if triton is not None:
                                  _dequant8(qj, sj, G, BLOCK).to(out_ptr.dtype.element_ty), mask=m)
 
     @triton.jit
+    def _hag_kernel(x_ptr, out_ptr, data_ptr, flag_ptr, ctr_ptr, arr_ptr, n,
+                    RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
+                    FLAG_STRIDE: tl.constexpr, BLOCK: tl.constexpr, TIMEOUT: tl.constexpr,
+                    LEAN: tl.constexpr):
+        """All-gather of 16-bit words (any dtype viewed as int16): out[j * n:(j + 1) * n] =
+        rank j's x[:n]. Same slots, flags and epoch counter as the all-reduce."""
+        pid = tl.program_id(0)
+        step = tl.num_programs(0) * BLOCK
+        ar = tl.arange(0, BLOCK)
+        ctr0 = tl.load(ctr_ptr).to(tl.uint32)
+        nrounds = tl.cdiv(n, ROUND)
+        ctr_new = (ctr0 + nrounds.to(tl.uint32)).to(tl.int32)
+        for rnd in range(0, nrounds):
+            epoch = ctr0 + (rnd + 1).to(tl.uint32)
+            par = (epoch & 1).to(tl.int32)
+            base = rnd * ROUND
+            rn = tl.minimum(n - base, ROUND)
+            final = rnd == nrounds - 1
+            dat = data_ptr + par * (WORLD * ROUND)
+            for s in range(pid * BLOCK, rn, step):
+                o = s + ar
+                m = o < rn
+                v = tl.load(x_ptr + base + o, mask=m)
+                tl.store(dat + RANK * ROUND + o, v, mask=m, cache_modifier=".wt")
+                tl.store(out_ptr + RANK * n + base + o, v, mask=m)
+            _barrier(flag_ptr + par * (2 * WORLD * FLAG_STRIDE), arr_ptr, arr_ptr + 2, epoch,
+                     ctr_ptr, ctr_new, final, RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+            for j in tl.static_range(WORLD):
+                if j != RANK:
+                    for s in range(pid * BLOCK, rn, step):
+                        o = s + ar
+                        m = o < rn
+                        v = tl.load(dat + j * ROUND + o, mask=m, cache_modifier=".cv")
+                        tl.store(out_ptr + j * n + base + o, v, mask=m)
+
+    @triton.jit
     def _copy_kernel(src, dst, n, CV: tl.constexpr, WT: tl.constexpr, BLOCK: tl.constexpr):
         """Bandwidth probe: dst[:n] = src[:n] (host-mapped either side)."""
         for s in range(tl.program_id(0) * BLOCK, n, tl.num_programs(0) * BLOCK):
@@ -485,6 +521,24 @@ class HostAllReduce:
             num_warps=4)
         return out
 
+    def supports_gather(self, x) -> bool:
+        return (not self.disabled and x.is_cuda and x.is_contiguous()
+                and x.element_size() in (2, 4))
+
+    def all_gather_into(self, out, x) -> None:
+        """out (contiguous, world * x.numel() elements, x's dtype) = concat of every rank's x."""
+        import torch
+
+        xi = x.reshape(-1).view(torch.int16)
+        n = xi.numel()
+        if n == 0:
+            return
+        self.int16 = getattr(self, "int16", None) or _Ptr(self.data.addr, torch.int16)
+        _hag_kernel[(self.grid(n),)](
+            xi, out.view(-1).view(torch.int16), self.int16, self.flags, self.ctr, self.arr, n,
+            RANK=self.rank, WORLD=self.world, ROUND=self.round, FLAG_STRIDE=FLAG_STRIDE,
+            BLOCK=BLOCK, TIMEOUT=self.timeout, LEAN=self.lean, num_warps=4)
+
     def destroy(self) -> None:
         import torch
 
@@ -551,6 +605,7 @@ VARIANTS = (
     ("q8g32", {"q8_min_bytes": 0, "q8_group": 32}, (48, 192, 1024), (None,)),
 )
 STRESS_TOKENS = (1, 6, 48, 192)
+GATHER_ROWS = (1, 6, 32, 48, 192)  # GLM logits shards: rows x vocab / world bf16
 
 
 def _sysfacts() -> list[str]:
@@ -654,6 +709,20 @@ def _bench_worker(rank, world, port, q, hidden) -> None:
             del cbuf
             mm.close()
         nccl = PyNcclCommunicator(group=cpu, device=dev)
+        har = HostAllReduce(cpu, dev, timeout_spins=1 << 23)
+        out["gather"] = []
+        for rows in GATHER_ROWS:  # all-gather: exact bytes vs NCCL, graphed us
+            g = torch.Generator(device=dev).manual_seed(77 + rows * world + rank)
+            x = torch.randn(rows, 154880 // world, device=dev, generator=g).to(torch.bfloat16)
+            ref = torch.empty((world * rows, x.shape[1]), dtype=x.dtype, device=dev)
+            nccl.all_gather(ref, x)
+            got = torch.empty_like(ref)
+            har.all_gather_into(got, x)
+            torch.cuda.synchronize()
+            out["gather"].append({"rows": rows, "exact": bool(torch.equal(got, ref)),
+                                  "har_us": ns.graph_time_us(lambda: har.all_gather_into(got, x)),
+                                  "nccl_us": ns.graph_time_us(lambda: nccl.all_gather(ref, x))})
+        har.destroy()
         nccl_us = {}
         for vname, kw, toks, grids in VARIANTS:
             har = HostAllReduce(cpu, dev, timeout_spins=1 << 23, **kw)
@@ -752,11 +821,17 @@ def bench(hidden: int = 6144) -> int:
                            f"sum {sum(rr[k] for rr in rows):6.1f}" for k in ("write", "read", "h2h"))
         print(f"{MARK} bw {'thp' if row['huge'] else '4k '} {row['foot'] >> 20:3d} MiB/rank: {cells} GB/s "
               f"[{row['pmd']}]", flush=True)
+    for i, row in enumerate(res[0]["gather"]):
+        rows = [r["gather"][i] for r in res]
+        h, n_ = max(rr["har_us"] for rr in rows), max(rr["nccl_us"] for rr in rows)
+        print(f"{MARK} all-gather {row['rows']:4d} x {154880 // world} bf16/rank: host {h:8.1f} us | nccl "
+              f"{n_:8.1f} us ({n_ / h:4.2f}x) | exact {all(rr['exact'] for rr in rows)}", flush=True)
+    gather_ok = all(rr["exact"] for r in res for rr in r["gather"])
     stress = [all(r["stress"][i][2] for r in res) for i in range(len(res[0]["stress"]))]
     print(f"{MARK} stress (64 back-to-back calls, 4 rotating inputs, every output exact): "
           + ", ".join(f"{t}tok {'one' if one else 'two'} {ok}" for (t, one, _), ok in
                       zip(res[0]["stress"], stress)), flush=True)
-    ok = all(stress)
+    ok = all(stress) and gather_ok
     for i, row in enumerate(res[0]["rows"]):
         rows = [r["rows"][i] for r in res]
         cell = {k: max(rr[k] for rr in rows) for k in ("two_us", "one_us", "nccl_us") if k in row}

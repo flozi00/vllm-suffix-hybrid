@@ -107,6 +107,30 @@ def test_har_bands_tp_only_and_unsupported_dtypes_fall_through(monkeypatch):
     assert ep._suffix_pick is None and list(made) == ["har"]
 
 
+def test_host_all_gather_routes_tp_only(monkeypatch):
+    for k in (ns.ENV, ns.AUTOTUNE_ENV, ns.QAR_ENV, ns.BANDS_ENV, "NCCL_ALGO", "NCCL_PROTO"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv(ns.HAR_AG_ENV, "1")
+    assert "_suffix_hag" in ns.patch_all_gather(FIX.read_text())
+    made = {}
+
+    def make(spec, g, d):
+        comm = made.setdefault(spec, FakeComm(spec))
+        comm.supports_gather = lambda x: x.element_size() in (2, 4)
+        comm.all_gather_into = lambda out, x: out.copy_(x.repeat(8, *([1] * (x.dim() - 1))))
+        return comm
+
+    monkeypatch.setattr(ns, "make_comm", make)
+    mod = _fake_module()
+    mod.current_platform = types.SimpleNamespace(is_rocm=lambda: False)
+    mod.should_nccl_symm_mem_ag_rs = lambda: False
+    ns.apply(mod)
+    cc = mod.CudaCommunicator()
+    out = cc.all_gather(torch.arange(6, dtype=torch.bfloat16).view(2, 3), dim=-1)
+    assert out.shape == (2, 24) and list(made) == ["har"]
+    assert mod.CudaCommunicator(unique_name="ep:0")._suffix_hag is None
+
+
 def test_legacy_small_envs_are_one_inclusive_band(monkeypatch):
     for k in (ns.BANDS_ENV, ns.AUTOTUNE_ENV, ns.QAR_ENV, "NCCL_ALGO", "NCCL_PROTO", ns.BYTES_ENV):
         monkeypatch.delenv(k, raising=False)
