@@ -229,6 +229,8 @@ class State:
         self.status = {"state": "starting", "last_run": None, "checkpoint": None}
         self.info = None
         self.chat_template = None
+        # serving renders with --default-chat-template-kwargs; so must training
+        self.template_defaults = dict(getattr(args, "default_chat_template_kwargs", None) or {})
         if getattr(args, "chat_template", None):
             try:
                 from vllm.renderers.chat_utils import load_chat_template
@@ -326,8 +328,8 @@ class State:
         if not math.isfinite(lr) or not 0 < lr <= 1 or not math.isfinite(wd) or wd < 0:
             raise _http(400, "learning_rate must be in (0, 1], weight_decay >= 0")
         tok = await self.tokenizer()
-        data = [encode(tok, ex, req.get("chat_template_kwargs"), self.chat_template)
-                for ex in examples]
+        kw = dict(self.template_defaults, **(req.get("chat_template_kwargs") or {}))
+        data = [encode(tok, ex, kw, self.chat_template) for ex in examples]
         for i, (ids, _) in enumerate(data):
             if len(ids) > c.max_tokens:
                 raise _http(400, f"example {i} has {len(ids)} tokens > SUFFIX_SFT_MAX_TOKENS="
@@ -347,6 +349,7 @@ class State:
             stage = "training"
             await self.rpc("begin", dict(lr=lr, weight_decay=wd))
             losses, first, checked = [], None, False
+            mem = dict(train_peak_gib=0.0, min_free_gib=None, host_pinned_gib=None, max_micro_ms=0.0)
             for step, idx in enumerate(schedule(len(data), steps, bs, int(req.get("seed", 0)))):
                 batch = [data[i] for i in idx]
                 norm = sum(sum(m[1:]) for _, m in batch)
@@ -355,6 +358,11 @@ class State:
                     r = await self.rpc("micro", dict(mb, norm=norm, check=not checked))
                     checked = True
                     loss_sum += r["loss_sum"]
+                    mem["max_micro_ms"] = max(mem["max_micro_ms"], r["ms"])
+                    if "peak_gib" in r:
+                        mem["train_peak_gib"] = max(mem["train_peak_gib"], r["peak_gib"])
+                        mem["min_free_gib"] = min(mem["min_free_gib"] or 1e9, r["free_gib"])
+                        mem["host_pinned_gib"] = r.get("host_pinned_gib")
                     await self.yield_to_serving(r["ms"])
                 loss = loss_sum / norm
                 if not math.isfinite(loss):
@@ -362,7 +370,8 @@ class State:
                 r = await self.rpc("step")
                 first = loss if first is None else first
                 losses.append(loss)
-                self.status.update(step=step + 1, loss=round(loss, 5), grad_norm=r["grad_norm"])
+                self.status.update(step=step + 1, loss=round(loss, 5), grad_norm=r["grad_norm"],
+                                   memory=mem)
                 await self.yield_to_serving(r["ms"])
             stage = "checkpoint"
             run_dir.mkdir(parents=True)
@@ -385,7 +394,7 @@ class State:
             await self.rpc("commit")
             await self.reset_cache()
             post = await self.parity(*data[0])
-            result = dict(meta, parity_before=pre, parity_after=post, served=True,
+            result = dict(meta, parity_before=pre, parity_after=post, served=True, memory=mem,
                           commit_sha=getattr(commit, "oid", None),
                           commit_url=getattr(commit, "commit_url", None),
                           training_time=round(time.monotonic() - t0, 3))
