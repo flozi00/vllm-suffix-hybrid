@@ -86,6 +86,23 @@ def store(ptr, val, mask=None, **_):
     ptr.buf[off] = val.to(ptr.buf.dtype)
 
 
+def atomic_add(ptr, val, mask=None, sem=None, scope=None):
+    """Programs run one at a time: a plain read-modify-write returning the old value."""
+    off = _off(ptr)
+    _bounds(off.reshape(-1), ptr.buf.numel())
+    old = ptr.buf[off].clone()
+    ptr.buf[off] = old + val
+    return old
+
+
+def atomic_xchg(ptr, val, mask=None, sem=None, scope=None):
+    off = _off(ptr)
+    _bounds(off.reshape(-1), ptr.buf.numel())
+    old = ptr.buf[off].clone()
+    ptr.buf[off] = torch.as_tensor(val).to(ptr.buf.dtype)
+    return old
+
+
 def program_id(axis):
     return torch.tensor(_PID[0][axis], dtype=torch.int32)
 
@@ -316,7 +333,8 @@ def _modules():
                  "zeros_like", "where", "sum", "max", "min", "cumsum", "histogram", "minimum",
                  "maximum", "abs", "exp2", "reshape", "split", "join", "permute", "trans",
                  "expand_dims", "broadcast_to", "dot", "cast", "static_range", "debug_barrier",
-                 "multiple_of", "max_contiguous", "inline_asm_elementwise", "constexpr"):
+                 "multiple_of", "max_contiguous", "inline_asm_elementwise", "constexpr",
+                 "atomic_add", "atomic_xchg"):
         setattr(tl, name, globals()[name])
     tl.range = range_
     tl.float32, tl.float16, tl.bfloat16 = torch.float32, torch.float16, torch.bfloat16
@@ -326,6 +344,7 @@ def _modules():
     math.div_rn = div_rn
     tl.math = math
     libdevice.rint = rint
+    libdevice.tanh = lambda x: torch.tanh(torch.as_tensor(x))
     extra.libdevice = libdevice
     extra.cuda = cuda
     cuda.gdc_wait = lambda: None

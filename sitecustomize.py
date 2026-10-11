@@ -407,6 +407,14 @@ if os.environ.get("SUFFIX_HAR_L2_PREFETCH", "").strip() == "1":
     from suffix_hybrid.har_prefetch import install_post_import_hook as _l2pf_hook
     _l2pf_hook()
 
+# Our MoE router for GLM 5.3 (suffix_hybrid/kernels/glm_router.py): SUFFIX_ROUTER_OURS=
+# 1|auto|gemv (+ SUFFIX_ROUTER_OURS_MAX_M, default 192). Router GEMV (+ fused vLLM
+# single-group top-k) in one Triton kernel; fail-closed load oracle (bit-identical selection
+# vs ops.grouped_topk, GEMV vs fp64, graphs); TP-identical routes. Bench: glm_router_bench.
+if os.environ.get("SUFFIX_ROUTER_OURS", "").strip() not in ("", "0"):
+    from suffix_hybrid.kernels.glm_router import install_post_import_hook as _router_hook
+    _router_hook()
+
 if os.environ.get("SUFFIX_PROFILE_WORKER", "").strip():
     try:
         from suffix_hybrid.step_profiler import install_worker_hook
@@ -615,6 +623,10 @@ _BOOT_GATES = {
     # (SUFFIX_NVFP4_MOE_FUSE_SHARED), best tune each, numerics vs f64 / stock / the BF16 MLP,
     # fused tune table, per-step saving. Lines: [suffix moe-shared].
     "glm_moe_shared_bench": (["-m", "suffix_hybrid.tools.glm_moe_shared"], {}),
+    # GLM-5.3 MoE router (SUFFIX_ROUTER_OURS): vLLM's cuBLAS GateLinear + ops.grouped_topk vs
+    # our GEMV (+ fused selection) per M, cold L2, graphed; selection bit-identity, cuBLAS
+    # kernel names, other BF16 shapes vs cuBLAS. Lines: [suffix router-ours].
+    "glm_router_bench": (["-m", "suffix_hybrid.kernels.glm_router", "bench"], {}),
     # Our TP-sharded NVFP4 MoE in Triton (suffix_hybrid/kernels/nvfp4_moe_tp.py), GLM-5.3 TP8 shard,
     # one GPU, cold L2, CUDA graphs: oracle of every plan (f64 + oxide, graph replay), then us/layer
     # per M vs oxide (g10 table) and FlashInfer + % of the weight roofline + the paste-able
