@@ -38,4 +38,4 @@ def test_glm_preset_via_neutral_name():
     r = subprocess.run([sys.executable, "-c", "import os; print(os.environ.get('SUFFIX_NCCL_BANDS'), "
                         "os.environ.get('SUFFIX_SM120_NVP4DSMLA'))"], env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.split() == ["0-inf:har", "1"]
+    assert r.stdout.splitlines()[-1].split() == ["0-inf:har", "1"]  # boot oracles may print first
