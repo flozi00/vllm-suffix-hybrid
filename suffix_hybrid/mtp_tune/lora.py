@@ -202,7 +202,9 @@ def base_apply(layer, x):
     if isinstance(qm, _QuantProxy):
         qm = qm._inner
     if qm is not None:
-        return qm.apply(layer, x, None)
+        # suffix_hybrid.sft swaps the method's class; call the original apply
+        base = getattr(type(qm), "_sft_base", None)
+        return base.apply(qm, layer, x, None) if base is not None else qm.apply(layer, x, None)
     return torch.nn.functional.linear(x, layer.weight)
 
 

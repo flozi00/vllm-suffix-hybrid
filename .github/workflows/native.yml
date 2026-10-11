@@ -100,7 +100,7 @@ jobs:
           docker-options: -e CUDA_TOOLKIT_PATH=${{ github.workspace }}/.cuda13/nvidia/cu13
       - name: Exercise installed Linux wheel
         run: |
-          python -m pip install dist/*.whl numpy pytest safetensors pillow opencv-python-headless
+          python -m pip install dist/*.whl numpy pytest safetensors fastapi pillow opencv-python-headless
           python -m pip install torch==$TORCH_CPU_VERSION --index-url https://download.pytorch.org/whl/cpu
           # Helion interpret-mode CPU checks (tests/test_helion_*.py) must run,
           # not skip: helion imports without a GPU (no device probe at import).
