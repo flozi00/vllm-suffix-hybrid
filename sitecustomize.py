@@ -553,6 +553,10 @@ _BOOT_GATES = {
     # Same + nccl_qar int8/fp8 compressed all-reduce vs best NCCL per size.
     "allreduce_qar_bench": (["-m", "suffix_hybrid.tools.ar_bench", "--qar",
                              "--sizes-kib", "48"], {}),
+    # suffix_hybrid/host_ar.py (nccl_split spec "har"): bf16 all-reduce through one shared
+    # pinned host buffer, two-shot / one-shot vs NCCL at GLM token sizes, every rank bit-exact
+    # vs the fp32 rank-order sum, graphed us, GPU<->host PCIe probes. Lines: [suffix har].
+    "host_ar_bench": (["-m", "suffix_hybrid.host_ar", "bench"], {}),
     # ROCm card facts: arch/CUs, AITER tuned-config coverage for this CU count,
     # HBM bandwidth, BF16 vs MXFP4 GEMM at the qwen3.8-flash TP1 decode shapes.
     "rocm_probe": (["-m", "suffix_hybrid.tools.rocm_probe"], {}),

@@ -26,6 +26,10 @@ communicator) or "<NCCL_ALGO>[/<NCCL_PROTO>]", e.g. "allreduce:ring/Simple".
       (0.05: a candidate must beat default by 5 %), _CANDIDATES (comma list),
       _HIDDEN (else model config). Overrides _BANDS on the tp group. One
       "[suffix nccl-split] AUTOTUNE" line (rank 0) with table + bands.
+  Spec "har" (tp group only): suffix_hybrid/host_ar.py, bf16 all-reduce through one
+      shared pinned host buffer (two-shot; one-shot up to SUFFIX_HAR_ONESHOT_MAX_BYTES,
+      default 0); "har1" / "har2" force one-shot / two-shot. Other dtypes fall
+      through to the default communicator.
   SUFFIX_NCCL_QAR=int8|fp8 (tp group only, default off): bf16/fp16 all-reduces
       in [SUFFIX_NCCL_QAR_MIN_BYTES (4 MiB), SUFFIX_NCCL_QAR_MAX_BYTES (inf))
       go through suffix_hybrid/nccl_qar.py (LOSSY -- quality-gate first).
@@ -91,8 +95,11 @@ def fmt_size(n: int) -> str:
     return str(n)
 
 
+HAR_SPECS = ("har", "har1", "har2")
+
+
 def spec_env(spec: str) -> dict[str, str]:
-    if spec == "default":
+    if spec == "default" or spec in HAR_SPECS:
         return {}
     algo, _, proto = spec.partition("/")
     if not algo.strip():
@@ -133,7 +140,8 @@ def make_pick(routes, qar=None, qar_lo: int = 0, qar_hi: int = INF):
             return qar
         for lo, hi, comm in routes:
             if lo <= nbytes < hi:
-                return comm
+                ok = getattr(comm, "supports", None)
+                return comm if ok is None or ok(x) else default
         return default
     return pick
 
@@ -249,8 +257,45 @@ def time_us(fn, iters: int) -> float:
     return statistics.median(s.elapsed_time(e) * 1e3 for s, e in ev)
 
 
+def graph_time_us(fn, reps: int = 20, replays: int = 5) -> float:
+    """Median per-call us of `reps` back-to-back fn() calls captured in ONE CUDA graph: decode
+    all-reduces run graphed, so eager launch overhead must not decide a band."""
+    import statistics
+
+    import torch
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(reps):
+            fn()
+    torch.cuda.synchronize()
+    ts = []
+    for _ in range(replays):
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a.record()
+        g.replay()
+        b.record()
+        torch.cuda.synchronize()
+        ts.append(a.elapsed_time(b) * 1e3 / reps)
+    del g
+    return statistics.median(ts)
+
+
 def make_comm(spec: str, cpu_group, device):
-    """PyNcclCommunicator built while the spec's NCCL_ALGO/NCCL_PROTO are set."""
+    """PyNcclCommunicator built while the spec's NCCL_ALGO/NCCL_PROTO are set (or "har*")."""
+    if spec in HAR_SPECS:
+        from suffix_hybrid.host_ar import HostAllReduce
+
+        one = {"har1": INF, "har2": 0}.get(spec, parse_size(_env("SUFFIX_HAR_ONESHOT_MAX_BYTES", "0")))
+        return HostAllReduce(cpu_group, device, oneshot_max_bytes=one,
+                             max_blocks=int(_env("SUFFIX_HAR_BLOCKS", "64")))
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
     env = spec_env(spec)
@@ -287,7 +332,10 @@ def tune(cpu_group, device, default, sizes, candidates=CANDIDATES, budget_s=20.0
             raise RuntimeError("communicator disabled")
         ok = torch.equal(out, (x - rank % 3) * world + offs)
         del out
-        t = time_us(lambda: comm.all_reduce(x), iters if nbytes <= 8 << 20 else 3)
+        if nbytes <= 16 << 20:
+            t = graph_time_us(lambda: comm.all_reduce(x), reps=max(iters, 10))
+        else:
+            t = time_us(lambda: comm.all_reduce(x), 3)
         if not ok:  # after the timed calls: every rank issues the same collectives
             raise RuntimeError("wrong all-reduce result")
         return t
@@ -391,6 +439,8 @@ def setup(self, bands, autotune_on: bool, qar: str) -> None:
             tuned = True
         except Exception as exc:  # noqa: BLE001 - symmetric failures (OOM, bad env) degrade
             _say(f"AUTOTUNE FAILED on {self.unique_name} rank {self.rank}: {exc!r}; static bands")
+    if not tp:  # the host all-reduce owns one shared buffer per node: tp group only
+        bands = [(lo, hi, "default" if s in HAR_SPECS else s) for lo, hi, s in bands]
     if not tuned:
         for spec in sorted({s for *_, s in bands} - {"default"}):  # same order on every rank
             comms[spec] = make_comm(spec, self.cpu_group, self.device)

@@ -229,3 +229,9 @@ def test_owners_attribute_kernels_to_innermost_cpu_op():
     text = "\n".join(sp.summarize({"traceEvents": ev}))
     assert "__amd_rocclr_copyBuffer <- aten::copy_" in text
     assert "triton_poi_fused_0 <- -" in text
+
+
+def test_worker_buckets_map_request_counts_to_nearest_level():
+    from suffix_hybrid.step_profiler import nearest_bucket
+    assert [nearest_bucket(n, [1, 8, 32]) for n in (0, 1, 4, 5, 8, 19, 21, 31, 40)] == \
+        [1, 1, 1, 8, 8, 8, 32, 32, 32]

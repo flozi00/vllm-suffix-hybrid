@@ -84,6 +84,29 @@ def test_apply_routes_real_patched_all_reduce_by_bytes(monkeypatch):
     assert single._suffix_pick is None
 
 
+def test_har_bands_tp_only_and_unsupported_dtypes_fall_through(monkeypatch):
+    for k in (ns.ENV, ns.AUTOTUNE_ENV, ns.QAR_ENV, "NCCL_ALGO", "NCCL_PROTO"):
+        monkeypatch.delenv(k, raising=False)
+    assert ns.spec_env("har") == {} and ns.parse_bands("0-inf:har2")[0][2] == "har2"
+    monkeypatch.setenv(ns.BANDS_ENV, "0-64M:har")
+    made = {}
+
+    def make(spec, g, d):
+        comm = made.setdefault(spec, FakeComm(spec))
+        comm.supports = lambda x: x.dtype == torch.bfloat16
+        return comm
+
+    monkeypatch.setattr(ns, "make_comm", make)
+    mod = _fake_module()
+    ns.apply(mod)
+    cc = mod.CudaCommunicator()
+    cc.all_reduce(torch.ones(K, dtype=torch.bfloat16))
+    cc.all_reduce(torch.ones(K, dtype=torch.float32))  # not bf16 -> the default communicator
+    assert made["har"].calls == [2 * K] and cc.pynccl_comm.calls == [4 * K]
+    ep = mod.CudaCommunicator(unique_name="ep:0")  # one shared host buffer per node: tp only
+    assert ep._suffix_pick is None and list(made) == ["har"]
+
+
 def test_legacy_small_envs_are_one_inclusive_band(monkeypatch):
     for k in (ns.BANDS_ENV, ns.AUTOTUNE_ENV, ns.QAR_ENV, "NCCL_ALGO", "NCCL_PROTO", ns.BYTES_ENV):
         monkeypatch.delenv(k, raising=False)
@@ -305,6 +328,7 @@ def test_boot_gates_and_sitecustomize_arm_the_hook(tmp_path):
     exec(src[src.index("_BOOT_GATES = {"):src.index("\n_boot_gates = ")], g)
     assert g["_BOOT_GATES"]["allreduce_matrix_bench"][0][:3] == ["-m", "suffix_hybrid.tools.ar_bench", "--matrix"]
     assert "--qar" in g["_BOOT_GATES"]["allreduce_qar_bench"][0]
+    assert g["_BOOT_GATES"]["host_ar_bench"][0] == ["-m", "suffix_hybrid.host_ar", "bench"]
     env = {k: v for k, v in os.environ.items() if not k.startswith(("SUFFIX_", "NCCL_"))}
     env.update(PYTHONPATH=str(repo), SUFFIX_NCCL_AUTOTUNE="1")
     r = subprocess.run([sys.executable, "-c", "import sitecustomize, sys; "
