@@ -60,7 +60,12 @@ DEFAULT_TARGETS = (
 )
 FUSED_FLAGS = ("use_fused_qk_norm_rope_gate",)    # Qwen3NextAttention Triton fusion
 CE_BYTES = 256 << 20                              # fp32 logits per CE chunk
-GDN_HEAD_GROUP = 8                                # heads per checkpointed delta-rule group
+GDN_HEAD_GROUP = None       # heads per delta-rule backward group; None = from GDN_GROUP_BYTES
+GDN_GROUP_BYTES = 3 << 29   # ~1.5 GiB of fp32 intermediates (~8 KiB per head-token)
+
+
+def _heads_per_group(t, h):
+    return GDN_HEAD_GROUP or max(1, min(h, GDN_GROUP_BYTES // max(1, t * 8192)))
 
 _TRAIN = None   # the active TrainMode (only ever set inside an RPC)
 
@@ -234,8 +239,9 @@ class _FlaRule(torch.autograd.Function):
     def backward(ctx, do):
         ins = ctx.saved_tensors
         grads = [torch.zeros_like(t) for t in ins]
-        for h0 in range(0, ins[0].shape[1], GDN_HEAD_GROUP):
-            sl = slice(h0, h0 + GDN_HEAD_GROUP)
+        n = _heads_per_group(*ins[0].shape[:2])
+        for h0 in range(0, ins[0].shape[1], n):
+            sl = slice(h0, h0 + n)
             with torch.enable_grad():
                 part = [t[:, sl].detach().requires_grad_(True) for t in ins]
                 o = chunk_gated_delta_rule(*(x[None] for x in part))[0]
@@ -489,7 +495,7 @@ class TrainMode(contextlib.ContextDecorator):
             if not torch.is_grad_enabled():
                 return self.fla(q[None], k[None], v[None], g[None], beta[None])[0].to(v.dtype)
             return _FlaRule.apply(q, k, v, g, beta, self.fla)
-        heads = GDN_HEAD_GROUP
+        heads = _heads_per_group(*q.shape[:2])
         if not torch.is_grad_enabled() or q.shape[1] <= heads:
             return chunk_gated_delta_rule(q[None], k[None], v[None], g[None], beta[None])[0]
         outs = []
