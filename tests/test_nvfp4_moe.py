@@ -1440,3 +1440,18 @@ def test_fuse_shared_knobs(monkeypatch):
     assert nm.fuse_shared_on()
     with pytest.raises(ValueError):
         nm.shared_headroom()
+
+
+def test_load_time_helpers_ignore_vllms_bf16_default_dtype():
+    """vLLM loads under torch.set_default_dtype(bf16): the oracle inputs and the
+    per-expert global scales must stay fp32 (bf16 @ fp32 crashed a boot)."""
+    import torch
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        ids, tw = nm.rand_routing(6, 16, 4, "cpu", seed=1)
+        p = nm.make_problem(2, 64, 32, device="cpu")
+    finally:
+        torch.set_default_dtype(prev)
+    assert tw.dtype == torch.float32 and len(set(ids[0].tolist())) == 4
+    assert p["g1"].dtype == torch.float32
