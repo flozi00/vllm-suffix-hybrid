@@ -631,19 +631,34 @@ def test_host_launch_args_match_kernel_abi():
     assert "32 * nw, (k * 8 * 4) as u32" in HOST
 
 
+# nvfp4_moe's fused shared-expert additions (SUFFIX_NVFP4_MOE_FUSE_SHARED):
+# the only lines its route / combine kernels have beyond fp8_moe's copies
+_SHARED_LINES = (r"\n        nsh: u32,", r"\n        shared_e: u32,", r"\n        shared_slot!\(.*?\);",
+                 r"\n        if shared_e != NO_SHARED \{.*?\n        \}",
+                 r"\n            if kt > topk \{.*?\n            \}")
+
+
+def _routed_only(s: str) -> str:
+    for pat in _SHARED_LINES:
+        s = re.sub(pat, "", s, flags=re.S)
+    return s
+
+
 def test_route_and_combine_are_nvfp4s_verified_kernels():
     """moe_route / moe_combine / moe_fc2_combine's k-ascending sum and the
     route_cta macro are byte-identical to nvfp4_moe's (silicon-verified
-    there), so nm.route_twin is their spec here too."""
+    there) minus nvfp4's shared-slot lines, so nm.route_twin is their spec
+    here too."""
     nv = (ROOT / "kernels-oxide" / "nvfp4_moe" / "src" / "main.rs").read_text()
     body = lambda s, n: re.search(rf"pub unsafe fn {n}\(.*?\n    \}}\n", s, re.S).group(0)
-    for n in ("moe_route", "moe_combine"):
-        assert body(KSRC, n) == body(nv, n), n
+    for n, extra in (("moe_route", 2), ("moe_combine", 2)):
+        assert body(KSRC, n) == _routed_only(body(nv, n)), n
+        assert sum(len(re.findall(p, body(nv, n), re.S)) for p in _SHARED_LINES) == extra, n
     macro = lambda s: re.search(r"macro_rules! route_cta \{.*?\n\}\n", s, re.S).group(0)
     assert macro(KSRC) == macro(nv)
     tail = lambda s: re.search(r"        thread::sync_threads\(\);\n        if tid < 8 \{.*?\n    \}\n",
                                s[s.index("pub unsafe fn moe_fc2_combine("):], re.S).group(0)
-    assert tail(KSRC) == tail(nv)
+    assert tail(KSRC) == _routed_only(tail(nv)) != tail(nv)
 
 
 def test_first_forward_hook_decides_each_gated_family(monkeypatch):

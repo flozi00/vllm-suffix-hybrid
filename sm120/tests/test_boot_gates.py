@@ -170,3 +170,12 @@ def test_nvfp4_dense_oracle_gate_and_hook():
     assert (REPO / "sm120/fp8_dense_patch/nvfp4_oracle.py").is_file()
     i = src.find('os.environ.get("SUFFIX_NVFP4_DENSE"')
     assert i != -1 and i < src.index('if os.environ.get("SUFFIX_HYBRID_WRAP"')
+
+
+def test_glm_moe_shared_gate_is_allowlisted():
+    src = (REPO / "sitecustomize.py").read_text()
+    ns = {}
+    exec(src[src.index("_BOOT_GATES = {"):src.index("\n_boot_gates = ")], ns)
+    assert ns["_BOOT_GATES"]["glm_moe_shared_bench"] == (
+        ["-m", "suffix_hybrid.tools.glm_moe_shared"], {})
+    assert (REPO / "suffix_hybrid" / "tools" / "glm_moe_shared.py").is_file()

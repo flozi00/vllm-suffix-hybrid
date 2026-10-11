@@ -103,6 +103,23 @@ Decode-sized calls (1 <= M <= SUFFIX_NVFP4_MOE_MAX_M, default 32) run ours;
 everything else calls the parent unchanged. Gated on but no layer engaged ->
 startup error naming why.
 
+Fused shared expert (``SUFFIX_NVFP4_MOE_FUSE_SHARED=1``, needs the gate
+above; GLM-5.3 TP8: the BF16 shared MLP = 2 cuBLAS GEMMs + act + the
+runner's add per layer). vLLM's combine (fused_moe/runner/moe_runner.py
+forward): result = shared_out + fused_out * runner.routed_scaling_factor
+(runner rsf = 1.0 when the router already folded it into topk_weights:
+layer.py apply_routed_scale_to_output=False, the nightly DSA model), then
+the TP all-reduce of that sum. Our kernel runs the shared MLP as one more
+slot (kernel doc) quantized to NVFP4 W4A4 from its BF16 weights at load
+(``quant_shared``: [up; gate] rows like a routed expert, separate gate/up
+global scales, up pre-scaled by a power of two c so its intermediate sits
+inside the routed a2 range, g2 = 1/(c * a2 * gw2 * rsf)), weight 1 ->
+out = sum_k w_k E_k(x) + S(x) / rsf, the runner's rsf restores S. The
+runner stops running the shared MLP (its _shared_experts -> None, forward
+entry re-selected) and calls >max_m (prefill) add the module's own output
+here: shared + routed, stock's order. EP / gated / latent shared experts:
+not fused (reason logged). Fail-closed LAYER ORACLE at M 1/6/32/96.
+
 CLI (in-pod, SM120 + oxide bundle):
   python -m suffix_hybrid.kernels.nvfp4_moe oracle   # ours vs FlashInfer vs f64 ref, per stage
   python -m suffix_hybrid.kernels.nvfp4_moe bench    # us: ours vs FlashInfer (CUDA graphs)
@@ -111,6 +128,7 @@ CLI (in-pod, SM120 + oxide bundle):
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import zlib
@@ -126,9 +144,18 @@ LA_FULL = 255  # lookahead >= K/64: the whole weight row prefetched at CTA start
 # window above); `sweep` prints the measured table to paste into TUNE_ENV
 DEFAULT_TUNE = "8:fused3/255/255/0,256:front4/16/255/0"
 # kernel parameter counts the host op passes (a stale cubin fails closed)
-PARAMS = {"moe_route": 10, "moe_quant_rows": 8, "moe_fc1": 18, "moe_fc2": 14,
-          "moe_combine": 10, "moe_route_quant": 17, "moe_fc1_quant": 20,
-          "moe_fc2_combine": 16}
+PARAMS = {"moe_route": 11, "moe_quant_rows": 8, "moe_fc1": 25, "moe_fc2": 18,
+          "moe_combine": 11, "moe_route_quant": 18, "moe_fc1_quant": 27,
+          "moe_fc2_combine": 20}
+FUSE_SHARED_ENV = "SUFFIX_NVFP4_MOE_FUSE_SHARED"
+# log2 headroom of the shared intermediate below the routed one (quant_shared)
+HEADROOM_ENV = "SUFFIX_NVFP4_MOE_SHARED_HEADROOM"
+SHARED_ORACLE_MS = (1, 6, 32, 96)
+# NVFP4 W4A4 shared MLP vs its BF16 module (rel-l2, Gaussian probe): FP4
+# noise is 0.095 per element, 0.13 per W4A4 GEMM, 0.2-0.25 through the MLP
+# (2 GEMMs + h requant); a gate/up order, scale or layout bug is >= 0.8
+# (tests pin both). Same noise class as the checkpoint's NVFP4 routed experts.
+SHARED_TOL = 0.4
 MARKER = "[suffix nvfp4-moe]"
 FAMILY = "nvfp4_moe"
 ACT_CODE = {"silu": 0, "gelu_tanh": 1}
@@ -147,6 +174,7 @@ _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _MID = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 _state = {"armed": False, "instances": 0, "layers_ours": 0, "stock": {},
           "ws": {}, "checked": False, "hook": None, "oracle": [], "active_logged": False,
+          "shared_fused": 0, "shared_stock": {}, "in_oracle": False,
           # FP8 block layers (suffix_hybrid/kernels/fp8_moe.py, SUFFIX_FP8_MOE)
           # share this module's single OOT class; their own counters:
           "fp8": {"seen": 0, "ours": 0, "stock": {}, "oracle": []}}
@@ -171,6 +199,17 @@ def max_m() -> int:
 
 def fused_on() -> bool:
     return os.environ.get(FUSED_ENV, "1").strip() != "0"
+
+
+def fuse_shared_on() -> bool:
+    return os.environ.get(FUSE_SHARED_ENV, "").strip() == "1"
+
+
+def shared_headroom() -> int:
+    v = int(os.environ.get(HEADROOM_ENV, "4"))
+    if not 0 <= v <= 16:
+        raise ValueError(f"{HEADROOM_ENV}={v} outside [0, 16]")
+    return v
 
 
 def launch_mode(m: int, fused: bool = True) -> int:
@@ -365,10 +404,30 @@ def fc1_ref(p, x, ids, fi=False):
     return h
 
 
+def _one_w(w, w_sf):
+    """Dequantized f32 weight of ONE expert's tensors ([R, K/2] + flat
+    swizzled scales, e.g. the shared slot's), without 1/g_w."""
+    return _expert_w(w[None], w_sf.reshape(1, -1), 0)
+
+
+def shared_ref(p, x):
+    """f64 [M, H] of the shared slot (p["shared"], quant_shared): the
+    kernel's x quant, h = act(g1 * gate) * g1u * up, h quantized with the
+    layer's a2 gscale, y = g2 * (hq @ w2^T), weight 1 (rows P + t)."""
+    sp = p["shared"]
+    i = sp["w13"].shape[0] // 2
+    gu = qdq(x.float(), p["a1g"]).double() @ _one_w(sp["w13"], sp["w13_sf"]).double().T
+    h = act_ref(sp["g1"] * gu[:, i:], p["act"]) * (sp["g1u"] * gu[:, :i])
+    hd = qdq(h.float(), p["a2g"]).double()
+    return sp["g2"] * (hd @ _one_w(sp["w2"], sp["w2_sf"]).double().T)
+
+
 def moe_ref(p, x, ids, tw, fi=False):
     """Exact f64 [M, H] routed-experts output of the quantized problem: the
     NVFP4 spec with f64 arithmetic between the two FP4 quantizations (the
-    kernel keeps f32 there). fi=True: emulation of FlashInfer's numerics."""
+    kernel keeps f32 there). fi=True: emulation of FlashInfer's numerics.
+    A fused shared slot (p["shared"]) adds shared_ref after the routed k
+    (not with fi=True: FlashInfer only ever runs the routed experts)."""
     import torch
     m, topk = ids.shape
     e_count, hdim = p["w2"].shape[0], p["w2"].shape[1]
@@ -384,6 +443,8 @@ def moe_ref(p, x, ids, tw, fi=False):
     out = torch.zeros(m, hdim, dtype=torch.float64, device=x.device)
     for k in range(topk):  # the kernel's fixed k order
         out += y[:, k]
+    if p.get("shared") is not None and not fi:
+        out += shared_ref(p, x)
     return out
 
 
@@ -474,6 +535,72 @@ def rand_routing(m, e_count, topk, device, seed=0, base=0, local=None, dead=None
     return ids.to(device), tw.to(device)
 
 
+def shared_c(h_routed: float, h_shared: float, headroom: int) -> float:
+    """Power of two c for the shared slot's up rows: the shared intermediate
+    is quantized with the layer's a2 gscale, calibrated (real data) on the
+    routed experts' max. On one probe batch c * max|h_shared| lands
+    2^headroom below max over routed experts of max|h_e| — the probe's
+    amplitude cancels (h ~ x^2 for both), the headroom covers what the
+    probe cannot see (the shared expert sees every token's outliers). A
+    power of two: exact in the f32 alphas."""
+    if not (h_shared > 0 and h_routed > 0 and math.isfinite(h_shared * h_routed)):
+        return 1.0
+    return 2.0 ** min(30, max(-30, math.floor(math.log2(h_routed / h_shared)) - headroom))
+
+
+def probe_h_routed(p, x, chunk=16):
+    """max over routed experts of max|h_e(x)| (real units, f64 spec of the
+    NVFP4 weights, x unquantized), for shared_c. Chunked dequant on x's
+    device."""
+    import torch
+    e_count, two_i = p["w13"].shape[0], p["w13"].shape[1]
+    i = two_i // 2
+    xd = x.float()
+    best = 0.0
+    for e0 in range(0, e_count, chunk):
+        es = range(e0, min(e0 + chunk, e_count))
+        w = torch.stack([_expert_w(p["w13"], p["w13_sf"], e) for e in es])  # [c, 2I, H] * gw
+        g = (p["g1"][e0:e0 + len(es)].float() * p["a1g"])[:, None, None]
+        gu = g * torch.matmul(xd, w.transpose(1, 2))  # x . W (g1 * a1g = 1 / gw)
+        best = max(best, float((act_ref(gu[..., i:], p["act"]) * gu[..., :i]).abs().max()))
+    return best
+
+
+def quant_shared(w_gu, w_down, a1g: float, a2g: float, c: float, rsf: float = 1.0):
+    """BF16 shared MLP -> the kernel's NVFP4 shared slot. w_gu [2I, H] =
+    vLLM's merged [gate; up] (SiluAndMul: act(first half) * second half),
+    w_down [H, I]. Returns dict(w13 [2I, H/2] = [up; gate] codes (the FI
+    routed row order), w13_sf / w2_sf flat 128x4-swizzled e4m3, w2 [H, I/2],
+    f32-exact alphas g1 (gate) / g1u (up, carries c) / g2 (carries 1/c and
+    1/rsf), c). Each of gate / up / down gets its own global scale
+    gw = 2688 / amax (block max -> 448 * 6), so alpha = 1 / (gw * a_gscale)."""
+    import torch
+    i = w_gu.shape[0] // 2
+    f32 = lambda v: float(torch.tensor(v, dtype=torch.float32))  # noqa: E731
+    gw = lambda w: 2688.0 / max(float(w.abs().max()), 1e-30)  # noqa: E731
+    gate, up, down = w_gu[:i].float(), w_gu[i:].float(), w_down.float()
+    gwg, gwu, gw2 = gw(gate), gw(up), gw(down)
+    qu, su = quant_codes(up, gwu)
+    qg, sg = quant_codes(gate, gwg)
+    q2, s2 = quant_codes(down, gw2)
+    return dict(w13=torch.cat([qu, qg]).contiguous(), w13_sf=swizzle(torch.cat([su, sg])),
+                w2=q2, w2_sf=swizzle(s2), g1=f32(1.0 / (gwg * a1g)),
+                g1u=f32(c / (gwu * a1g)), g2=f32(1.0 / (c * a2g * gw2 * rsf)), c=c)
+
+
+def shared_args(sp) -> tuple:
+    """The host op's `shared=` tuple (src/nvfp4_moe_oxide.rs)."""
+    return (sp["w13"], sp["w13_sf"], sp["w2"], sp["w2_sf"], sp["g1"], sp["g1u"], sp["g2"])
+
+
+def add_shared(routed, shared, rsf: float):
+    """What vLLM's runner makes of (shared, routed) when the shared MLP runs
+    outside it: stock = shared + routed * rsf, so the routed tensor handed
+    back (the runner still applies rsf) is routed + shared / rsf; rsf 1 ->
+    exactly stock's bf16 `shared_output + fused_output`."""
+    return shared + routed if rsf == 1.0 else routed + shared * (1.0 / rsf)
+
+
 REF_TOL = 5e-3  # ours vs the f64 spec, end to end (see oracle_ok)
 STAGE_TOL = {"xq": 1e-3, "fc1": 1e-4, "hq": 1e-3, "fc2": 1e-4, "comb": 1e-3}
 
@@ -524,6 +651,8 @@ def stages(p, x, ids, tw, ws, out):
       hq    inter -> NVFP4 (a2 gscale)    frac differing vs quant of its inter
       fc2   g2 * tw * (hq @ w2^T)          rel vs f64 from the kernel's hq
       comb  bf16(sum_k y), fixed k order   frac differing
+    A fused shared slot (p["shared"]) adds its rows P + t to fc1 / hq / fc2
+    (max with the routed value) and its y row to comb, after the routed k.
     Tolerances STAGE_TOL: quant/combine are the same f32 ops as the spec
     (bit-exact expected, 1e-3 allows rare rounding ties); GEMM stages are
     f32 accumulation over K <= 6144 (~sqrt(K) * 2^-24 ~ 5e-6), 20x headroom.
@@ -571,6 +700,20 @@ def stages(p, x, ids, tw, ws, out):
     yk = yk.view(m, topk, hdim)
     for k in range(topk):  # the kernel's order, f32
         acc = torch.where(valid[:, k, None], acc + yk[:, k], acc)
+    sp = p.get("shared")
+    if sp is not None:  # rows P + t, read back like the routed pairs
+        rs = slice(pairs, pairs + m)
+        hs = inter[pairs * idim:(pairs + m) * idim].view(m, idim)
+        gu = xq.double() @ _one_w(sp["w13"], sp["w13_sf"]).double().T
+        hs_ref = act_ref(sp["g1"] * gu[:, idim:], p["act"]) * (sp["g1u"] * gu[:, :idim])
+        hds = dequant(hq[:(pairs + m) * idim // 2].view(pairs + m, -1)[rs],
+                      f8(hsf[:(pairs + m) * idim // 16].view(pairs + m, -1)[rs]))
+        ys = y[:(pairs + m) * hdim].view(pairs + m, hdim)[rs]
+        ys_ref = sp["g2"] * (hds.double() @ _one_w(sp["w2"], sp["w2_sf"]).double().T)
+        got["fc1"] = max(got["fc1"], _rel(hs, hs_ref))
+        got["hq"] = max(got["hq"], frac(hds, qdq(hs, p["a2g"])))
+        got["fc2"] = max(got["fc2"], _rel(ys, ys_ref))
+        acc = acc + ys
     got["comb"] = frac(out.float(), acc.bfloat16().float())
     ok = all(got[k] <= STAGE_TOL[k] for k in got)
     return ok, ("stages " + " ".join(f"{k}={v:.1e}" for k, v in got.items())
@@ -580,13 +723,14 @@ def stages(p, x, ids, tw, ws, out):
 # ---------------------------------------------------------------------------
 # native launch (shared by serving, oracle, bench)
 # ---------------------------------------------------------------------------
-def workspace(dev, m: int, topk: int, hdim: int, idim: int, e_count: int, ws=None):
+def workspace(dev, m: int, topk: int, hdim: int, idim: int, e_count: int, ws=None, ns: int = 0):
     """(aq, asf, inter, hq, hsf, y, route) sized for M tokens; grown, never
-    shrunk. Called at LOAD time only when serving."""
+    shrunk. Called at LOAD time only when serving. ns = 1: a fused shared
+    expert (M more rows after the P = M*topk pairs, one more route slot)."""
     import torch
-    p = m * topk
+    p = m * topk + ns * m
     need = (m * hdim // 2, m * hdim // 16, p * idim, p * idim // 2, p * idim // 16,
-            p * hdim, 3 * e_count + p)
+            p * hdim, 3 * (e_count + ns) + p)
     dts = (torch.uint8, torch.uint8, torch.float32, torch.uint8, torch.uint8,
            torch.float32, torch.int32)
     if ws is not None and all(t.numel() >= n for t, n in zip(ws, need)):
@@ -604,9 +748,11 @@ def run_ours(native, p, x, ids, tw, ws, stream, out=None, mode=None, tune=0):
         out = torch.empty(x.shape[0], p["w2"].shape[1], dtype=torch.bfloat16, device=x.device)
     if mode is None:
         mode, tune = tune_for(x.shape[0], p.get("tune"), p.get("fused", fused_on()))
+    kw = {} if p.get("shared") is None else {"shared": shared_args(p["shared"])}
     native.nvfp4_moe_cuda(x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"],
                           p["g2"], *ws, out, float(p["a1g"]), float(p["a2g"]),
-                          int(p["act"]), int(p.get("id_base", 0)), int(mode), int(tune), stream)
+                          int(p["act"]), int(p.get("id_base", 0)), int(mode), int(tune), stream,
+                          **kw)
     return out
 
 
@@ -614,24 +760,27 @@ def _vname(v) -> str:
     return PLANS[v] if isinstance(v, int) else f"{PLANS[v[0]]}+tune{v[1]:#x}"
 
 
-def run_plans(run, ws, lid, xq_len, hq_len, variants=(1, 2)):
+def run_plans(run, ws, lid, xq_len, hq_len, variants=(1, 2), extra: int = 0):
     """Runs every launch plan, legacy first, via run(mode) -> out, and
     checks `variants` (plans 1 and 2; nvfp4 adds (plan, tune) pairs) against
     the legacy plan BIT FOR BIT: out, the x
     quant (ws[0]/ws[1], xq_len = per-token lengths) and the h quant rows of
     every LOCAL pair (ws[3]/ws[4], hq_len = per-pair lengths; off-rank rows
-    are never written by the fused fc1). Order 0, 1, 2 leaves ws as
+    are never written by the fused fc1; `extra` = a fused shared slot's M
+    rows after the P pairs, compared too). Order 0, 1, 2 leaves ws as
     `stages` expects (every variant rewrites the same bytes when ok).
     Family-agnostic (fp8_moe uses it too). Returns (the last variant's out,
     ok, msg)."""
     import torch
     m, topk = lid.shape
+    rows = m * topk + extra
     vp = torch.nonzero(lid.reshape(-1) >= 0).reshape(-1)
+    vp = torch.cat([vp, torch.arange(m * topk, rows, device=vp.device)])
     u8 = lambda t: t.contiguous().reshape(-1).view(torch.uint8)
 
     def snap(out):
         xs = [u8(ws[i][:m * n]).clone() for i, n in zip((0, 1), xq_len)]
-        hs = [u8(ws[i][:m * topk * n].view(m * topk, n)[vp]).clone() for i, n in zip((3, 4), hq_len)]
+        hs = [u8(ws[i][:rows * n].view(rows, n)[vp]).clone() for i, n in zip((3, 4), hq_len)]
         return [u8(out).clone()] + xs + hs
 
     ref = snap(run(0))
@@ -660,7 +809,7 @@ def plans_nvfp4(native, p, x, ids, tw, ws, stream):
     run = lambda v: run_ours(native, p, x, ids, tw, ws, stream, mode=v if isinstance(v, int)
                              else v[0], tune=0 if isinstance(v, int) else v[1])
     return run_plans(run, ws, lid, (hdim // 2, hdim // 16), (idim // 2, idim // 16),
-                     variants=[1, 2] + tuned)
+                     variants=[1, 2] + tuned, extra=x.shape[0] if p.get("shared") else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +852,60 @@ def eligibility(info: dict) -> str | None:
     return None
 
 
+def shared_eligibility(s: dict) -> str | None:
+    """Why a layer on our kernel cannot fuse its shared expert, or None.
+    Pure (plain values from _sfx_shared_info) so the CPU tests pin every
+    branch."""
+    if not s.get("runner"):
+        return "no MoERunner for the layer (vLLM runner layout changed)"
+    if not s.get("shared"):
+        return "no shared expert"
+    if s.get("shared_gate"):
+        return "gated shared expert (shared_expert_gate)"
+    if s.get("transform"):
+        return "latent MoE (routed input/output transform)"
+    if s.get("ep") != 1:
+        return f"expert parallel (ep={s.get('ep')}): the shared expert is TP-sharded, the routed are not"
+    if s.get("sp"):
+        return "sequence-parallel MoE"
+    if s.get("reduced"):
+        return "routed output reduced inside the kernel"
+    if not s.get("mlp"):
+        return "shared expert is not gate_up_proj -> SiluAndMul -> down_proj"
+    if s.get("wdtype") != "torch.bfloat16":
+        return f"shared expert weights {s.get('wdtype')} (BF16 unquantized only)"
+    if s.get("bias"):
+        return "shared expert biases"
+    if s.get("reduce_results"):
+        return "shared down_proj all-reduces by itself"
+    if s.get("routed_act") != "silu":
+        return f"routed activation {s.get('routed_act')} != the shared SiluAndMul"
+    if (s.get("I"), s.get("H")) != (s.get("routed_I"), s.get("routed_H")):
+        return (f"shared I/H {s.get('I')}/{s.get('H')} != routed per-rank "
+                f"{s.get('routed_I')}/{s.get('routed_H')}")
+    if not s.get("rsf", 0) > 0:
+        return f"routed_scaling_factor {s.get('rsf')}"
+    return None
+
+
+def _hook_runner(runner_cls, layer_cls) -> None:
+    """MoERunner.__init__ post-hook: our routed-experts layer keeps a weak
+    reference to its runner (the shared MLP and the combine live there)."""
+    import weakref
+    orig = runner_cls.__init__
+    if getattr(orig, "_sfx_hooked", False):
+        return
+
+    def init(self, *a, **kw):
+        orig(self, *a, **kw)
+        layer = getattr(self, "routed_experts", None)
+        if isinstance(layer, layer_cls):
+            layer._sfx_runner = weakref.ref(self)
+
+    init._sfx_hooked = True
+    runner_cls.__init__ = init
+
+
 def _make_layer_cls():
     import torch
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -719,6 +922,7 @@ def _make_layer_cls():
             super().__init__(*args, **kwargs)
             _state["instances"] += 1
             self._sfx_moe = None
+            self._sfx_runner = None  # weakref, set by _hook_runner (fused shared expert)
             qm = self.quant_method
             orig = qm.process_weights_after_loading
 
@@ -806,6 +1010,123 @@ def _make_layer_cls():
             self._sfx_moe = cfg
             _state["oracle"].append(self._sfx_oracle(cfg, info))
             _state["layers_ours"] += 1
+            if fuse_shared_on():
+                self._sfx_fuse_shared(cfg, info)
+
+        def _sfx_shared_info(self, runner, info):
+            """(plain facts for shared_eligibility, the shared MLP or None)."""
+            s = dict(runner=runner is not None, ep=info.get("ep"), routed_act=info.get("act"),
+                     routed_I=info.get("I"), routed_H=info.get("H"))
+            mlp = getattr(getattr(runner, "_shared_experts", None), "_layer", None)
+            s["shared"] = mlp is not None
+            if mlp is None:
+                return s, None
+            mc = runner.moe_config
+            s.update(shared_gate=getattr(runner, "shared_expert_gate", None) is not None,
+                     transform=(getattr(runner, "routed_input_transform", None) is not None
+                                or getattr(runner, "routed_output_transform", None) is not None),
+                     sp=bool(getattr(mc, "is_sequence_parallel", False)),
+                     reduced=bool(runner._fused_output_is_reduced),
+                     rsf=float(runner.routed_scaling_factor))
+            gu, dn = getattr(mlp, "gate_up_proj", None), getattr(mlp, "down_proj", None)
+            w1, w2 = getattr(gu, "weight", None), getattr(dn, "weight", None)
+            s["mlp"] = (type(getattr(mlp, "act_fn", None)).__name__ == "SiluAndMul"
+                        and w1 is not None and w2 is not None and w1.dim() == w2.dim() == 2
+                        and tuple(w2.shape) == (w1.shape[1], w1.shape[0] // 2))
+            if not s["mlp"]:
+                return s, None
+            plain = all(type(getattr(m, "quant_method", None)).__name__ == "UnquantizedLinearMethod"
+                        for m in (gu, dn))
+            s.update(wdtype=str(w1.dtype) if plain and w1.dtype == w2.dtype else "quantized",
+                     bias=getattr(gu, "bias", None) is not None or getattr(dn, "bias", None) is not None,
+                     reduce_results=bool(getattr(dn, "reduce_results", False)),
+                     I=w1.shape[0] // 2, H=w1.shape[1])
+            return s, mlp
+
+        def _sfx_fuse_shared(self, cfg, info):
+            """SUFFIX_NVFP4_MOE_FUSE_SHARED: the runner's shared MLP becomes our
+            kernel's shared slot (module doc), after its LAYER ORACLE."""
+            runner = self._sfx_runner() if self._sfx_runner is not None else None
+            s, mlp = self._sfx_shared_info(runner, info)
+            why = shared_eligibility(s)
+            if why is not None:
+                _state["shared_stock"][why] = _state["shared_stock"].get(why, 0) + 1
+                _log(f"layer {self.layer_name}: shared expert stays on vLLM's path: {why}")
+                return
+            dev, i = self.w13_weight.device, info["I"]
+            w_gu, w_dn = mlp.gate_up_proj.weight, mlp.down_proj.weight
+            seed = zlib.crc32(str(self.layer_name).encode()) % 10007
+            gen = torch.Generator(device="cpu").manual_seed(seed)
+            amax = 2688.0 / cfg["a1g"]  # calibrated activation range (as _sfx_oracle)
+            xp = (torch.randn(256, info["H"], generator=gen) * (amax / 4.5)).to(
+                dev, torch.bfloat16).float()
+            gu = xp @ w_gu.float().T  # vLLM's merged [gate; up]
+            h_sh = float((act_ref(gu[:, :i], cfg["act"]) * gu[:, i:]).abs().max())
+            h_r = probe_h_routed(cfg, xp)
+            c = shared_c(h_r, h_sh, shared_headroom())
+            cfg["shared"] = quant_shared(w_gu, w_dn, cfg["a1g"], cfg["a2g"], c, s["rsf"])
+            _state["ws"][dev] = workspace(dev, cfg["max_m"], cfg["topk"], info["H"], i, info["E"],
+                                          _state["ws"].get(dev), ns=1)
+            # the oracle calls the shared MLP module: not the first forward
+            _state["in_oracle"] = True
+            try:
+                self._sfx_shared_oracle(cfg, info, mlp, s["rsf"], seed,
+                                        f"c=2^{int(math.log2(c))} probe max|h| routed={h_r:.4g} "
+                                        f"(x{h_r * cfg['a2g'] / 2688.0:.3g} of the a2 calibration) "
+                                        f"shared={h_sh:.4g}")
+            finally:
+                _state["in_oracle"] = False
+            # from here vLLM's runner no longer runs the shared MLP: our
+            # kernel (decode M) or forward_modular (any other M) adds it
+            cfg.update(shared_mod=mlp, shared_rsf=s["rsf"])
+            runner._shared_experts = None  # keeps the _modules key (None): safe mid named_modules()
+            runner._forward_entry = runner._select_forward()
+            _state["shared_fused"] += 1
+
+        def _sfx_shared_oracle(self, cfg, info, mlp, rsf, seed, note):
+            """Fused layer, on its real weights: ours (every plan, bitwise incl.
+            the shared rows; per-stage readback incl. them) vs the f64 spec with
+            the NVFP4 shared slot at M in SHARED_ORACLE_MS (REF_TOL); the slot
+            vs its BF16 module (SHARED_TOL, probe scaled to <= 1/4 of the e4m3
+            block-scale range so no block saturates); vs vLLM's stock layer
+            output, FlashInfer routed + the BF16 MLP (SHARED_TOL). Fatal."""
+            dev = self.w13_weight.device
+            stream = torch.cuda.current_stream(dev).cuda_stream
+            base, local, hdim = cfg["id_base"], info["E"], info["H"]
+            amax = 2688.0 / cfg["a1g"]
+            sp, i = cfg["shared"], info["I"]
+            gen = torch.Generator(device="cpu").manual_seed(seed + 1)
+            xb = torch.randn(64, hdim, generator=gen).to(dev) * (amax / 4.5)
+            gu = xb @ mlp.gate_up_proj.weight.float().T
+            sf_max = sp["c"] * float((act_ref(gu[:, :i], cfg["act"]) * gu[:, i:]).abs().max()) \
+                * cfg["a2g"] / 6.0
+            xb = (xb * min(1.0, (112.0 / max(sf_max, 1e-30)) ** 0.5)).bfloat16()
+            r_sh = _rel(shared_ref(cfg, xb) * rsf, mlp(xb.clone()).double())
+            worst_ref, worst_stock, last = 0.0, 0.0, ""
+            for m in [m for m in SHARED_ORACLE_MS if m <= cfg["max_m"]]:
+                gen = torch.Generator(device="cpu").manual_seed(seed + 100 + m)
+                x = (torch.randn(m, hdim, generator=gen) * (amax / 4.5)).to(dev, torch.bfloat16)
+                ids, tw = rand_routing(m, cfg["E_global"], cfg["topk"], dev, seed + m, base, local)
+                out, pl_ok, pl = plans_nvfp4(native, cfg, x.clone(), ids, tw, _state["ws"][dev],
+                                             stream)
+                lid = to_local(ids, base, local)
+                st_ok, st = stages(cfg, x, lid, tw, _state["ws"][dev], out)
+                fi = super().forward_modular(x.clone(), tw.clone(), ids.clone())
+                stock = add_shared(fi, mlp(x.clone()), rsf).float()
+                r_ref = _rel(out.float(), moe_ref(cfg, x, lid, tw))
+                r_stock = _rel(out.float(), stock)
+                worst_ref, worst_stock = max(worst_ref, r_ref), max(worst_stock, r_stock)
+                last = (f"M={m} rel_vs_ref={r_ref:.2e} rel_vs_stock={r_stock:.2e} "
+                        f"shared_rel_vs_bf16={r_sh:.2e} {st} {pl}")
+                if not (r_ref <= REF_TOL and r_stock <= SHARED_TOL and r_sh <= SHARED_TOL
+                        and st_ok and pl_ok and bool(torch.isfinite(out.float()).all())):
+                    raise RuntimeError(
+                        f"{MARKER} SHARED LAYER ORACLE FAIL {self.layer_name} {last} {note} — "
+                        f"refusing to serve with {FUSE_SHARED_ENV}=1")
+            torch.cuda.synchronize(dev)
+            _log(f"SHARED LAYER ORACLE PASS {self.layer_name} I={i} rsf={rsf:g} {note} "
+                 f"shared_rel_vs_bf16={r_sh:.2e} max_rel_vs_ref={worst_ref:.2e} "
+                 f"max_rel_vs_stock={worst_stock:.2e} (last {last})")
 
         def _sfx_run(self, cfg, x, topk_weights, topk_ids):
             if cfg.get("kind") == "fp8":
@@ -875,13 +1196,17 @@ def _make_layer_cls():
         def forward_modular(self, x, topk_weights, topk_ids, shared_experts=None,
                             shared_experts_input=None):
             # shared_experts: never run by a non-overlapping MK (eligibility
-            # rejects mk_shared_overlap) -> MoERunner already ran them.
+            # rejects mk_shared_overlap) -> MoERunner already ran them; a fused
+            # layer's runner has none: our kernel's slot runs it, else here.
             cfg = self._sfx_moe
             if (cfg is None or x.dim() != 2
                     or not 1 <= x.shape[0] <= cfg["max_m"] or x.dtype != torch.bfloat16
                     or x.shape[1] != cfg["H"]):
-                return super().forward_modular(x, topk_weights, topk_ids,
-                                               shared_experts, shared_experts_input)
+                out = super().forward_modular(x, topk_weights, topk_ids,
+                                              shared_experts, shared_experts_input)
+                if cfg is not None and cfg.get("shared_mod") is not None:
+                    out = add_shared(out, cfg["shared_mod"](x), cfg["shared_rsf"])
+                return out
             if cfg.get("kind") != "fp8" and not _state["active_logged"]:
                 _state["active_logged"] = True
                 _log(summary())
@@ -909,11 +1234,14 @@ def _first_forward_check(module, args):
     """Global forward pre-hook (PyTorch API): at the first module call after
     weight processing, fail startup if a gated family engaged no layer."""
     from suffix_hybrid.kernels import fp8_moe
-    if _state["checked"]:
+    if _state["checked"] or _state["in_oracle"]:
         return
     errs = []
     if gate_on():
         errs.append(verdict(_state["instances"], _state["layers_ours"], _state["stock"]))
+        if fuse_shared_on() and _state["layers_ours"] and not _state["shared_fused"]:
+            why = "; ".join(f"{k} x{v}" for k, v in sorted(_state["shared_stock"].items()))
+            errs.append(f"{MARKER} {FUSE_SHARED_ENV}=1 but no shared expert fused: {why or '-'}")
     if fp8_moe.gate_on():
         f = _state["fp8"]
         errs.append(fp8_moe.verdict(f["seen"], f["ours"], f["stock"]))
@@ -936,6 +1264,10 @@ def _first_forward_check(module, args):
             stock = "; ".join(f"{k} x{v}" for k, v in sorted(stk.items())) or "-"
             _log(f"{name} SELECTION: {ours} RoutedExperts layers on our decode kernel "
                  f"(M<={mm()}), stock: {stock}")
+    if gate_on() and fuse_shared_on():
+        stock = "; ".join(f"{k} x{v}" for k, v in sorted(_state["shared_stock"].items())) or "-"
+        _log(f"SHARED SELECTION: {_state['shared_fused']} shared experts fused into our kernel, "
+             f"stock: {stock}")
 
 
 def register():
@@ -977,11 +1309,18 @@ def arm():
                     + (f" tune {format_tune(tune_table())}" if fam == FAMILY else ""))
     cls = _make_layer_cls()
     RoutedExperts.register_oot(cls, name="RoutedExperts")
+    if gate_on() and fuse_shared_on():
+        try:
+            from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+        except ImportError as exc:
+            raise RuntimeError(f"{FUSE_SHARED_ENV}=1: this vLLM has no MoERunner ({exc})") from exc
+        _hook_runner(MoERunner, cls)
     _state["hook"] = torch.nn.modules.module.register_module_forward_pre_hook(
         _first_forward_check)
     _state["armed"] = True
     _log(f"MOE armed ({', '.join(f[0] for f in fams)}): RoutedExperts -> SuffixRoutedExperts "
-         f"({'; '.join(shas)}; else vLLM's MoE path)")
+         f"({'; '.join(shas)}; else vLLM's MoE path)"
+         + (f"; {FUSE_SHARED_ENV}=1: shared experts fused" if gate_on() and fuse_shared_on() else ""))
     return _state
 
 

@@ -14,6 +14,11 @@
 //! mask (launch i of the plan is skipped when bit 24+i is set: the sweep's
 //! per-launch timing only; serving never sets it). Every tune value is
 //! bit-identical to tune 0: prefetches are hints, the loads are unchanged.
+//! `shared` (optional): the layer's shared expert as one more always-active
+//! slot after the routed ones (kernel doc: rows P + t, weight 1, summed
+//! after the routed k) — (w13 [2I, H/2], w13_sf, w2 [H, I/2], w2_sf, g1
+//! gate alpha, g1 up alpha, g2 alpha), same NVFP4 layouts as one routed
+//! expert, separate tensors (the routed [E, ..] ones stay vLLM's).
 //! Oracle/bench + vLLM wiring: suffix_hybrid/kernels/nvfp4_moe.py.
 
 use crate::oxide::{function, launch, Arg};
@@ -22,6 +27,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
 pub const FAMILY: &str = "nvfp4_moe";
+/// `shared_e` of a call without a shared expert (kernel NO_SHARED).
+const NO_SHARED: u32 = 0xFFFF_FFFF;
 
 pub(crate) struct T {
     pub(crate) ptr: u64,
@@ -109,9 +116,11 @@ pub(crate) fn need(
 /// topk_ids are GLOBAL ids, pairs outside [id_base, id_base + E) contribute
 /// nothing on this rank (vLLM all-reduces the partial outputs afterwards).
 /// mode: launch plan (module doc); ws_inter is written only by mode 0,
-/// ws_y only by modes 0 and 1. tune: module doc.
+/// ws_y only by modes 0 and 1. tune: module doc. shared: module doc; it
+/// adds M rows to ws_inter / ws_hq / ws_hsf / ws_y (P + M) and one slot to
+/// ws_route (3 * (E + 1) + P + M).
 #[pyfunction]
-#[pyo3(signature = (x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter, ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, id_base, mode, tune, stream_ptr))]
+#[pyo3(signature = (x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter, ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, id_base, mode, tune, stream_ptr, shared=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn nvfp4_moe_cuda<'py>(
     py: Python<'py>,
@@ -139,6 +148,7 @@ pub fn nvfp4_moe_cuda<'py>(
     mode: u32,
     tune: u32,
     stream_ptr: usize,
+    shared: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<()> {
     if mode > 2 {
         return Err(PyValueError::new_err(format!("mode {mode} not in 0..=2")));
@@ -164,6 +174,9 @@ pub fn nvfp4_moe_cuda<'py>(
     let y = info("ws_y", ws_y)?;
     let route = info("ws_route", ws_route)?;
     let out = info("out", out)?;
+    #[allow(clippy::type_complexity)]
+    let shared: Option<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>, f32, f32, f32)> =
+        shared.map(|s| s.extract()).transpose()?;
     if x.shape.len() != 2 || ids.shape.len() != 2 || w13.shape.len() != 3 || w2.shape.len() != 3 {
         return Err(PyValueError::new_err("x/topk_ids 2-D, w13/w2 3-D required"));
     }
@@ -175,6 +188,9 @@ pub fn nvfp4_moe_cuda<'py>(
     if m == 0 {
         return Ok(());
     }
+    // shared expert: one more slot (es) and M more rows (pp) after the P routed pairs
+    let ns = usize::from(shared.is_some());
+    let (nsh, pp, es) = (m * ns, p + m * ns, e + ns);
     // I % 32: moe_fc1_quant's CTA = 32 cols of I = two whole NVFP4 blocks
     if e > 256 || h % 64 != 0 || i % 64 != 0 || k == 0 {
         return Err(PyValueError::new_err(format!(
@@ -217,13 +233,42 @@ pub fn nvfp4_moe_cuda<'py>(
     }
     need("g1", &g1, &["torch.float32"], Some(&[e]), 0)?;
     need("g2", &g2, &["torch.float32"], Some(&[e]), 0)?;
+    let sh = match &shared {
+        None => None,
+        Some((s13, s13s, s2, s2s, g1s, g1us, g2s)) => {
+            let (s13, s13s) = (info("shared w13", s13)?, info("shared w13_sf", s13s)?);
+            let (s2, s2s) = (info("shared w2", s2)?, info("shared w2_sf", s2s)?);
+            need("shared w13", &s13, &["torch.uint8"], Some(&[2 * i, h / 2]), 0)?;
+            need("shared w2", &s2, &["torch.uint8"], Some(&[h, i / 2]), 0)?;
+            for (nm, t, n) in [("shared w13_sf", &s13s, r13 * c13), ("shared w2_sf", &s2s, r2 * c2)] {
+                need(nm, t, &["torch.float8_e4m3fn", "torch.uint8"], None, n)?;
+                if t.shape.iter().product::<usize>() != n {
+                    return Err(PyValueError::new_err(format!(
+                        "{nm}: not one expert's padded swizzled scales ({n} B)"
+                    )));
+                }
+            }
+            for (nm, t) in [("shared w13", &s13), ("shared w13_sf", &s13s), ("shared w2", &s2),
+                            ("shared w2_sf", &s2s)] {
+                if t.device != x.device {
+                    return Err(PyValueError::new_err(format!("{nm} on another device")));
+                }
+            }
+            Some((s13.ptr, s13s.ptr, s2.ptr, s2s.ptr, *g1s, *g1us, *g2s))
+        }
+    };
+    // (shared_e, w13, w13_sf, w2, w2_sf, g1, g1u, g2): the kernels' shared args
+    let (she, s13p, s13sp, s2p, s2sp, g1s, g1us, g2s) = match sh {
+        Some((a, b, c, d, gg, gu, g2v)) => (e as u32, a, b, c, d, gg, gu, g2v),
+        None => (NO_SHARED, 0, 0, 0, 0, 0.0, 0.0, 0.0),
+    };
     need("ws_aq", &aq, &["torch.uint8"], None, m * h / 2)?;
     need("ws_asf", &asf, &["torch.uint8"], None, m * h / 16)?;
-    need("ws_inter", &inter, &["torch.float32"], None, p * i)?;
-    need("ws_hq", &hq, &["torch.uint8"], None, p * i / 2)?;
-    need("ws_hsf", &hsf, &["torch.uint8"], None, p * i / 16)?;
-    need("ws_y", &y, &["torch.float32"], None, p * h)?;
-    need("ws_route", &route, &["torch.int32"], None, 3 * e + p)?;
+    need("ws_inter", &inter, &["torch.float32"], None, pp * i)?;
+    need("ws_hq", &hq, &["torch.uint8"], None, pp * i / 2)?;
+    need("ws_hsf", &hsf, &["torch.uint8"], None, pp * i / 16)?;
+    need("ws_y", &y, &["torch.float32"], None, pp * h)?;
+    need("ws_route", &route, &["torch.int32"], None, 3 * es + pp)?;
     need("out", &out, &["torch.bfloat16"], Some(&[m, h]), 0)?;
     for (nm, t) in [
         ("topk_ids", &ids),
@@ -253,10 +298,11 @@ pub fn nvfp4_moe_cuda<'py>(
     if route_par_smem > crate::oxide::MAX_DYN_SMEM as usize {
         return Err(PyValueError::new_err(format!("M*topk={p} pairs exceed the route smem")));
     }
-    let slots = e.min(p);
+    let slots = e.min(p); // routed; the shared slot is slots (grids: gslots)
+    let gslots = slots + ns;
     let r = route.ptr;
     let (slot_expert, slot_off, slot_cnt, pair_list) =
-        (r, r + 4 * e as u64, r + 8 * e as u64, r + 12 * e as u64);
+        (r, r + 4 * es as u64, r + 8 * es as u64, r + 12 * es as u64);
     let u = |v: usize| Arg::U32(v as u32);
     let route_args = [
         Arg::Ptr(ids.ptr),
@@ -269,6 +315,7 @@ pub fn nvfp4_moe_cuda<'py>(
         Arg::Ptr(slot_off),
         Arg::Ptr(slot_cnt),
         Arg::Ptr(pair_list),
+        u(nsh),
     ];
     let qx_args = [
         Arg::Ptr(x.ptr),
@@ -299,13 +346,20 @@ pub fn nvfp4_moe_cuda<'py>(
         Arg::U32(pf2),
         Arg::Ptr(w2.ptr),
         Arg::Ptr(w2s.ptr),
+        Arg::U32(she),
+        Arg::Ptr(s13p),
+        Arg::Ptr(s13sp),
+        Arg::F32(g1s),
+        Arg::F32(g1us),
+        Arg::Ptr(s2p),
+        Arg::Ptr(s2sp),
     ];
     let qh_args = [
         Arg::Ptr(inter.ptr),
         Arg::U32(1),
         Arg::Ptr(hq.ptr),
         Arg::Ptr(hsf.ptr),
-        u(p),
+        u(pp),
         u(i),
         u(i),
         Arg::F32(a2_gscale),
@@ -325,6 +379,10 @@ pub fn nvfp4_moe_cuda<'py>(
         u(h),
         u(i),
         Arg::U32(la2),
+        Arg::U32(she),
+        Arg::Ptr(s2p),
+        Arg::Ptr(s2sp),
+        Arg::F32(g2s),
     ];
     let comb_args = [
         Arg::Ptr(out.ptr),
@@ -337,6 +395,7 @@ pub fn nvfp4_moe_cuda<'py>(
         u(h),
         u(e),
         u(out.stride[0]),
+        Arg::U32(she),
     ];
     // fused launch plan (modes 1, 2)
     let rq_args = [
@@ -357,6 +416,7 @@ pub fn nvfp4_moe_cuda<'py>(
         u(h),
         u(x.stride[0]),
         Arg::F32(a1_gscale),
+        u(nsh),
     ];
     let fq_args = [
         Arg::Ptr(hq.ptr),
@@ -379,6 +439,13 @@ pub fn nvfp4_moe_cuda<'py>(
         Arg::U32(pf2),
         Arg::Ptr(w2.ptr),
         Arg::Ptr(w2s.ptr),
+        Arg::U32(she),
+        Arg::Ptr(s13p),
+        Arg::Ptr(s13sp),
+        Arg::F32(g1s),
+        Arg::F32(g1us),
+        Arg::Ptr(s2p),
+        Arg::Ptr(s2sp),
     ];
     let fc_args = [
         Arg::Ptr(out.ptr),
@@ -397,6 +464,10 @@ pub fn nvfp4_moe_cuda<'py>(
         u(e),
         u(out.stride[0]),
         Arg::U32(la2),
+        Arg::U32(she),
+        Arg::Ptr(s2p),
+        Arg::Ptr(s2sp),
+        Arg::F32(g2s),
     ];
     let route_smem = (2 * e * 4) as u32;
     let mm = m as u32;
@@ -404,18 +475,18 @@ pub fn nvfp4_moe_cuda<'py>(
     let legacy: [(&str, (u32, u32), u32, u32, &[Arg]); 6] = [
         ("moe_route", (1, 1), 256, route_smem, &route_args),
         ("moe_quant_rows", ((h / 16).div_ceil(128) as u32, mm), 128, 0, &qx_args),
-        ("moe_fc1", ((i / 32) as u32, slots as u32), 128, 0, &fc1_args),
-        ("moe_quant_rows", ((i / 16).div_ceil(128) as u32, p as u32), 128, 0, &qh_args),
-        ("moe_fc2", ((h / 32) as u32, slots as u32), 128, 0, &fc2_args),
+        ("moe_fc1", ((i / 32) as u32, gslots as u32), 128, 0, &fc1_args),
+        ("moe_quant_rows", ((i / 16).div_ceil(128) as u32, pp as u32), 128, 0, &qh_args),
+        ("moe_fc2", ((h / 32) as u32, gslots as u32), 128, 0, &fc2_args),
         ("moe_combine", ((m * h).div_ceil(256) as u32, 1), 256, 0, &comb_args),
     ];
     let front: [(&str, (u32, u32), u32, u32, &[Arg]); 2] = [
         ("moe_route_quant", (1 + (m * h / 16).div_ceil(256) as u32, 1), 256, route_par_smem as u32, &rq_args),
-        ("moe_fc1_quant", ((i / 32) as u32, slots as u32), 128, 16 * 32 * 4, &fq_args),
+        ("moe_fc1_quant", ((i / 32) as u32, gslots as u32), 128, 16 * 32 * 4, &fq_args),
     ];
     let tail: Vec<(&str, (u32, u32), u32, u32, &[Arg])> = if mode == 2 {
-        let nw = k.min(16) as u32;
-        vec![("moe_fc2_combine", ((h / 8) as u32, mm), 32 * nw, (k * 8 * 4) as u32, &fc_args)]
+        let nw = (k + ns).min(16) as u32;
+        vec![("moe_fc2_combine", ((h / 8) as u32, mm), 32 * nw, ((k + ns) * 8 * 4) as u32, &fc_args)]
     } else {
         legacy[4..].to_vec()
     };
