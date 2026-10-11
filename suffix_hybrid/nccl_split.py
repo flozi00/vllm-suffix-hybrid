@@ -31,6 +31,8 @@ communicator) or "<NCCL_ALGO>[/<NCCL_PROTO>]", e.g. "allreduce:ring/Simple".
       default 0); "har1" / "har2" force one-shot / two-shot. Other dtypes fall
       through to the default communicator. SUFFIX_HAR_Q8_MIN_BYTES (default inf):
       two-shot messages from this size use int8 transport (LOSSY, quality-gate first).
+      SUFFIX_HAR_ALLGATHER=1 (tp group): all-gathers of 2/4-byte tensors (the vocab
+      logits) go through the same host buffer (exact bytes).
   SUFFIX_NCCL_QAR=int8|fp8 (tp group only, default off): bf16/fp16 all-reduces
       in [SUFFIX_NCCL_QAR_MIN_BYTES (4 MiB), SUFFIX_NCCL_QAR_MAX_BYTES (inf))
       go through suffix_hybrid/nccl_qar.py (LOSSY -- quality-gate first).
@@ -64,6 +66,15 @@ NEW = ("        assert pynccl_comm is not None\n"
        "        if _pick is not None:\n"
        "            pynccl_comm = _pick(input_, pynccl_comm)\n"
        "        out = pynccl_comm.all_reduce(input_)\n")
+
+
+OLD_AG = "        pynccl_comm.all_gather(output_tensor, input_.contiguous())\n"
+NEW_AG = (f"        _hag = getattr(self, '_suffix_hag', None)  # {TAG}\n"
+          "        if _hag is not None and _hag.supports_gather(input_):\n"
+          "            _hag.all_gather_into(output_tensor, input_.contiguous())\n"
+          "        else:\n"
+          "            pynccl_comm.all_gather(output_tensor, input_.contiguous())\n")
+HAR_AG_ENV = "SUFFIX_HAR_ALLGATHER"
 
 
 class PatchDriftError(RuntimeError):
@@ -388,23 +399,35 @@ def config():
     return bands, autotune_on, qar
 
 
-def patch_all_reduce(src: str) -> str:
-    """CudaCommunicator.all_reduce source with the size route (dedented)."""
+def _patch_method(src: str, name: str, old: str, new: str) -> str:
+    """CudaCommunicator.<name> source with one anchor rewritten (dedented)."""
     import ast
     import textwrap
 
     cls = next((n for n in ast.parse(src).body if isinstance(n, ast.ClassDef)
                 and n.name == "CudaCommunicator"), None)
     fn = next((n for n in (cls.body if cls else []) if isinstance(n, ast.FunctionDef)
-               and n.name == "all_reduce"), None)
+               and n.name == name), None)
     if fn is None:
-        raise PatchDriftError("CudaCommunicator.all_reduce missing")
+        raise PatchDriftError(f"CudaCommunicator.{name} missing")
     body = "".join(src.splitlines(keepends=True)[fn.lineno - 1:fn.end_lineno])
-    if body.count(OLD) != 1:
-        raise PatchDriftError(f"all_reduce anchor: expected 1, found {body.count(OLD)}")
-    out = textwrap.dedent(body.replace(OLD, NEW))
+    if body.count(old) != 1:
+        raise PatchDriftError(f"{name} anchor: expected 1, found {body.count(old)}")
+    out = textwrap.dedent(body.replace(old, new))
     compile(out, f"<{TAG}>", "exec")
     return out
+
+
+def patch_all_reduce(src: str) -> str:
+    """CudaCommunicator.all_reduce source with the size route (dedented)."""
+    return _patch_method(src, "all_reduce", OLD, NEW)
+
+
+def patch_all_gather(src: str) -> str:
+    """CudaCommunicator.all_gather source routing through the host all-gather (dedented).
+    Compiled outside the class body: zero-argument super() has no __class__ cell there."""
+    return _patch_method(src, "all_gather", OLD_AG, NEW_AG).replace(
+        "super().", "super(CudaCommunicator, self).")
 
 
 def _autotune_group(self):
@@ -456,6 +479,11 @@ def setup(self, bands, autotune_on: bool, qar: str) -> None:
         qar_hi = parse_size(_env("SUFFIX_NCCL_QAR_MAX_BYTES", "inf"))
     if routes or qar_obj is not None:
         self._suffix_pick = make_pick(routes, qar_obj, qar_lo, qar_hi)
+    self._suffix_hag = None
+    if tp and _env(HAR_AG_ENV) == "1":
+        self._suffix_hag = next((c for sp, c in comms.items() if sp in HAR_SPECS), None)
+        if self._suffix_hag is None:
+            comms["har"] = self._suffix_hag = make_comm("har", self.cpu_group, self.device)
     if self.rank == 0:
         _say(f"{self.unique_name}: bands={bands_str(bands) or '-'} "
              f"qar={f'{qar}[{fmt_size(qar_lo)},{fmt_size(qar_hi)})' if qar_obj else 'off'} "
@@ -464,14 +492,17 @@ def setup(self, bands, autotune_on: bool, qar: str) -> None:
 
 def apply(module) -> None:
     bands, autotune_on, qar = config()
-    if not (bands or autotune_on or qar):
+    if not (bands or autotune_on or qar or _env(HAR_AG_ENV) == "1"):
         return
     import __future__
     import linecache
     from pathlib import Path
 
     path = Path(module.__file__)
-    src = patch_all_reduce(path.read_text())
+    text = path.read_text()
+    src = patch_all_reduce(text)
+    if _env(HAR_AG_ENV) == "1":
+        src += "\n\n" + patch_all_gather(text)
     fname = f"{path}.{TAG.replace(' ', '-')}.py"
     linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)
     ns: dict = {}
@@ -486,14 +517,17 @@ def apply(module) -> None:
 
     ns["all_reduce"].__qualname__ = "CudaCommunicator.all_reduce"
     cls.all_reduce = ns["all_reduce"]
+    if "all_gather" in ns:
+        ns["all_gather"].__qualname__ = "CudaCommunicator.all_gather"
+        cls.all_gather = ns["all_gather"]
     cls.__init__ = __init__
     _say(f"ACTIVE: static bands={bands_str(bands) or '-'} autotune={'tp' if autotune_on else 'off'} "
-         f"qar={qar or 'off'}")
+         f"qar={qar or 'off'} host-all-gather={'on' if 'all_gather' in ns else 'off'}")
 
 
 def install_post_import_hook() -> None:
     """sitecustomize entry; fail closed (SystemExit) on drift/bad config while enabled."""
-    if not any(_env(k) for k in (ENV, BANDS_ENV, AUTOTUNE_ENV, QAR_ENV)):
+    if not any(_env(k) for k in (ENV, BANDS_ENV, AUTOTUNE_ENV, QAR_ENV, HAR_AG_ENV)):
         return
 
     def run(module):
