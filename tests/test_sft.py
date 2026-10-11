@@ -37,6 +37,7 @@ from suffix_hybrid.sft import model as M
 from suffix_hybrid.sft import worker as W
 
 H, NH, NKV, D, I = 32, 4, 2, 8, 48
+NE, TOPK, IE = 4, 2, 16          # routed experts (EP-sharded), top-k, expert intermediate
 HK, HV, DK, DV, CK = 2, 4, 8, 8, 4
 V, VPAD = 60, 64
 REF = {"on": False, "params": {}}     # oracle mode: plain autograd everywhere
@@ -79,7 +80,7 @@ class Lin(nn.Module):
                 y = y + (x @ p[0]) @ p[1] * p[2]
         else:
             y = self.quant_method.apply(self, x, None)
-        if self.tp_size > 1 and hasattr(self, "input_is_parallel"):
+        if self.tp_size > 1 and hasattr(self, "input_is_parallel") and self.reduce_results:
             y = self.group.all_reduce(y)
         return y, None
 
@@ -269,6 +270,52 @@ class Mlp(nn.Module):
         return self.down_proj(self.act(self.gate_up_proj(x)[0]))[0]
 
 
+class RoutedExperts(nn.Module):
+    """vLLM RoutedExperts surface: float w13 [E_local, 2I, H] ([gate; up]),
+    w2 [E_local, H, I], top_k, renormalize, expert_map (EP)."""
+
+    def __init__(self, w13, w2, emap):
+        super().__init__()
+        self.w13_weight = nn.Parameter(w13.clone(), requires_grad=False)
+        self.w2_weight = nn.Parameter(w2.clone(), requires_grad=False)
+        self.top_k, self.renormalize = TOPK, True
+        self.expert_map = emap
+
+
+class MoEBlock(nn.Module):
+    """Qwen3Next sparse MoE block surface: gate, experts.routed_experts,
+    shared_expert (TP-partial down), shared_expert_gate; one all-reduce."""
+
+    def __init__(self, ws, group):
+        super().__init__()
+        self.group = group
+        self.gate = Lin(ws["router"])
+        self.experts = nn.Module()
+        self.experts.routed_experts = RoutedExperts(ws["w13"], ws["w2"], ws["emap"])
+        self.shared_expert = nn.Module()
+        self.shared_expert.gate_up_proj = Lin(ws["gu"], group=group, kind="col")
+        self.shared_expert.act_fn = SiluAndMul()
+        self.shared_expert.down_proj = Lin(ws["down"], group=group, kind="row")
+        self.shared_expert.down_proj.reduce_results = False
+        self.shared_expert_gate = Lin(ws["sgate"])
+
+    def forward(self, x):
+        if not REF["on"]:
+            raise RuntimeError("fused MoE runner called in training")
+        re_ = self.experts.routed_experts
+        tw, ids = torch.softmax(self.gate(x)[0].float(), -1).topk(TOPK, -1)
+        tw = tw / tw.sum(-1, keepdim=True)
+        out = torch.zeros_like(x)
+        for t in range(x.shape[0]):
+            for j in range(TOPK):
+                e = int(ids[t, j])
+                gu = re_.w13_weight[e] @ x[t]
+                out[t] = out[t] + tw[t, j] * (re_.w2_weight[e] @ (F.silu(gu[:IE]) * gu[IE:]))
+        se = self.shared_expert
+        sd = se.down_proj(se.act_fn(se.gate_up_proj(x)[0]))[0]
+        return out + torch.sigmoid(self.shared_expert_gate(x)[0]) * sd
+
+
 class Layer(nn.Module):
     def __init__(self, kind, ws, group, g, idx):
         super().__init__()
@@ -280,7 +327,7 @@ class Layer(nn.Module):
             self.self_attn = AttnBlock(ws, group, f"model.layers.{idx}.self_attn.attn",
                                        sliding=5 if idx == 0 else None,
                                        target="model.layers.0.self_attn.attn" if kind == "shared" else None)
-        self.mlp = Mlp(ws, group)
+        self.mlp = MoEBlock(ws["moe"], group) if kind == "gdn" else Mlp(ws, group)
 
     def forward(self, positions, hidden_states, residual):
         if residual is None:
@@ -352,7 +399,9 @@ def full_weights(seed=3):
             qkv=r((NH + 2 * NKV) * D, H), q=r(NH * D, H), o=r(H, NH * D),
             qkvz=r(2 * HK * DK + 2 * HV * DV, H), ba=r(2 * HV, H), conv=r(2 * HK * DK + HV * DV, CK, sc=0.5),
             A_log=r(HV, sc=0.5), dt_bias=r(HV, sc=0.5), out=r(H, HV * DV),
-            gu=r(2 * I, H), down=r(H, I)))
+            gu=r(2 * I, H), down=r(H, I),
+            moe=dict(router=r(NE, H, sc=1.0), w13=r(NE, 2 * IE, H, sc=0.3), w2=r(NE, H, IE, sc=0.3),
+                     gu=r(2 * I, H), down=r(H, I), sgate=r(1, H))))
     head = r(VPAD, H)
     head[V:] = 0
     return dict(emb=r(VPAD, H, sc=1.0), head=head, layers=layers)
@@ -383,8 +432,20 @@ def shard(ws, rank, world):
             qkv=L["qkv"][qkv], qkv_idx=qkv, q=L["q"][qi], q_idx=qi, o=L["o"][:, qi], o_idx=qi,
             qkvz=L["qkvz"][qkvz], qkvz_idx=qkvz, ba=L["ba"][ba], ba_idx=ba, conv=L["conv"][conv],
             A_log=L["A_log"][hv], dt_bias=L["dt_bias"][hv], out=L["out"][:, vo], out_idx=vo,
-            gu=L["gu"][gu], gu_idx=gu, down=L["down"][:, gi], down_idx=gi))
+            gu=L["gu"][gu], gu_idx=gu, down=L["down"][:, gi], down_idx=gi,
+            moe=_shard_moe(L["moe"], rank, world, gu, gi)))
     return out
+
+
+def _shard_moe(mw, rank, world, gu, gi):
+    per = NE // world
+    emap = None
+    if world > 1:
+        emap = torch.full((NE,), -1, dtype=torch.long)
+        emap[rank * per:(rank + 1) * per] = torch.arange(per)
+    return dict(router=mw["router"], sgate=mw["sgate"], emap=emap,
+                w13=mw["w13"][rank * per:(rank + 1) * per], w2=mw["w2"][rank * per:(rank + 1) * per],
+                gu=mw["gu"][gu], gu_idx=gu, down=mw["down"][:, gi], down_idx=gi)
 
 
 def build(rank=0, world=1, group=None, seed=3):
@@ -396,6 +457,9 @@ def build(rank=0, world=1, group=None, seed=3):
         if layer.kind == "gdn":
             mods.update({"linear_attn.in_proj_qkvz": "qkvz", "linear_attn.in_proj_ba": "ba",
                          "linear_attn.out_proj": "out"})
+            del mods["mlp.gate_up_proj"], mods["mlp.down_proj"]
+            layer.get_submodule("mlp.shared_expert.gate_up_proj").shard_idx = L["moe"]["gu_idx"]
+            layer.get_submodule("mlp.shared_expert.down_proj").shard_idx = L["moe"]["down_idx"]
         elif layer.kind == "shared":
             mods.update({"self_attn.q_proj": "q", "self_attn.o_proj": "o"})
         else:
@@ -609,7 +673,7 @@ class OpaqueKernel(nn.Module):
 def test_grad_reach_catches_op_without_autograd():
     lm = build()
     sft = sft_for(lm)
-    lm.model.layers[1].mlp.act = OpaqueKernel()
+    lm.model.layers[2].mlp.act = OpaqueKernel()
     W.SFT = sft
     try:
         sft.begin(dict(lr=1e-3))

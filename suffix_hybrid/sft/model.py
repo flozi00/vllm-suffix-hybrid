@@ -44,14 +44,17 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
+import inspect
+import sys
 
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from suffix_hybrid.mtp_tune.lora import (
-    LoRA, SingleGroup, _ReduceFromTP, copy_to_tp, in_out, tp_kind)
-from suffix_hybrid.mtp_tune.train import FrozenLinear, _vocab_range, vocab_parallel_ce
+    LoRA, SingleGroup, _ReduceFromTP, copy_to_tp, in_out, reduce_from_tp, tp_kind)
+from suffix_hybrid.mtp_tune.train import (
+    FrozenExperts, FrozenLinear, _vocab_range, experts_handle, vocab_parallel_ce)
 
 DEFAULT_TARGETS = (
     "*.qkv_proj", "*.q_proj", "*.o_proj",          # attention (incl. KV-shared)
@@ -59,6 +62,7 @@ DEFAULT_TARGETS = (
     "*.gate_up_proj", "*.down_proj",               # dense MLP
 )
 FUSED_FLAGS = ("use_fused_qk_norm_rope_gate",)    # Qwen3NextAttention Triton fusion
+QSA_DENSE_MAX = 2048        # QSA selects every key up to its 2048-block budget: dense = exact
 CE_BYTES = 256 << 20                              # fp32 logits per CE chunk
 GDN_HEAD_GROUP = None       # heads per delta-rule backward group; None = from GDN_GROUP_BYTES
 GDN_GROUP_BYTES = 3 << 29   # ~1.5 GiB of fp32 intermediates (~8 KiB per head-token)
@@ -95,24 +99,52 @@ def is_gdn(m) -> bool:
     return hasattr(m, "in_proj_qkvz") and hasattr(m, "A_log") and hasattr(m, "conv1d")
 
 
+def is_qsa(m) -> bool:      # Qwen4Exp query-sparse attention owner (qkv + indexer + o)
+    return hasattr(m, "_run_qsa") and hasattr(m, "qkv_proj") and hasattr(m, "o_proj")
+
+
+def is_moe_block(m) -> bool:  # Qwen3Next / Qwen4Exp sparse MoE block (router + runner)
+    return hasattr(getattr(m, "experts", None), "routed_experts") and hasattr(m, "gate")
+
+
+def is_hc(m) -> bool:       # Qwen4Exp GatedResidual hyper-connection
+    return hasattr(m, "hc_norm") and hasattr(m, "input_mix_weight_up")
+
+
+def is_ple(m) -> bool:      # Qwen4Exp per-layer n-gram embedding + short conv
+    return hasattr(m, "ple_embedding") and hasattr(m, "kv_proj") and hasattr(m, "norm_conv")
+
+
 def check_supported(lm, vllm_config=None):
     """Raise NotImplementedError naming the first module SFT cannot train."""
     if vllm_config is not None and vllm_config.parallel_config.pipeline_parallel_size > 1:
         raise NotImplementedError("pipeline parallel")
     if vllm_config is not None and getattr(vllm_config.cache_config, "kv_sharing_fast_prefill", False):
         raise NotImplementedError("kv_sharing_fast_prefill (in-place buffer copies)")
+    moe = [name for name, m in lm.named_modules() if is_moe_block(m)]
+    for name, m in lm.named_modules():
+        if not is_moe_block(m):
+            continue
+        re_ = m.experts.routed_experts
+        if (getattr(re_, "enable_eplb", False) or getattr(m, "is_sequence_parallel", False)
+                or getattr(m, "is_fused_shared_expert_enabled", False)):
+            raise NotImplementedError(f"MoE with EPLB / sequence parallel ({name})")
+        if getattr(re_, "use_grouped_topk", False) or getattr(re_, "scoring_func", "softmax") != "softmax":
+            raise NotImplementedError(f"MoE routing other than softmax top-k ({name})")
+        experts_handle(m.experts)   # raises for unsupported expert dtypes
     for name, m in lm.named_modules():
         cls = type(m).__name__
-        if hasattr(m, "w13_weight") or cls.endswith(("FusedMoE", "RoutedExperts")):
-            raise NotImplementedError(f"MoE experts ({name}: {cls})")
+        inside = any(name == b or name.startswith(b + ".") for b in moe)
+        if not inside and (hasattr(m, "w13_weight") or cls.endswith(("FusedMoE", "RoutedExperts"))):
+            raise NotImplementedError(f"MoE experts outside a supported MoE block ({name}: {cls})")
         if "MLA" in cls:
             raise NotImplementedError(f"MLA attention ({name}: {cls})")
-        if is_attention(m):
+        if is_attention(m) and not is_qsa(m):
             if getattr(m.impl, "logits_soft_cap", None):
                 raise NotImplementedError(f"attention soft-capping ({name})")
             if str(getattr(m, "attn_type", "decoder")).lower().split(".")[-1] != "decoder":
                 raise NotImplementedError(f"non-causal attention ({name})")
-        if hasattr(m, "get_state_shape") and not is_gdn(m):
+        if hasattr(m, "get_state_shape") and not (is_gdn(m) or is_ple(m) or is_qsa(m)):
             raise NotImplementedError(f"recurrent layer {name}: {cls}")
 
 
@@ -255,6 +287,70 @@ class _FlaRule(torch.autograd.Function):
 
 
 # ---------------------------------------------------------------------------
+# Qwen4Exp custom ops: torch twins (vllm/models/qwen4_exp/nvidia/ops/hc.py,
+# ops/ple.py @ v0.30.0, same rounding boundaries)
+# ---------------------------------------------------------------------------
+def _gemma_rms_groups(x, w, eps, groups):
+    n = x.shape[0]
+    xf = x.float().view(n, groups, -1)
+    y = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
+    y = y + y * w.float().view(-1 if w.numel() == y.shape[-1] else groups, y.shape[-1])
+    return y.reshape(n, -1)
+
+
+def hc_grouped_gemma_rmsnorm(x, weight, eps, num_groups):
+    return _gemma_rms_groups(x, weight, eps, num_groups).to(x.dtype)
+
+
+def hc_silu(x, hc_count):
+    xf = x.float() / hc_count
+    return (xf * torch.sigmoid(xf)).to(x.dtype)
+
+
+def hc_gate_mix(x, gate, hc_count):
+    n = x.shape[0]
+    mixed = torch.sigmoid(gate.float()).view(n, hc_count, -1) * x.float().view(n, hc_count, -1)
+    return (mixed.sum(1) / hc_count).to(x.dtype)
+
+
+def hc_combine(residual, block_output, injection_logits, hc_count):
+    n = residual.shape[0]
+    blk = block_output.float()[:, None, :]
+    if injection_logits is not None:
+        blk = blk * (2.0 * torch.sigmoid(injection_logits.float() / hc_count))[:, :, None]
+    return (residual.float().view(n, hc_count, -1) + blk).reshape(n, -1).to(residual.dtype)
+
+
+def hc_combine_norm(residual, block_output, injection_logits, norm_weight, eps, hc_count):
+    out = hc_combine(residual, block_output, injection_logits, hc_count)
+    return out, _gemma_rms_groups(out, norm_weight, eps, hc_count).to(out.dtype)
+
+
+HC_TWINS = dict(grouped_gemma_rmsnorm=hc_grouped_gemma_rmsnorm, hc_silu=hc_silu,
+                hc_gate_mix=hc_gate_mix, hc_combine=hc_combine, hc_combine_norm=hc_combine_norm)
+
+
+def ple_gate(key, value, hidden, nk, nq, ncw, eps):
+    """(gated, normed) [T, HC*H]: per stream g = sigmoid(sign(d) sqrt|d|),
+    d = <rms(key)(1+nk), rms(hidden)(1+nq)> / sqrt(H); gated = g * value."""
+    t, h = value.shape[0], value.shape[-1]
+    hc, dt = hidden.shape[-1] // h, hidden.dtype
+
+    def rms(x, w):
+        xf = x.float().view(t, hc, h)
+        return (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
+                * (1.0 + w.float().view(hc, h))).to(dt)
+    kn, qn = rms(key, nk), rms(hidden, nq)
+    d = (kn.float() * qn.float()).to(dt).float().sum(-1).to(dt).float() / h ** 0.5
+    d = d.to(dt).float()
+    mag = torch.sqrt(torch.clamp(d.abs(), min=1e-6)).to(dt).float()
+    g = torch.sigmoid(torch.sign(d) * mag).to(dt).float()
+    gated = (g[..., None] * value.float()[:, None, :]).to(dt)
+    normed = rms(gated, ncw)
+    return gated.reshape(t, -1), normed.reshape(t, -1)
+
+
+# ---------------------------------------------------------------------------
 # training mode
 # ---------------------------------------------------------------------------
 class _Raw:
@@ -324,7 +420,9 @@ class TrainMode(contextlib.ContextDecorator):
             mods = self.s.__dict__.get("_sft_mods")
             if mods is None:   # classify once per model (thousands of modules)
                 mods = self.s.__dict__["_sft_mods"] = [
-                    (m, "attn" if is_attention(m) else "gdn" if is_gdn(m) else
+                    (m, "qsa" if is_qsa(m) else "moe" if is_moe_block(m) else
+                     "hc" if is_hc(m) else "ple" if is_ple(m) else
+                     "attn" if is_attention(m) else "gdn" if is_gdn(m) else
                      "op" if hasattr(m, "_forward_method") and hasattr(m, "forward_native") else None,
                      hasattr(m, "do_not_compile"), [f for f in FUSED_FLAGS if hasattr(m, f)])
                     for m in self.s.lm.modules()]
@@ -335,8 +433,23 @@ class TrainMode(contextlib.ContextDecorator):
             if self.check:
                 from torch.nn.modules.module import register_module_forward_hook
                 st.callback(register_module_forward_hook(self._cut_hook).remove)
+            hc_mods = {sys.modules[type(m).__module__] for m, kind, _, _ in mods if kind == "hc"}
+            for mod in hc_mods:      # the HC Triton ops have no autograd: torch twins
+                for name, fn in HC_TWINS.items():
+                    if hasattr(mod, name):
+                        self._set(mod, name, fn)
+            if getattr(self.s.inner, "_mtp_hidden_buffer", None) is not None:
+                self._set(self.s.inner, "_mtp_hidden_buffer", None)   # serving's drafter state
             for m, kind, compiled, flags in mods:
-                if kind == "attn":
+                if kind == "qsa":
+                    self._set(m, "forward", lambda positions, hidden_states, _m=m:
+                              self.qsa(_m, positions, hidden_states))
+                elif kind == "moe":
+                    self._set(m, "forward", lambda hidden_states, *a, _m=m, **kw:
+                              self.moe(_m, hidden_states))
+                elif kind == "ple":
+                    self._set(m, "forward", lambda *a, _m=m, **kw: self.ple(_m, *a, **kw))
+                elif kind == "attn":
                     self._set(m, "forward", lambda q, k, v, *a, _m=m, **kw: self.attention(_m, q, k, v))
                 elif kind == "gdn":
                     self._set(m, "forward", lambda hidden_states, _m=m: self.gdn(_m, hidden_states))
@@ -491,6 +604,84 @@ class TrainMode(contextlib.ContextDecorator):
         o, _ = m.out_proj(core.flatten(-2))
         return o
 
+    def qsa(self, m, positions, hidden_states):
+        """Qwen4Exp QSA as dense causal attention: exact while every segment
+        fits the indexer budget (every key selected); sigma(gate) in f32."""
+        qkv, _ = m.qkv_proj(hidden_states)
+        q, k, v, gate = m._project_qkv_gate(qkv, positions)
+        t = hidden_states.shape[0]
+        nh, nkv, hd = m.num_heads, m.num_kv_heads, m.head_dim
+        q, k, v = q.reshape(t, nh, hd), k.reshape(t, nkv, hd), v.reshape(t, nkv, hd)
+        if nh != nkv:
+            k, v = k.repeat_interleave(nh // nkv, 1), v.repeat_interleave(nh // nkv, 1)
+        out = []
+        for s, e in self.segments:
+            if e - s > QSA_DENSE_MAX:
+                raise ValueError(f"sequence of {e - s} tokens > {QSA_DENSE_MAX}: QSA would be "
+                                 "sparse there; use shorter examples")
+            qs, ks, vs = (z[s:e].transpose(0, 1)[None] for z in (q, k, v))
+            out.append(F.scaled_dot_product_attention(qs, ks, vs, is_causal=True,
+                                                      scale=m.scaling)[0].transpose(0, 1))
+        o = torch.cat(out).reshape(t, nh * hd)
+        o = (o.float() * torch.sigmoid(gate.float())).to(hidden_states.dtype)
+        return m.o_proj(o)[0]
+
+    def moe(self, m, hidden_states):
+        """Router softmax top-k -> frozen routed experts (local to this EP
+        rank) + gated shared expert, partials summed by one TP all-reduce."""
+        shape = hidden_states.shape
+        x = hidden_states.reshape(-1, shape[-1])
+        re_ = m.experts.routed_experts
+        logits = m.gate(x)
+        logits = (logits[0] if isinstance(logits, tuple) else logits).float()
+        tw, ids = torch.softmax(logits, -1).topk(int(re_.top_k), -1)
+        if getattr(re_, "renormalize", True):
+            tw = tw / tw.sum(-1, keepdim=True)
+        emap = getattr(re_, "expert_map", None)
+        local = ids if emap is None else emap.to(ids.device)[ids]
+        handle = self.s.__dict__.setdefault("_sft_experts", {})
+        if id(re_) not in handle:
+            handle[id(re_)] = experts_handle(re_)
+        # x and the routing weights are replicated but only this rank's
+        # experts see them: their grads are partial sums over the TP/EP ranks
+        out = FrozenExperts.apply(copy_to_tp(x, self.g), copy_to_tp(tw.to(x.dtype), self.g),
+                                  local, handle[id(re_)])
+        full = None
+        se = getattr(m, "shared_expert", None)
+        if se is not None:
+            gu, _ = se.gate_up_proj(x)
+            sd, _ = se.down_proj(se.act_fn(gu))
+            gate = torch.sigmoid(m.shared_expert_gate(x)[0])
+            if getattr(m, "replicate_shared_expert", False):
+                full = gate * sd
+            else:   # TP-partial down_proj output (reduce_results=False): partial gate grad
+                out = out + copy_to_tp(gate, self.g) * sd
+        out = reduce_from_tp(out, self.g)
+        return (out if full is None else out + full).reshape(shape)
+
+    def ple(self, m, hidden_states, input_ids, query_start_loc, ngram_context):
+        """Qwen4Exp PLE: frozen n-gram lookup (serving's own path, no grad),
+        gate + dilated causal short conv per segment with autograd."""
+        with torch.no_grad():
+            emb = m.ple_embedding(hidden_states, input_ids.reshape(-1), query_start_loc,
+                                  ngram_context)
+            emb = m._dequantize_embeddings(emb, hidden_states.dtype)
+        kv, _ = m.kv_proj(emb)
+        key, value = kv.split(m.kv_proj.output_sizes, dim=-1)
+        gated, normed = ple_gate(key, value, hidden_states, m.norm_key.weight.detach(),
+                                 m.norm_query.weight.detach(), m.norm_conv.weight.detach(),
+                                 m.norm_key.eps)
+        w = m.conv1d.weight.detach()        # [C, 1, K]
+        dil, k = m.short_conv_dilation, w.shape[-1]
+        conv = []
+        for s, e in self.segments:
+            c = F.conv1d(normed[s:e].t()[None].float(), w.float(), padding=(k - 1) * dil,
+                         dilation=dil, groups=w.shape[0])[0, :, :e - s].t()
+            c = c.to(hidden_states.dtype).float()
+            conv.append((c * torch.sigmoid(c)).to(hidden_states.dtype))
+        ple_out = (gated.float() + torch.cat(conv).float()).to(hidden_states.dtype)
+        return (hidden_states.float() + ple_out.float()).to(hidden_states.dtype)
+
     def _rule_grouped(self, q, k, v, g, beta):
         """[T, H, D] delta rule. With the serving kernel available: its
         forward + a grouped torch backward (_FlaRule). Without (CPU tests):
@@ -519,7 +710,20 @@ class TrainMode(contextlib.ContextDecorator):
         pos = torch.cat([torch.arange(e - s, device=ids.device) for s, e in self.segments])
         if self.s.mrope:
             pos = pos.expand(3, n)
-        h = self.s.inner(input_ids=ids, positions=pos, intermediate_tensors=None)
+        kw = {}
+        params = self.s.__dict__.get("_sft_fwd_params")
+        if params is None:
+            params = self.s.__dict__["_sft_fwd_params"] = set(
+                inspect.signature(type(self.s.inner).forward).parameters)
+        if "query_start_loc" in params:     # Qwen4Exp PLE: segment layout + n-gram context
+            ng = next((m.ple_embedding for m in self.s.lm.modules() if is_ple(m)), None)
+            if ng is not None:
+                kw["query_start_loc"] = torch.tensor([0] + [e for _, e in self.segments],
+                                                     dtype=torch.int32, device=ids.device)
+                kw["ngram_context"] = torch.full((len(self.segments), ng.ngram_size - 1),
+                                                 ng.eos_token_id, dtype=torch.int32,
+                                                 device=ids.device)
+        h = self.s.inner(input_ids=ids, positions=pos, intermediate_tensors=None, **kw)
         if isinstance(h, tuple):
             h = h[0]
         h = h[rows]

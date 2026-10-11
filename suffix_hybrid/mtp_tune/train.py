@@ -158,7 +158,16 @@ def nvfp4_verified(layer, k, rows, dtype, cols=64):
 
 
 def expert_weights(handle, e):
-    """(w13 [2I, H], w2 [H, I]) f32 of local expert e."""
+    """(w13 [2I, H] as [gate; up], w2 [H, I]) f32 effective weights of local
+    expert e."""
+    if handle["kind"] == "nvfp4":
+        # serving: g1[e] * (qdq(x, a1g) @ deq(w13)^T), qdq(x, a1g) ~ x * a1g;
+        # vLLM's FlashInfer layout stores w13 as [up; gate]
+        from suffix_hybrid.kernels.nvfp4_moe import _expert_w
+        w13 = _expert_w(handle["w13"], handle["w13_sf"], e) * (handle["g1"][e] * handle["a1g"])
+        i = w13.shape[0] // 2
+        w2 = _expert_w(handle["w2"], handle["w2_sf"], e) * (handle["g2"][e] * handle["a2g"])
+        return torch.cat([w13[i:], w13[:i]]), w2
     if handle["kind"] == "fp8":
         from suffix_hybrid.kernels.fp8_moe import expert_w
         return (expert_w(handle["w13"], handle["w13_s"], e),
@@ -167,6 +176,10 @@ def expert_weights(handle, e):
 
 
 def _qdq(x, handle, stage):
+    if handle["kind"] == "nvfp4":   # serving quantizes x and h to NVFP4
+        from suffix_hybrid.kernels.nvfp4_moe import qdq
+        g = handle["a1g"] if stage == "x" else handle["a2g"]
+        return qdq(x, g) / g
     if handle["kind"] != "fp8" or not handle.get("act_qdq", True):
         return x
     from suffix_hybrid.kernels.fp8_moe import qdq
@@ -234,9 +247,16 @@ class FrozenExperts(torch.autograd.Function):
 def experts_handle(experts):
     """Frozen routed-experts handle from a vLLM FusedMoE layer (or a test
     fake with the same attribute surface)."""
+    # vLLM >= 0.30: MoERunner holds the experts module at .routed_experts
+    experts = getattr(experts, "routed_experts", experts)
     if getattr(experts, "enable_eplb", False):
         raise NotImplementedError("EPLB redundant experts not supported")
     w13, w2 = experts.w13_weight, experts.w2_weight
+    qc = getattr(getattr(experts, "quant_method", None), "moe_quant_config", None)
+    if w13.dtype == torch.uint8 and getattr(qc, "quant_dtype", None) == "nvfp4":
+        return dict(kind="nvfp4", w13=w13, w13_sf=qc.w1_scale, w2=w2, w2_sf=qc.w2_scale,
+                    g1=qc.g1_alphas.float(), g2=qc.g2_alphas.float(),
+                    a1g=float(qc.a1_gscale.reshape(-1)[0]), a2g=float(qc.a2_gscale.reshape(-1)[0]))
     if w13.dtype.is_floating_point and w13.element_size() >= 2:
         return dict(kind="float", w13=w13, w2=w2)
     if w13.dtype == torch.float8_e4m3fn:
@@ -260,8 +280,6 @@ def experts_handle(experts):
             pass
         return dict(kind="fp8", w13=w13, w13_s=s13, w2=w2, w2_s=s2, ue8m0=ue8m0,
                     act_qdq=True)
-    # ponytail: NVFP4 routed experts (GLM prod) need nvfp4_moe._expert_w + the
-    # global scale; add with the GLM family.
     raise NotImplementedError(f"routed expert dtype {w13.dtype} not supported")
 
 
@@ -443,7 +461,7 @@ class Qwen4ExpFunctional:
         return self.lin(sa.o_proj, o, params)
 
     def moe(self, mlp, x, params):
-        ex = mlp.experts
+        ex = getattr(mlp.experts, "routed_experts", mlp.experts)   # vLLM >= 0.30 MoERunner
         logits = self.lin(mlp.gate, x, params).float()
         tw, ids = torch.softmax(logits, -1).topk(int(ex.top_k), -1)
         if getattr(ex, "renormalize", True):
