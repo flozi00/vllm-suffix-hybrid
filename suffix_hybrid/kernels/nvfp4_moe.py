@@ -150,6 +150,10 @@ PARAMS = {"moe_route": 11, "moe_quant_rows": 8, "moe_fc1": 25, "moe_fc2": 18,
 FUSE_SHARED_ENV = "SUFFIX_NVFP4_MOE_FUSE_SHARED"
 # log2 headroom of the shared intermediate below the routed one (quant_shared)
 HEADROOM_ENV = "SUFFIX_NVFP4_MOE_SHARED_HEADROOM"
+# Largest M that runs the shared expert as the fused slot (glm_moe_shared_bench, g13 boot:
+# the slot walks all M rows and is the long pole past M=8: M=96 -5.4, M=192 -22 ms/step);
+# above it the BF16 shared MLP runs on vLLM's aux stream beside our routed-only kernel.
+FUSE_MAX_ENV = "SUFFIX_NVFP4_MOE_FUSE_SHARED_MAX_M"
 SHARED_ORACLE_MS = (1, 6, 32, 96)
 # NVFP4 W4A4 shared MLP vs its BF16 module (rel-l2, Gaussian probe): FP4
 # noise is 0.095 per element, 0.13 per W4A4 GEMM, 0.2-0.25 through the MLP
@@ -203,6 +207,41 @@ def fused_on() -> bool:
 
 def fuse_shared_on() -> bool:
     return os.environ.get(FUSE_SHARED_ENV, "").strip() == "1"
+
+
+def fuse_shared_max_m() -> int:
+    return int(os.environ.get(FUSE_MAX_ENV, "8"))
+
+
+def _shared_async(cfg, x):
+    """vLLM SharedExperts' MULTI_STREAM_OVERLAPPED order (input event -> the BF16 shared MLP on
+    vLLM's aux stream -> output event) for a fused layer above the slot's M. Serial when the
+    aux stream is unavailable. The routed kernel only reads x."""
+    import torch
+    try:
+        from vllm.utils.torch_utils import aux_stream
+        side = aux_stream()
+    except ImportError:
+        side = None
+    if side is None:
+        return cfg["shared_mod"](x), None
+    ev = cfg.get("_sh_ev")
+    if ev is None:
+        ev = cfg["_sh_ev"] = (torch.cuda.Event(), torch.cuda.Event())
+    ev[0].record(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        ev[0].wait(side)
+        out = cfg["shared_mod"](x)
+        ev[1].record(side)
+    return out, ev[1]
+
+
+def _shared_join(cfg, routed, pending):
+    import torch
+    out, ev = pending
+    if ev is not None:
+        ev.wait(torch.cuda.current_stream())
+    return add_shared(routed, out, cfg["shared_rsf"])
 
 
 def shared_headroom() -> int:
@@ -1138,12 +1177,19 @@ def _make_layer_cls():
                 return fp8_moe.run(native, cfg, x, topk_weights, topk_ids)
             dev = x.device
             tw = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
+            # fused shared slot only up to SUFFIX_NVFP4_MOE_FUSE_SHARED_MAX_M (a function of
+            # M: CUDA-graph safe); above it routed-only kernel + vLLM's overlapped BF16 MLP
+            split = cfg.get("shared") is not None and x.shape[0] > fuse_shared_max_m()
+            pending = _shared_async(cfg, x) if split else None
+            run_cfg = dict(cfg, shared=None) if split else cfg
             tp = cfg.get("tp_impl")  # SUFFIX_NVFP4_MOE_IMPL: a plan per M, None = oxide
             if tp is not None and tp.plans[x.shape[0]] is not None:
-                return tp(x.contiguous(), topk_ids.contiguous(), tw.contiguous())
-            return run_ours(native, cfg, x.contiguous(), topk_ids.contiguous(),
-                            tw.contiguous(), _state["ws"][dev],
-                            torch.cuda.current_stream(dev).cuda_stream)
+                out = tp(x.contiguous(), topk_ids.contiguous(), tw.contiguous(), slot=not split)
+            else:
+                out = run_ours(native, run_cfg, x.contiguous(), topk_ids.contiguous(),
+                               tw.contiguous(), _state["ws"][dev],
+                               torch.cuda.current_stream(dev).cuda_stream)
+            return _shared_join(cfg, out, pending) if split else out
 
         def _sfx_oracle(self, cfg, info):
             """Ours vs the parent (vLLM FlashInfer cutlass_fused_moe, with

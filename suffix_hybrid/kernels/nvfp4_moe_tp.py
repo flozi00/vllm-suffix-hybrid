@@ -754,12 +754,13 @@ class TPLayer:
     """What nvfp4_moe's forward_modular dispatches to: `tp(x, ids, tw)` -> out, or None when
     this M belongs to the oxide kernel (a function of M only: CUDA-graph safe)."""
 
-    __slots__ = ("st", "plans")
+    __slots__ = ("st", "plans", "st_routed")
 
     def __init__(self, st, plans):
         self.st, self.plans = st, plans
+        self.st_routed = dict(st, sh=None)  # nvfp4_moe above SUFFIX_NVFP4_MOE_FUSE_SHARED_MAX_M
 
-    def __call__(self, x, ids, tw):
+    def __call__(self, x, ids, tw, slot=True):
         m = x.shape[0]
         plan = self.plans[m] if m < len(self.plans) else None
         if plan is None:
@@ -767,7 +768,8 @@ class TPLayer:
         if not _ST["logged"]:
             _ST["logged"] = True
             _log(f"ACTIVE: first MoE call on our TP kernels (M={m}, plan {plan})")
-        return run(self.st, x, ids if ids.dtype == torch.int32 else ids.int(), tw, plan)
+        return run(self.st if slot else self.st_routed, x,
+                   ids if ids.dtype == torch.int32 else ids.int(), tw, plan)
 
 
 # ---------------------------------------------------------------------------

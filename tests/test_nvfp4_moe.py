@@ -1406,6 +1406,16 @@ def test_fused_shared_wiring_rewires_the_runner(monkeypatch):
     big = torch.randn(5, 64).bfloat16()  # > max_m: FlashInfer + the module, stock order
     out = layer.forward_modular(big, torch.rand(5, 2), torch.zeros(5, 2, dtype=torch.int32))
     assert torch.equal(out, mlp(big) + big * 2) and len(calls) == 1
+    # above SUFFIX_NVFP4_MOE_FUSE_SHARED_MAX_M: routed-only kernel + the module (stock combine)
+    monkeypatch.setenv(nm.FUSE_MAX_ENV, "2")
+    seen = []
+    monkeypatch.setattr(nm, "run_ours", lambda native, p, x, *a, **kw: seen.append(p) or x * 3)
+    out = layer.forward_modular(x, torch.rand(3, 2), torch.zeros(3, 2, dtype=torch.int32))
+    assert seen[-1]["shared"] is None and cfg["shared"] is not None
+    assert torch.equal(out, mlp(x) + x * 3)
+    monkeypatch.setenv(nm.FUSE_MAX_ENV, "3")
+    layer.forward_modular(x, torch.rand(3, 2), torch.zeros(3, 2, dtype=torch.int32))
+    assert seen[-1]["shared"] is cfg["shared"]
 
     ep_layer = cls("model.layers.4.mlp.experts")
     ep_runner = Runner(ep_layer, _MLP(w_gu, w_dn))
@@ -1440,6 +1450,8 @@ def test_fuse_shared_knobs(monkeypatch):
     assert nm.fuse_shared_on()
     with pytest.raises(ValueError):
         nm.shared_headroom()
+    monkeypatch.delenv(nm.FUSE_MAX_ENV, raising=False)
+    assert nm.fuse_shared_max_m() == 8
 
 
 def test_load_time_helpers_ignore_vllms_bf16_default_dtype():

@@ -329,3 +329,17 @@ def test_boot_gate_and_hook_are_wired():
     moe = (ROOT / "suffix_hybrid/kernels/nvfp4_moe.py").read_text()
     assert "nvfp4_moe_tp.prepare(self, cfg, info," in moe
     assert 'cfg.get("tp_impl")' in moe
+
+
+def test_tp_layer_runs_routed_only_above_the_fused_slot_m(tp, prob_sh, monkeypatch):
+    """nvfp4_moe passes slot=False above SUFFIX_NVFP4_MOE_FUSE_SHARED_MAX_M: same plan, no slot."""
+    st = _state(tp, prob_sh)
+    seen = []
+    monkeypatch.setattr(tp, "run", lambda s, *a, **kw: seen.append(s))
+    layer = tp.TPLayer(st, ["f1"] * 4)
+    x = torch.zeros(2, H, dtype=torch.bfloat16)
+    ids, tw = torch.zeros(2, TOPK, dtype=torch.int32), torch.zeros(2, TOPK)
+    layer(x, ids, tw)
+    layer(x, ids, tw, slot=False)
+    assert seen[0]["sh"] is st["sh"] is not None and seen[1]["sh"] is None
+    assert seen[1]["w13"] is st["w13"]
