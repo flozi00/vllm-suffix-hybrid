@@ -46,8 +46,9 @@ import uuid
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 except ImportError:  # CPU CI: the Python side stays importable
-    triton = tl = None
+    triton = tl = libdevice = None
 
 MARK = "[suffix har]"
 ROUND_BYTES = 4 << 20    # one round's partial per rank
@@ -56,6 +57,7 @@ FLAG_BYTES = 64 << 10    # 2 parities x 2 phases x world lines
 BLOCK = 1024             # bf16 per program step (16 B per thread at 4 warps)
 ELEMS_PER_PROGRAM = 1024  # grid = clamp(first round / this, 1, max_blocks)
 MAX_BLOCKS = 128
+Q8_GROUP = 128           # int8 transport: one fp32 absmax scale per 128 elements
 TIMEOUT_SPINS = 1 << 30  # minutes of polling: survives profiler exports and JIT stalls on one rank
 WORLDS = (2, 4, 8)
 
@@ -201,6 +203,101 @@ if triton is not None:
                             tl.store(out_ptr + base + o, v, mask=m)
 
     @triton.jit
+    def _quant8(v, G: tl.constexpr, BLOCK: tl.constexpr):
+        """fp32 [BLOCK] -> int8 codes [BLOCK], fp32 scales [BLOCK // G] (amax / 127 per G)."""
+        g = tl.reshape(v, (BLOCK // G, G))
+        amax = tl.max(tl.abs(g), axis=1)
+        k = tl.full([BLOCK // G], 127.0, tl.float32)
+        inv = tl.where(amax > 0, tl.math.div_rn(k, amax), 0.0)
+        q = libdevice.rint(g * inv[:, None])
+        return tl.reshape(q, (BLOCK,)).to(tl.int8), tl.math.div_rn(amax, k)
+
+    @triton.jit
+    def _dequant8(q, scale, G: tl.constexpr, BLOCK: tl.constexpr):
+        return tl.reshape(tl.reshape(q.to(tl.float32), (BLOCK // G, G)) * scale[:, None], (BLOCK,))
+
+    @triton.jit
+    def _har_q8_kernel(x_ptr, out_ptr, qd, sd, qr, sr, flag_ptr, ctr_ptr, arr_ptr, n,
+                       RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
+                       FLAG_STRIDE: tl.constexpr, BLOCK: tl.constexpr, G: tl.constexpr,
+                       TIMEOUT: tl.constexpr, LEAN: tl.constexpr):
+        """Two-shot with int8 transport (per-G absmax scales) in the bf16 kernel's slots: a
+        partial slot holds ROUND codes then ROUND // G fp32 scales, a reduced slot RCH codes then
+        RCH // G scales. Rank r adds its own partial unquantized and keeps for its own chunk
+        exactly the dequantized bytes the others read -> identical bits on every rank."""
+        RCH: tl.constexpr = ROUND // WORLD
+        NG: tl.constexpr = BLOCK // G
+        pid = tl.program_id(0)
+        step = tl.num_programs(0) * BLOCK
+        ar = tl.arange(0, BLOCK)
+        ag = tl.arange(0, NG)
+        ctr0 = tl.load(ctr_ptr).to(tl.uint32)
+        nrounds = tl.cdiv(n, ROUND)
+        ctr_new = (ctr0 + nrounds.to(tl.uint32)).to(tl.int32)
+        for rnd in range(0, nrounds):
+            epoch = ctr0 + (rnd + 1).to(tl.uint32)
+            par = (epoch & 1).to(tl.int32)
+            base = rnd * ROUND
+            rn = tl.multiple_of(tl.minimum(n - base, ROUND), G)
+            final = rnd == nrounds - 1
+            ch = tl.cdiv(tl.cdiv(rn, WORLD), G) * G
+            lo = tl.multiple_of(RANK * ch, G)
+            hi = tl.multiple_of(tl.minimum(lo + ch, rn), G)
+            flags = flag_ptr + par * (2 * WORLD * FLAG_STRIDE)
+            mq = qd + (par * WORLD + RANK) * (2 * ROUND)       # own partial slot (int8 view)
+            ms = sd + (par * WORLD + RANK) * (ROUND // 2) + ROUND // 4
+            for s in range(pid * BLOCK, rn, step):  # phase 1: quantize own partial of others' chunks
+                o = s + ar
+                m = (o < rn) & ((o < lo) | (o >= hi))
+                og = s // G + ag
+                mg = (og * G < rn) & ((og * G < lo) | (og * G >= hi))
+                v = tl.load(x_ptr + base + o, mask=m, other=0.0).to(tl.float32)
+                q, sc = _quant8(v, G, BLOCK)
+                tl.store(mq + o, q, mask=m, cache_modifier=".wt")
+                tl.store(ms + og, sc, mask=mg, cache_modifier=".wt")
+            _barrier(flags, arr_ptr, arr_ptr + 2, epoch, ctr_ptr, ctr_new, False,
+                     RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+            rq = qr + (par * WORLD + RANK) * (2 * RCH)
+            rs = sr + (par * WORLD + RANK) * (RCH // 2) + RCH // 4
+            for s in range(lo + pid * BLOCK, hi, step):  # phase 2: reduce own chunk
+                o = s + ar
+                m = o < hi
+                og = s // G + ag
+                mg = og * G < hi
+                acc = tl.zeros([BLOCK], dtype=tl.float32)
+                for j in tl.static_range(WORLD):
+                    if j == RANK:
+                        v = tl.load(x_ptr + base + o, mask=m, other=0.0).to(tl.float32)
+                    else:
+                        qj = tl.load(qd + (par * WORLD + j) * (2 * ROUND) + o, mask=m, other=0,
+                                     cache_modifier=".cv")
+                        sj = tl.load(sd + (par * WORLD + j) * (ROUND // 2) + ROUND // 4 + og, mask=mg,
+                                     other=0.0, cache_modifier=".cv")
+                        v = _dequant8(qj, sj, G, BLOCK)
+                    acc += v
+                q, sc = _quant8(acc, G, BLOCK)
+                tl.store(out_ptr + base + o, _dequant8(q, sc, G, BLOCK).to(out_ptr.dtype.element_ty), mask=m)
+                tl.store(rq + (o - lo), q, mask=m, cache_modifier=".wt")
+                tl.store(rs + (og - lo // G), sc, mask=mg, cache_modifier=".wt")
+            _barrier(flags + WORLD * FLAG_STRIDE, arr_ptr + 1, arr_ptr + 3, epoch, ctr_ptr,
+                     ctr_new, final, RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+            for j in tl.static_range(WORLD):  # phase 3: the others' reduced chunks
+                if j != RANK:
+                    jl = tl.multiple_of(j * ch, G)
+                    jh = tl.multiple_of(tl.minimum(jl + ch, rn), G)
+                    for s in range(jl + pid * BLOCK, jh, step):
+                        o = s + ar
+                        m = o < jh
+                        og = (s - jl) // G + ag
+                        mg = og * G < jh - jl
+                        qj = tl.load(qr + (par * WORLD + j) * (2 * RCH) + (o - jl), mask=m, other=0,
+                                     cache_modifier=".cv")
+                        sj = tl.load(sr + (par * WORLD + j) * (RCH // 2) + RCH // 4 + og, mask=mg,
+                                     other=0.0, cache_modifier=".cv")
+                        tl.store(out_ptr + base + o,
+                                 _dequant8(qj, sj, G, BLOCK).to(out_ptr.dtype.element_ty), mask=m)
+
+    @triton.jit
     def _copy_kernel(src, dst, n, CV: tl.constexpr, WT: tl.constexpr, BLOCK: tl.constexpr):
         """Bandwidth probe: dst[:n] = src[:n] (host-mapped either side)."""
         for s in range(tl.program_id(0) * BLOCK, n, tl.num_programs(0) * BLOCK):
@@ -272,7 +369,7 @@ class HostAllReduce:
     def __init__(self, cpu_group, device, oneshot_max_bytes: int = 0, max_blocks: int = 64,
                  round_bytes: int = ROUND_BYTES, timeout_spins: int = TIMEOUT_SPINS,
                  numa: str = "owner", elems_per_program: int = ELEMS_PER_PROGRAM,
-                 lean: bool = True):
+                 lean: bool = True, q8_min_bytes: int = 1 << 62, q8_group: int = Q8_GROUP):
         import torch
         import torch.distributed as dist
 
@@ -286,7 +383,7 @@ class HostAllReduce:
             raise ValueError(f"round_bytes must be a multiple of {2 * self.world * BLOCK}")
         self.oneshot_max, self.timeout = oneshot_max_bytes, timeout_spins
         self.max_blocks, self.per_program = min(max_blocks, MAX_BLOCKS), elems_per_program
-        self.lean = lean
+        self.lean, self.q8_min, self.q8_group = lean, q8_min_bytes, q8_group
         rch = self.round // self.world
         data_bytes = 2 * self.world * self.round * 2
         self.size = FLAG_BYTES + data_bytes + 2 * self.world * rch * 2
@@ -331,6 +428,9 @@ class HostAllReduce:
         self.flags = _Ptr(self.addr, torch.int32)
         self.data = _Ptr(self.addr + FLAG_BYTES, torch.bfloat16)
         self.red = _Ptr(self.addr + FLAG_BYTES + data_bytes, torch.bfloat16)
+        # int8-transport views of the same slots (codes, then fp32 scales; see _har_q8_kernel)
+        self.data_q, self.data_s = _Ptr(self.data.addr, torch.int8), _Ptr(self.data.addr, torch.float32)
+        self.red_q, self.red_s = _Ptr(self.red.addr, torch.int8), _Ptr(self.red.addr, torch.float32)
         self.ctr = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.arr = torch.zeros(4, dtype=torch.int32, device=self.device)  # arrive x2, go x2
         self.disabled = False
@@ -355,7 +455,8 @@ class HostAllReduce:
     def grid(self, n: int) -> int:
         return max(1, min(self.max_blocks, -(-min(n, self.round) // self.per_program)))
 
-    def all_reduce(self, x, oneshot: bool | None = None, grid: int | None = None):
+    def all_reduce(self, x, oneshot: bool | None = None, grid: int | None = None,
+                   q8: bool | None = None):
         import torch
 
         out = torch.empty_like(x)
@@ -364,6 +465,15 @@ class HostAllReduce:
             return out
         if oneshot is None:
             oneshot = n * 2 <= self.oneshot_max
+        if q8 is None:
+            q8 = not oneshot and n * 2 >= self.q8_min
+        if q8 and n % self.q8_group == 0:
+            _har_q8_kernel[(grid or self.grid(n),)](
+                x, out, self.data_q, self.data_s, self.red_q, self.red_s, self.flags, self.ctr,
+                self.arr, n, RANK=self.rank, WORLD=self.world, ROUND=self.round,
+                FLAG_STRIDE=FLAG_STRIDE, BLOCK=BLOCK, G=self.q8_group, TIMEOUT=self.timeout,
+                LEAN=self.lean, num_warps=4)
+            return out
         _har_kernel[(grid or self.grid(n),)](
             x, out, self.data, self.red, self.flags, self.ctr, self.arr, n,
             RANK=self.rank, WORLD=self.world, ROUND=self.round, FLAG_STRIDE=FLAG_STRIDE,
@@ -384,7 +494,7 @@ class HostAllReduce:
 
 
 # ------------------------------------------------------------------ boot gate
-def _inputs(rank: int, world: int, n: int, device):
+def _inputs(rank: int, world: int, n: int, device, all_inputs: bool = False):
     """Every rank regenerates all ranks' inputs (seeded) -> the exact reference needs no comm."""
     import torch
 
@@ -395,14 +505,46 @@ def _inputs(rank: int, world: int, n: int, device):
     acc = xs[0].float()
     for t in xs[1:]:
         acc = acc + t.float()  # rank order, fp32: the kernel's exact arithmetic
+    if all_inputs:
+        return xs, acc
     return xs[rank], acc.to(torch.bfloat16)
+
+
+def q8_reference(xs, world: int, group: int = Q8_GROUP):
+    """_har_q8_kernel's arithmetic for one round in torch (exact bits)."""
+    import torch
+
+    def quant(v):
+        g = v.view(-1, group)
+        amax = g.abs().amax(1)
+        inv = torch.where(amax > 0, 127.0 / amax, torch.zeros_like(amax))
+        return torch.round(g * inv[:, None]), amax / 127.0
+
+    def deq(q, sc):
+        return (q * sc[:, None]).view(-1)
+
+    n = xs[0].numel()
+    ch = -(-(-(-n // world)) // group) * group
+    out = torch.empty_like(xs[0])
+    for c in range(world):
+        lo, hi = c * ch, min((c + 1) * ch, n)
+        if lo >= hi:
+            continue
+        acc = torch.zeros(hi - lo, dtype=torch.float32, device=xs[0].device)
+        for j in range(world):
+            t = xs[j][lo:hi].float()
+            acc = acc + (t if j == c else deq(*quant(t)))
+        out[lo:hi] = deq(*quant(acc)).to(out.dtype)
+    return out
 
 
 # (name, HostAllReduce kwargs, token counts, grids to sweep (None = policy))
 VARIANTS = (
     ("lean", {}, (1, 6, 12, 24, 48, 96, 192, 384, 1024, 8192), (None,)),
     ("fenced", {"lean": False}, (1, 6, 48, 192, 1024), (None,)),
-    ("lean-grid", {}, (6, 48, 192), (8, 16, 32, 64, 96)),
+    ("lean-grid", {}, (6, 48, 192), (16, 64)),
+    ("q8", {"q8_min_bytes": 0}, (24, 48, 96, 192, 384, 1024, 8192), (None,)),
+    ("q8g32", {"q8_min_bytes": 0, "q8_group": 32}, (48, 192, 1024), (None,)),
 )
 STRESS_TOKENS = (1, 6, 48, 192)
 
@@ -522,6 +664,24 @@ def _bench_worker(rank, world, port, q, hidden) -> None:
             for t in toks:
                 n = t * hidden
                 x, ref = _inputs(rank, world, n, dev)
+                if vname.startswith("q8"):
+                    xs, exact = _inputs(rank, world, n, dev, all_inputs=True)
+                    y = har.all_reduce(x)
+                    torch.cuda.synchronize()
+                    row = {"v": vname, "tok": t, "grid": har.grid(n),
+                           "two_exact": (bool(torch.equal(y, q8_reference(xs, world, har.q8_group)))
+                                         if n <= har.round else True),
+                           "q8_err": float((y.float() - exact).norm() / exact.norm()),
+                           "bf16_err": float((ref.float() - exact).norm() / exact.norm()),
+                           "two_us": ns.graph_time_us(lambda: har.all_reduce(x))}
+                    if t not in nccl_us:
+                        nccl.all_reduce(x)
+                        torch.cuda.synchronize()
+                        nccl_us[t] = ns.graph_time_us(lambda: nccl.all_reduce(x))
+                    row["nccl_us"] = nccl_us[t]
+                    out["rows"].append(row)
+                    del xs, exact
+                    continue
                 for grid in grids:
                     row = {"v": vname, "tok": t, "grid": grid or har.grid(n)}
                     for mode, one in (("two", False), ("one", True)):
@@ -600,9 +760,11 @@ def bench(hidden: int = 6144) -> int:
         ok &= exact
         best = min(v for k, v in cell.items() if k != "nccl_us")
         one = f"{cell['one_us']:8.1f}" if "one_us" in cell else "       -"
+        err = (f" | rel-l2 q8 {max(rr['q8_err'] for rr in rows):.2e} vs bf16 {row['bf16_err']:.2e}"
+               if "q8_err" in row else "")
         print(f"{MARK} {row['v']:9s} {row['tok']:5d} tok ({row['tok'] * hidden * 2 / 1024:8.1f} KiB) "
               f"grid {row['grid']:3d}: two-shot {cell['two_us']:8.1f} us | one-shot {one} us | nccl "
-              f"{cell['nccl_us']:8.1f} us ({cell['nccl_us'] / best:4.2f}x) | exact {exact}", flush=True)
+              f"{cell['nccl_us']:8.1f} us ({cell['nccl_us'] / best:4.2f}x) | exact {exact}{err}", flush=True)
     print(f"{MARK} {'PASS' if ok else 'FAIL'}: every rank bit-exact vs the fp32 rank-order sum", flush=True)
     return 0 if ok else 1
 
