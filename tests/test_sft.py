@@ -452,7 +452,7 @@ def oracle(lm, sft, batch=BATCH):
 
 
 def run_micro(sft, batch=BATCH, offload=False):
-    sft.cfg.offload = offload
+    sft.cfg.offload_gib = 1.0 if offload else 0.0
     sft.begin(dict(lr=1e-2))
     r = sft.micro(dict(batch, norm=1.0, check=True))
     grads = {n: (sft.run.flat.grad[sft.run.spans[(n, "A")][0]:][:lo.A.numel()].view_as(lo.A).clone(),
@@ -546,7 +546,9 @@ def test_adapters_zero_noop_isinstance_and_delta():
 # ---------------------------------------------------------------------------
 # (c) training forward == oracle
 # ---------------------------------------------------------------------------
-def test_trainmode_matches_oracle_and_restores():
+@pytest.mark.parametrize("head_group", [8, 1])
+def test_trainmode_matches_oracle_and_restores(head_group, monkeypatch):
+    monkeypatch.setattr(M, "GDN_HEAD_GROUP", head_group)
     lm = build()
     sft = sft_for(lm)
     set_adapters(sft)
@@ -572,7 +574,8 @@ def test_trainmode_matches_oracle_and_restores():
     assert "forward" not in lm.model.layers[0].__dict__ and M._TRAIN is None
 
 
-def test_offload_and_eval_agree():
+def test_offload_and_eval_agree(monkeypatch):
+    monkeypatch.setattr(M, "GDN_HEAD_GROUP", 1)     # exercise the grouped checkpoint path too
     lm = build()
     sft = sft_for(lm)
     set_adapters(sft)
@@ -911,3 +914,37 @@ def test_routes_on_a_real_fastapi_app(tmp_path, monkeypatch):
             assert cl.post("/v1/sft/load", json=dict(prompt="x", run_id="base")).status_code == 200
     finally:
         W.SFT, A._S = None, None
+
+
+def test_parity_aligns_served_prompt_logprobs(tmp_path, monkeypatch):
+    """Served prompt_logprobs (from the serving path of the toy) line up token by
+    token with the training forward: delta ~0, worst-token stats present."""
+    lm = build()
+    sft = sft_for(lm)
+    set_adapters(sft)
+    s = _state(tmp_path, sft)
+    ids, mask = A.encode(Tok(), CHATS[1])
+
+    def generate(prompt, sp, rid):
+        ev = W.rpc("eval", dict(ids=ids, mask=[1] * len(ids), seg_lens=[len(ids)], per_token=True))
+        lp = [None] + [{ids[i]: SimpleNamespace(logprob=-x)} for i, x in enumerate(ev["nll"], 1)]
+
+        async def gen():
+            yield SimpleNamespace(prompt_logprobs=lp)
+        return gen()
+
+    s.engine.generate = generate
+    import sys
+    import types
+    vllm = types.ModuleType("vllm")
+    vllm.SamplingParams = lambda **kw: kw
+    inputs = types.ModuleType("vllm.inputs")
+    inputs.TokensPrompt = dict
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.inputs", inputs)
+    try:
+        p = asyncio.run(s.parity(ids, mask))
+    finally:
+        W.SFT = None
+    assert p["delta"] < 1e-3 and p["tok_max"] < 1e-3 and p["tokens"] == sum(mask[1:])
+    assert mask[p["tok_max_pos"]] == 1

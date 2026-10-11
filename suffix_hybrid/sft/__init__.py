@@ -40,7 +40,10 @@ Env (all optional)
   SUFFIX_SFT_RANK=16 / _ALPHA=32 / _TARGETS=glob,glob  (LM-relative names)
   SUFFIX_SFT_MAX_TOKENS=4096    tokens per micro-batch (= longest example)
   SUFFIX_SFT_MIN_FREE_GIB=4     refuse a micro-step below this free VRAM
-  SUFFIX_SFT_OFFLOAD=1          host-offload checkpointed layer inputs
+  SUFFIX_SFT_OFFLOAD_GIB=2      pinned host budget for checkpointed layer
+                                inputs per micro-step (0 = keep on GPU); the
+                                pod's RAM limit also holds vLLM + the master /
+                                AdamW state (12 B per adapter param)
   SUFFIX_SFT_DUTY=0.5           training share of GPU time while serving
   SUFFIX_SFT_MAX_EXAMPLES=256 / _MAX_STEPS=1000
   SUFFIX_SFT_REPO_ID=<org/name> private HF model repo for checkpoints
@@ -89,7 +92,7 @@ class Config:
     targets: tuple = field(default_factory=tuple)
     max_tokens: int = 4096
     min_free_gib: float = 4.0
-    offload: bool = True
+    offload_gib: float = 2.0
     duty: float = 0.5
     max_examples: int = 256
     max_steps: int = 1000
@@ -106,7 +109,7 @@ class Config:
         return cls(rank=int(_env("RANK", 16)), alpha=float(_env("ALPHA", 32)),
                    targets=t or DEFAULT_TARGETS, max_tokens=int(_env("MAX_TOKENS", 4096)),
                    min_free_gib=float(_env("MIN_FREE_GIB", 4)),
-                   offload=_env("OFFLOAD", "1") == "1",
+                   offload_gib=float(_env("OFFLOAD_GIB", 2)),
                    duty=min(1.0, max(0.05, float(_env("DUTY", 0.5)))),
                    max_examples=int(_env("MAX_EXAMPLES", 256)),
                    max_steps=int(_env("MAX_STEPS", 1000)), repo_id=_env("REPO_ID", ""),
