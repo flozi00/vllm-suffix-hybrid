@@ -46,7 +46,7 @@ def one(url, model, gen, temp, seed):
                                  headers={"content-type": "application/json"})
     t0 = time.monotonic()
     ttft = last = None
-    n = 0
+    n = chunks = 0
     gaps = []
     with urllib.request.urlopen(req, context=CTX, timeout=600) as resp:
         for raw in resp:
@@ -64,8 +64,9 @@ def one(url, model, gen, temp, seed):
                 gaps += [(now - last) / k] * k
             last = now
             n += k
+            chunks += 1
     dec = (n - 1) / (last - t0 - ttft) if n > 1 and last - t0 > ttft else None
-    return {"ttft": ttft, "n": n, "decode": dec, "gaps": gaps, "t0": t0, "t1": last}
+    return {"ttft": ttft, "n": n, "decode": dec, "gaps": gaps, "t0": t0, "t1": last, "chunks": chunks}
 
 
 def cell(url, model, c, seconds, gen, temp):
@@ -99,7 +100,11 @@ def cell(url, model, c, seconds, gen, temp):
     return {"conc": c, "requests": len(ok), "errors": errs, "agg_tps": toks / wall,
             "stream_tps_med": statistics.median(dec) if dec else None, "stream_tps_p10": q(dec, 0.10),
             "ttft_p50": q(ttfts, 0.5), "ttft_max": ttfts[-1] if ttfts else None,
-            "itl_p99_ms": q(gaps, 0.99) * 1e3 if gaps else None}
+            "itl_p99_ms": q(gaps, 0.99) * 1e3 if gaps else None,
+            # tokens per stream chunk after the first = tokens the engine emitted per step for one
+            # request (spec decode: accepted + 1)
+            "tok_per_step": (sum(r["n"] - 1 for r in ok) / max(1, sum(r["chunks"] - 1 for r in ok))
+                             if ok else None)}
 
 
 def main():
