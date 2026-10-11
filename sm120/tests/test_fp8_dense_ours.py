@@ -201,7 +201,8 @@ def _x(b, m, k, seed=1):
 @pytest.mark.parametrize("b,n,k,ms", [(1, 96, 512, (1, 3, 6, 17, 40, 70)),
                                       (1, 80, 768, (2, 8, 33)),      # N % 32 != 0: masks
                                       (3, 48, 192, (1, 5, 24))])     # heads, K = 3 x 64
-def test_every_planned_kernel_matches_the_exact_reference(O, kind, b, n, k, ms):
+def test_every_planned_kernel_matches_the_exact_reference(O, kind, b, n, k, ms, monkeypatch):
+    monkeypatch.setenv(O.A8_ENV, "1")  # a8 plans are opt-in on silicon; the emulation covers them
     _w, wt = _weights(O, kind, b, n, k)
     deq = O.dequant(wt)
     sem = torch.zeros(O.SEM_SLOTS, dtype=torch.int32)
@@ -534,9 +535,12 @@ def test_load_time_code_under_vllm_bf16_default_dtype(fake_vllm, monkeypatch, be
         torch.set_default_dtype(prev)
 
 
-def test_a8_plans_get_their_own_bound(O):
-    """Silicon: e4m3 x e4m3 tensor-core products sit 1.5-2.2e-3 off the exact emulation of the
-    a8 activation quantization (g14 boot); exact-activation plans keep OURS_BOUND."""
+def test_a8_plans_get_their_own_bound(O, monkeypatch):
+    """Silicon: a8 plans sat 1.5e-3..4.1e-3 off the exact emulation of their own activation
+    quantization (g14 boots): opt-in (SUFFIX_FP8_DENSE_OURS_A8=1) with their own bound."""
+    monkeypatch.delenv(O.A8_ENV, raising=False)
+    assert not any(c.a8 for c in O.configs("w8", 6144, 96))
+    monkeypatch.setenv(O.A8_ENV, "1")
     a8 = next(c for c in O.configs("w8", 6144, 96) if c.a8)
     plain = next(c for c in O.configs("w8", 6144, 96) if not c.a8)
     assert O.bound(a8) == O.A8_BOUND == 4e-3 and O.bound(plain) == O.OURS_BOUND == 1e-3

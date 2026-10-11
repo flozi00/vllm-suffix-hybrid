@@ -64,6 +64,16 @@ OURS_BOUND = 1e-3   # rel. Frobenius vs the exact reference rounded to the outpu
 A8_BOUND = 4e-3
 
 
+# a8 plans (e4m3 activation quantized in the GEMM) are off unless SUFFIX_FP8_DENSE_OURS_A8=1:
+# on silicon they sat 1.5e-3..4.1e-3 off the exact emulation of their own quantization, varying
+# by batch (g14 boots) — unexplained, so not served until it is (exact-activation plans are).
+A8_ENV = "SUFFIX_FP8_DENSE_OURS_A8"
+
+
+def a8_on() -> bool:
+    return os.environ.get(A8_ENV, "0").strip() == "1"
+
+
 def bound(cfg) -> float:
     return A8_BOUND if cfg is not None and cfg.a8 else OURS_BOUND
 WS_CAP = 4 << 20    # fp32 partial elements per split launch (16 MiB, transient)
@@ -194,7 +204,7 @@ def configs(kind: str, k: int, m: int, big: bool = False) -> list:
         for bn, bk, w, st in MMA_TILES[bm]:
             for xs in ((False, True) if w4 and bm <= 32 else (False,)):
                 raw.append(Cfg(True, bm, bn, bk, w, st, xs=xs))
-        if not w4:
+        if not w4 and a8_on():
             raw += [Cfg(True, bm, bn, bk, w, st, a8=True) for bn, bk, w, st in A8_TILES[bm]]
     out = []
     for c in raw:
