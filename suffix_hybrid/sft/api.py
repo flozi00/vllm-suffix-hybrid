@@ -46,6 +46,7 @@ from pathlib import Path
 from suffix_hybrid.sft import Config
 
 MARK = "[suffix sft]"
+PARITY_WINDOW = 1024
 _S = None   # the plugin's app state (one API server process)
 
 
@@ -292,9 +293,15 @@ class State:
             _log(f"served NLL unavailable: {type(exc).__name__}: {exc}")
             return None
 
-    async def parity(self, ids, mask):
+    async def parity(self, ids, mask, window=PARITY_WINDOW):
         """Served vs training-forward NLL on one example: mean delta (the
-        guard) + per-token |delta| quantiles and where the worst token sits."""
+        guard) + per-token |delta| quantiles and where the worst token sits.
+        Measured on <= `window` tokens: past ~2k tokens serving's own NLL
+        drifts up (NVFP4 KV / long prefill: measured 1.22 vs 1.10 on
+        qwen-fable at 3.4k tokens, while <= 1k agrees to ~0.02), which says
+        nothing about the training forward."""
+        if len(ids) > window:
+            ids, mask = (ids[:window], mask[:window]) if any(mask[1:window]) else (ids[-window:], mask[-window:])
         served = await self.served_nll(ids, mask)
         r = await self.rpc("eval", dict(ids=ids, mask=mask, seg_lens=[len(ids)], per_token=True))
         trained = r["loss_sum"] / max(1, r["tokens"])
