@@ -77,18 +77,23 @@ so only the shared swap arrays grow (4 x topk int32 rows per index group).
 """
 
 import importlib
+import importlib.util
 import os
 import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-09-27.4"
+PATCH_REVISION = "2026-10-11.1"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
 DEPENDENT_MODULE = "vllm.v1.attention.backends.mla.flashinfer_mla_sparse"
 RUNTIME_MODULE = "vllm.v1.hisparse.runtime"
 PINNED_VLLM = "0.30.0"
+# vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18) fix three of the
+# 0.30.0 bugs upstream; there the patch steps aside per anchor (see ALTERNATIVES,
+# NATIVE_SWAP_ROWS, patch_nostage_source) instead of double-patching.
+SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1")
 GATE_ENV = "SUFFIX_SM120_HISPARSE_MTP"
 MARKER_ATTR = "__suffix_hisparse_mtp_revision__"
 HELPER_TAG = "suffix sm120 hisparse-mtp patch"
@@ -209,6 +214,22 @@ EDITS = [
 ]
 
 
+# 0.31.1 nightly: the HiSparse branch no longer turns spec-as-decode off
+# (sparse_mla_attention.py:253-265) and the SM120 builder asks for it
+# (flashinfer_mla_sparse.py:275-277): only the build_marker attribute is set.
+ALTERNATIVES = {
+    "hisparse_spec_as_decode": (
+        "        if self.vllm_config.attention_config.hisparse_config is not None:\n"
+        "            reorder_batch_threshold = 1\n"
+        "        super()._init_reorder_batch_threshold(\n",
+        "        if self.vllm_config.attention_config.hisparse_config is not None:\n"
+        "            reorder_batch_threshold = 1\n"
+        "            self._suffix_hisparse_mtp = _suffix_sm120_hisparse_mtp(self)\n"
+        "        super()._init_reorder_batch_threshold(\n",
+    ),
+}
+
+
 # runtime.py: the function is replaced (anchor = its whole stock text); the
 # call-site anchor proves every consumer looks it up at call time.
 RUNTIME_OLD = (
@@ -221,6 +242,12 @@ RUNTIME_OLD = (
     "    )\n"
 )
 RUNTIME_CALL_SITE = "    max_swap_rows = _get_max_swap_rows(vllm_config)\n"
+# 0.31.1 nightly: same function on the shared max_decode_query_len, and the index
+# group sends every batch above max_swap_rows to _convert_once (index_group.py:236),
+# so the all-resident prefill no longer overflows the swap rows: stays stock.
+NATIVE_SWAP_ROWS = RUNTIME_OLD.replace("_get_max_decode_query_len(", "max_decode_query_len(")
+NATIVE_SWAP_DISPATCH = "        if num_tokens > cache.runtime.max_swap_rows:\n"
+INDEX_GROUP_MODULE = "vllm.v1.attention.backends.mla.index_group"
 RUNTIME_NEW = (
     f"# --- {HELPER_TAG} (rev {PATCH_REVISION}): swap rows == index-group\n"
     "# workspace rows (max_rows + 1, index_group.py:465), so the all-resident\n"
@@ -397,14 +424,19 @@ def check_layout_source(src: str) -> None:
             f"vLLM {PINNED_VLLM}): layout_call_site: expected 1, found {n}")
 
 
-def patch_runtime_source(src: str) -> str:
+def patch_runtime_source(src: str, index_group_src: str | None = None) -> str:
     """Pure check of runtime.py; returns the replacement functions' source
-    (_get_max_swap_rows, pinning helpers, allocate_hisparse_host_pools)."""
-    anchors = (("swap_rows_def", RUNTIME_OLD), ("swap_rows_call", RUNTIME_CALL_SITE),
-               ("pool_def", POOL_DEF), ("pool_register_loop", POOL_OLD),
-               ("pool_call_site", POOL_CALL_SITE))
+    (_get_max_swap_rows unless upstream fixed it, pinning helpers,
+    allocate_hisparse_host_pools). index_group_src proves the upstream fix."""
+    native = src.count(RUNTIME_OLD) == 0 and src.count(NATIVE_SWAP_ROWS) == 1
+    anchors = (() if native else (("swap_rows_def", RUNTIME_OLD),
+                                  ("swap_rows_call", RUNTIME_CALL_SITE))) + (
+        ("pool_def", POOL_DEF), ("pool_register_loop", POOL_OLD),
+        ("pool_call_site", POOL_CALL_SITE))
     bad = [f"{n}: expected 1, found {src.count(t)}"
            for n, t in anchors if src.count(t) != 1]
+    if native and (index_group_src or "").count(NATIVE_SWAP_DISPATCH) != 1:
+        bad.append("swap_rows: upstream form but index_group.py lacks the max_swap_rows dispatch")
     if not bad and not (src.index(POOL_DEF) < src.index(POOL_OLD)
                         and "\ndef " not in src[src.index(POOL_DEF) + 1:
                                                 src.index(POOL_OLD)]):
@@ -417,7 +449,8 @@ def patch_runtime_source(src: str) -> str:
             f"(expected vLLM {PINNED_VLLM}): " + "; ".join(bad))
     pool = src[src.index(POOL_DEF):src.index(POOL_OLD) + len(POOL_OLD)]
     # runtime.py is PEP 563 (lazy annotations); keep the rewrite that way.
-    new = "from __future__ import annotations\n" + RUNTIME_NEW + POOL_HELPER + pool.replace(POOL_OLD, POOL_NEW)
+    new = ("from __future__ import annotations\n" + ("" if native else RUNTIME_NEW)
+           + POOL_HELPER + pool.replace(POOL_OLD, POOL_NEW))
     compile(new, f"<{PATCH_NAME}:runtime>", "exec")
     return new
 
@@ -660,11 +693,15 @@ def nostage_gate_enabled() -> bool:
     return os.environ.get(NOSTAGE_ENV, "").strip() == "1"
 
 
-def patch_nostage_source(src: str) -> str:
+def patch_nostage_source(src: str) -> str | None:
     """runtime.py: initialize_hisparse_runtime_buffers without the staging
-    allocation (dedented, compilable). Both anchors must sit in their def."""
+    allocation (dedented, compilable). Both anchors must sit in their def.
+    None: upstream dropped the buffer (0.31.1 nightly), nothing to rewrite."""
     import ast
     import textwrap
+
+    if "mirror_staging" not in src and "mirror_write_target" not in src:
+        return None
 
     defs = {n.name: n for n in ast.walk(ast.parse(src))
             if isinstance(n, ast.FunctionDef)}
@@ -821,20 +858,26 @@ def install_hot_methods(stc, methods: dict, path: Path) -> None:
 
 def patch_source(src: str) -> tuple[str, list[str]]:
     """Pure transform of sparse_mla_attention.py. Every anchor is
-    count-verified BEFORE any replacement (all failures reported at once)."""
+    count-verified BEFORE any replacement (all failures reported at once);
+    an anchor with an upstream ALTERNATIVE uses it when only that one matches."""
+    edits = []
+    for n, old, new, c in EDITS:
+        if src.count(old) != c and n in ALTERNATIVES and src.count(ALTERNATIVES[n][0]) == 1:
+            n, (old, new), c = f"{n}(upstream)", ALTERNATIVES[n], 1
+        edits.append((n, old, new, c))
     bad = [f"{n}: expected {c}, found {src.count(old)}"
-           for n, old, _new, c in EDITS if src.count(old) != c]
+           for n, old, _new, c in edits if src.count(old) != c]
     if bad:
         raise PatchDriftError(
             "sparse_mla_attention.py does not match the pinned anchor text "
-            f"(expected vLLM {PINNED_VLLM}): " + "; ".join(bad))
+            f"(expected vLLM {SUPPORTED_VLLM}): " + "; ".join(bad))
     out = src
-    for n, old, new, c in EDITS:
+    for n, old, new, c in edits:
         if out.count(old) != c:
             raise PatchDriftError(f"internal error: anchor {n} overlaps")
         out = out.replace(old, new)
     compile(out, f"<{PATCH_NAME}>", "exec")  # syntax gate
-    return out, [n for n, *_ in EDITS]
+    return out, [n for n, *_ in edits]
 
 
 def exec_patched_source(module, new_src: str, src_path: Path) -> None:
@@ -864,8 +907,8 @@ def apply(module=None) -> bool:
     import vllm
 
     ver = getattr(vllm, "__version__", "")
-    if not ver.startswith(PINNED_VLLM):
-        raise PatchDriftError(f"vllm {ver!r} != pinned {PINNED_VLLM}")
+    if not ver.startswith(SUPPORTED_VLLM):
+        raise PatchDriftError(f"vllm {ver!r} != pinned {' / '.join(SUPPORTED_VLLM)}")
     src_path = Path(module.__file__)
     src = src_path.read_text()
     if HELPER_TAG in src:
@@ -874,7 +917,10 @@ def apply(module=None) -> bool:
     runtime = importlib.import_module(RUNTIME_MODULE)
     rt_path = Path(runtime.__file__)
     rt_src = rt_path.read_text()
-    rt_new = patch_runtime_source(rt_src)
+    ig_src = None
+    if rt_src.count(NATIVE_SWAP_ROWS) == 1:  # upstream swap rows: prove the index_group dispatch
+        ig_src = Path(importlib.util.find_spec(INDEX_GROUP_MODULE).origin).read_text()
+    rt_new = patch_runtime_source(rt_src, ig_src)
     prefetch = patch_prefetch_source(rt_src) if prefetch_gate_enabled() else None
     nostage = patch_nostage_source(rt_src) if nostage_gate_enabled() else None
     layout = importlib.import_module(LAYOUT_MODULE)
@@ -900,20 +946,24 @@ def apply(module=None) -> bool:
         install_connector_method(connector, mixed, Path(connector.__file__))
     exec_patched_source(module, new_src, src_path)
     setattr(module, MARKER_ATTR, PATCH_REVISION)
-    print(f"[suffix {PATCH_NAME}] ACTIVE on SM120: HiSparse spec-verify tokens "
-          f"-> multi-token hot-buffer decode + swap rows = max_rows+1 "
-          f"+ prefill staging plan w/o prefill backend "
-          f"+ serialized shared host-pool pinning "
-          f"+ minimal profiling host pool "
-          f"+ counted hot-region allocation + in-use-only copy adoption "
+    upstream = ig_src is not None  # 0.31.1 nightly: three fixes are upstream
+    print(f"[suffix {PATCH_NAME}] ACTIVE on SM120: "
+          + ("upstream multi-token hot-buffer decode + swap rows "
+             if upstream else "HiSparse spec-verify tokens -> multi-token hot-buffer "
+                              "decode + swap rows = max_rows+1 ")
+          + "+ prefill staging plan w/o prefill backend "
+          "+ serialized shared host-pool pinning "
+          "+ minimal profiling host pool "
+          "+ counted hot-region allocation + in-use-only copy adoption "
           + ("+ follower prefetch for multi-token decode "
              if prefetch is not None else "")
           + ("+ prefill-only residency flag (mixed batches) "
              if mixed is not None else "")
           + ("+ no prefill mirror staging buffer "
              if nostage is not None else "")
-          +
-          f"(rev {PATCH_REVISION}; {len(applied) + 6 + (len(prefetch) if prefetch else 0)} anchors; vllm {ver}).",
+          + ("(no mirror staging buffer upstream) "
+             if upstream and nostage_gate_enabled() else "")
+          + f"(rev {PATCH_REVISION}; {', '.join(applied)}; vllm {ver}).",
           file=sys.stderr, flush=True)
     return True
 

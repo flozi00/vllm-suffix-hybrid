@@ -46,6 +46,8 @@ from pathlib import Path
 PATCH_NAME = "fp8-dense"
 PATCH_REVISION = "2026-09-28.1"
 PINNED_VLLM = "0.30.0"
+# + vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18): same anchors.
+SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1")
 GATE_ENV = "SUFFIX_FP8_DENSE"
 LAYERS_ENV = "SUFFIX_FP8_DENSE_LAYERS"
 NVFP4_GATE_ENV = "SUFFIX_NVFP4_DENSE"
@@ -207,8 +209,8 @@ def apply(module) -> bool:
     import vllm
 
     ver = getattr(vllm, "__version__", "")
-    if not ver.startswith(PINNED_VLLM):
-        raise PatchDriftError(f"vllm {ver!r} != pinned {PINNED_VLLM}")
+    if not ver.startswith(SUPPORTED_VLLM):
+        raise PatchDriftError(f"vllm {ver!r} != pinned {' / '.join(SUPPORTED_VLLM)}")
     src_path = Path(module.__file__)
     src = src_path.read_text()
     if HELPER_TAG in src:

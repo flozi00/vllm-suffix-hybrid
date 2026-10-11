@@ -44,8 +44,10 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-ds-mla"
-PATCH_REVISION = "2026-09-27.1"
+PATCH_REVISION = "2026-10-11.1"
 PINNED_VLLM = "0.30.0"
+# + vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18): same anchors.
+SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1")
 GATE_ENV = "SUFFIX_SM120_NVP4DSMLA"
 MARKER_ATTR = "__suffix_nvfp4_ds_mla_revision__"
 HELPER_TAG = "suffix sm120 nvfp4-ds-mla patch"
@@ -190,7 +192,8 @@ IMPL_EDITS.append((
     + "                    _leader = index_group.cache(0)\n"
     "                    topk_indices_physical = triton_convert_req_index_to_global_index(\n"
     "                        attn_metadata.req_id_per_token[num_decode_tokens:num_actual_toks],\n"
-    "                        _leader.block_table,\n"
+    "                        (_leader.batch_block_table() if hasattr(_leader, 'batch_block_table')\n"
+    "                         else _leader.block_table),\n"
     "                        topk_indices[num_decode_tokens:],\n"
     "                        BLOCK_SIZE=_leader.view.block_size,\n"
     "                        BLOCK_STRIDE_ROWS=_leader.view.attention_block_stride,\n"
@@ -405,8 +408,8 @@ def apply(module) -> bool:
     import vllm
 
     ver = getattr(vllm, "__version__", "")
-    if not ver.startswith(PINNED_VLLM):
-        raise PatchDriftError(f"vllm {ver!r} != pinned {PINNED_VLLM}")
+    if not ver.startswith(SUPPORTED_VLLM):
+        raise PatchDriftError(f"vllm {ver!r} != pinned {' / '.join(SUPPORTED_VLLM)}")
     src_path = Path(module.__file__)
     src = src_path.read_text()
     if HELPER_TAG in src:
