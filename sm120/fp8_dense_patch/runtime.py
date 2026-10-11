@@ -25,9 +25,18 @@ FP4_KERNEL_BOUND = 2e-2  # Marlin zeroes block scales < 2^-6 of the largest (S0E
 #               both FP8 layouts stay resident (+1x the converted FP8 bytes)
 #   marlin_fp4  NVFP4 weight-only (W4A16 Marlin) for every M: half the FP8 bytes, LOSSY
 #               (per-16 e4m3 scales + per-tensor global) -- quality-gate before serving
+#   ours        our Triton W8A16 / in-GEMM-quant W8A8 kernels (ours.py) and cutlass, the
+#               fastest per (shape, M bucket) from a load-time cold-L2 timing table; one
+#               FP8 copy (cutlass reads the same [N, K] tensor transposed)
+#   best        ours + Marlin W8A16 as a third route (its repack kept only for shapes
+#               where Marlin wins a bucket)
+#   ours_fp4    NVFP4 weight-only through our W4A16 kernel for every M, LOSSY like
+#               marlin_fp4 -- quality-gate before serving
 BACKEND_ENV = "SUFFIX_FP8_DENSE_BACKEND"
 MARLIN_MAX_M_ENV = "SUFFIX_FP8_DENSE_MARLIN_MAX_M"
-BACKENDS = ("cutlass", "marlin", "auto", "marlin_fp4")
+OURS_BACKENDS = ("ours", "best", "ours_fp4")
+BACKENDS = ("cutlass", "marlin", "auto", "marlin_fp4") + OURS_BACKENDS
+ROUTED = ("auto",) + OURS_BACKENDS  # per-call M route inside torch.ops.suffix_fp8d.linear
 MARLIN_MAX_M = 64  # placeholder until glm_dense_marlin_bench recommends one
 ORACLE_MS = (1, 6, 32)
 OP_NS = "suffix_fp8d"
@@ -35,7 +44,10 @@ OP_NS = "suffix_fp8d"
 _OPS = None  # vllm._custom_ops, bound by convert_model (tests inject a fake)
 _METHOD_CLS = None
 _SELFTESTED = set()
-_LAYERS = {}  # op key -> module (backend auto)
+_LAYERS = {}  # op key -> module (routed backends)
+_ROUTES = {}  # (backend, device, N, K) -> ours.Route (tuned on the first layer of a shape)
+_OURS = None  # the ours module, bound at load (no imports inside the traced forward)
+_NO_SEM = set()  # streams already reported without split-K counters
 _LIB = None
 _APPLY = {}   # "fp8" / "fp4" -> vLLM's apply_fp{8,4}_marlin_linear, bound at load (no
               # imports inside the traced forward)
@@ -150,10 +162,35 @@ def marlin_linear(x2, mod):
     return _APPLY["fp8"](x2, mod.marlin_w, mod.marlin_s, mod.marlin_ws, n, k, None)
 
 
+def ours_apply(x2, mod):
+    """Routed backends ours / best / ours_fp4: x2 [M, K] -> [M, N] on the path the
+    load-time table picked for this M bucket."""
+    path, plan = mod._sfx_ours.lookup(x2.shape[0])
+    if path == "cutlass":
+        return fp8_linear(x2, mod.weight, mod.weight_scale)
+    if path == "marlin":
+        return marlin_linear(x2, mod)
+    if x2.stride(-1) != 1 or x2.data_ptr() % 16 or (x2.shape[0] > 1 and x2.stride(0) % 16):
+        x2 = x2.clone(memory_format=torch.contiguous_format)  # keep one specialization
+    sem = None
+    if plan.n_split > 1 and not plan.two:
+        stream = torch.cuda.current_stream(x2.device).cuda_stream
+        sem = _OURS.sem_for(x2.device, stream)
+        if sem is None:  # more streams than ours.N_SEMS: same tile and split, two-stage
+            if stream not in _NO_SEM:
+                _NO_SEM.add(stream)
+                _log(f"stream {stream:#x} found no free split-K counters (ours.N_SEMS = "
+                     f"{_OURS.N_SEMS}): its last-CTA plans run two-stage")
+            plan = plan.two_stage()
+    return _OURS.run(x2, mod._sfx_ours_w, plan, sem)
+
+
 def _op_impl(x, n: int, layer: str):
-    """torch.ops.suffix_fp8d.linear: the per-call M route of backend auto (opaque to
-    Dynamo: vLLM traces once at max_num_batched_tokens with guards skipped)."""
+    """torch.ops.suffix_fp8d.linear: the per-call M route of the routed backends (opaque
+    to Dynamo: vLLM traces once at max_num_batched_tokens with guards skipped)."""
     mod = _LAYERS[layer]
+    if mod._sfx_fp8d != "auto":
+        return ours_apply(x, mod)
     if x.shape[0] <= mod._sfx_fp8d_max_m:
         return marlin_linear(x, mod)
     return fp8_linear(x, mod.weight, mod.weight_scale)
@@ -183,7 +220,7 @@ def dense_linear(x, mod, bias=None):
         return fp8_linear(x, mod.weight, mod.weight_scale, bias)
     n = mod._sfx_fp8d_nk[0]
     x2 = x.reshape(-1, x.shape[-1])
-    out = register_op()(x2, n, mod._sfx_fp8d_key) if tag == "auto" else marlin_linear(x2, mod)
+    out = register_op()(x2, n, mod._sfx_fp8d_key) if tag in ROUTED else marlin_linear(x2, mod)
     if bias is not None:
         out = out + bias
     return out.view(*x.shape[:-1], n)
@@ -257,6 +294,80 @@ def _selftest_marlin(name, w, mod, bias, wq4=None) -> None:
                 f"vs exact dequant {ek:.3e} (<= {kb})")
 
 
+def _log(msg: str) -> None:
+    print(f"[suffix {PATCH_NAME}] {msg}", file=sys.stderr, flush=True)
+
+
+def _convert_ours(name, mod, w, bias, be, n, k):
+    """Backends ours / best / ours_fp4 for one layer: quantize, attach, route (timed on
+    the first layer of each (backend, device, N, K)). Returns (resident bytes, first)."""
+    global _OURS
+    if _OURS is None:
+        from . import ours
+
+        _OURS = ours
+    rkey = (be, w.device, n, k)
+    route = _ROUTES.get(rkey)
+    if be == "ours_fp4":
+        wq, wsf, g = fp4_quantize(w)
+        wt = _OURS.Weights.fp4(wq, wsf, g)
+        params = dict(weight=wq, ours_sf=wsf)
+    else:
+        q, s = quantize_weight(w)
+        if route is None:  # cutlass serves above the last bucket: its own self-test
+            _selftest(name, w, q, s, bias)
+        wt = _OURS.Weights.fp8(q, s)
+        params = dict(weight=q, weight_scale=wt.s)
+    for attr, t in params.items():
+        setattr(mod, attr, nn.Parameter(t, requires_grad=False))
+    mod._sfx_fp8d_nk, mod._sfx_ours_w = (n, k), wt
+    if be == "best" and (route is None or "marlin" in route.paths()):
+        for attr, t in marlin_fp8_pack(q, s).items():
+            setattr(mod, attr, None if t is None else nn.Parameter(t, requires_grad=False))
+    first = route is None
+    if first:
+        extra = {}
+        if be != "ours_fp4":
+            extra["cutlass"] = lambda x: fp8_linear(x, q, s)
+        if be == "best":
+            extra["marlin"] = lambda x: marlin_linear(x, mod)
+        route = _ROUTES[rkey] = _OURS.tune_route(
+            wt, w.device, extra, None if be == "ours_fp4" else "cutlass",
+            log=lambda line: _log(f"{name}: {line}"))
+        if be == "best" and "marlin" not in route.paths():
+            for attr in ("marlin_w", "marlin_s", "marlin_ws"):
+                delattr(mod, attr)
+    mod._sfx_ours = route
+    kept = [getattr(mod, a, None) for a in ("marlin_w", "marlin_s", "marlin_ws")]
+    return wt.nbytes() + sum(t.numel() * t.element_size() for t in kept if t is not None), first
+
+
+def _oracle_ours(name, w, mod) -> None:
+    """Once per (backend, device, N, K), counters in place: the routed path through
+    ours_apply at ORACLE_MS vs BF16 and vs the exact reference of the path it took, before
+    the BF16 weight is freed. Fails closed."""
+    wt = mod._sfx_ours_w
+    deq = _OURS.dequant(wt)
+    qb = FP4_QUANT_BOUND if wt.w4 else QUANT_BOUND
+    for m in ORACLE_MS:
+        x = torch.randn(m, w.shape[1], device=w.device, dtype=torch.bfloat16)
+        path, plan = mod._sfx_ours.lookup(m)
+        out = ours_apply(x, mod)
+        if path == "ours":
+            ek, kb = _OURS.rel_err(out, _OURS.reference(x, deq, plan.cfg)), _OURS.OURS_BOUND
+        elif path == "cutlass":
+            ek, kb = rel_frob(out, reference(x, mod.weight, mod.weight_scale)), KERNEL_BOUND
+        else:  # Marlin reads the channel scales in the activation dtype
+            mdeq = mod.weight.float() * mod.weight_scale.to(torch.bfloat16).float()[:, None]
+            ek, kb = rel_frob(out, x.float() @ mdeq.t()), KERNEL_BOUND
+        eq = rel_frob(out, nn.functional.linear(x, w))
+        if not (bool(torch.isfinite(out).all()) and eq <= qb and ek <= kb):
+            raise RuntimeError(
+                f"[suffix {PATCH_NAME}] {mod._sfx_fp8d} oracle FAILED on {name} "
+                f"{tuple(w.shape)} at M={m} ({plan.tag() if plan else path}): rel err vs "
+                f"bf16 {eq:.3e} (<= {qb}), vs exact {ek:.3e} (<= {kb})")
+
+
 def _capability(dev):
     return torch.cuda.get_device_capability(dev) if dev.type == "cuda" else None
 
@@ -282,10 +393,11 @@ def convert_model(model, patterns=None) -> list:
         _OPS = _custom_ops
     be = backend()
     max_m = marlin_max_m() if be == "auto" else 0
-    if be == "auto":
+    if be in ROUTED:
         register_op()  # here, not inside the traced forward
     method = method_cls()()
     done, skipped, bf16_bytes, kept_bytes = [], [], 0, 0
+    pending = []  # (name, bf16 weight, module): routed-path oracle once counters exist
     for name, mod in list(model.named_modules()):
         if not selected(name, patterns):
             continue
@@ -305,36 +417,43 @@ def convert_model(model, patterns=None) -> list:
         bias = getattr(mod, "bias", None)
         bias_d = None if bias is None else bias.data
         key = (be, w.device, n, k)
-        if be == "marlin_fp4":
-            wq4 = fp4_quantize(w.data)
-            packed = marlin_fp4_pack(*wq4)
+        if be in OURS_BACKENDS:
+            nbytes, first = _convert_ours(name, mod, w.data, bias_d, be, n, k)
+            kept_bytes += nbytes
+            if first:
+                pending.append((name, w.data, mod))
         else:
-            q, s = quantize_weight(w.data)
-            if be != "marlin" and key not in _SELFTESTED:
-                _selftest(name, w.data, q, s, bias_d)
-            packed = marlin_fp8_pack(q, s) if be in ("marlin", "auto") else {}
-        if packed:
-            for attr, t in packed.items():
-                setattr(mod, attr, None if t is None else nn.Parameter(t, requires_grad=False))
-            mod._sfx_fp8d_nk = (n, k)
-            if key not in _SELFTESTED:
-                if be != "marlin_fp4":
-                    mod.weight_fp8_ref, mod.weight_scale_ref = q, s
-                _selftest_marlin(name, w.data, mod, bias_d, wq4 if be == "marlin_fp4" else None)
-                for ref_attr in ("weight_fp8_ref", "weight_scale_ref"):
-                    mod.__dict__.pop(ref_attr, None)
+            if be == "marlin_fp4":
+                wq4 = fp4_quantize(w.data)
+                packed = marlin_fp4_pack(*wq4)
+            else:
+                q, s = quantize_weight(w.data)
+                if be != "marlin" and key not in _SELFTESTED:
+                    _selftest(name, w.data, q, s, bias_d)
+                packed = marlin_fp8_pack(q, s) if be in ("marlin", "auto") else {}
+            if packed:
+                for attr, t in packed.items():
+                    setattr(mod, attr, None if t is None else nn.Parameter(t, requires_grad=False))
+                mod._sfx_fp8d_nk = (n, k)
+                if key not in _SELFTESTED:
+                    if be != "marlin_fp4":
+                        mod.weight_fp8_ref, mod.weight_scale_ref = q, s
+                    _selftest_marlin(name, w.data, mod, bias_d, wq4 if be == "marlin_fp4" else None)
+                    for ref_attr in ("weight_fp8_ref", "weight_scale_ref"):
+                        mod.__dict__.pop(ref_attr, None)
+            if be in ("cutlass", "auto"):
+                mod.weight = nn.Parameter(q, requires_grad=False)
+                mod.weight_scale = nn.Parameter(s, requires_grad=False)
+                kept_bytes += q.numel() + s.numel() * 4
+            else:  # Marlin only: the repacked tensor IS the weight (no second copy)
+                mod.weight = mod.marlin_w
+            kept_bytes += sum(t.numel() * t.element_size() for t in packed.values() if t is not None)
         _SELFTESTED.add(key)
         bf16_bytes += w.numel() * 2
-        if be in ("cutlass", "auto"):
-            mod.weight = nn.Parameter(q, requires_grad=False)
-            mod.weight_scale = nn.Parameter(s, requires_grad=False)
-            kept_bytes += q.numel() + s.numel() * 4
-        else:  # Marlin only: the repacked tensor IS the weight (no second copy)
-            mod.weight = mod.marlin_w
-        kept_bytes += sum(t.numel() * t.element_size() for t in packed.values() if t is not None)
         mod._sfx_fp8d = be
         if be == "auto":
             mod._sfx_fp8d_max_m = max_m
+        if be in ROUTED:
             mod._sfx_fp8d_key = f"{name}#{len(_LAYERS)}"
             _LAYERS[mod._sfx_fp8d_key] = mod
         if kind == "linear":
@@ -342,14 +461,25 @@ def convert_model(model, patterns=None) -> list:
         else:
             mod.__class__ = Fp8DenseNNLinear
         done.append((name, n, k))
+    banks = ""
+    if be in OURS_BACKENDS:
+        _OURS.ensure_sems(dev)
+        need = max([0] + [r.ws(1, rk[2]) for rk, r in _ROUTES.items() if rk[:2] == (be, dev)])
+        banks = (f" + split-K counters {_OURS.N_SEMS} streams x {_OURS.SEM_SLOTS * 4 >> 10} KiB"
+                 f", partials <= {need * 4 / 2**20:.1f} MiB per call (caching allocator)")
+        while pending:  # pop: no reference to a freed BF16 weight survives
+            _oracle_ours(*pending.pop())
     torch.cuda.empty_cache()
     shapes = sorted({(n, k) for _, n, k in done})
     mode = {"cutlass": "FP8 W8A8 (cutlass)", "marlin": "FP8 W8A16 (Marlin, every M)",
             "auto": f"FP8 W8A16 Marlin M<={max_m} / W8A8 cutlass above",
-            "marlin_fp4": "NVFP4 W4A16 (Marlin, every M)"}[be]
+            "marlin_fp4": "NVFP4 W4A16 (Marlin, every M)",
+            "ours": "FP8 ours W8A16/W8A8 | cutlass routed per (shape, M bucket)",
+            "best": "FP8 ours W8A16/W8A8 | cutlass | Marlin W8A16 routed per (shape, M bucket)",
+            "ours_fp4": "NVFP4 W4A16 ours (every M)"}[be]
     print(f"[suffix {PATCH_NAME}] converted {len(done)} linears to {mode} on "
           f"{dev} ({bf16_bytes / 2**30:.2f} GiB bf16 -> "
-          f"{kept_bytes / 2**30:.2f} GiB resident; shapes N x K {shapes}; rev "
+          f"{kept_bytes / 2**30:.2f} GiB resident{banks}; shapes N x K {shapes}; rev "
           f"{PATCH_REVISION})" + (f"; skipped {skipped}" if skipped else ""),
           file=sys.stderr, flush=True)
     return done

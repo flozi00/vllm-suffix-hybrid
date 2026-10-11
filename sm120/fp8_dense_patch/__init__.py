@@ -30,7 +30,13 @@ above, routed inside the custom op ``torch.ops.suffix_fp8d.linear``; both FP8
 layouts stay resident) or ``marlin_fp4`` (NVFP4 weight-only W4A16 Marlin for
 every M; LOSSY, quality-gate first). Marlin layers get their own fail-closed
 self-test at M in runtime.ORACLE_MS vs BF16 and vs the exact dequantized
-weight. Bench: boot gate ``glm_dense_marlin_bench``. A boot
+weight. Bench: boot gate ``glm_dense_marlin_bench``. Our own kernels (ours.py,
+Triton): ``ours`` (W8A16 gemv / mma + in-GEMM-quant W8A8, routed against
+cutlass per (shape, M bucket) from a load-time cold-L2 timing table; one FP8
+copy), ``best`` (+ Marlin W8A16 as a route) and ``ours_fp4`` (NVFP4 W4A16
+for every M; LOSSY); every candidate is checked against the exact dequantized
+weight before it is timed and the route passes a fail-closed oracle at
+runtime.ORACLE_MS. Bench: boot gate ``glm_dense_ours_bench``. A boot
 self-test per (N, K) shape runs each converted shape once at M=6 against the
 BF16 weight before it is freed (fails closed: the SM120 block-scaled
 "cutlass_gemm_caller Invalid status" class of failure dies at load, not in
@@ -53,7 +59,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "fp8-dense"
-PATCH_REVISION = "2026-09-28.1"
+PATCH_REVISION = "2026-10-11.1"
 PINNED_VLLM = "0.30.0"
 # + vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18): same anchors.
 SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1")
