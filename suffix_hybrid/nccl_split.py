@@ -484,6 +484,12 @@ def setup(self, bands, autotune_on: bool, qar: str) -> None:
         qar_hi = parse_size(_env("SUFFIX_NCCL_QAR_MAX_BYTES", "inf"))
     if routes or qar_obj is not None:
         self._suffix_pick = make_pick(routes, qar_obj, qar_lo, qar_hi)
+    if tp:  # the fused all-reduce + RMSNorm op (suffix_hybrid/har_norm.py) uses the tp group's buffer
+        har = next((c for sp, c in comms.items() if sp in HAR_SPECS), None)
+        if har is not None:
+            from suffix_hybrid import host_ar
+
+            host_ar.TP_COMM = har
     self._suffix_hag = None
     if tp and _env(HAR_AG_ENV) == "1":
         self._suffix_hag = next((c for sp, c in comms.items() if sp in HAR_SPECS), None)
