@@ -575,8 +575,9 @@ def q8_reference(xs, world: int, group: int = Q8_GROUP):
     def quant(v):
         g = v.view(-1, group)
         amax = g.abs().amax(1)
-        inv = torch.where(amax > 0, 127.0 / amax, torch.zeros_like(amax))
-        return torch.round(g * inv[:, None]), amax / 127.0
+        k = torch.full_like(amax, 127.0)  # tensor / tensor: IEEE division (scalar / t is
+        inv = torch.where(amax > 0, k / amax, torch.zeros_like(amax))  # reciprocal(t) * scalar)
+        return torch.round(g * inv[:, None]), amax / k
 
     def deq(q, sc):
         return (q * sc[:, None]).view(-1)
@@ -741,7 +742,9 @@ def _bench_worker(rank, world, port, q, hidden) -> None:
                     xs, exact = _inputs(rank, world, n, dev, all_inputs=True)
                     y = har.all_reduce(x)
                     torch.cuda.synchronize()
-                    row = {"v": vname, "tok": t, "grid": har.grid(n),
+                    sums = [None] * world
+                    dist.all_gather_object(sums, float(y.view(torch.int16).double().sum()), group=cpu)
+                    row = {"v": vname, "tok": t, "grid": har.grid(n), "ranks_same": len(set(sums)) == 1,
                            "two_exact": (bool(torch.equal(y, q8_reference(xs, world, har.q8_group)))
                                          if n <= har.round else True),
                            "q8_err": float((y.float() - exact).norm() / exact.norm()),
@@ -839,8 +842,9 @@ def bench(hidden: int = 6144) -> int:
         ok &= exact
         best = min(v for k, v in cell.items() if k != "nccl_us")
         one = f"{cell['one_us']:8.1f}" if "one_us" in cell else "       -"
-        err = (f" | rel-l2 q8 {max(rr['q8_err'] for rr in rows):.2e} vs bf16 {row['bf16_err']:.2e}"
-               if "q8_err" in row else "")
+        err = (f" | rel-l2 q8 {max(rr['q8_err'] for rr in rows):.2e} vs bf16 {row['bf16_err']:.2e} "
+               f"ranks-identical {all(rr['ranks_same'] for rr in rows)}" if "q8_err" in row else "")
+        ok &= all(rr.get("ranks_same", True) for rr in rows)
         print(f"{MARK} {row['v']:9s} {row['tok']:5d} tok ({row['tok'] * hidden * 2 / 1024:8.1f} KiB) "
               f"grid {row['grid']:3d}: two-shot {cell['two_us']:8.1f} us | one-shot {one} us | nccl "
               f"{cell['nccl_us']:8.1f} us ({cell['nccl_us'] / best:4.2f}x) | exact {exact}{err}", flush=True)
