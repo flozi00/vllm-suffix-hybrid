@@ -133,10 +133,13 @@ def _sft_class(cls):
     return _CLASSES[cls]
 
 
-def install_adapters(lm, targets=DEFAULT_TARGETS, rank=16, alpha=32.0, tp_rank=0):
-    """Re-class every linear's quant method; zero-init adapters on the
-    linears matching `targets`. Returns {name: (layer, LoRA)} (LM-relative
-    names, sorted)."""
+def install_adapters(lm, targets=DEFAULT_TARGETS, rank=16, alpha=32.0, tp_rank=0, dtype=None):
+    """Re-class every linear's quant method; zero-init adapters (in the
+    model's activation `dtype`) on the linears matching `targets`. Returns
+    {name: (layer, LoRA)} (LM-relative names, sorted). Every LM parameter is
+    frozen (vLLM never trains; stray .grad on served norms would accumulate)."""
+    for p in lm.parameters():
+        p.requires_grad_(False)
     out = {}
     for name, m in lm.named_modules():
         if not is_linear(m):
@@ -145,11 +148,12 @@ def install_adapters(lm, targets=DEFAULT_TARGETS, rank=16, alpha=32.0, tp_rank=0
         if not any(fnmatch.fnmatch(name, p) for p in targets):
             continue
         k, n = in_out(m)
-        w = next((p for p in m.parameters() if p.dtype.is_floating_point and p.element_size() >= 2),
-                 None)
+        w = getattr(m, "weight", None)   # NVFP4 layers: uint8 weight, fp32 scales
+        dt = dtype or (w.dtype if w is not None and w.dtype in (torch.bfloat16, torch.float16,
+                                                                 torch.float32) else torch.bfloat16)
         lora = LoRA(name, k, n, rank, alpha, tp_kind(m), tp_rank,
-                    int(getattr(m, "tp_size", 1) or 1),
-                    w.dtype if w is not None else torch.bfloat16, next(m.parameters()).device)
+                    int(getattr(m, "tp_size", 1) or 1), dt, next(m.parameters()).device)
+        m.requires_unquantized_input = True    # the delta reads the bf16 input (as vLLM LoRA)
         m.register_buffer("sft_A", lora.A, persistent=False)
         m.register_buffer("sft_B", lora.B, persistent=False)
         m.sft_scale = lora.scale
@@ -221,11 +225,30 @@ class _Raw:
         self.all_reduce, self.world_size, self.rank_in_group = all_reduce, g.world_size, g.rank_in_group
 
 
-def _to_host(x):
-    if not x.is_cuda:
-        return x
-    dst = torch.empty(x.shape, dtype=x.dtype, pin_memory=True)
-    return dst.copy_(x, non_blocking=True)
+class _Park(torch.autograd.Function):
+    """x -> (1-element handle broadcast to x's shape); x's data parked on the
+    host. The handle is what activation checkpointing keeps; its gradient
+    (full-size, on the device) is x's gradient: no gradient crosses PCIe."""
+
+    @staticmethod
+    def forward(ctx, x, slot):
+        h = torch.empty(x.shape, dtype=x.dtype, pin_memory=x.is_cuda)
+        slot.append(h.copy_(x.detach(), non_blocking=True))
+        return x.new_zeros(()).expand(x.shape)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g, None
+
+
+class _Unpark(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, handle, slot):
+        return slot[0].to(handle.device, non_blocking=True, copy=True)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g, None
 
 
 class TrainMode(contextlib.ContextDecorator):
@@ -234,9 +257,10 @@ class TrainMode(contextlib.ContextDecorator):
     [(start, end)] of the packed sequences (attention / GDN never cross them).
     """
 
-    def __init__(self, sft, params, segments, grad=True, offload=True):
+    def __init__(self, sft, params, segments, grad=True, offload=True, check=False):
         self.s, self.params, self.segments = sft, params, segments
-        self.grad, self.offload = grad, offload
+        self.grad, self.offload, self.check = grad, offload, check
+        self.cut = []      # modules whose output lost the input's grad (check=True)
         self.g = sft.g
         self.kv = {}
         self.rule = _gdn_rule()
@@ -264,6 +288,13 @@ class TrainMode(contextlib.ContextDecorator):
                      "op" if hasattr(m, "_forward_method") and hasattr(m, "forward_native") else None,
                      hasattr(m, "do_not_compile"), [f for f in FUSED_FLAGS if hasattr(m, f)])
                     for m in self.s.lm.modules()]
+                self.s.__dict__["_sft_kv_targets"] = {
+                    m.kv_sharing_target_layer_name for m, kind, _, _ in mods
+                    if kind == "attn" and m.kv_sharing_target_layer_name}
+            self.kv_targets = self.s.__dict__["_sft_kv_targets"]
+            if self.check:
+                from torch.nn.modules.module import register_module_forward_hook
+                st.callback(register_module_forward_hook(self._cut_hook).remove)
             for m, kind, compiled, flags in mods:
                 if kind == "attn":
                     self._set(m, "forward", lambda q, k, v, *a, _m=m, **kw: self.attention(_m, q, k, v))
@@ -298,6 +329,14 @@ class TrainMode(contextlib.ContextDecorator):
         self._stack.close()
         return False
 
+    def _cut_hook(self, m, args, out):
+        """A module that received a grad-requiring tensor but returns float
+        tensors without grad ran an op with no autograd (a fused kernel)."""
+        flat = lambda x: [t for t in (x if isinstance(x, (tuple, list)) else [x]) if torch.is_tensor(t)]
+        if (torch.is_grad_enabled() and any(t.requires_grad for t in flat(args))
+                and any(t.is_floating_point() and not t.requires_grad for t in flat(out))):
+            self.cut.append(type(m).__name__)
+
     @staticmethod
     def _native_ir(st):
         try:
@@ -319,15 +358,15 @@ class TrainMode(contextlib.ContextDecorator):
             # checkpoint as host copies; ints (positions) and the rest stay
             slots = [(i, a) for i, a in enumerate(args)] + list(kwargs.items())
             keys = [k for k, v in slots if torch.is_tensor(v) and v.is_floating_point()]
-            dev = {k: v.device for k, v in slots if k in keys}
+            parked = {k: [] for k in keys} if self.offload else {}
 
             def body(*vals):
-                got = {k: v.to(dev[k], non_blocking=True) for k, v in zip(keys, vals)}
+                got = {k: (_Unpark.apply(v, parked[k]) if parked else v) for k, v in zip(keys, vals)}
                 a = [got.get(i, v) for i, v in enumerate(args)]
                 kw = {k: got.get(k, v) for k, v in kwargs.items()}
                 return fwd(*a, **kw)
 
-            vals = [(_to_host(v) if self.offload else v) for k, v in slots if k in keys]
+            vals = [(_Park.apply(v, parked[k]) if parked else v) for k, v in slots if k in keys]
             return checkpoint(body, *vals, use_reentrant=False)
         return run
 
@@ -355,7 +394,10 @@ class TrainMode(contextlib.ContextDecorator):
             k, v = self.kv[m.kv_sharing_target_layer_name]
         else:
             k, v = k.reshape(t, nkv, hd), v.reshape(t, nkv, hdv)
-            self.kv[m.layer_name] = (k, v)
+            if m.layer_name in self.kv_targets:
+                self.kv[m.layer_name] = (k, v)
+        if nh != nkv:   # explicit GQA: SDPA's enable_gqa forces the O(n^2) math kernel
+            k, v = k.repeat_interleave(nh // nkv, 1), v.repeat_interleave(nh // nkv, 1)
         sw = getattr(m, "sliding_window", None)
         out = []
         for s, e in self.segments:
@@ -367,7 +409,7 @@ class TrainMode(contextlib.ContextDecorator):
                 d = i[:, None] - i[None, :]
                 mask = (d >= 0) & (d < sw)
             o = F.scaled_dot_product_attention(qs, ks, vs, attn_mask=mask, is_causal=mask is None,
-                                               scale=m.impl.scale, enable_gqa=nh != nkv)
+                                               scale=m.impl.scale)
             out.append(o[0].transpose(0, 1))
         return torch.cat(out).reshape(t, nh * hdv)
 
@@ -413,7 +455,7 @@ class TrainMode(contextlib.ContextDecorator):
         pos = torch.cat([torch.arange(e - s, device=ids.device) for s, e in self.segments])
         if self.s.mrope:
             pos = pos.expand(3, n)
-        h = self.s.inner(input_ids=ids, positions=pos)
+        h = self.s.inner(input_ids=ids, positions=pos, intermediate_tensors=None)
         if isinstance(h, tuple):
             h = h[0]
         h = h[rows]

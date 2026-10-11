@@ -319,7 +319,7 @@ class Inner(nn.Module):
             raise RuntimeError("compiled forward called in training")
         return self.forward(*a, **kw)
 
-    def forward(self, input_ids, positions):
+    def forward(self, input_ids, positions, intermediate_tensors):   # no default, like Gemma4
         h, res = self.embed_tokens(input_ids), None
         for layer in self.layers:
             h, res = layer(positions=positions, hidden_states=h, residual=res)
@@ -441,7 +441,7 @@ def oracle(lm, sft, batch=BATCH):
     pos = torch.cat([torch.arange(e - s) for s, e in segs])
     REF.update(on=True, params=params, segs=segs, kv={})
     try:
-        h = lm.model(input_ids=ids, positions=pos)
+        h = lm.model(input_ids=ids, positions=pos, intermediate_tensors=None)
         logits = h[rows] @ lm.lm_head.weight[:V].T
         loss = F.cross_entropy(logits, ids[tgt], reduction="sum")
         loss.backward()
@@ -567,7 +567,7 @@ def test_trainmode_matches_oracle_and_restores():
     assert abs(la + lb - loss) < 1e-4 * loss
     # every swap restored: serving paths raise / dispatch fused again
     with pytest.raises(RuntimeError, match="compiled"):
-        lm.model(input_ids=torch.tensor([1, 2]), positions=torch.arange(2))
+        lm.model(input_ids=torch.tensor([1, 2]), positions=torch.arange(2), intermediate_tensors=None)
     assert lm.model.layers[0].input_layernorm._forward_method == lm.model.layers[0].input_layernorm.forward_fused
     assert "forward" not in lm.model.layers[0].__dict__ and M._TRAIN is None
 
@@ -607,7 +607,27 @@ def test_grad_reach_catches_op_without_autograd():
         r = W.rpc("micro", dict(BATCH, norm=1.0, check=True))
     finally:
         W.SFT = None
-    assert "gradient does not reach" in r["error"] and sft.run is None
+    assert "gradient cut" in r["error"] and sft.run is None
+
+
+class OpaqueRope(nn.Module):
+    """Correct values, no autograd: B grads still flow through v / the
+    residual, so only the module cut hook can see it."""
+
+    def forward(self, pos, q, k=None):
+        with torch.no_grad():
+            return Rope.forward_native(None, pos, q, k)
+
+
+def test_cut_hook_catches_values_right_grads_wrong():
+    lm = build()
+    sft = sft_for(lm)
+    set_adapters(sft)
+    lm.model.layers[0].self_attn.rotary_emb = OpaqueRope()
+    sft.begin(dict(lr=1e-3))
+    assert not M.grad_reach(sft.adapters, lambda n: None) == []    # sanity: helper works
+    with pytest.raises(RuntimeError, match="op:OpaqueRope"):
+        sft.micro(dict(BATCH, norm=1.0, check=True))
 
 
 # ---------------------------------------------------------------------------
@@ -761,8 +781,10 @@ class FakeEngine:
     def get_tokenizer(self):
         return Tok()
 
-    async def reset_prefix_cache(self):
+    async def reset_prefix_cache(self, reset_running_requests=False):
+        assert reset_running_requests
         self.resets += 1
+        return True
 
     def generate(self, *a, **kw):
         raise RuntimeError("no engine in tests")
