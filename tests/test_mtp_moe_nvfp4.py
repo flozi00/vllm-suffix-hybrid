@@ -309,3 +309,16 @@ def test_oracle_matches_the_tp_shard_and_catches_a_gate_up_swap():
     mm._state["keep"] = {78: {0: full[0], 1: full[1]}}
     with pytest.raises(RuntimeError, match="LAYER ORACLE FAIL"):
         mm.oracle(layer, 78, 0.01, 0.01, forward=_shard_forward(full, swap=True))
+
+
+def test_oracle_under_vllms_bf16_default_dtype():
+    """g11b boot: vLLM loads under torch.set_default_dtype(bf16); the oracle's random
+    activations must stay fp32 against the fp32 reference weights."""
+    layer, full = _layer()
+    mm._state["keep"] = {78: {0: full[0], 1: full[1]}}
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        assert mm.oracle(layer, 78, 0.01, 0.01, forward=_shard_forward(full)) < 1e-3
+    finally:
+        torch.set_default_dtype(prev)
