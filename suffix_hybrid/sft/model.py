@@ -133,7 +133,11 @@ def _sft_class(cls):
             a = getattr(layer, "sft_A", None)
             if a is None:
                 return out
-            return out + ((x.to(a.dtype) @ a) @ layer.sft_B * layer.sft_scale).to(out.dtype)
+            # 2 kernels per adapter: shrink GEMM + expand GEMM whose epilogue
+            # does the scale and the add (decode runs ~250 of these per step)
+            x2 = x.reshape(-1, x.shape[-1]).to(a.dtype)
+            return torch.addmm(out.reshape(-1, out.shape[-1]), x2 @ a, layer.sft_B,
+                               alpha=layer.sft_scale).view(out.shape)
 
         _CLASSES[cls] = type(f"Sft{cls.__name__}", (cls,), {"apply": apply, "_sft_base": cls})
     return _CLASSES[cls]
