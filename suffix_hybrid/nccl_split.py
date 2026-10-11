@@ -29,7 +29,8 @@ communicator) or "<NCCL_ALGO>[/<NCCL_PROTO>]", e.g. "allreduce:ring/Simple".
   Spec "har" (tp group only): suffix_hybrid/host_ar.py, bf16 all-reduce through one
       shared pinned host buffer (two-shot; one-shot up to SUFFIX_HAR_ONESHOT_MAX_BYTES,
       default 0); "har1" / "har2" force one-shot / two-shot. Other dtypes fall
-      through to the default communicator.
+      through to the default communicator. SUFFIX_HAR_Q8_MIN_BYTES (default inf):
+      two-shot messages from this size use int8 transport (LOSSY, quality-gate first).
   SUFFIX_NCCL_QAR=int8|fp8 (tp group only, default off): bf16/fp16 all-reduces
       in [SUFFIX_NCCL_QAR_MIN_BYTES (4 MiB), SUFFIX_NCCL_QAR_MAX_BYTES (inf))
       go through suffix_hybrid/nccl_qar.py (LOSSY -- quality-gate first).
@@ -295,7 +296,8 @@ def make_comm(spec: str, cpu_group, device):
 
         one = {"har1": INF, "har2": 0}.get(spec, parse_size(_env("SUFFIX_HAR_ONESHOT_MAX_BYTES", "0")))
         return HostAllReduce(cpu_group, device, oneshot_max_bytes=one,
-                             max_blocks=int(_env("SUFFIX_HAR_BLOCKS", "64")))
+                             max_blocks=int(_env("SUFFIX_HAR_BLOCKS", "64")),
+                             q8_min_bytes=parse_size(_env("SUFFIX_HAR_Q8_MIN_BYTES", "inf")))
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
     env = spec_env(spec)
