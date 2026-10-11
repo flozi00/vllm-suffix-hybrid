@@ -83,7 +83,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-hisparse-mtp"
-PATCH_REVISION = "2026-10-11.1"
+PATCH_REVISION = "2026-10-11.2"
 TARGET_MODULE = "vllm.model_executor.layers.attention.sparse_mla_attention"
 # Modules that subclass the target's builder: once imported they hold the
 # pre-rewrite base class, so a late apply() could not reach them.
@@ -753,6 +753,181 @@ def install_nostage(runtime, fn_src: str, rt_path: Path) -> None:
         binding.initialize_hisparse_runtime_buffers = ns["initialize_hisparse_runtime_buffers"]
 
 
+# --- Split residency resolution (0.31.1 nightly, MTP k > 3 on SM120) ---
+# The nightly resolves all of a request's verify rows in ONE block whose shared
+# memory holds the union hash of every row's top-k (runtime.py:165-189,
+# hisparse_kernels.cu:276-293 and 1218-1237): 4*(2*(q*top_k+1) +
+# 3*ceil(hot/32) + 7) + 2*hot bytes. SM120 allows 101,376 B per block, so GLM's
+# MTP k=5 (q=6, hot=14336) needs 132,388 B and HiSparseRuntime refuses to start;
+# k<=3 fits. 0.30.0 has no union resolver (nothing to do there).
+# Fix: the leader resolves each request's rows in passes of r rows (the most
+# whose union fits; k=5 -> r=4, 2 passes). Pass p keeps the request id only on
+# rows at positions [p*r, (p+1)*r) of their request (the last pass also takes
+# any rows beyond, e.g. all-resident prefill rows: no host rows, union 0) and
+# sets -1 elsewhere, which the kernel already handles as padding (writes -1 /
+# zero counts, touches no request state). The kernel gets max_union_rows=r*top_k.
+# Correct: the hot buffer holds every pass's union at once (device_buffer_size
+# >= q*top_k, runtime.py:118-128). Kernel phase 5 leaves a pass's union at the
+# MRU end of the request's LRU and phase 3 evicts oldest-first, so a later pass
+# (<= r*top_k misses) only takes slots no earlier pass of this step resolved
+# (at least hot - (p+1)*r*top_k >= r*top_k of those exist). Positions shared
+# with an earlier pass are hits (dgi is written in phase 3). Pass p >= 1 writes
+# its own _SharedTopKState (the -1 rows would clobber pass 0's outputs); its
+# rows are merged into pass 0's outputs, and _swap_rows copies every pass's
+# misses. Fixed-shape tensor ops only: CUDA-graph safe.
+SPLIT_STATS = "_SUFFIX_HISPARSE_SPLIT"
+SPLIT_ANCHORS = (
+    ("smem_formula",
+     "    required = 4 * (2 * (config.max_union_rows + 1) + 3 * num_chunks + 7) + 2 * hot_size\n"),
+    ("init_check", "            _check_residency_shared_memory(self.device, config)\n"),
+    ("init_union", "        self.max_union_rows = config.max_union_rows\n"),
+    ("resolve_shared", "        shared = group.shared_topk\n"),
+    ("resolve_union_arg", "            self.max_union_rows,\n"),
+    ("swap_shared", "        shared = self.index_group.shared_topk\n"),
+    ("swap_in_result",
+     "        physical_topk_indices = group.shared_topk.physical_topk_indices[shared_rows]\n"),
+)
+
+
+def residency_smem_bytes(union_rows: int, hot_size: int) -> int:
+    """hisparse_resolve_residency's dynamic shared memory (runtime.py:174)."""
+    return 4 * (2 * (union_rows + 1) + 3 * -(-hot_size // 32) + 7) + 2 * hot_size
+
+
+def residency_pass_rows(rows: int, top_k: int, hot_size: int, available: int) -> int:
+    """Rows per resolution pass: `rows` when the whole union fits (upstream, one
+    pass), else the most that fit; 0 when not even one row's top-k fits."""
+    return next((r for r in range(rows, 0, -1)
+                 if residency_smem_bytes(r * top_k, hot_size) <= available), 0)
+
+
+def check_split_source(src: str) -> bool:
+    """runtime.py: True = nightly union resolver (install the split), False =
+    no such resolver (0.30.0). Drifted anchors raise."""
+    if "def _check_residency_shared_memory(" not in src:
+        return False
+    bad = [f"{n}: expected 1, found {src.count(t)}"
+           for n, t in SPLIT_ANCHORS if src.count(t) != 1]
+    if bad:
+        raise PatchDriftError("hisparse/runtime.py does not match the residency-split "
+                              "anchors: " + "; ".join(bad))
+    return True
+
+
+def residency_passes(ids, row_indices, pass_rows: int, passes: int):
+    """Pass of each launch row: its position inside its request's contiguous run
+    of rows (padding runs are -1 everywhere) // pass_rows, capped at passes-1."""
+    import torch
+
+    start = torch.ones_like(ids, dtype=torch.bool)
+    start[1:] = ids[1:] != ids[:-1]
+    first = torch.where(start, row_indices, torch.zeros_like(row_indices)).cummax(0).values
+    return torch.div(row_indices - first, pass_rows, rounding_mode="floor").clamp_(max=passes - 1)
+
+
+def enable_split(runtime, rt, pass_rows: int, rows: int, top_k: int) -> int:
+    """Resolve rt's index group in passes of pass_rows (per-pass outputs + ids);
+    returns the pass count. Also used by split_oracle to force a split."""
+    import torch
+
+    group = rt.index_group
+    passes = -(-rows // pass_rows)
+    cap = group.shared_topk.physical_topk_indices.shape[0]
+    group._suffix_pass_rows = pass_rows
+    group._suffix_states = [runtime._SharedTopKState(rt.device, cap, top_k)
+                            for _ in range(passes - 1)]
+    group._suffix_ids = torch.empty((passes, cap), dtype=torch.int32, device=rt.device)
+    rt.max_union_rows = pass_rows * top_k
+    return passes
+
+
+def install_split(runtime) -> None:
+    """Replace the stock shared-memory check and wrap HiSparseRuntime.__init__ /
+    _resolve_residency / _swap_rows on the live class (see the block comment)."""
+    import torch
+
+    cls = runtime.HiSparseRuntime
+    orig_init, orig_resolve, orig_swap = cls.__init__, cls._resolve_residency, cls._swap_rows
+    stats = runtime.__dict__.setdefault(SPLIT_STATS, {"split_groups": 0, "pass_rows": 0, "passes": 1})
+
+    def available(device) -> int:
+        index = device.index if device.index is not None else torch.accelerator.current_device_index()
+        return runtime.get_max_shared_memory_bytes(index)
+
+    def check(device, config) -> None:
+        rows = config.max_union_rows // config.top_k
+        if not residency_pass_rows(rows, config.top_k, config.device_buffer_size, available(device)):
+            raise ValueError(
+                "HiSparse residency resolution needs "
+                f"{residency_smem_bytes(config.top_k, config.device_buffer_size)} B of shared "
+                f"memory per block even for one row (device_buffer_size="
+                f"{config.device_buffer_size}), but the device allows {available(device)} B.")
+
+    def __init__(self, config, *a, **kw):
+        orig_init(self, config, *a, **kw)
+        if self.device.type != "cuda" or not self.is_group_leader:
+            return
+        rows = config.max_union_rows // config.top_k
+        r = residency_pass_rows(rows, config.top_k, config.device_buffer_size, available(self.device))
+        if r >= rows:
+            return  # the whole union fits: upstream single pass
+        passes = enable_split(runtime, self, r, rows, config.top_k)
+        if not stats["split_groups"]:
+            print(f"[suffix {PATCH_NAME}] SPLIT residency: {rows} verify rows/request -> "
+                  f"{passes} passes of {r} (union {residency_smem_bytes(r * config.top_k, config.device_buffer_size)}"
+                  f" B <= {available(self.device)} B shared memory)", file=sys.stderr, flush=True)
+        stats.update(split_groups=stats["split_groups"] + 1, pass_rows=r, passes=passes)
+
+    def _resolve_residency(self, **kw):
+        group = self.index_group
+        r = getattr(group, "_suffix_pass_rows", 0)
+        if not r:
+            return orig_resolve(self, **kw)
+        n = kw["topk_indices"].shape[0]
+        ids, rows_sl = kw["req_id_per_token"], kw["shared_rows"]
+        pass_of = residency_passes(ids, group.row_indices[:n], r, len(group._suffix_states) + 1)
+        shared = group.shared_topk
+        out = kw.get("attention_indices_out")
+        out = shared.physical_topk_indices[rows_sl] if out is None else out
+        counts = kw.get("valid_counts_out")
+        counts = shared.valid_topk_counts[rows_sl] if counts is None else counts
+        for p in range(len(group._suffix_states) + 1):
+            ids_p = group._suffix_ids[p, :n]
+            ids_p.copy_(ids)
+            ids_p.masked_fill_(pass_of != p, -1)
+            if p == 0:
+                orig_resolve(self, **{**kw, "req_id_per_token": ids_p})
+                continue
+            state = group._suffix_states[p - 1]
+            group.shared_topk = state  # orig_resolve writes this pass into its own state
+            try:
+                orig_resolve(self, **{**kw, "req_id_per_token": ids_p,
+                                      "attention_indices_out": None, "valid_counts_out": None})
+            finally:
+                group.shared_topk = shared
+            mine = pass_of == p
+            out.copy_(torch.where(mine[:, None], state.physical_topk_indices[rows_sl], out))
+            if kw.get("return_valid_counts"):
+                counts.copy_(torch.where(mine, state.valid_topk_counts[rows_sl], counts))
+
+    def _swap_rows(self, shared_rows):
+        orig_swap(self, shared_rows)
+        group = self.index_group
+        shared = group.shared_topk
+        for state in getattr(group, "_suffix_states", ()):
+            group.shared_topk = state
+            try:
+                orig_swap(self, shared_rows)
+            finally:
+                group.shared_topk = shared
+
+    runtime._check_residency_shared_memory = check
+    for name, fn in (("__init__", __init__), ("_resolve_residency", _resolve_residency),
+                     ("_swap_rows", _swap_rows)):
+        fn.__qualname__ = f"HiSparseRuntime.{name}"
+        setattr(cls, name, fn)
+
+
 STC_MODULE = "vllm.v1.core.single_type_kv_cache_manager"
 # Engine-fatal race (glm_stack_mixed_oracle 2026-09-27, "Cannot get 224 free
 # blocks from the pool"): KVCacheManager.allocate_slots checks free blocks from
@@ -921,6 +1096,7 @@ def apply(module=None) -> bool:
     if rt_src.count(NATIVE_SWAP_ROWS) == 1:  # upstream swap rows: prove the index_group dispatch
         ig_src = Path(importlib.util.find_spec(INDEX_GROUP_MODULE).origin).read_text()
     rt_new = patch_runtime_source(rt_src, ig_src)
+    split = check_split_source(rt_src)
     prefetch = patch_prefetch_source(rt_src) if prefetch_gate_enabled() else None
     nostage = patch_nostage_source(rt_src) if nostage_gate_enabled() else None
     layout = importlib.import_module(LAYOUT_MODULE)
@@ -935,6 +1111,8 @@ def apply(module=None) -> bool:
         mixed = patch_connector_method(Path(connector.__file__).read_text())
     # Every file verified before any changes (fail closed, all or nothing).
     exec_patched_source(runtime, rt_new, rt_path)
+    if split:
+        install_split(runtime)
     if prefetch is not None:
         install_prefetch(runtime, prefetch, rt_path)
     if nostage is not None:
@@ -963,6 +1141,8 @@ def apply(module=None) -> bool:
              if nostage is not None else "")
           + ("(no mirror staging buffer upstream) "
              if upstream and nostage_gate_enabled() else "")
+          + ("+ residency resolution split into shared-memory-sized passes when "
+             "needed " if split else "")
           + f"(rev {PATCH_REVISION}; {', '.join(applied)}; vllm {ver}).",
           file=sys.stderr, flush=True)
     return True
