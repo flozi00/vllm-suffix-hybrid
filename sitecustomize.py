@@ -96,11 +96,27 @@ _PRESETS = {
         # injection logits); k38 full GSM8K 0.9689, tools 5/5, needle, image.
         "SUFFIX_ROCM_HC_WQ": "fp8",
     },
+    # GLM 5.3 NVFP4 on 8x RTX PRO 6000 (TP8+EP, no P2P): the prod gate set plus the host-memory
+    # all-reduce (suffix_hybrid/host_ar.py; g4 2026-10-11: c1/c8/c32 +15/+15/+23%, GSM8K-400
+    # 0.9775, tools 5/5, needle).
+    "glm53-sm120": {
+        "SUFFIX_OXIDE_PROBE": "1", "SUFFIX_SM120_NVP4DSMLA": "1", "SUFFIX_SM120_HISPARSE_MTP": "1",
+        "SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING": "1", "SUFFIX_FP8_DENSE": "1",
+        "SUFFIX_FP8_DENSE_LAYERS": "*.self_attn.fused_qkv_a_proj,*.self_attn.q_b_proj,*.self_attn.o_proj,"
+                                   "*.indexer.wq_b,*.mlp.gate_up_proj,*.mlp.down_proj,*.eh_proj",
+        "SUFFIX_SM120_DSA_INDEXER": "1", "SUFFIX_SM120_DSA_INDEXER_GROUP": "6",
+        "SUFFIX_NVFP4_MOE": "1", "SUFFIX_NVFP4_MOE_MAX_M": "16",
+        "SUFFIX_NVFP4_MOE_TUNE": "1:fused3/32/255/1,5:front4/8/255/1,10:front4/8/0/1,32:front4/8/255/1,"
+                                 "64:front4/8/255/0",
+        "SUFFIX_NCCL_BANDS": "0-inf:har", "SUFFIX_HAR_ONESHOT_MAX_BYTES": "48K",
+    },
 }
-_preset = os.environ.get("SUFFIX_ROCM_PRESET", "").strip()
+# SUFFIX_PRESET is the vendor-neutral spelling (SUFFIX_ROCM_PRESET predates the GLM preset).
+_preset = (os.environ.get("SUFFIX_PRESET", "").strip()
+           or os.environ.get("SUFFIX_ROCM_PRESET", "").strip())
 if _preset:
     if _preset not in _PRESETS:
-        raise SystemExit(f"[suffix] SUFFIX_ROCM_PRESET={_preset!r}: unknown (known: {sorted(_PRESETS)})")
+        raise SystemExit(f"[suffix] SUFFIX_PRESET={_preset!r}: unknown (known: {sorted(_PRESETS)})")
     for _k, _v in _PRESETS[_preset].items():
         os.environ.setdefault(_k, _v)
 
