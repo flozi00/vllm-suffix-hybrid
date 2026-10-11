@@ -24,12 +24,14 @@ TOP_K, BS, ROW = 2048, 64, 64  # top-k, source/hot block size, row bytes
 CONTEXT = 6000
 
 
-def _runtime(R, q, reqs, dev):
+def _runtime(R, q, reqs, dev, hot=None, union=None, swap_rows=None):
     import torch
 
-    hot = (q + 1) * TOP_K
-    cfg = R.ResolvedHiSparseConfig(top_k=TOP_K, device_buffer_size=hot, max_union_rows=q * TOP_K)
-    rt = R.HiSparseRuntime(cfg, reqs, ROW, torch.uint8, dev, max_swap_rows=reqs * q + 1)
+    hot = hot or (q + 1) * TOP_K
+    cfg = R.ResolvedHiSparseConfig(top_k=TOP_K, device_buffer_size=hot,
+                                   max_union_rows=union or q * TOP_K)
+    rt = R.HiSparseRuntime(cfg, reqs, ROW, torch.uint8, dev,
+                           max_swap_rows=swap_rows or reqs * q + 1)
     hot_blocks = hot // BS
     raw = torch.zeros(reqs * hot * ROW, dtype=torch.uint8, device=dev)
     table = torch.arange(reqs * hot_blocks, dtype=torch.int32, device=dev).view(reqs, hot_blocks)

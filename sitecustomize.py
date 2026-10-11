@@ -500,6 +500,10 @@ _BOOT_GATES = {
     # (k=5, CUDA graph). Also runs fail-closed before serving (below). Lines:
     # [suffix sm120-hisparse-mtp] split oracle.
     "hisparse_resolver_oracle": (["-m", "hisparse_mtp_patch.split_oracle"], {}),
+    # Our single-pass resolver (SUFFIX_SM120_HISPARSE_OWN_RESOLVER): bit-identical to
+    # upstream where upstream fits, == reference at k=5, CUDA graph, invalidation,
+    # us vs split / upstream. Lines: [suffix sm120-hisparse-mtp] own resolver oracle.
+    "hisparse_own_resolver_oracle": (["-m", "hisparse_mtp_patch.own_resolver"], {}),
     # Full GLM stack inside a real vLLM engine (what prod runs, minus TP=8):
     # nvfp4_ds_mla KV + HiSparse + MTP k=5, ref vs patched greedy parity.
     "glm_stack_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "5",
@@ -747,20 +751,25 @@ if (os.environ.get("SUFFIX_SM120_NVP4KV_ORACLE", "").strip() == "1"
 # HiSparse residency split (hisparse_mtp_patch.split_oracle): with the HiSparse MTP
 # patch on, the nightly's union resolver runs in passes on SM120 (k > 3 does not fit
 # 101,376 B of shared memory); the passes must prove byte-exact on this GPU before
-# vLLM loads. Once per pod, child process, SUFFIX_* stripped. Exit 3 = not
+# vLLM loads. With SUFFIX_SM120_HISPARSE_OWN_RESOLVER=1 our single-pass resolver
+# replaces the split and its oracle (hisparse_mtp_patch.own_resolver) gates instead.
+# Once per pod, child process, SUFFIX_* stripped. Exit 3 = not
 # applicable (vLLM 0.30.0 / not SM120); anything else but 0 refuses to serve.
 if (os.environ.get("SUFFIX_SM120_HISPARSE_MTP", "").strip() == "1"
         and not os.environ.get("SUFFIX_SM120_HISPARSE_SPLIT_ORACLE_DONE")):
     import subprocess
     import sys
     os.environ["SUFFIX_SM120_HISPARSE_SPLIT_ORACLE_DONE"] = "1"
+    _which = ("own resolver" if os.environ.get("SUFFIX_SM120_HISPARSE_OWN_RESOLVER", "").strip() == "1"
+              else "split")
     _rc = subprocess.run(
-        [sys.executable, "-m", "hisparse_mtp_patch.split_oracle"],
+        [sys.executable, "-m", {"split": "hisparse_mtp_patch.split_oracle",
+                                "own resolver": "hisparse_mtp_patch.own_resolver"}[_which]],
         env={k: v for k, v in os.environ.items()
              if not k.startswith("SUFFIX_") or k.endswith("_DONE")}).returncode
-    print(f"[suffix sm120-hisparse-mtp] split oracle: exit {_rc}", file=sys.stderr, flush=True)
+    print(f"[suffix sm120-hisparse-mtp] {_which} oracle: exit {_rc}", file=sys.stderr, flush=True)
     if _rc not in (0, 3):
-        raise SystemExit("suffix sm120 hisparse-mtp: residency split oracle did not pass "
+        raise SystemExit(f"suffix sm120 hisparse-mtp: residency {_which} oracle did not pass "
                          f"(exit {_rc}); refusing to serve HiSparse")
 
 # NOTE: the WARM-START debug endpoint is NO LONGER armed here. The old
