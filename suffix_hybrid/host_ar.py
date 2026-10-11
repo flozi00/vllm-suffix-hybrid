@@ -54,9 +54,13 @@ except ImportError:  # CPU CI: the Python side stays importable
     triton = tl = libdevice = None
 
 MARK = "[suffix har]"
+TP_COMM = None  # the tp group's HostAllReduce (set by nccl_split), for suffix_hybrid/har_norm.py
 ROUND_BYTES = 4 << 20    # one round's partial per rank
 FLAG_STRIDE = 16         # int32 per flag (one 64 B line per rank: no false sharing)
-FLAG_BYTES = 64 << 10    # 2 parities x 2 phases x world lines
+FLAG_BYTES = 128 << 10   # [0, 64K): 2 parities x 2 phases x world lines; [64K, 128K): per-program lines
+PP_OFFSET = 64 << 10
+PP_MAXP = 32              # programs of the per-program-flag kernel
+PP_LINE = 16              # int32 per (rank, program) flag: one 64 B line each
 BLOCK = 1024             # bf16 per program step (16 B per thread at 4 warps)
 ELEMS_PER_PROGRAM = 1024  # grid = clamp(first round / this, 1, max_blocks)
 MAX_BLOCKS = 128
@@ -301,6 +305,166 @@ if triton is not None:
                                  _dequant8(qj, sj, G, BLOCK).to(out_ptr.dtype.element_ty), mask=m)
 
     @triton.jit
+    def _pp_publish_wait(lines, epoch, RANK: tl.constexpr, WORLD: tl.constexpr,
+                         LINE: tl.constexpr, TIMEOUT: tl.constexpr):
+        """Program-level barrier over the same program of every rank: each (rank, program) flag
+        owns a 64 B host line, so 8 writers never share a line."""
+        tl.debug_barrier()
+        _st_release(lines + RANK * LINE, epoch, True)
+        ranks = tl.arange(0, WORLD)
+        done = tl.zeros([], dtype=tl.int32)
+        spins = tl.zeros([], dtype=tl.int32)
+        while done == 0:
+            f = _ld_acquire(lines + ranks * LINE, True)
+            done = tl.min(((f == epoch) | (ranks == RANK)).to(tl.int32), axis=0)
+            spins += 1
+            if spins > TIMEOUT:
+                _trap()
+
+    @triton.jit
+    def _har_pp_kernel(x_ptr, out_ptr, data_ptr, red_ptr, ppf_ptr, ctr_ptr, arr_ptr, n,
+                       RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
+                       MAXP: tl.constexpr, LINE: tl.constexpr, BLOCK: tl.constexpr,
+                       TIMEOUT: tl.constexpr):
+        """Two-shot, one round (n <= ROUND), synchronized per program: program b of every rank owns
+        sub-slice b of every chunk, so no grid barrier and no device go-word hop."""
+        RCH: tl.constexpr = ROUND // WORLD
+        b = tl.program_id(0)
+        nb = tl.num_programs(0)
+        ar = tl.arange(0, BLOCK)
+        ctr0 = tl.load(ctr_ptr).to(tl.uint32)
+        epoch = ctr0 + 1
+        par = (epoch & 1).to(tl.int32)
+        dat = data_ptr + par * (WORLD * ROUND)
+        red = red_ptr + par * (WORLD * RCH)
+        ch = tl.cdiv(tl.cdiv(n, WORLD), 8) * 8
+        sub = tl.cdiv(tl.cdiv(ch, nb), 8) * 8
+        s0 = tl.multiple_of(b * sub, 8)
+        s1 = tl.multiple_of(tl.minimum(s0 + sub, ch), 8)
+        f1 = ppf_ptr + ((par * 2) * MAXP + b) * WORLD * LINE
+        f2 = ppf_ptr + ((par * 2 + 1) * MAXP + b) * WORLD * LINE
+        for c in tl.static_range(WORLD):
+            if c != RANK:
+                lo = tl.multiple_of(c * ch + s0, 8)
+                hi = tl.multiple_of(tl.minimum(c * ch + s1, n), 8)
+                for s in range(lo, hi, BLOCK):
+                    o = s + ar
+                    m = o < hi
+                    v = tl.load(x_ptr + o, mask=m)
+                    tl.store(dat + RANK * ROUND + o, v, mask=m, cache_modifier=".wt")
+        _pp_publish_wait(f1, epoch, RANK, WORLD, LINE, TIMEOUT)
+        lo = tl.multiple_of(RANK * ch + s0, 8)
+        hi = tl.multiple_of(tl.minimum(RANK * ch + s1, n), 8)
+        for s in range(lo, hi, BLOCK):
+            o = s + ar
+            m = o < hi
+            acc = tl.zeros([BLOCK], dtype=tl.float32)
+            for j in tl.static_range(WORLD):
+                if j == RANK:
+                    v = tl.load(x_ptr + o, mask=m, other=0.0)
+                else:
+                    v = tl.load(dat + j * ROUND + o, mask=m, other=0.0, cache_modifier=".cv")
+                acc += v.to(tl.float32)
+            r = acc.to(out_ptr.dtype.element_ty)
+            tl.store(out_ptr + o, r, mask=m)
+            tl.store(red + RANK * RCH + (o - RANK * ch), r, mask=m, cache_modifier=".wt")
+        _pp_publish_wait(f2, epoch, RANK, WORLD, LINE, TIMEOUT)
+        for c in tl.static_range(WORLD):
+            if c != RANK:
+                lo = tl.multiple_of(c * ch + s0, 8)
+                hi = tl.multiple_of(tl.minimum(c * ch + s1, n), 8)
+                for s in range(lo, hi, BLOCK):
+                    o = s + ar
+                    m = o < hi
+                    v = tl.load(red + c * RCH + (o - c * ch), mask=m, cache_modifier=".cv")
+                    tl.store(out_ptr + o, v, mask=m)
+        old = tl.atomic_add(arr_ptr + 4, 1, sem="acq_rel", scope="gpu")
+        if old == nb - 1:
+            tl.store(arr_ptr + 4, 0)
+            tl.store(ctr_ptr, epoch.to(tl.int32))
+
+    @triton.jit
+    def _har_rms_kernel(x_ptr, res_ptr, w_ptr, onorm_ptr, ores_ptr, data_ptr, red_ptr, flag_ptr,
+                        ctr_ptr, arr_ptr, n, rows, eps,
+                        RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
+                        FLAG_STRIDE: tl.constexpr, BLOCK: tl.constexpr, H: tl.constexpr,
+                        HB: tl.constexpr, TIMEOUT: tl.constexpr):
+        """One-round two-shot all-reduce of the row-parallel partial x [rows, H] fused with vLLM's
+        fused_add_rms_norm: ores = bf16(allreduce(x) + res) (the new residual), onorm =
+        bf16(ores * rsqrt(mean(ores^2) + eps) * w). The reduced rows land in ores (phase 2/3), a
+        device barrier makes every row complete, then each program normalizes whole rows."""
+        RCH: tl.constexpr = ROUND // WORLD
+        pid = tl.program_id(0)
+        nprog = tl.num_programs(0)
+        step = nprog * BLOCK
+        ar = tl.arange(0, BLOCK)
+        ctr0 = tl.load(ctr_ptr).to(tl.uint32)
+        epoch = ctr0 + 1
+        par = (epoch & 1).to(tl.int32)
+        ch = tl.cdiv(tl.cdiv(n, WORLD), 8) * 8
+        lo = tl.multiple_of(RANK * ch, 8)
+        hi = tl.multiple_of(tl.minimum(lo + ch, n), 8)
+        dat = data_ptr + par * (WORLD * ROUND)
+        red = red_ptr + par * (WORLD * RCH)
+        flags = flag_ptr + par * (2 * WORLD * FLAG_STRIDE)
+        for s in range(pid * BLOCK, n, step):
+            o = s + ar
+            m = (o < n) & ((o < lo) | (o >= hi))
+            v = tl.load(x_ptr + o, mask=m)
+            tl.store(dat + RANK * ROUND + o, v, mask=m, cache_modifier=".wt")
+        _barrier(flags, arr_ptr, arr_ptr + 2, epoch, ctr_ptr, (ctr0 + 1).to(tl.int32), False,
+                 RANK, WORLD, FLAG_STRIDE, TIMEOUT, True)
+        for s in range(lo + pid * BLOCK, hi, step):
+            o = s + ar
+            m = o < hi
+            acc = tl.zeros([BLOCK], dtype=tl.float32)
+            for j in tl.static_range(WORLD):
+                if j == RANK:
+                    v = tl.load(x_ptr + o, mask=m, other=0.0)
+                else:
+                    v = tl.load(dat + j * ROUND + o, mask=m, other=0.0, cache_modifier=".cv")
+                acc += v.to(tl.float32)
+            r = acc.to(ores_ptr.dtype.element_ty)
+            tl.store(ores_ptr + o, r, mask=m)
+            tl.store(red + RANK * RCH + (o - lo), r, mask=m, cache_modifier=".wt")
+        _barrier(flags + WORLD * FLAG_STRIDE, arr_ptr + 1, arr_ptr + 3, epoch, ctr_ptr,
+                 (ctr0 + 1).to(tl.int32), True, RANK, WORLD, FLAG_STRIDE, TIMEOUT, True)
+        for j in tl.static_range(WORLD):
+            if j != RANK:
+                jl = tl.multiple_of(j * ch, 8)
+                jh = tl.multiple_of(tl.minimum(jl + ch, n), 8)
+                for s in range(jl + pid * BLOCK, jh, step):
+                    o = s + ar
+                    m = o < jh
+                    v = tl.load(red + j * RCH + (o - jl), mask=m, cache_modifier=".cv")
+                    tl.store(ores_ptr + o, v, mask=m)
+        # every reduced row is complete once all programs of this rank arrive (device barrier)
+        tl.debug_barrier()
+        old = tl.atomic_add(arr_ptr + 6, 1, sem="acq_rel", scope="gpu")
+        if old == nprog - 1:
+            tl.atomic_xchg(arr_ptr + 6, 0, sem="relaxed", scope="gpu")
+            _st_release(arr_ptr + 7, epoch, False)
+        else:
+            done = tl.zeros([], dtype=tl.int32)
+            spins = tl.zeros([], dtype=tl.int32)
+            while done == 0:
+                done = (_ld_acquire(arr_ptr + 7, False) == epoch).to(tl.int32)
+                spins += 1
+                if spins > TIMEOUT:
+                    _trap()
+        hs = tl.arange(0, HB)
+        hm = hs < H
+        w = tl.load(w_ptr + hs, mask=hm, other=0.0).to(tl.float32)
+        for row in range(pid, rows, nprog):
+            a = tl.load(ores_ptr + row * H + hs, mask=hm, other=0.0, cache_modifier=".cg")
+            b = tl.load(res_ptr + row * H + hs, mask=hm, other=0.0)
+            z = (a.to(tl.float32) + b.to(tl.float32)).to(ores_ptr.dtype.element_ty)
+            zf = z.to(tl.float32)
+            rs = tl.math.rsqrt(tl.sum(zf * zf, axis=0) / H + eps)
+            tl.store(ores_ptr + row * H + hs, z, mask=hm)
+            tl.store(onorm_ptr + row * H + hs, (zf * rs * w).to(onorm_ptr.dtype.element_ty), mask=hm)
+
+    @triton.jit
     def _hag_kernel(x_ptr, out_ptr, data_ptr, flag_ptr, ctr_ptr, arr_ptr, n,
                     RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
                     FLAG_STRIDE: tl.constexpr, BLOCK: tl.constexpr, TIMEOUT: tl.constexpr,
@@ -408,7 +572,8 @@ class HostAllReduce:
     def __init__(self, cpu_group, device, oneshot_max_bytes: int = 0, max_blocks: int = 64,
                  round_bytes: int = ROUND_BYTES, timeout_spins: int = TIMEOUT_SPINS,
                  numa: str = "owner", elems_per_program: int = ELEMS_PER_PROGRAM,
-                 lean: bool = True, q8_min_bytes: int = 1 << 62, q8_group: int = Q8_GROUP):
+                 lean: bool = True, q8_min_bytes: int = 1 << 62, q8_group: int = Q8_GROUP,
+                 pp_max_bytes: int = 0, pp_grid: int = 8):
         import torch
         import torch.distributed as dist
 
@@ -427,6 +592,7 @@ class HostAllReduce:
         self.oneshot_max, self.timeout = oneshot_max_bytes, timeout_spins
         self.max_blocks, self.per_program = min(max_blocks, MAX_BLOCKS), elems_per_program
         self.lean, self.q8_min, self.q8_group = lean, q8_min_bytes, q8_group
+        self.pp_max, self.pp_grid = pp_max_bytes, min(pp_grid, PP_MAXP)
         rch = self.round // self.world
         data_bytes = 2 * self.world * self.round * 2
         self.size = FLAG_BYTES + data_bytes + 2 * self.world * rch * 2
@@ -469,13 +635,15 @@ class HostAllReduce:
             raise RuntimeError(f"cudaHostRegister failed (rank {self.rank}: error {err})")
         self.pages = numa_pages(self.addr)
         self.flags = _Ptr(self.addr, torch.int32)
+        self.ppf = _Ptr(self.addr + PP_OFFSET, torch.int32)
         self.data = _Ptr(self.addr + FLAG_BYTES, torch.bfloat16)
         self.red = _Ptr(self.addr + FLAG_BYTES + data_bytes, torch.bfloat16)
         # int8-transport views of the same slots (codes, then fp32 scales; see _har_q8_kernel)
         self.data_q, self.data_s = _Ptr(self.data.addr, torch.int8), _Ptr(self.data.addr, torch.float32)
         self.red_q, self.red_s = _Ptr(self.red.addr, torch.int8), _Ptr(self.red.addr, torch.float32)
         self.ctr = torch.zeros(1, dtype=torch.int32, device=self.device)
-        self.arr = torch.zeros(4, dtype=torch.int32, device=self.device)  # arrive x2, go x2
+        # arrive x2, go x2 (grid barriers), [4] pp end counter, [6]/[7] fused-norm local barrier
+        self.arr = torch.zeros(8, dtype=torch.int32, device=self.device)
         self.disabled = False
 
     def _touch(self, regions) -> None:
@@ -499,7 +667,7 @@ class HostAllReduce:
         return max(1, min(self.max_blocks, -(-min(n, self.round) // self.per_program)))
 
     def all_reduce(self, x, oneshot: bool | None = None, grid: int | None = None,
-                   q8: bool | None = None):
+                   q8: bool | None = None, pp: bool | None = None):
         import torch
 
         out = torch.empty_like(x)
@@ -508,6 +676,14 @@ class HostAllReduce:
             return out
         if oneshot is None:
             oneshot = n * 2 <= self.oneshot_max
+        if pp is None:
+            pp = not oneshot and n * 2 <= self.pp_max
+        if pp and n <= self.round:
+            _har_pp_kernel[(grid or self.pp_grid,)](
+                x, out, self.data, self.red, self.ppf, self.ctr, self.arr, n,
+                RANK=self.rank, WORLD=self.world, ROUND=self.round, MAXP=PP_MAXP, LINE=PP_LINE,
+                BLOCK=BLOCK, TIMEOUT=self.timeout, num_warps=4)
+            return out
         if q8 is None:
             q8 = not oneshot and n * 2 >= self.q8_min
         if q8 and n % self.q8_group == 0:
@@ -523,6 +699,27 @@ class HostAllReduce:
             ONESHOT=bool(oneshot), BLOCK=BLOCK, TIMEOUT=self.timeout, LEAN=self.lean,
             num_warps=4)
         return out
+
+    def ar_rmsnorm(self, x, residual, weight, eps: float):
+        """(norm(allreduce(x) + residual), allreduce(x) + residual) for x [rows, H] bf16; one
+        fused kernel when x fits one round and H <= 8192, else all-reduce + vLLM's fused op."""
+        import torch
+
+        rows, h = x.shape
+        n = x.numel()
+        if n <= self.round and h <= 8192 and n % 8 == 0:
+            onorm, ores = torch.empty_like(x), torch.empty_like(x)
+            _har_rms_kernel[(max(self.grid(n), min(rows, self.max_blocks)),)](
+                x, residual, weight, onorm, ores, self.data, self.red, self.flags, self.ctr, self.arr,
+                n, rows, float(eps), RANK=self.rank, WORLD=self.world, ROUND=self.round,
+                FLAG_STRIDE=FLAG_STRIDE, BLOCK=BLOCK, H=h, HB=triton.next_power_of_2(h),
+                TIMEOUT=self.timeout, num_warps=8)
+            return onorm, ores
+        from vllm import _custom_ops as ops
+
+        out, res = self.all_reduce(x), residual.clone()
+        ops.fused_add_rms_norm(out, res, weight, eps)
+        return out, res
 
     def supports_gather(self, x) -> bool:
         return (not self.disabled and x.is_cuda and x.is_contiguous()
@@ -605,6 +802,7 @@ VARIANTS = (
     ("lean", {}, (1, 6, 12, 24, 48, 96, 192, 384, 1024, 8192), (None,)),
     ("fenced", {"lean": False}, (1, 6, 48, 192, 1024), (None,)),
     ("lean-grid", {}, (6, 48, 192), (16, 64)),
+    ("pp", {"pp_max_bytes": 1 << 30}, (1, 6, 12, 24, 48), (4, 8, 16, 32)),
     ("q8", {"q8_min_bytes": 0}, (24, 48, 96, 192, 384, 1024, 8192), (None,)),
     ("q8g32", {"q8_min_bytes": 0, "q8_group": 32}, (48, 192, 1024), (None,)),
 )
@@ -726,10 +924,42 @@ def _bench_worker(rank, world, port, q, hidden) -> None:
             out["gather"].append({"rows": rows, "exact": bool(torch.equal(got, ref)),
                                   "har_us": ns.graph_time_us(lambda: har.all_gather_into(got, x)),
                                   "nccl_us": ns.graph_time_us(lambda: nccl.all_gather(ref, x))})
+        out["norm"] = []
+        from vllm import _custom_ops as ops
+
+        for t in (1, 6, 32, 96):  # fused all-reduce + add + RMSNorm vs all-reduce + vLLM's kernel
+            x = _inputs(rank, world, t * hidden, dev)[0].view(t, hidden)
+            g = torch.Generator(device=dev).manual_seed(5 + t)  # residual/weight replicated on all ranks
+            res = torch.randn(t, hidden, device=dev, generator=g).to(torch.bfloat16)
+            w = (1 + 0.1 * torch.randn(hidden, device=dev, generator=g)).to(torch.bfloat16)
+            on, orr = har.ar_rmsnorm(x, res, w, 1e-5)
+            ref_o, ref_r = har.all_reduce(x), res.clone()
+            ops.fused_add_rms_norm(ref_o, ref_r, w, 1e-5)
+            torch.cuda.synchronize()
+            sums = [None] * world
+            dist.all_gather_object(sums, float(on.view(torch.int16).double().sum()), group=cpu)
+            rb = res.clone()
+
+            def split():
+                o2 = har.all_reduce(x)
+                ops.fused_add_rms_norm(o2, rb, w, 1e-5)
+            out["norm"].append({"t": t, "res_exact": bool(torch.equal(orr, ref_r)),
+                                "norm_maxdiff": float((on.float() - ref_o.float()).abs().max()),
+                                "ranks_same": len(set(sums)) == 1,
+                                "fused_us": ns.graph_time_us(lambda: har.ar_rmsnorm(x, res, w, 1e-5)),
+                                "split_us": ns.graph_time_us(split)})
         har.destroy()
         nccl_us = {}
         for vname, kw, toks, grids in VARIANTS:
             har = HostAllReduce(cpu, dev, timeout_spins=1 << 23, **kw)
+            if vname == "pp":  # per-program barrier interleaved with the grid-barrier kernels
+                for t in (1, 6, 24):
+                    pairs = [_inputs(rank, world, t * hidden + 8 * k, dev) for k in range(4)]
+                    ys = [har.all_reduce(pairs[i % 4][0], oneshot=False, pp=bool(i % 2 == 0))
+                          for i in range(64)]
+                    torch.cuda.synchronize()
+                    out["stress"].append((t, "pp-mix", all(torch.equal(y, pairs[i % 4][1])
+                                                          for i, y in enumerate(ys))))
             if vname == "lean":  # back-to-back calls, 4 rotating inputs, both modes, every output
                 for t in STRESS_TOKENS:
                     pairs = [_inputs(rank, world, t * hidden + 8 * k, dev) for k in range(4)]
@@ -833,6 +1063,15 @@ def bench(hidden: int = 6144) -> int:
         print(f"{MARK} all-gather {row['rows']:4d} x {154880 // world} bf16/rank: host {h:8.1f} us | nccl "
               f"{n_:8.1f} us ({n_ / h:4.2f}x) | exact {all(rr['exact'] for rr in rows)}", flush=True)
     gather_ok = all(rr["exact"] for r in res for rr in r["gather"])
+    for i, row in enumerate(res[0]["norm"]):
+        rows = [r["norm"][i] for r in res]
+        f, sp = max(rr["fused_us"] for rr in rows), max(rr["split_us"] for rr in rows)
+        print(f"{MARK} fused AR+add+RMSNorm {row['t']:3d} x {hidden}: {f:7.1f} us vs AR + fused_add_rms_norm "
+              f"{sp:7.1f} us ({sp / f:4.2f}x) | residual exact {all(rr['res_exact'] for rr in rows)} | "
+              f"norm max|d| {max(rr['norm_maxdiff'] for rr in rows):.3g} | ranks-identical "
+              f"{all(rr['ranks_same'] for rr in rows)}", flush=True)
+    gather_ok &= all(rr["res_exact"] and rr["ranks_same"] and rr["norm_maxdiff"] < 0.05
+                     for r in res for rr in r["norm"])
     stress = [all(r["stress"][i][2] for r in res) for i in range(len(res[0]["stress"]))]
     print(f"{MARK} stress (64 back-to-back calls, 4 rotating inputs, every output exact): "
           + ", ".join(f"{t}tok {one if isinstance(one, str) else 'one' if one else 'two'} {ok}"
