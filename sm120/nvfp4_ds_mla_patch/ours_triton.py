@@ -196,8 +196,8 @@ def _fwd(q_ptr, kv_ptr, topk_ptr, out_ptr, opart_ptr, lse_ptr, stats_ptr,
                    lse_ptr, t_last, L, s, NS, topk_st, o_st, o_sh, BS, BSTRIDE, HQ, TN, ASM)
         else:
             # per token: the same tile path with one token's rows (M = 16)
-            for jj in range(G):
-                tj = t0 + jj
+            for jt in range(G):  # not `jj`: the static loop above binds it as a constexpr
+                tj = t0 + jt
                 if tj <= t_last:
                     rt1, h1, rok1 = _rows(tj, tj, h0, HQ, HB, 1, 16)
                     q1e, q1o, q1p, rs1 = _load_q(q_ptr, rt1, h1, rok1, q_st, q_sh,

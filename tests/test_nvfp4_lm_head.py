@@ -237,3 +237,19 @@ def test_load_oracle_passes_on_either_backend_contract(monkeypatch):
                              quant, lambda x: x @ w.t(), n_rows=128) for b in lh.BACKENDS}
     for r in res.values():
         assert r["plumb_rel"] <= lh.PLUMB_REL and r["m16"]["top1"] == 1.0
+
+
+def test_first_forward_check_waits_out_moe_load_oracles(monkeypatch):
+    """g13 boot: the shared-expert oracle calls the shared MLP mid-load; that call
+    must not count as the first forward (no head converted yet -> false refusal)."""
+    from suffix_hybrid.kernels import nvfp4_moe as nm
+    monkeypatch.setitem(lh._state, "checked", False)
+    monkeypatch.setitem(lh._state, "heads", 0)
+    monkeypatch.setitem(lh._state, "hook", None)
+    monkeypatch.setitem(nm._state, "in_oracle", True)
+    lh._first_forward_check(None, ())
+    assert lh._state["checked"] is False
+    monkeypatch.setitem(nm._state, "in_oracle", False)
+    monkeypatch.setitem(lh._state, "heads", 2)
+    lh._first_forward_check(None, ())
+    assert lh._state["checked"] is True
