@@ -33,7 +33,8 @@ def test_no_preset_is_inert():
 
 def test_glm_preset_via_neutral_name():
     env = {k: v for k, v in os.environ.items() if not k.startswith(("SUFFIX_", "VLLM_ROCM_", "NCCL_"))}
-    env.update(PYTHONPATH=str(ROOT), SUFFIX_PRESET="glm53-sm120")
+    # the sm120 patch packages ship top-level in the bundle (scripts/runtime_bundle.py)
+    env.update(PYTHONPATH=f"{ROOT}{os.pathsep}{ROOT / 'sm120'}", SUFFIX_PRESET="glm53-sm120")
     r = subprocess.run([sys.executable, "-c", "import os; print(os.environ.get('SUFFIX_NCCL_BANDS'), "
                         "os.environ.get('SUFFIX_SM120_NVP4DSMLA'))"], env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
