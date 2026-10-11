@@ -54,8 +54,10 @@ def _log(msg):
 
 
 def _http(code, detail):
+    """vLLM's HTTPException handler only takes string details."""
     from fastapi import HTTPException
-    return HTTPException(code, detail)
+    return HTTPException(code, detail if isinstance(detail, str) else
+                         json.dumps(detail, ensure_ascii=False, default=str))
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +276,7 @@ class State:
         await asyncio.sleep(ms / 1e3 * (1.0 / self.cfg.duty - 1.0) if self.busy() else 0)
 
     async def served_nll(self, ids, mask):
-        """Mean NLL of the masked tokens as SERVING computes them
+        """Per-token NLL of the masked tokens as SERVING computes them
         (prompt_logprobs); None when the engine cannot produce them."""
         try:
             from vllm import SamplingParams
@@ -285,18 +287,28 @@ class State:
                                                   f"suffix-sft-parity-{uuid.uuid4().hex}"):
                 final = out
             lp = final.prompt_logprobs
-            vals = [lp[i][ids[i]].logprob for i in range(1, len(ids)) if mask[i]]
-            return -sum(vals) / len(vals)
+            return [-lp[i][ids[i]].logprob for i in range(1, len(ids)) if mask[i]]
         except Exception as exc:  # noqa: BLE001 - parity is a measurement
             _log(f"served NLL unavailable: {type(exc).__name__}: {exc}")
             return None
 
     async def parity(self, ids, mask):
+        """Served vs training-forward NLL on one example: mean delta (the
+        guard) + per-token |delta| quantiles and where the worst token sits."""
         served = await self.served_nll(ids, mask)
-        r = await self.rpc("eval", dict(ids=ids, mask=mask, seg_lens=[len(ids)]))
+        r = await self.rpc("eval", dict(ids=ids, mask=mask, seg_lens=[len(ids)], per_token=True))
         trained = r["loss_sum"] / max(1, r["tokens"])
-        return dict(served_nll=served, trained_nll=round(trained, 5),
-                    delta=None if served is None else round(abs(served - trained), 5))
+        out = dict(served_nll=None, trained_nll=round(trained, 5), delta=None, tokens=r["tokens"])
+        if served is not None and len(served) == len(r["nll"]):
+            d = sorted(abs(a - b) for a, b in zip(served, r["nll"]))
+            worst = max(range(len(d)), key=lambda i: abs(served[i] - r["nll"][i]))
+            pos = [i for i in range(1, len(ids)) if mask[i]][worst]
+            mean = sum(served) / len(served)
+            out.update(served_nll=round(mean, 5), delta=round(abs(mean - trained), 5),
+                       tok_p50=round(d[len(d) // 2], 4), tok_p99=round(d[int(len(d) * 0.99)], 4),
+                       tok_max=round(d[-1], 4), tok_max_pos=pos, len=len(ids),
+                       tok_max_served=round(served[worst], 4), tok_max_trained=r["nll"][worst])
+        return out
 
     # -- startup restore ------------------------------------------------------
     async def restore(self):
@@ -353,7 +365,8 @@ class State:
             stage = "training"
             await self.rpc("begin", dict(lr=lr, weight_decay=wd))
             losses, first, checked = [], None, False
-            mem = dict(train_peak_gib=0.0, min_free_gib=None, host_pinned_gib=None, max_micro_ms=0.0)
+            mem = dict(train_peak_gib=0.0, min_free_gib=None, host_pinned_gib=None, max_micro_ms=0.0,
+                       fwd_ms=0.0, bwd_ms=0.0, tokens=0)
             for step, idx in enumerate(schedule(len(data), steps, bs, int(req.get("seed", 0)))):
                 batch = [data[i] for i in idx]
                 norm = sum(sum(m[1:]) for _, m in batch)
@@ -363,6 +376,8 @@ class State:
                     checked = True
                     loss_sum += r["loss_sum"]
                     mem["max_micro_ms"] = max(mem["max_micro_ms"], r["ms"])
+                    for k in ("fwd_ms", "bwd_ms", "tokens"):
+                        mem[k] += r.get(k, 0)
                     if "peak_gib" in r:
                         mem["train_peak_gib"] = max(mem["train_peak_gib"], r["peak_gib"])
                         mem["min_free_gib"] = min(mem["min_free_gib"] or 1e9, r["free_gib"])

@@ -60,6 +60,7 @@ DEFAULT_TARGETS = (
 )
 FUSED_FLAGS = ("use_fused_qk_norm_rope_gate",)    # Qwen3NextAttention Triton fusion
 CE_BYTES = 256 << 20                              # fp32 logits per CE chunk
+GDN_HEAD_GROUP = 8                                # heads per checkpointed delta-rule group
 
 _TRAIN = None   # the active TrainMode (only ever set inside an RPC)
 
@@ -257,9 +258,10 @@ class TrainMode(contextlib.ContextDecorator):
     [(start, end)] of the packed sequences (attention / GDN never cross them).
     """
 
-    def __init__(self, sft, params, segments, grad=True, offload=True, check=False):
+    def __init__(self, sft, params, segments, grad=True, offload_bytes=0, check=False):
         self.s, self.params, self.segments = sft, params, segments
-        self.grad, self.offload, self.check = grad, offload, check
+        self.grad, self.check = grad, check
+        self.offload_left = offload_bytes   # host budget for parked layer inputs
         self.cut = []      # modules whose output lost the input's grad (check=True)
         self.g = sft.g
         self.kv = {}
@@ -358,7 +360,11 @@ class TrainMode(contextlib.ContextDecorator):
             # checkpoint as host copies; ints (positions) and the rest stay
             slots = [(i, a) for i, a in enumerate(args)] + list(kwargs.items())
             keys = [k for k, v in slots if torch.is_tensor(v) and v.is_floating_point()]
-            parked = {k: [] for k in keys} if self.offload else {}
+            size = sum(v.numel() * v.element_size() for k, v in slots if k in keys)
+            parked = {}
+            if size <= self.offload_left:   # past the host budget inputs stay on the GPU
+                self.offload_left -= size
+                parked = {k: [] for k in keys}
 
             def body(*vals):
                 got = {k: (_Unpark.apply(v, parked[k]) if parked else v) for k, v in zip(keys, vals)}
@@ -441,15 +447,30 @@ class TrainMode(contextlib.ContextDecorator):
             beta = b[s:e].sigmoid()
             g = -m.A_log.detach().float().exp() * F.softplus(a[s:e].float()
                                                              + m.dt_bias.detach().float())
-            out.append(self.rule(qs[None], ks[None], vs[None], g[None], beta[None])[0])
+            out.append(self._rule_grouped(qs, ks, vs, g, beta))
         core = torch.cat(out).to(hidden_states.dtype)
         core = m.norm(core, z)
         o, _ = m.out_proj(core.flatten(-2))
         return o
 
+    def _rule_grouped(self, q, k, v, g, beta):
+        """The delta rule per group of heads, each checkpointed: the fp32
+        chunk states saved for backward exist for one group at a time."""
+        heads = GDN_HEAD_GROUP
+        if not torch.is_grad_enabled() or q.shape[1] <= heads:
+            return self.rule(q[None], k[None], v[None], g[None], beta[None])[0]
+        outs = []
+        for h0 in range(0, q.shape[1], heads):
+            sl = slice(h0, h0 + heads)
+            outs.append(checkpoint(lambda *t: self.rule(*(x[None] for x in t))[0],
+                                   q[:, sl], k[:, sl], v[:, sl], g[:, sl], beta[:, sl],
+                                   use_reentrant=False))
+        return torch.cat(outs, 1)
+
     # -- loss ------------------------------------------------------------------
-    def nll(self, ids, rows, tgt):
-        """Summed next-token NLL of ids[tgt] predicted from hidden rows."""
+    def nll(self, ids, rows, tgt, per_token=False):
+        """Summed next-token NLL of ids[tgt] predicted from hidden rows (or
+        the per-token vector, no grad)."""
         targets = ids[tgt]
         n = ids.shape[0]
         pos = torch.cat([torch.arange(e - s, device=ids.device) for s, e in self.segments])
@@ -472,9 +493,13 @@ class TrainMode(contextlib.ContextDecorator):
             if y.shape[-1] > end - start:   # vocab padding of the shard
                 y = torch.cat([y[:, :end - start], torch.full_like(y[:, end - start:], float("-inf"))],
                               -1)
-            return vocab_parallel_ce(y, tgt, start, end, g).sum()
+            ce = vocab_parallel_ce(y, tgt, start, end, g)
+            return ce if per_token else ce.sum()
 
         step = max(16, CE_BYTES // (4 * max(1, end - start)))
+        if per_token:
+            return torch.cat([chunk_ce(h[c:c + step], targets[c:c + step])
+                              for c in range(0, h.shape[0], step)])
         total = h.new_zeros((), dtype=torch.float32)
         for c in range(0, h.shape[0], step):
             args = (h[c:c + step], targets[c:c + step])

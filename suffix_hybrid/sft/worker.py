@@ -180,11 +180,16 @@ class WorkerSFT:
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
             base = torch.cuda.memory_allocated(self.device)
-        with M.TrainMode(self, self.run.params(), segs, grad=True, offload=self.cfg.offload,
-                         check=check) as tm:
+        t0 = time.perf_counter()
+        with M.TrainMode(self, self.run.params(), segs, grad=True,
+                         offload_bytes=int(self.cfg.offload_gib * 2**30), check=check) as tm:
             loss = tm.nll(ids, rows, tgt)
+            fwd = float(loss.detach())        # syncs: forward time
+            t1 = time.perf_counter()
             (loss / float(p["norm"])).backward()
-        out = dict(loss_sum=float(loss.detach()), tokens=int(tgt.numel()))
+            _sync()
+        out = dict(loss_sum=fwd, tokens=int(tgt.numel()), fwd_ms=round((t1 - t0) * 1e3, 1),
+                   bwd_ms=round((time.perf_counter() - t1) * 1e3, 1))
         if self.device.type == "cuda":   # what training adds on top of serving's resident set
             out.update(peak_gib=round((torch.cuda.max_memory_allocated(self.device) - base) / 2**30, 3),
                        free_gib=round(free / 2**30, 2), host_pinned_gib=_pinned_gib())
@@ -208,7 +213,10 @@ class WorkerSFT:
         ids, segs, rows, tgt = self._batch(p)
         live = {id(layer): (lo.A, lo.B, lo.scale) for layer, lo in self.adapters.values()}
         with M.TrainMode(self, live, segs, grad=False) as tm:
-            loss = tm.nll(ids, rows, tgt)
+            loss = tm.nll(ids, rows, tgt, per_token=bool(p.get("per_token")))
+        if p.get("per_token"):
+            return dict(loss_sum=float(loss.sum()), tokens=int(tgt.numel()),
+                        nll=[round(x, 4) for x in loss.tolist()])
         return dict(loss_sum=float(loss), tokens=int(tgt.numel()))
 
     def save(self, p):
