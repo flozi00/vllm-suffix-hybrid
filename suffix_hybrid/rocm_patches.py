@@ -639,6 +639,24 @@ PATCHES = {
     ),
     "SUFFIX_JIT_LOG": Patch("triton.runtime.jit", "log every Triton compile",
                             after="suffix_hybrid.jit_log:install"),
+    # NVIDIA: the NVFP4 routed experts on one MoE backend while --moe-backend stays auto for
+    # every other MoE (vLLM's flag is global, and e.g. flashinfer_b12x rejects GLM's BF16 MTP
+    # experts at startup). Valued gate: the backend name. GLM-5.3-NVFP4 is a ModelOpt
+    # checkpoint; compressed-tensors NVFP4 checkpoints go through the second module.
+    "SUFFIX_NVFP4_MOE_BACKEND": tuple(
+        Patch(mod, "NVFP4 routed experts on SUFFIX_NVFP4_MOE_BACKEND",
+              after="suffix_hybrid.kernels.nvfp4_moe:scope_backend")
+        for mod in ("vllm.model_executor.layers.quantization.modelopt",
+                    "vllm.model_executor.layers.quantization.compressed_tensors."
+                    "compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4")),
+    # NVIDIA GLM 5.3: the MTP draft layer's BF16 routed experts served as NVFP4 like layers 3..77
+    # (suffix_hybrid/mtp_moe_nvfp4.py): quant method + on-load quantization, fail-closed oracles.
+    "SUFFIX_MTP_MOE_NVFP4": (
+        Patch("vllm.model_executor.layers.quantization.modelopt",
+              "MTP draft experts -> ModelOpt NVFP4 MoE", after="suffix_hybrid.mtp_moe_nvfp4:patch_quant"),
+        Patch("vllm.models.deepseek_v32.nvidia.mtp", "MTP draft BF16 experts quantized to NVFP4 on load",
+              after="suffix_hybrid.mtp_moe_nvfp4:patch_mtp"),
+    ),
     "SUFFIX_ROCM_QSA_NOSPEC": tuple(
         Patch("vllm.models.qwen4_exp.amd.ops.qsa", f"QSA {name}: runtime counts not specialized",
               f"@triton.jit\ndef {name}(\n",
@@ -673,7 +691,8 @@ _MARK = "_suffix_rocm_patch"
 
 
 # Gates that take a value instead of 1 (any other non-empty value refuses to start).
-VALUES = {"SUFFIX_ROCM_HC_WQ": ("mxfp4", "fp8")}
+VALUES = {"SUFFIX_ROCM_HC_WQ": ("mxfp4", "fp8"),
+          "SUFFIX_NVFP4_MOE_BACKEND": ("flashinfer_b12x", "b12x", "flashinfer_cutlass", "cutlass")}
 
 
 def enabled() -> dict:

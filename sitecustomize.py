@@ -96,11 +96,27 @@ _PRESETS = {
         # injection logits); k38 full GSM8K 0.9689, tools 5/5, needle, image.
         "SUFFIX_ROCM_HC_WQ": "fp8",
     },
+    # GLM 5.3 NVFP4 on 8x RTX PRO 6000 (TP8+EP, no P2P): the prod gate set plus the host-memory
+    # all-reduce (suffix_hybrid/host_ar.py; g4 2026-10-11: c1/c8/c32 +15/+15/+23%, GSM8K-400
+    # 0.9775, tools 5/5, needle).
+    "glm53-sm120": {
+        "SUFFIX_OXIDE_PROBE": "1", "SUFFIX_SM120_NVP4DSMLA": "1", "SUFFIX_SM120_HISPARSE_MTP": "1",
+        "SUFFIX_SM120_HISPARSE_NO_MIRROR_STAGING": "1", "SUFFIX_FP8_DENSE": "1",
+        "SUFFIX_FP8_DENSE_LAYERS": "*.self_attn.fused_qkv_a_proj,*.self_attn.q_b_proj,*.self_attn.o_proj,"
+                                   "*.indexer.wq_b,*.mlp.gate_up_proj,*.mlp.down_proj,*.eh_proj",
+        "SUFFIX_SM120_DSA_INDEXER": "1", "SUFFIX_SM120_DSA_INDEXER_GROUP": "6",
+        "SUFFIX_NVFP4_MOE": "1", "SUFFIX_NVFP4_MOE_MAX_M": "16",
+        "SUFFIX_NVFP4_MOE_TUNE": "1:fused3/32/255/1,5:front4/8/255/1,10:front4/8/0/1,32:front4/8/255/1,"
+                                 "64:front4/8/255/0",
+        "SUFFIX_NCCL_BANDS": "0-inf:har", "SUFFIX_HAR_ONESHOT_MAX_BYTES": "48K",
+    },
 }
-_preset = os.environ.get("SUFFIX_ROCM_PRESET", "").strip()
+# SUFFIX_PRESET is the vendor-neutral spelling (SUFFIX_ROCM_PRESET predates the GLM preset).
+_preset = (os.environ.get("SUFFIX_PRESET", "").strip()
+           or os.environ.get("SUFFIX_ROCM_PRESET", "").strip())
 if _preset:
     if _preset not in _PRESETS:
-        raise SystemExit(f"[suffix] SUFFIX_ROCM_PRESET={_preset!r}: unknown (known: {sorted(_PRESETS)})")
+        raise SystemExit(f"[suffix] SUFFIX_PRESET={_preset!r}: unknown (known: {sorted(_PRESETS)})")
     for _k, _v in _PRESETS[_preset].items():
         os.environ.setdefault(_k, _v)
 
@@ -331,7 +347,9 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
                   "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG",
                   "SUFFIX_ROCM_QK_FUSED", "SUFFIX_ROCM_ACT_QUANT_FUSE",
-                  "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC")) or os.environ.get("SUFFIX_ROCM_HC_WQ", "").strip() not in ("", "0"):
+                  "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC", "SUFFIX_MTP_MOE_NVFP4")) or any(
+        os.environ.get(_g, "").strip() not in ("", "0")
+        for _g in ("SUFFIX_ROCM_HC_WQ", "SUFFIX_NVFP4_MOE_BACKEND")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
             and not all(os.environ.get(_g, "").strip() == "1"
                         for _g in ("SUFFIX_ROCM_GDN_MTP", "SUFFIX_ROCM_GDN_ASYNC_IDX"))):
@@ -373,7 +391,8 @@ if os.environ.get("SUFFIX_SAMPLER_WARMUP", "1").strip() != "0":
 # SUFFIX_NCCL_SMALL_* (static bands), SUFFIX_NCCL_AUTOTUNE=1, SUFFIX_NCCL_QAR.
 # The module decides from its own gates; all unset = inert.
 if any(os.environ.get(k, "").strip() for k in ("SUFFIX_NCCL_SMALL_ALGO", "SUFFIX_NCCL_BANDS",
-                                               "SUFFIX_NCCL_AUTOTUNE", "SUFFIX_NCCL_QAR")):
+                                               "SUFFIX_NCCL_AUTOTUNE", "SUFFIX_NCCL_QAR",
+                                               "SUFFIX_HAR_ALLGATHER")):
     from suffix_hybrid.nccl_split import install_post_import_hook as _ncsplit_hook
     _ncsplit_hook()
 
@@ -477,6 +496,15 @@ _BOOT_GATES = {
                              "--prompt-len", "4096", "--layers", "2",
                              "--gpu-blocks", "-1"],
                             {"SUFFIX_SM120": "1"}),
+    # HiSparse residency split (vLLM 0.31.1 nightly, MTP k > 3 on SM120): vLLM's own
+    # resolver in shared-memory-sized passes vs one pass (k=3) and byte-exact host rows
+    # (k=5, CUDA graph). Also runs fail-closed before serving (below). Lines:
+    # [suffix sm120-hisparse-mtp] split oracle.
+    "hisparse_resolver_oracle": (["-m", "hisparse_mtp_patch.split_oracle"], {}),
+    # Our single-pass resolver (SUFFIX_SM120_HISPARSE_OWN_RESOLVER): bit-identical to
+    # upstream where upstream fits, == reference at k=5, CUDA graph, invalidation,
+    # us vs split / upstream. Lines: [suffix sm120-hisparse-mtp] own resolver oracle.
+    "hisparse_own_resolver_oracle": (["-m", "hisparse_mtp_patch.own_resolver"], {}),
     # Full GLM stack inside a real vLLM engine (what prod runs, minus TP=8):
     # nvfp4_ds_mla KV + HiSparse + MTP k=5, ref vs patched greedy parity.
     "glm_stack_oracle": (["-m", "hisparse_mtp_patch.oracle", "--k", "5",
@@ -553,6 +581,18 @@ _BOOT_GATES = {
     # Same + nccl_qar int8/fp8 compressed all-reduce vs best NCCL per size.
     "allreduce_qar_bench": (["-m", "suffix_hybrid.tools.ar_bench", "--qar",
                              "--sizes-kib", "48"], {}),
+    # suffix_hybrid/host_ar.py (nccl_split spec "har"): bf16 all-reduce through one shared
+    # pinned host buffer, two-shot / one-shot vs NCCL at GLM token sizes, every rank bit-exact
+    # vs the fp32 rank-order sum, graphed us, GPU<->host PCIe probes. Lines: [suffix har].
+    "host_ar_bench": (["-m", "suffix_hybrid.host_ar", "bench"], {}),
+    # GLM-5.3 routed MoE per rank, one GPU, cold L2: EP8's busiest rank vs TP8 (no EP) at decode
+    # M 1..192 for FlashInfer CUTLASS, our NVFP4 kernel and FlashInfer b12x; numerics vs f64; the
+    # TP tune table. Lines: [suffix moe-tp].
+    "glm_moe_tp_bench": (["-m", "suffix_hybrid.tools.glm_moe_tp"], {}),
+    # GLM-5.3 TP8 dense projections per rank, one GPU, cold L2: BF16 vs FP8 W8A8 cutlass (+act
+    # quant) vs Marlin W8A16 vs Marlin W4A16 (SUFFIX_FP8_DENSE_BACKEND) at decode M 1..192,
+    # numerics vs fp32, per-step sums, SUFFIX_FP8_DENSE_MARLIN_MAX_M. Lines: [suffix dense-marlin].
+    "glm_dense_marlin_bench": (["-m", "suffix_hybrid.tools.glm_dense_marlin"], {}),
     # ROCm card facts: arch/CUs, AITER tuned-config coverage for this CU count,
     # HBM bandwidth, BF16 vs MXFP4 GEMM at the qwen3.8-flash TP1 decode shapes.
     "rocm_probe": (["-m", "suffix_hybrid.tools.rocm_probe"], {}),
@@ -712,6 +752,30 @@ if (os.environ.get("SUFFIX_SM120_NVP4KV_ORACLE", "").strip() == "1"
     if _rc != 0 and os.environ.get("SUFFIX_SM120_NVP4KV", "").strip() == "1":
         raise SystemExit("suffix sm120 nvfp4-kv: on-silicon oracle did not "
                          f"pass (exit {_rc}); refusing to serve NVFP4 KV")
+
+# HiSparse residency split (hisparse_mtp_patch.split_oracle): with the HiSparse MTP
+# patch on, the nightly's union resolver runs in passes on SM120 (k > 3 does not fit
+# 101,376 B of shared memory); the passes must prove byte-exact on this GPU before
+# vLLM loads. With SUFFIX_SM120_HISPARSE_OWN_RESOLVER=1 our single-pass resolver
+# replaces the split and its oracle (hisparse_mtp_patch.own_resolver) gates instead.
+# Once per pod, child process, SUFFIX_* stripped. Exit 3 = not
+# applicable (vLLM 0.30.0 / not SM120); anything else but 0 refuses to serve.
+if (os.environ.get("SUFFIX_SM120_HISPARSE_MTP", "").strip() == "1"
+        and not os.environ.get("SUFFIX_SM120_HISPARSE_SPLIT_ORACLE_DONE")):
+    import subprocess
+    import sys
+    os.environ["SUFFIX_SM120_HISPARSE_SPLIT_ORACLE_DONE"] = "1"
+    _which = ("own resolver" if os.environ.get("SUFFIX_SM120_HISPARSE_OWN_RESOLVER", "").strip() == "1"
+              else "split")
+    _rc = subprocess.run(
+        [sys.executable, "-m", {"split": "hisparse_mtp_patch.split_oracle",
+                                "own resolver": "hisparse_mtp_patch.own_resolver"}[_which]],
+        env={k: v for k, v in os.environ.items()
+             if not k.startswith("SUFFIX_") or k.endswith("_DONE")}).returncode
+    print(f"[suffix sm120-hisparse-mtp] {_which} oracle: exit {_rc}", file=sys.stderr, flush=True)
+    if _rc not in (0, 3):
+        raise SystemExit(f"suffix sm120 hisparse-mtp: residency {_which} oracle did not pass "
+                         f"(exit {_rc}); refusing to serve HiSparse")
 
 # NOTE: the WARM-START debug endpoint is NO LONGER armed here. The old
 # sys.meta_path build_app loader-proxy never attached on the live pod

@@ -30,3 +30,10 @@ fixture + anchor set is required.
 
 - `vllm_0.30.0/model_loader_utils.py` — `vllm/model_executor/model_loader/utils.py`
   at v0.30.0 (`process_weights_after_loading`, fp8_dense_patch anchor).
+
+- `vllm_0.31.1rc1.dev273/` — the same upstream files at vLLM main 2eb491e18 (image
+  `vllm/vllm-openai:nightly-2eb491e18b1ce5b8a25e4c88f32dbb5d028d525c`, CUDA 13.0.2):
+  sparse_mla_attention.py, hisparse runtime.py / layout.py, mla index_group.py,
+  flashinfer_mla_sparse{,_sm120}.py, model_loader utils.py, cuda_communicator.py.
+  `test_vllm_nightly_anchors.py` replays every GLM-5.3 patch on them (glm pool's
+  "always latest vLLM" lane; other pools stay on 0.30.0).

@@ -21,7 +21,16 @@ sm120/tests/fixtures/vllm_0.30.0/model_loader_utils.py):
   The drafter (MTP) model is loaded through the same function.
 
 Runtime per call: dynamic_per_token_scaled_fp8_quant + cutlass_scaled_mm
-(static shapes, no host sync: CUDA-graph and torch.compile safe). A boot
+(static shapes, no host sync: CUDA-graph and torch.compile safe).
+``SUFFIX_FP8_DENSE_BACKEND`` (runtime.BACKENDS): ``cutlass`` (default, the
+above), ``marlin`` (FP8 weight-only W8A16 through vLLM's Marlin repack +
+marlin_gemm for every M: no activation-quant kernel, no extra memory),
+``auto`` (Marlin for M <= ``SUFFIX_FP8_DENSE_MARLIN_MAX_M``, cutlass W8A8
+above, routed inside the custom op ``torch.ops.suffix_fp8d.linear``; both FP8
+layouts stay resident) or ``marlin_fp4`` (NVFP4 weight-only W4A16 Marlin for
+every M; LOSSY, quality-gate first). Marlin layers get their own fail-closed
+self-test at M in runtime.ORACLE_MS vs BF16 and vs the exact dequantized
+weight. Bench: boot gate ``glm_dense_marlin_bench``. A boot
 self-test per (N, K) shape runs each converted shape once at M=6 against the
 BF16 weight before it is freed (fails closed: the SM120 block-scaled
 "cutlass_gemm_caller Invalid status" class of failure dies at load, not in
@@ -46,6 +55,8 @@ from pathlib import Path
 PATCH_NAME = "fp8-dense"
 PATCH_REVISION = "2026-09-28.1"
 PINNED_VLLM = "0.30.0"
+# + vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18): same anchors.
+SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1")
 GATE_ENV = "SUFFIX_FP8_DENSE"
 LAYERS_ENV = "SUFFIX_FP8_DENSE_LAYERS"
 NVFP4_GATE_ENV = "SUFFIX_NVFP4_DENSE"
@@ -207,8 +218,8 @@ def apply(module) -> bool:
     import vllm
 
     ver = getattr(vllm, "__version__", "")
-    if not ver.startswith(PINNED_VLLM):
-        raise PatchDriftError(f"vllm {ver!r} != pinned {PINNED_VLLM}")
+    if not ver.startswith(SUPPORTED_VLLM):
+        raise PatchDriftError(f"vllm {ver!r} != pinned {' / '.join(SUPPORTED_VLLM)}")
     src_path = Path(module.__file__)
     src = src_path.read_text()
     if HELPER_TAG in src:

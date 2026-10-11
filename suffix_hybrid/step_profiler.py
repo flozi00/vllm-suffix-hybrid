@@ -799,8 +799,15 @@ def install_post_import_hook() -> None:
 # <skip> calls it profiles the next <N> (CPU+CUDA, everything in between incl.
 # sample_tokens and collectives), prints the same summary, repeats <windows>
 # times (default 1) with <skip> calls between windows. Fail-soft, never alters
-# a result.
+# a result. SUFFIX_PROFILE_WORKER_BUCKETS=1,8,32: one window per load level
+# instead -- it starts after <skip> consecutive calls whose request count is
+# nearest to that level (scheduler_output.num_scheduled_tokens).
 WORKER_ENV = "SUFFIX_PROFILE_WORKER"
+WORKER_BUCKETS_ENV = "SUFFIX_PROFILE_WORKER_BUCKETS"
+
+
+def nearest_bucket(nreq: int, buckets) -> int:
+    return min(buckets, key=lambda b: (abs(b - nreq), b))
 _WORKER_MODULE = "vllm.v1.worker.gpu_worker"
 
 
@@ -811,7 +818,11 @@ def _patch_worker(module) -> None:
         return
     n, skip, windows = cfg
     orig = cls.execute_model
-    st = {"calls": 0, "prof": None, "left": windows, "t0": 0.0, "k": 0}
+    st = {"calls": 0, "prof": None, "left": windows, "t0": 0.0, "k": 0, "bucket": None, "run": 0}
+    buckets = [int(b) for b in os.environ.get(WORKER_BUCKETS_ENV, "").split(",") if b.strip()]
+    todo = set(buckets)
+    if buckets:
+        st["left"] = len(buckets)
 
     def rank0() -> bool:
         try:
@@ -829,8 +840,9 @@ def _patch_worker(module) -> None:
         st["k"] += 1
         path = f"/tmp/suffix-wprof-{os.getpid()}-{st['k']}.json"
         prof.export_chrome_trace(path)
-        _say(f"worker window {st['k']}: {n} execute_model calls in "
-             f"{wall * 1e3:.0f} ms ({wall * 1e3 / n:.2f} ms/call); trace {path}")
+        _say(f"worker window {st['k']}{' (bucket %s reqs)' % st['bucket'] if buckets else ''}: "
+             f"{n} execute_model calls in {wall * 1e3:.0f} ms ({wall * 1e3 / n:.2f} ms/call); "
+             f"trace {path}")
 
         def work():
             try:
@@ -848,7 +860,20 @@ def _patch_worker(module) -> None:
         if st["left"] <= 0:
             return orig(self, *a, **kw)
         try:
-            if st["prof"] is None and rank0():
+            if st["prof"] is None and buckets and rank0():
+                so = a[0] if a else kw.get("scheduler_output")
+                b = nearest_bucket(len(getattr(so, "num_scheduled_tokens", None) or {}), buckets)
+                st["run"] = st["run"] + 1 if b == st["bucket"] else 1
+                st["bucket"] = b
+                if b in todo and st["run"] > skip:
+                    todo.discard(b)
+                    from torch.profiler import ProfilerActivity, profile
+                    st["prof"] = profile(activities=[ProfilerActivity.CPU,
+                                                     ProfilerActivity.CUDA])
+                    st["prof"].__enter__()
+                    st["t0"], st["calls"] = time.perf_counter(), 0
+                    _say(f"worker window START on rank 0 (pid {os.getpid()}, bucket {b} reqs)")
+            elif st["prof"] is None and not buckets and st["left"] > 0 and rank0():
                 st["calls"] += 1
                 if st["calls"] > skip:
                     from torch.profiler import ProfilerActivity, profile

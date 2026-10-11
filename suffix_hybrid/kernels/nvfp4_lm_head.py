@@ -244,7 +244,19 @@ def _device_ops(native):
 
     import torch
     from vllm._custom_ops import scaled_fp4_quant
-    from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm_out, has_flashinfer
+    from vllm.utils.flashinfer import has_flashinfer
+    try:
+        from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm_out
+    except ImportError:  # vLLM 0.31.1 dropped the _out helper; the same FlashInfer call, into out
+        def flashinfer_scaled_fp4_mm_out(a, b, block_scale_a, block_scale_b, alpha, out, out_dtype,
+                                         use_8x4_sf_layout, backend):
+            from flashinfer import mm_fp4
+
+            if backend in ("cutlass", "cudnn"):
+                block_scale_a, block_scale_b = block_scale_a.view(torch.uint8), block_scale_b.view(torch.uint8)
+            mm_fp4(a, b, block_scale_a, block_scale_b, alpha, out_dtype or out.dtype, out=out,
+                   block_size=16, use_8x4_sf_layout=use_8x4_sf_layout, backend=backend)
+            return out
 
     from suffix_hybrid.kernels.nvfp4_gemm import _graph_us
     from suffix_hybrid.kernels.nvfp4_linear import AUTOROUTE_REPS

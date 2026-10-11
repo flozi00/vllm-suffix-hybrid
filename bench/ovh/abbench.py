@@ -32,6 +32,9 @@ TOPICS = ["volcanoes", "the history of tea", "sorting algorithms", "Roman roads"
 PASSAGE = None
 
 
+FIXED = False  # --fixed-prompts: the same prompt + sampling seed sequence in every run/arm
+
+
 def one(url, model, gen, temp, seed):
     r = random.Random(seed)
     prompt = (f"[{seed}] Write a detailed essay about {r.choice(TOPICS)} and "
@@ -41,12 +44,12 @@ def one(url, model, gen, temp, seed):
                   f"'river' with 'stream'. Output only the text.\n\n{PASSAGE}")
     body = {"model": model, "messages": [{"role": "user", "content": prompt}],
             "max_tokens": gen, "ignore_eos": True, "stream": True,
-            "temperature": temp, "return_token_ids": True}
+            "temperature": temp, "return_token_ids": True, **({"seed": seed} if FIXED else {})}
     req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"content-type": "application/json"})
     t0 = time.monotonic()
     ttft = last = None
-    n = 0
+    n = chunks = 0
     gaps = []
     with urllib.request.urlopen(req, context=CTX, timeout=600) as resp:
         for raw in resp:
@@ -64,8 +67,9 @@ def one(url, model, gen, temp, seed):
                 gaps += [(now - last) / k] * k
             last = now
             n += k
+            chunks += 1
     dec = (n - 1) / (last - t0 - ttft) if n > 1 and last - t0 > ttft else None
-    return {"ttft": ttft, "n": n, "decode": dec, "gaps": gaps, "t0": t0, "t1": last}
+    return {"ttft": ttft, "n": n, "decode": dec, "gaps": gaps, "t0": t0, "t1": last, "chunks": chunks}
 
 
 def cell(url, model, c, seconds, gen, temp):
@@ -75,7 +79,8 @@ def cell(url, model, c, seconds, gen, temp):
         j = 0
         while time.monotonic() < stop:
             try:
-                r = one(url, model, gen, temp, hash((i, j, time.time())) & 0xFFFFFFF)
+                r = one(url, model, gen, temp,
+                        (1000 * i + j) if FIXED else hash((i, j, time.time())) & 0xFFFFFFF)
             except Exception as e:  # noqa: BLE001
                 r = {"error": repr(e)}
             with lock:
@@ -99,7 +104,11 @@ def cell(url, model, c, seconds, gen, temp):
     return {"conc": c, "requests": len(ok), "errors": errs, "agg_tps": toks / wall,
             "stream_tps_med": statistics.median(dec) if dec else None, "stream_tps_p10": q(dec, 0.10),
             "ttft_p50": q(ttfts, 0.5), "ttft_max": ttfts[-1] if ttfts else None,
-            "itl_p99_ms": q(gaps, 0.99) * 1e3 if gaps else None}
+            "itl_p99_ms": q(gaps, 0.99) * 1e3 if gaps else None,
+            # tokens per stream chunk after the first = tokens the engine emitted per step for one
+            # request (spec decode: accepted + 1)
+            "tok_per_step": (sum(r["n"] - 1 for r in ok) / max(1, sum(r["chunks"] - 1 for r in ok))
+                             if ok else None)}
 
 
 def main():
@@ -113,8 +122,11 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--ledger", default=None)
     ap.add_argument("--mode", choices=["essay", "edit"], default="essay")
+    ap.add_argument("--fixed-prompts", action="store_true",
+                    help="stream i, request j always sends prompt/seed 1000*i+j (identical work per arm)")
     a = ap.parse_args()
-    global PASSAGE
+    global PASSAGE, FIXED
+    FIXED = a.fixed_prompts
     if a.mode == "edit":
         PASSAGE = " ".join(f"Sentence {i}: the river near village {i % 7} carried {i * 3} boats past "
                            f"the mill while the miller counted sacks of grain." for i in range(40))
