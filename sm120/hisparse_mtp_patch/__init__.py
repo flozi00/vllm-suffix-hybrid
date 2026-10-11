@@ -841,6 +841,18 @@ def enable_split(runtime, rt, pass_rows: int, rows: int, top_k: int) -> int:
     return passes
 
 
+def prepare_runtime(rt_src: str, ig_src) -> tuple:
+    """(helper source to exec, split needed, own-resolver methods or None).
+    The own resolver rewrites methods of the STOCK HiSparseRuntime source:
+    rt_new holds only our replacement helpers, not the class."""
+    from . import own_resolver
+
+    rt_new = patch_runtime_source(rt_src, ig_src)
+    split = check_split_source(rt_src)
+    own = own_resolver.patch_source(rt_src) if split and own_resolver.gate_enabled() else None
+    return rt_new, split, own
+
+
 def install_split(runtime, auto: bool = True) -> None:
     """Replace the stock shared-memory check and wrap HiSparseRuntime.__init__ /
     _resolve_residency / _swap_rows on the live class (see the block comment).
@@ -1099,13 +1111,8 @@ def apply(module=None) -> bool:
     ig_src = None
     if rt_src.count(NATIVE_SWAP_ROWS) == 1:  # upstream swap rows: prove the index_group dispatch
         ig_src = Path(importlib.util.find_spec(INDEX_GROUP_MODULE).origin).read_text()
-    rt_new = patch_runtime_source(rt_src, ig_src)
+    rt_new, split, own = prepare_runtime(rt_src, ig_src)
     from . import own_resolver
-
-    split = check_split_source(rt_src)
-    own = None
-    if split and own_resolver.gate_enabled():
-        own = own_resolver.patch_source(rt_new)
     prefetch = patch_prefetch_source(rt_src) if prefetch_gate_enabled() else None
     nostage = patch_nostage_source(rt_src) if nostage_gate_enabled() else None
     layout = importlib.import_module(LAYOUT_MODULE)

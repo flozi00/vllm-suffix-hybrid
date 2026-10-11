@@ -90,3 +90,14 @@ def test_oracle_is_a_boot_gate_and_fails_closed_before_serving():
     block = src[src.index('"SUFFIX_SM120_HISPARSE_SPLIT_ORACLE_DONE")'):]
     assert "hisparse_mtp_patch.split_oracle" in block and "_rc not in (0, 3)" in block
     assert "raise SystemExit" in block[:block.index("# NOTE: the WARM-START")]
+
+
+def test_prepare_runtime_feeds_the_stock_source_to_the_own_resolver(monkeypatch):
+    """g11b boot: the own resolver was handed the helper-only rewrite -> drift."""
+    d = FIX / "vllm_0.31.1rc1.dev273"
+    rt, ig = (d / "hisparse_runtime.py").read_text(), (d / "index_group.py").read_text()
+    monkeypatch.setenv("SUFFIX_SM120_HISPARSE_OWN_RESOLVER", "1")
+    _, split, own = HS.prepare_runtime(rt, ig)
+    assert split and set(own) == {"_resolve_residency", "invalidate_written_slots"}
+    monkeypatch.delenv("SUFFIX_SM120_HISPARSE_OWN_RESOLVER")
+    assert HS.prepare_runtime(rt, ig)[2] is None
