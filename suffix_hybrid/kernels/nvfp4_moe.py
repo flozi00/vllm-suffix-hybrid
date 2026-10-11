@@ -496,8 +496,8 @@ def make_problem(e_count, hdim, idim, act="gelu_tanh", device="cpu", seed=0, wst
     w2 = torch.empty(e_count, hdim, idim // 2, dtype=torch.uint8, device=dev)
     s13 = torch.empty(e_count, rp13 * cp13, dtype=torch.uint8, device=dev)
     s2 = torch.empty(e_count, rp2 * cp2, dtype=torch.uint8, device=dev)
-    gw13 = torch.empty(e_count)
-    gw2 = torch.empty(e_count)
+    gw13 = torch.empty(e_count, dtype=torch.float32)
+    gw2 = torch.empty(e_count, dtype=torch.float32)
     for e in range(e_count):
         for w, s, gw, shape in ((w13, s13, gw13, (2 * idim, hdim)), (w2, s2, gw2, (hdim, idim))):
             wf = (torch.randn(*shape, generator=gen) * wstd).bfloat16().float().to(dev)
@@ -525,13 +525,13 @@ def rand_routing(m, e_count, topk, device, seed=0, base=0, local=None, dead=None
     must return as exact zeros."""
     import torch
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    score = torch.rand(m, e_count, generator=gen)
+    score = torch.rand(m, e_count, generator=gen, dtype=torch.float32)
     local = e_count if local is None else local
     if local < e_count and dead is not False:
         rows = slice(None) if dead else slice(1, None, 3)
         score[rows, base:base + local] = -1.0
     ids = score.topk(topk, -1).indices.int()
-    tw = torch.softmax(torch.randn(m, topk, generator=gen), -1).float()
+    tw = torch.softmax(torch.randn(m, topk, generator=gen, dtype=torch.float32), -1)
     return ids.to(device), tw.to(device)
 
 
@@ -1012,6 +1012,10 @@ def _make_layer_cls():
             _state["layers_ours"] += 1
             if fuse_shared_on():
                 self._sfx_fuse_shared(cfg, info)
+            if os.environ.get("SUFFIX_NVFP4_MOE_IMPL", "").strip() not in ("", "oxide"):
+                from suffix_hybrid.kernels import nvfp4_moe_tp  # TP-sharded Triton family
+                nvfp4_moe_tp.prepare(self, cfg, info, lambda x, i, w: run_ours(
+                    native, cfg, x, i, w, _state["ws"][dev], torch.cuda.current_stream(dev).cuda_stream))
 
         def _sfx_shared_info(self, runner, info):
             """(plain facts for shared_eligibility, the shared MLP or None)."""
@@ -1096,7 +1100,7 @@ def _make_layer_cls():
             amax = 2688.0 / cfg["a1g"]
             sp, i = cfg["shared"], info["I"]
             gen = torch.Generator(device="cpu").manual_seed(seed + 1)
-            xb = torch.randn(64, hdim, generator=gen).to(dev) * (amax / 4.5)
+            xb = torch.randn(64, hdim, generator=gen, dtype=torch.float32).to(dev) * (amax / 4.5)
             gu = xb @ mlp.gate_up_proj.weight.float().T
             sf_max = sp["c"] * float((act_ref(gu[:, :i], cfg["act"]) * gu[:, i:]).abs().max()) \
                 * cfg["a2g"] / 6.0
@@ -1134,6 +1138,9 @@ def _make_layer_cls():
                 return fp8_moe.run(native, cfg, x, topk_weights, topk_ids)
             dev = x.device
             tw = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
+            tp = cfg.get("tp_impl")  # SUFFIX_NVFP4_MOE_IMPL: a plan per M, None = oxide
+            if tp is not None and tp.plans[x.shape[0]] is not None:
+                return tp(x.contiguous(), topk_ids.contiguous(), tw.contiguous())
             return run_ours(native, cfg, x.contiguous(), topk_ids.contiguous(),
                             tw.contiguous(), _state["ws"][dev],
                             torch.cuda.current_stream(dev).cuda_stream)

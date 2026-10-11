@@ -219,7 +219,7 @@ def oracle(layer, layer_idx: int, a13: float, a2: float, ms=ORACLE_MS, forward=N
 
     for m in ms:
         gen = torch.Generator(device="cpu").manual_seed(7919 + m)
-        xu = torch.randn(m, hdim, generator=gen).to(dev)
+        xu = torch.randn(m, hdim, generator=gen, dtype=torch.float32).to(dev)
         sc = a13 * FP4_MAX / float(xu.abs().amax())
         for _ in range(4):
             hm = h_amax(xu * sc)
@@ -229,7 +229,7 @@ def oracle(layer, layer_idx: int, a13: float, a2: float, ms=ORACLE_MS, forward=N
         x = (xu * sc).to(torch.bfloat16)
         ids = torch.tensor(slots, dtype=torch.int32, device=dev).expand(m, k).contiguous()
         tw = torch.zeros(m, k, dtype=torch.float32, device=dev)
-        tw[:, :len(check)] = torch.rand(m, len(check), generator=gen).to(dev) + 0.25
+        tw[:, :len(check)] = torch.rand(m, len(check), generator=gen, dtype=torch.float32).to(dev) + 0.25
         out = forward(layer, x.clone(), tw.clone(), ids.clone()).float()
         ref = torch.zeros(m, hdim, dtype=torch.float32, device=dev)
         for j, e in enumerate(check):

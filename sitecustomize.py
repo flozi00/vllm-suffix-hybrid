@@ -17,6 +17,10 @@ PYTHONPATH. Each section is independently gated:
                                write-only prefill mirror staging buffer
   SUFFIX_SM120_NVP4DSMLA=1  -> arm the deferred SM120 nvfp4_ds_mla sparse-MLA
                                KV patch (our kernels; fail closed on SM120)
+    + SUFFIX_SM120_DSMLA_ATTN=ours|auto -> our Triton sparse-MLA decode
+                               (nvfp4_ds_mla_patch/ours.py) instead of / per T
+                               against the oxide pair; boot oracle + timing table
+                               before serving (ours: fail closed)
   SUFFIX_FP8_DENSE=1        -> arm the deferred FP8 W8A8 dense-linear patch
                                (fp8_dense_patch/; SUFFIX_FP8_DENSE_LAYERS =
                                glob allowlist; fail closed when enabled)
@@ -467,6 +471,11 @@ _BOOT_GATES = {
                         "--page", "64", "--max-gb", "8"], {}),
     "nvfp4_dsmla_oracle": (["-m", "nvfp4_ds_mla_patch.oracle"], {}),
     "nvfp4_dsmla_bench": (["-m", "nvfp4_ds_mla_patch.oracle", "--bench", "--json"], {}),
+    # Our Triton sparse-MLA decode (SUFFIX_SM120_DSMLA_ATTN) vs the oxide pair: the fail-closed
+    # oracle (f64 reference, oxide, stock FlashInfer, adversarial, graph replay, union paths) then
+    # graphed cold-L2 us per (G, T) on short-context and long-context lists. Lines: [suffix dsmla-ours].
+    "dsmla_attn_bench": (["-m", "nvfp4_ds_mla_patch.ours", "bench", "--table",
+                          "/tmp/suffix_dsmla_bench.json"], {}),
     # NVFP4 routed-experts MoE (gemma-4 26B + GLM-5.3 EP/TP8 shapes, one GPU):
     # ours vs vLLM FlashInfer vs f64 spec + per-stage readback; then us/call.
     "nvfp4_moe_oracle": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "oracle"], {}),
@@ -606,6 +615,11 @@ _BOOT_GATES = {
     # (SUFFIX_NVFP4_MOE_FUSE_SHARED), best tune each, numerics vs f64 / stock / the BF16 MLP,
     # fused tune table, per-step saving. Lines: [suffix moe-shared].
     "glm_moe_shared_bench": (["-m", "suffix_hybrid.tools.glm_moe_shared"], {}),
+    # Our TP-sharded NVFP4 MoE in Triton (suffix_hybrid/kernels/nvfp4_moe_tp.py), GLM-5.3 TP8 shard,
+    # one GPU, cold L2, CUDA graphs: oracle of every plan (f64 + oxide, graph replay), then us/layer
+    # per M vs oxide (g10 table) and FlashInfer + % of the weight roofline + the paste-able
+    # SUFFIX_NVFP4_MOE_TP_TABLE / _IMPL. Lines: [suffix moe-tp-kernel].
+    "glm_moe_tp_kernel_bench": (["-m", "suffix_hybrid.kernels.nvfp4_moe_tp", "bench"], {}),
     # GLM-5.3 TP8 dense projections per rank, one GPU, cold L2: BF16 vs FP8 W8A8 cutlass (+act
     # quant) vs Marlin W8A16 vs Marlin W4A16 (SUFFIX_FP8_DENSE_BACKEND) at decode M 1..192,
     # numerics vs fp32, per-step sums, SUFFIX_FP8_DENSE_MARLIN_MAX_M. Lines: [suffix dense-marlin].
@@ -793,6 +807,48 @@ if (os.environ.get("SUFFIX_SM120_HISPARSE_MTP", "").strip() == "1"
     if _rc not in (0, 3):
         raise SystemExit(f"suffix sm120 hisparse-mtp: residency {_which} oracle did not pass "
                          f"(exit {_rc}); refusing to serve HiSparse")
+
+# Our Triton sparse-MLA decode (nvfp4_ds_mla_patch/ours.py): SUFFIX_SM120_DSMLA_ATTN=ours|auto
+# needs the on-silicon oracle + timing table (the workers read it at impl init) before vLLM
+# loads. Once per pod (O_EXCL claim; other top-level processes wait for the table), child
+# process, SUFFIX_* stripped. ours: a failed oracle refuses to serve; auto: oxide everywhere.
+_dsmla_attn = os.environ.get("SUFFIX_SM120_DSMLA_ATTN", "").strip().lower()
+if (_dsmla_attn in ("ours", "auto")
+        and os.environ.get("SUFFIX_SM120_NVP4DSMLA", "").strip() == "1"
+        and not os.environ.get("SUFFIX_SM120_DSMLA_ORACLE_DONE")):
+    import json
+    import subprocess
+    import sys
+    import time
+    os.environ["SUFFIX_SM120_DSMLA_ORACLE_DONE"] = "1"
+    _tbl = os.environ.get("SUFFIX_SM120_DSMLA_TABLE", "").strip() or "/tmp/suffix_dsmla_ours.json"
+    try:
+        os.close(os.open(_tbl + ".claimed", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        _claimed = True
+    except FileExistsError:
+        _claimed = False
+    if _claimed:
+        _rc = subprocess.run(
+            [sys.executable, "-m", "nvfp4_ds_mla_patch.ours", "oracle", "--table", _tbl],
+            env={k: v for k, v in os.environ.items()
+                 if not k.startswith("SUFFIX_") or k.endswith("_DONE")}).returncode
+        if not os.path.exists(_tbl):  # not run / crashed: waiters need a verdict
+            with open(_tbl, "w") as _f:
+                json.dump({"pass": False, "rows": [], "failed": [f"oracle exit {_rc}"]}, _f)
+    else:
+        _t0 = time.time()
+        while not os.path.exists(_tbl) and time.time() - _t0 < 1800:
+            time.sleep(2)
+    try:
+        with open(_tbl) as _f:
+            _ok = bool(json.load(_f).get("pass"))
+    except (OSError, ValueError):
+        _ok = False
+    print(f"[suffix dsmla-ours] oracle {'PASS' if _ok else 'FAIL'} ({_tbl}); "
+          f"mode {_dsmla_attn}", file=sys.stderr, flush=True)
+    if not _ok and _dsmla_attn == "ours":
+        raise SystemExit("suffix dsmla-ours: on-silicon oracle did not pass; refusing to serve "
+                         "SUFFIX_SM120_DSMLA_ATTN=ours (auto would keep the oxide kernels)")
 
 # NOTE: the WARM-START debug endpoint is NO LONGER armed here. The old
 # sys.meta_path build_app loader-proxy never attached on the live pod

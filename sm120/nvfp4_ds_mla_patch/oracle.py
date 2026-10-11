@@ -89,8 +89,8 @@ def quant_rows_ref(kv_c, k_pe):
 
     t = kv_c.shape[0]
     x = kv_c.float().view(t, 32, 16)
-    sfv = torch.maximum(x.abs().amax(-1) * torch.tensor(1.0 / 6.0),
-                        torch.tensor(2.0 ** -9))
+    sfv = torch.maximum(x.abs().amax(-1) * torch.tensor(1.0 / 6.0, dtype=torch.float32),
+                        torch.tensor(2.0 ** -9, dtype=torch.float32))
     sf_b = e4m3_bytes(sfv)
     sf_f = e4m3_float(sf_b)
     inv = torch.where(sf_f == 0, torch.zeros_like(sf_f), 1.0 / sf_f)
@@ -117,7 +117,7 @@ def dequant_rows_ref(rows):
     import torch
 
     n = rows.shape[0]
-    lut = torch.tensor(E2M1, device=rows.device)
+    lut = torch.tensor(E2M1, dtype=torch.float32, device=rows.device)
     data = rows[:, :256].long()
     nib = torch.stack((data & 0xF, data >> 4), -1).view(n, DIM)
     sf = e4m3_float(rows[:, [320 + p for p in SF_PERM]])
@@ -141,7 +141,7 @@ def attention_ref(q, lat, rope, topk, scale):
     [T, H, 512] f32; an all-masked token is 0."""
     import torch
 
-    out = torch.zeros(q.shape[0], q.shape[1], DIM, device=q.device)
+    out = torch.zeros(q.shape[0], q.shape[1], DIM, dtype=q.dtype, device=q.device)
     for t in range(q.shape[0]):
         idx = topk[t][topk[t] >= 0].long()
         if idx.numel() == 0:
@@ -169,7 +169,7 @@ def row_rel_l2(a, b, keep):
 def randn(gen, dev, *shape):
     import torch
 
-    return torch.randn(*shape, generator=gen, device=gen.device).to(dev)
+    return torch.randn(*shape, generator=gen, device=gen.device, dtype=torch.float32).to(dev)
 
 
 def randperm(gen, dev, n):
@@ -246,7 +246,7 @@ class Stock:
         import torch
 
         self.ops.concat_and_cache_mla(kv_c, k_pe, cache, slots, "fp8_ds_mla",
-                                      torch.ones(1, device=kv_c.device))
+                                      torch.ones(1, dtype=torch.float32, device=kv_c.device))
 
     def decode(self, q, cache, topk, out=None):
         if out is None:
@@ -324,9 +324,10 @@ def gate_writer(ours, dev, gen, report):
     kpe_out = torch.empty(n, PE, dtype=torch.float32, device=dev)
     sl = torch.arange(n, device=dev)
     fused_norm_rope(
-        torch.arange(n, device=dev), torch.randn(n, 256, device=dev).bfloat16(),
-        torch.ones(256, device=dev).bfloat16(), 1e-6, kv_in,
-        torch.ones(DIM, device=dev).bfloat16(), 1e-6, kpe_in, cos_sin,
+        torch.arange(n, device=dev),
+        torch.randn(n, 256, device=dev, dtype=torch.float32).bfloat16(),
+        torch.ones(256, device=dev, dtype=torch.bfloat16), 1e-6, kv_in,
+        torch.ones(DIM, device=dev, dtype=torch.bfloat16), 1e-6, kpe_in, cos_sin,
         None, None, None, 1e-6, None,
         torch.zeros(n, TOPK, dtype=torch.int32, device=dev),
         slot_mapping=sl, mla_kv_cache=tri, mla_kv_cache_dtype="nvfp4_ds_mla",

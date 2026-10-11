@@ -30,6 +30,8 @@ vllm_0.30.0/ pin the sources):
                                 nvfp4_ds_mla (the HiSparse data plane is
                                 row-bytes generic; bind_source_cache
                                 re-checks the width, fail closed).
+  forward_mqa (impl file)       records the decode q-len group for our
+                                Triton decode (SUFFIX_SM120_DSMLA_ATTN, ours.py).
 The deepseek_v32 fused Triton writer (fused_norm_rope, non-HiSparse path)
 already emits the 352 B rows on any arch; the oracle checks our reader
 against it too.
@@ -43,8 +45,10 @@ import os
 import sys
 from pathlib import Path
 
+from . import ours
+
 PATCH_NAME = "sm120-nvfp4-ds-mla"
-PATCH_REVISION = "2026-10-11.1"
+PATCH_REVISION = "2026-10-11.2"
 PINNED_VLLM = "0.30.0"
 # + vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18): same anchors.
 SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1")
@@ -223,6 +227,22 @@ INDEX_GROUP_EDITS = [
     ),
 ]
 
+# Our Triton decode (ours.py) unions a request's MTP verify tokens: record the
+# decode slice's q-len group per forward (an attribute, read by the decode
+# helper; correctness never depends on it).
+IMPL_EDITS.append((
+    "forward_mqa_q_group",
+    "        num_actual_toks = q.shape[0]\n"
+    "\n"
+    "        assert self.topk_indices_buffer is not None\n",
+    "        num_actual_toks = q.shape[0]\n"
+    + _TAG
+    + "        self._suffix_q_group = _suffix_dsmla_q_group(attn_metadata)\n"
+    "\n"
+    "        assert self.topk_indices_buffer is not None\n",
+    1,
+))
+
 # module -> (fixture file name, edits)
 TARGETS = {
     BACKEND_MODULE: ("flashinfer_mla_sparse.py", BACKEND_EDITS),
@@ -279,7 +299,9 @@ def _suffix_nvfp4_ds_mla_init(impl) -> None:
     dev = torch.cuda.current_device()
     oxide_kernels.ensure_loaded(FAMILY, dev)
     impl._nvfp4_num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    if dev not in _SELFTESTED:
+    if dev not in _SELFTESTED:  # mode + oracle table first: the self-test runs the routed decode
+        print(f"[suffix {PATCH_NAME}] decode attention: {ours.init()}",
+              file=sys.stderr, flush=True)
         _suffix_nvfp4_ds_mla_selftest(impl, torch.device("cuda", dev))
         _SELFTESTED.add(dev)
     print(f"[suffix {PATCH_NAME}] NVFP4-DSMLA impl on cuda:{dev} "
@@ -309,10 +331,10 @@ def _suffix_nvfp4_ds_mla_selftest(impl, dev) -> None:
         # device="cpu" everywhere: vLLM builds impls under a CUDA default
         # device, and a CPU generator cannot fill CUDA tensors.
         g = torch.Generator(device="cpu").manual_seed(0)
-        kv_c = torch.randn(128, 512, generator=g, device="cpu")
+        kv_c = torch.randn(128, 512, generator=g, device="cpu", dtype=torch.float32)
         kv_c[:32] = kv_c[:32].sign() * 5000.0  # SF 448, every nibble +-6
-        k_pe = torch.randn(128, 64, generator=g, device="cpu")
-        q = torch.randn(2, 8, 576, generator=g, device="cpu")
+        k_pe = torch.randn(128, 64, generator=g, device="cpu", dtype=torch.float32)
+        q = torch.randn(2, 8, 576, generator=g, device="cpu", dtype=torch.float32)
         q[0] *= 2.0 ** 15  # |q| > f16 max on every dim (exact rescale:
         # as well-conditioned as q[1]; single-dim outliers live in the oracle)
         topk = torch.stack([torch.randperm(128, generator=g, device="cpu") for _ in range(2)]).int()
@@ -336,15 +358,30 @@ def _suffix_nvfp4_ds_mla_selftest(impl, dev) -> None:
             f"{bool(torch.isfinite(out).all())} (stale / pre-prescale cubin?)")
 
 
+def _suffix_dsmla_q_group(md):
+    """forward_mqa hook: (union group of the uniform decode slice, its token
+    count) from the sparse-MLA metadata; (1, -1) when it says nothing."""
+    nd = getattr(md, "num_decodes", 0) or 0
+    ndt = getattr(md, "num_decode_tokens", 0) or 0
+    return (ours.q_group(ndt // nd) if nd and ndt % nd == 0 else 1, ndt if nd else -1)
+
+
 def _suffix_nvfp4_ds_mla_decode(impl, q, kv_cache, topk, output):
     """_run_mqa_kernel body: q [T, H, 576] bf16, topk [T, C] int32 physical
-    slots (-1 masked), output [T, H, 512] bf16 (filled and returned)."""
+    slots (-1 masked), output [T, H, 512] bf16 (filled and returned). Our
+    Triton decode where SUFFIX_SM120_DSMLA_ATTN picks it (ours.use_ours; G =
+    the decode q-len group for the decode slice, 4 for prefill slices of
+    consecutive tokens), else the oxide pair."""
     import torch
 
-    n = _native()
     t, h = q.shape[0], q.shape[1]
     if t == 0:
         return output
+    g_dec, n_dec = getattr(impl, "_suffix_q_group", (1, -1))
+    g = g_dec if t == n_dec else 4
+    if ours.use_ours(t, g):
+        return ours.decode(q, kv_cache, topk, output, impl.scale, g, impl._nvfp4_num_sms)
+    n = _native()
     ns = n.nvfp4_ds_mla_plan(t, h, topk.shape[-1], impl._nvfp4_num_sms)["ns"]
     o_part = q.new_empty((t, h, ns, 512), dtype=torch.bfloat16)
     lse_part = q.new_empty((t, h, ns), dtype=torch.float32)
@@ -373,6 +410,7 @@ _HELPERS = {
     "_SUFFIX_HISPARSE_MIXED": os.environ.get("SUFFIX_SM120_HISPARSE_MIXED", "").strip() == "1",
     "_suffix_nvfp4_ds_mla_init": _suffix_nvfp4_ds_mla_init,
     "_suffix_nvfp4_ds_mla_decode": _suffix_nvfp4_ds_mla_decode,
+    "_suffix_dsmla_q_group": _suffix_dsmla_q_group,
     "_suffix_nvfp4_ds_mla_write": _suffix_nvfp4_ds_mla_write,
 }
 
