@@ -371,13 +371,18 @@ def test_host_launch_args_match_kernel_abi():
         n = len([a for a in re.split(r",\s*\n", body) if a.strip()])
         assert n == params[kern], (arr, n, params[kern])
         assert f'("{kern}", ' in host and f"&{arr})" in host
-    # dynamic smem the fused kernels index: fc1 tile 16 x 32 f32, ys topk x 8 f32
-    assert '"moe_fc1_quant", ((i / 32) as u32, slots as u32), 128, 16 * 32 * 4,' in host
+    # dynamic smem the fused kernels index: fc1 tile 16 x 32 f32, ys (topk + shared) x 8 f32
+    assert '"moe_fc1_quant", ((i / 32) as u32, gslots as u32), 128, 16 * 32 * 4,' in host
     # route_par: 16 i32 warp totals + u16 ids padded to 8 pairs, 256 threads
     assert "let route_par_smem = 64 + 2 * p.div_ceil(8) * 8;" in host
     assert '("moe_route_quant", (1 + (m * h / 16).div_ceil(256) as u32, 1), 256, route_par_smem' in host
     assert "const RT: u32 = 256;" in src and "let ids = unsafe { $sh.add(16) } as *mut u16;" in src
-    assert "32 * nw, (k * 8 * 4) as u32" in host and "let nw = k.min(16)" in host
+    assert "32 * nw, ((k + ns) * 8 * 4) as u32" in host and "let nw = (k + ns).min(16)" in host
+    # shared slot: one more grid slot / M more rows / one more route slot (E + 1 stride)
+    assert "let gslots = slots + ns;" in host and "let (nsh, pp, es) = (m * ns, p + m * ns, e + ns);" in host
+    assert "(r, r + 4 * es as u64, r + 8 * es as u64, r + 12 * es as u64)" in host
+    assert 'need("ws_route", &route, &["torch.int32"], None, 3 * es + pp)?;' in host
+    assert "const NO_SHARED: u32 = 0xFFFF_FFFF;" in host and "const NO_SHARED: u32 = 0xFFFF_FFFF;" in src
     assert "#[launch_bounds(512)]\n    pub unsafe fn moe_fc2_combine(" in src
     assert '"arch": "sm_120a"' in (ROOT / "kernels-oxide" / "nvfp4_moe"
                                    / "oxide-variants.json").read_text()
@@ -442,7 +447,9 @@ def _act32(x, kind):
         return (x / (np.float32(1) + np.exp2(-z))).astype(np.float32)
 
 
-def _route_emu(ids_flat, id_base, e_count, slots):
+def _route_emu(ids_flat, id_base, e_count, slots, nsh=0):
+    """moe_route (route_cta, then shared_slot! when nsh > 0: slot `slots` =
+    expert E over pair ids P + t)."""
     loc = ids_flat.astype(np.int64) - id_base
     cnt = np.array([(loc == tid).sum() for tid in range(e_count)], np.int32)
     se, so, sc = np.full(slots, -1), np.zeros(slots, np.int64), np.zeros(slots, np.int64)
@@ -453,24 +460,30 @@ def _route_emu(ids_flat, id_base, e_count, slots):
             se[s], so[s], sc[s] = e, off, cnt[e]
             s += 1
         off += cnt[e]
-    pl = np.full(len(loc) + 1, -7, np.int64)  # sentinel: must never be read
+    pl = np.full(len(loc) + nsh + 1, -7, np.int64)  # sentinel: must never be read
     for tid in range(e_count):
         w = offs[tid]
         for p in range(len(loc)):
             if loc[p] == tid:
                 pl[w] = p
                 w += 1
+    if nsh:
+        P = len(loc)
+        se, so, sc = np.append(se, e_count), np.append(so, P), np.append(sc, nsh)
+        pl[P:P + nsh] = np.arange(P, P + nsh)
     return se, so, sc, pl
 
 
-def _route_par_emu(ids_flat, id_base, e_count, slots, sentinel=-7):
+def _route_par_emu(ids_flat, id_base, e_count, slots, sentinel=-7, nsh=0):
     """route_par (moe_route_quant block 0) per thread as written: u16 id
     staging padded to 8 pairs, thread e counting 4 words (8 ids) per step,
     shfl.up warp scans of (cnt, cnt > 0), 8 warp totals, slot / empty-slot
     writes, the pair walk. -> (se, so, sc, pl, ws_route [3E + P]) with the
-    host's slot_expert / slot_off / slot_cnt / pair_list layout, unwritten
-    words = sentinel."""
+    host's slot_expert / slot_off / slot_cnt / pair_list layout (E + 1
+    slots with a shared expert, nsh > 0: shared_slot! after the routing),
+    unwritten words = sentinel."""
     rt, pairs = 256, len(ids_flat)
+    es = e_count + (nsh > 0)
     np8 = -(-pairs // 8) * 8
     loc = ids_flat.astype(np.int64) - id_base
     ids16 = np.full(np8, 0xFFFF, np.int64)
@@ -496,35 +509,42 @@ def _route_par_emu(ids_flat, id_base, e_count, slots, sentinel=-7):
     off = np.array([wc[:w].sum() for w in warp]) + c - cnt
     slot = np.array([wa[:w].sum() for w in warp]) + a - act
     na = wa.sum()
-    ws = np.full(3 * e_count + pairs, sentinel, np.int64)
+    ws = np.full(3 * es + pairs + nsh, sentinel, np.int64)
     for tid in range(rt):
         if tid < e_count and cnt[tid] > 0 and slot[tid] < slots:
-            ws[slot[tid]], ws[e_count + slot[tid]], ws[2 * e_count + slot[tid]] = tid, off[tid], cnt[tid]
+            ws[slot[tid]], ws[es + slot[tid]], ws[2 * es + slot[tid]] = tid, off[tid], cnt[tid]
         if tid < slots and tid >= na:
-            ws[tid], ws[2 * e_count + tid] = -1, 0
+            ws[tid], ws[2 * es + tid] = -1, 0
     for tid in range(min(e_count, rt)):
         if cnt[tid] > 0:
             o = off[tid]
             for w in range(0, np8 // 2, 4):
                 for j in range(8):
                     if (words[w + j // 2] >> (16 * (j % 2))) & 0xFFFF == tid:
-                        ws[3 * e_count + o] = 2 * w + j
+                        ws[3 * es + o] = 2 * w + j
                         o += 1
-    pl = np.full(pairs + 1, -7, np.int64)
-    pl[:pairs] = ws[3 * e_count:]
-    return ws[:slots], ws[e_count:e_count + slots], ws[2 * e_count:2 * e_count + slots], pl, ws
+    if nsh:  # shared_slot!: tid 0 the slot, threads t (stride 256) the rows
+        ws[slots], ws[es + slots], ws[2 * es + slots] = e_count, pairs, nsh
+        for t in range(nsh):
+            ws[3 * es + pairs + t] = pairs + t
+    n = slots + (nsh > 0)
+    pl = np.full(pairs + nsh + 1, -7, np.int64)
+    pl[:pairs + nsh] = ws[3 * es:]
+    return ws[:n], ws[es:es + n], ws[2 * es:2 * es + n], pl, ws
 
 
-def _route_cta_ws(ids_flat, id_base, e_count, slots, sentinel=-7):
+def _route_cta_ws(ids_flat, id_base, e_count, slots, sentinel=-7, nsh=0):
     """route_cta's ws_route words as written (empty slots' slot_off and the
-    pair_list tail beyond the local pairs are never stored)."""
-    se, so, sc, pl = _route_emu(ids_flat, id_base, e_count, slots)
-    ws = np.full(3 * e_count + len(ids_flat), sentinel, np.int64)
-    ws[:slots], ws[2 * e_count:2 * e_count + slots] = se, sc
+    pair_list tail beyond the local pairs are never stored), + shared_slot!."""
+    se, so, sc, pl = _route_emu(ids_flat, id_base, e_count, slots, nsh)
+    pairs, es, n = len(ids_flat), e_count + (nsh > 0), slots + (nsh > 0)
+    ws = np.full(3 * es + pairs + nsh, sentinel, np.int64)
+    ws[:n], ws[2 * es:2 * es + n] = se, sc
     act = se >= 0
-    ws[e_count:e_count + slots][act] = so[act]
-    n = int(sc.sum())
-    ws[3 * e_count:3 * e_count + n] = pl[:n]
+    ws[es:es + n][act] = so[act]
+    nr = int(sc[:slots].sum())
+    ws[3 * es:3 * es + nr] = pl[:nr]
+    ws[3 * es + pairs:3 * es + pairs + nsh] = pl[pairs:pairs + nsh]
     return ws
 
 
@@ -535,7 +555,8 @@ def _route_cta_ws(ids_flat, id_base, e_count, slots, sentinel=-7):
 def test_route_par_matches_route_cta_word_for_word(seed, pairs, e_count, base, span):
     """moe_route_quant's parallel route == moe_route's route_cta on every
     ws_route word (incl. what neither writes): EP off-rank ids, -1, pair
-    counts off the 8-pad, experts > 32 per warp, P < E and P >> E."""
+    counts off the 8-pad, experts > 32 per warp, P < E and P >> E; with a
+    shared slot (nsh rows) too: slot `slots`, rows P.., routed words equal."""
     rng = np.random.default_rng(seed)
     ids = rng.integers(-1, span, pairs)
     slots = min(e_count, pairs)
@@ -543,6 +564,12 @@ def test_route_par_matches_route_cta_word_for_word(seed, pairs, e_count, base, s
     assert np.array_equal(par[4], _route_cta_ws(ids, base, e_count, slots))
     se, so, sc, pl = nm.route_twin(torch.from_numpy(ids), e_count, base)
     assert list(par[0]) == se and list(par[2]) == sc and list(par[3][:len(pl)]) == pl
+    nsh = 1 + seed % 5
+    shp = _route_par_emu(ids, base, e_count, slots, nsh=nsh)
+    assert np.array_equal(shp[4], _route_cta_ws(ids, base, e_count, slots, nsh=nsh))
+    assert list(shp[0]) == se + [e_count] and list(shp[2]) == sc + [nsh]
+    assert shp[1][slots] == pairs and list(shp[3][pairs:pairs + nsh]) == list(range(pairs, pairs + nsh))
+    assert list(shp[3][:len(pl)]) == pl  # routed pair_list untouched
 
 
 def _pf_stream(la, steps, rows, sf_line):
@@ -659,19 +686,28 @@ def _warp_dot(aq, asf, w, wsf, e, rows_b, r0, r1, rs, ok0, ok1, oks, kdim, nrows
 
 
 def _gemm_emu(out, aq, asf, w, wsf, owner, se, so, sc, pl, a_row_div, kdim, ndim, nrows_w,
-              col_off, epi, sink=None):
+              col_off, epi, sink=None, sh=None):
     """Shared fc1/fc2 CTA/warp/lane walk (col_off: fc1 gate rows = idim + j).
     owner[p] = local expert of pair p: a CTA may only write its own pairs
     (a masked-row slip into the next expert's rows is a race on silicon).
     sink (moe_fc1_quant): instead of storing rows of `out`, the 4 warps'
     epilogue values of each 16-row chunk land in a 16x32 tile (row g / g+8,
     col warp*8 + 2t + dc, masked rows included) handed to
-    sink(e, off, cnt, r0, bx, tile) after the chunk (the kernel's barrier)."""
+    sink(e, off, cnt, r0, bx, tile) after the chunk (the kernel's barrier).
+    sh (shared slot): dict(e=E, w, wsf = its own tensors, read as expert 0,
+    tok_base = P for fc1's A rows tok_of(p) = p - P (masked p = 0 -> 0),
+    None for fc2's pair rows)."""
     sfa_row = 8 * (_LANE & 1) + _LANE // 4
     for slot, e in enumerate(se):
         if e < 0:
             continue
         off, cnt = so[slot], sc[slot]
+        on_sh = sh is not None and e == sh["e"]
+        wb, wsfb, ei = (sh["w"], sh["wsf"], 0) if on_sh else (w, wsf, e)
+        if on_sh and sh["tok_base"] is not None:
+            arow = lambda pp, b=sh["tok_base"]: np.where(pp >= b, pp - b, 0)  # noqa: E731
+        else:
+            arow = lambda pp: pp // a_row_div  # noqa: E731
         for bx in range(ndim // 32):
             for r0 in range(0, cnt, 16):
                 tile = np.full((16, 32), np.nan, np.float32)
@@ -685,8 +721,8 @@ def _gemm_emu(out, aq, asf, w, wsf, owner, se, so, sc, pl, a_row_div, kdim, ndim
                     p1 = np.where(ok1, pl[np.where(ok1, off + r0 + _LG + 8, 0)], 0)
                     ps = np.where(oks, pl[np.where(oks, off + r0 + sfa_row, 0)], 0)
                     assert (p0[ok0] >= 0).all() and (p1[ok1] >= 0).all() and (ps[oks] >= 0).all()
-                    acc = _warp_dot(aq, asf, w, wsf, e, rows_b, p0 // a_row_div, p1 // a_row_div,
-                                    ps // a_row_div, ok0, ok1, oks, kdim, nrows_w)
+                    acc = _warp_dot(aq, asf, wb, wsfb, ei, rows_b, arow(p0), arow(p1), arow(ps),
+                                    ok0, ok1, oks, kdim, nrows_w)
                     col = j0 + 2 * _LT
                     for ok, pp, q, rr in ((ok0, p0, 0, _LG), (ok1, p1, 2, _LG + 8)):
                         for dc in range(2):
@@ -700,20 +736,47 @@ def _gemm_emu(out, aq, asf, w, wsf, owner, se, so, sc, pl, a_row_div, kdim, ndim
                     sink(e, off, cnt, r0, bx, tile)
 
 
-def _fc1_quant_emu(p, aq, asf, loc, se, so, sc, pl, topk, hdim, idim):
+def _sh_emu(p, w, wsf, tok_base):
+    """_gemm_emu's `sh` for p["shared"] (None without one): slot expert E."""
+    sp = p.get("shared")
+    if sp is None:
+        return None
+    u8 = lambda t: t.reshape(-1).view(torch.uint8).numpy()  # noqa: E731
+    return dict(e=p["w13"].shape[0], w=u8(sp[w]), wsf=u8(sp[wsf]), tok_base=tok_base)
+
+
+def _epi1(p):
+    """fc1 epilogue as written: act(alpha * gate) * (alpha_u * up), alpha_u
+    = alpha except the shared slot's (g1, g1u)."""
+    g1, sp, e_sh = p["g1"].numpy(), p.get("shared"), p["w13"].shape[0]
+
+    def epi1(e, pp, c):  # c = [up, gate]
+        a, au = ((np.float32(sp["g1"]), np.float32(sp["g1u"])) if sp is not None and e == e_sh
+                 else (np.float32(g1[e]), np.float32(g1[e])))
+        return _act32(a * c[1], p["act"]) * (au * c[0])
+    return epi1
+
+
+def _epi2(p, tw):
+    """fc2 epilogue as written: c * (g2[e] * topk_w[p]); shared slot c * g2."""
+    g2, sp, e_sh = p["g2"].numpy(), p.get("shared"), p["w13"].shape[0]
+    twf = tw.reshape(-1).numpy().astype(np.float32)
+    return lambda e, pp, c: (c[0] * np.float32(sp["g2"]) if sp is not None and e == e_sh
+                             else c[0] * (np.float32(g2[e]) * twf[pp]))
+
+
+def _fc1_quant_emu(p, aq, asf, loc, se, so, sc, pl, topk, hdim, idim, nsh=0):
     """moe_fc1_quant: per CTA chunk, 32 threads = (row tid/2, block tid%2)
     quantize the smem tile (quant16 == nm.quant_codes) into their pair's
-    hq / hsf row; returns (hq [P, I/2], hsf [P, I/16]) with untouched rows
-    left at the 0xAB sentinel."""
-    pairs = len(loc)
+    hq / hsf row; returns (hq [P + nsh, I/2], hsf [P + nsh, I/16]) with
+    untouched rows left at the 0xAB sentinel (loc: P routed local ids;
+    shared rows P + t belong to expert E)."""
+    pairs = len(loc) + nsh
+    loc = np.concatenate([loc, np.full(nsh, p["w13"].shape[0])])
     hq = np.full((pairs, idim // 2), 0xAB, np.uint8)
     hsf = np.full((pairs, idim // 16), 0xAB, np.uint8)
     u8 = lambda t: t.reshape(-1).view(torch.uint8).numpy()
-    g1 = p["g1"].numpy()
-
-    def epi1(e, pp, c):  # c = [up, gate]
-        a = np.float32(g1[e])
-        return _act32(a * c[1], p["act"]) * (a * c[0])
+    epi1 = _epi1(p)
 
     def sink(e, off, cnt, r0, bx, tile):
         for tid in range(32):
@@ -728,7 +791,8 @@ def _fc1_quant_emu(p, aq, asf, loc, se, so, sc, pl, topk, hdim, idim):
                 hsf[pp, col // 16] = sf.numpy()[0, 0]
 
     _gemm_emu(None, aq, asf, u8(p["w13"]), u8(p["w13_sf"]), loc, se, so, sc, pl, topk,
-              hdim, idim, 2 * idim, (0, idim), epi1, sink)
+              hdim, idim, 2 * idim, (0, idim), epi1, sink,
+              _sh_emu(p, "w13", "w13_sf", len(loc) - nsh))
     return hq, hsf
 
 
@@ -737,10 +801,13 @@ def _fc2_combine_emu(p, hq, hsf, loc, e_count, tw, m, topk, hdim, idim):
     local pair sits alone in mma row 0 (ok0 = g < 1, ok1 = 0, oks =
     sfa_row < 1, all rows of the fragment walk = that pair); lanes g == 0
     park y = c * (g2 * tw) in ys[k]; 8 threads sum ys over local k
-    ascending (f32) -> bf16."""
+    ascending (f32) -> bf16. Shared slot: one more warp k = topk on row
+    P + tok with its own w2 / g2, weight 1, summed after the routed k."""
     u8 = lambda t: t.reshape(-1).view(torch.uint8).numpy()
     w2, w2sf = u8(p["w2"]), u8(p["w2_sf"])
     g2, twf = p["g2"].numpy(), tw.reshape(-1).numpy().astype(np.float32)
+    sp = p.get("shared")
+    kt = topk + (sp is not None)
     sfa_row = 8 * (_LANE & 1) + _LANE // 4
     ok0, ok1, oks = _LG < 1, np.zeros(32, bool), sfa_row < 1
     out = np.zeros((m, hdim), np.float32)
@@ -748,16 +815,17 @@ def _fc2_combine_emu(p, hq, hsf, loc, e_count, tw, m, topk, hdim, idim):
     for tok in range(m):
         for bx in range(hdim // 8):
             h0 = bx * 8
-            ys = np.full((topk, 8), np.nan, np.float32)
-            for k in range(topk):
-                pp = tok * topk + k
-                if not local(pp):
+            ys = np.full((kt, 8), np.nan, np.float32)
+            for k in range(kt):
+                sh = k == topk
+                pp = m * topk + tok if sh else tok * topk + k
+                if not sh and not local(pp):
                     continue
-                e = loc[pp]
+                wb, wsfb, e = (u8(sp["w2"]), u8(sp["w2_sf"]), 0) if sh else (w2, w2sf, loc[pp])
                 rows = np.full(32, pp)
-                c = _warp_dot(hq, hsf, w2, w2sf, e, [h0 + _LG], rows, rows, rows, ok0, ok1, oks,
+                c = _warp_dot(hq, hsf, wb, wsfb, e, [h0 + _LG], rows, rows, rows, ok0, ok1, oks,
                               idim, hdim)[0]
-                s = np.float32(g2[e]) * twf[pp]
+                s = np.float32(sp["g2"]) if sh else np.float32(g2[e]) * twf[pp]
                 for dc in range(2):
                     ys[k, 2 * _LT[ok0] + dc] = c[ok0, dc] * s
             for j in range(8):
@@ -765,6 +833,8 @@ def _fc2_combine_emu(p, hq, hsf, loc, e_count, tw, m, topk, hdim, idim):
                 for k in range(topk):
                     if local(tok * topk + k):
                         acc = np.float32(acc + ys[k, j])
+                if kt > topk:
+                    acc = np.float32(acc + ys[topk, j])
                 out[tok, h0 + j] = acc
     return out
 
@@ -776,12 +846,13 @@ def kernel_lane_emu_fused(p, x, ids, tw, base=0):
     m, topk = ids.shape
     e_count, two_i, kh1 = p["w13"].shape
     hdim, idim = kh1 * 2, two_i // 2
+    nsh = m if p.get("shared") is not None else 0
     ids_flat = ids.reshape(-1).numpy()
-    se, so, sc, pl = _route_par_emu(ids_flat, base, e_count, min(e_count, m * topk))[:4]
+    se, so, sc, pl = _route_par_emu(ids_flat, base, e_count, min(e_count, m * topk), nsh=nsh)[:4]
     aq_t, asf_t = nm.quant_codes(x.float(), p["a1g"])
     loc = ids_flat.astype(np.int64) - base
     hq, hsf = _fc1_quant_emu(p, aq_t.reshape(-1).numpy(), asf_t.reshape(-1).numpy(), loc, se, so,
-                             sc, pl, topk, hdim, idim)
+                             sc, pl, topk, hdim, idim, nsh)
     out = _fc2_combine_emu(p, hq.reshape(-1), hsf.reshape(-1), loc, e_count, tw, m, topk, hdim, idim)
     return hq, hsf, out
 
@@ -794,21 +865,24 @@ def kernel_lane_emu_front(p, x, ids, tw, base=0):
     m, topk = ids.shape
     e_count, two_i, kh1 = p["w13"].shape
     hdim, idim = kh1 * 2, two_i // 2
+    nsh = m if p.get("shared") is not None else 0
     ids_flat = ids.reshape(-1).numpy()
-    se, so, sc, pl = _route_par_emu(ids_flat, base, e_count, min(e_count, m * topk))[:4]
+    se, so, sc, pl = _route_par_emu(ids_flat, base, e_count, min(e_count, m * topk), nsh=nsh)[:4]
     aq_t, asf_t = nm.quant_codes(x.float(), p["a1g"])
     loc = ids_flat.astype(np.int64) - base
     hq, hsf = _fc1_quant_emu(p, aq_t.reshape(-1).numpy(), asf_t.reshape(-1).numpy(), loc, se, so,
-                             sc, pl, topk, hdim, idim)
+                             sc, pl, topk, hdim, idim, nsh)
     u8 = lambda t: t.reshape(-1).view(torch.uint8).numpy()
-    g2, twf = p["g2"].numpy(), tw.reshape(-1).numpy().astype(np.float32)
-    y = np.full((m * topk, hdim), np.nan, np.float32)
-    _gemm_emu(y, hq.reshape(-1), hsf.reshape(-1), u8(p["w2"]), u8(p["w2_sf"]), loc, se, so, sc, pl,
-              1, idim, hdim, hdim, (0,), lambda e, pp, c: c[0] * (np.float32(g2[e]) * twf[pp]))
+    owner = np.concatenate([loc, np.full(nsh, e_count)])
+    y = np.full((m * topk + nsh, hdim), np.nan, np.float32)
+    _gemm_emu(y, hq.reshape(-1), hsf.reshape(-1), u8(p["w2"]), u8(p["w2_sf"]), owner, se, so, sc, pl,
+              1, idim, hdim, hdim, (0,), _epi2(p, tw), sh=_sh_emu(p, "w2", "w2_sf", None))
     acc = np.zeros((m, hdim), np.float32)
     for k in range(topk):
         v = (loc[k::topk] >= 0) & (loc[k::topk] < e_count)
-        acc[v] += y[k::topk][v]
+        acc[v] += y[:m * topk][k::topk][v]
+    if nsh:  # moe_combine: the shared row P + t after the routed k
+        acc += y[m * topk:]
     return hq, hsf, acc
 
 
@@ -817,40 +891,33 @@ def kernel_lane_emu(p, x, ids, tw, base=0):
     m, topk = ids.shape
     e_count, two_i, kh1 = p["w13"].shape
     hdim, idim = kh1 * 2, two_i // 2
+    nsh = m if p.get("shared") is not None else 0
     pairs = m * topk
     slots = min(e_count, pairs)
     ids_flat = ids.reshape(-1).numpy()
-    se, so, sc, pl = _route_emu(ids_flat, base, e_count, slots)
+    se, so, sc, pl = _route_emu(ids_flat, base, e_count, slots, nsh)
     aq_t, asf_t = nm.quant_codes(x.float(), p["a1g"])
     aq, asf = aq_t.reshape(-1).numpy(), asf_t.reshape(-1).numpy()
     u8 = lambda t: t.reshape(-1).view(torch.uint8).numpy()
-    inter = np.full((pairs, idim), np.nan, np.float32)
-    g1, g2 = p["g1"].numpy(), p["g2"].numpy()
-    twf = tw.reshape(-1).numpy().astype(np.float32)
-
-    def epi1(e, pp, c):  # c = [up, gate]
-        a = np.float32(g1[e])
-        return _act32(a * c[1], p["act"]) * (a * c[0])
-
+    inter = np.full((pairs + nsh, idim), np.nan, np.float32)
     loc = ids_flat.astype(np.int64) - base
-    _gemm_emu(inter, aq, asf, u8(p["w13"]), u8(p["w13_sf"]), loc, se, so, sc, pl, topk,
-              hdim, idim, two_i, (0, idim), epi1)
+    owner = np.concatenate([loc, np.full(nsh, e_count)])
+    _gemm_emu(inter, aq, asf, u8(p["w13"]), u8(p["w13_sf"]), owner, se, so, sc, pl, topk,
+              hdim, idim, two_i, (0, idim), _epi1(p), sh=_sh_emu(p, "w13", "w13_sf", pairs))
     with np.errstate(invalid="ignore"):
         hq_t, hsf_t = nm.quant_codes(torch.from_numpy(inter), p["a2g"])
     hq, hsf = hq_t.reshape(-1).numpy(), hsf_t.reshape(-1).numpy()
-    y = np.full((pairs, hdim), np.nan, np.float32)
-
-    def epi2(e, pp, c):
-        return c[0] * (np.float32(g2[e]) * twf[pp])
-
-    _gemm_emu(y, hq, hsf, u8(p["w2"]), u8(p["w2_sf"]), loc, se, so, sc, pl, 1,
-              idim, hdim, hdim, (0,), epi2)
+    y = np.full((pairs + nsh, hdim), np.nan, np.float32)
+    _gemm_emu(y, hq, hsf, u8(p["w2"]), u8(p["w2_sf"]), owner, se, so, sc, pl, 1,
+              idim, hdim, hdim, (0,), _epi2(p, tw), sh=_sh_emu(p, "w2", "w2_sf", None))
     acc = np.zeros((m, hdim), np.float32)
     for k in range(topk):
         v = (loc[k::topk] >= 0) & (loc[k::topk] < e_count)
-        acc[v] += y[k::topk][v]
+        acc[v] += y[:m * topk][k::topk][v]
+    if nsh:  # moe_combine: the shared row P + t after the routed k
+        acc += y[pairs:]
     out = torch.from_numpy(acc).bfloat16()
-    ws = nm.workspace("cpu", m, topk, hdim, idim, e_count)
+    ws = nm.workspace("cpu", m, topk, hdim, idim, e_count, ns=int(nsh > 0))
     for t, v in zip(ws, (aq, asf, inter, hq, hsf, y)):
         t[:v.size] = torch.from_numpy(np.ascontiguousarray(v).reshape(-1))
     kernel_lane_emu.acc = acc  # f32 sum before the bf16 store (fused-order test)
@@ -1045,13 +1112,28 @@ def test_tune_word_matches_host_decode():
     assert (w & 0xFF, w >> 8 & 0xFF, w >> 16 & 1, w >> 24) == (7, 200, 1, 0x3F)
     assert w & 0xC0FE0000 == 0 and nm.ORACLE_TUNE == 0x1FFFF
     assert ".filter(|(n, _)| skip >> n & 1 == 0)" in host
-    # fc1 kernels get (la1, pf2, w2, w2_sf) last, fc2 kernels la2 last
+    # fc1 kernels get (la1, pf2, w2, w2_sf) then the shared block last, fc2
+    # kernels la2 then theirs (kernel signatures: the same order)
+    sh1 = ("\n        Arg::U32(she),\n        Arg::Ptr(s13p),\n        Arg::Ptr(s13sp),\n"
+           "        Arg::F32(g1s),\n        Arg::F32(g1us),\n        Arg::Ptr(s2p),\n"
+           "        Arg::Ptr(s2sp),\n    ];")
+    sh2 = ("\n        Arg::U32(she),\n        Arg::Ptr(s2p),\n        Arg::Ptr(s2sp),\n"
+           "        Arg::F32(g2s),\n    ];")
     for arr, tail in (("fc1_args", "Arg::U32(la1),\n        Arg::U32(pf2),\n        Arg::Ptr(w2.ptr),"
-                                   "\n        Arg::Ptr(w2s.ptr),\n    ];"),
+                                   "\n        Arg::Ptr(w2s.ptr)," + sh1),
                       ("fq_args", "Arg::U32(la1),\n        Arg::U32(pf2),\n        Arg::Ptr(w2.ptr),"
-                                  "\n        Arg::Ptr(w2s.ptr),\n    ];"),
-                      ("fc2_args", "Arg::U32(la2),\n    ];"), ("fc_args", "Arg::U32(la2),\n    ];")):
+                                  "\n        Arg::Ptr(w2s.ptr)," + sh1),
+                      ("fc2_args", "Arg::U32(la2)," + sh2), ("fc_args", "Arg::U32(la2)," + sh2)):
         assert re.search(rf"let {arr} = \[.*?\];", host, re.S).group(0).endswith(tail), arr
+    src = (ROOT / "kernels-oxide" / "nvfp4_moe" / "src" / "main.rs").read_text()
+    for fn, tail in (("moe_fc1", "w2_sf: *const u8,\n        shared_e: u32,\n        w13_sh: *const u8,"
+                                 "\n        w13_sf_sh: *const u8,\n        g1_sh: f32,\n        g1u_sh: f32,"
+                                 "\n        w2_sh: *const u8,\n        w2_sf_sh: *const u8,\n    )"),
+                     ("moe_fc2", "la: u32,\n        shared_e: u32,\n        w2_sh: *const u8,"
+                                 "\n        w2_sf_sh: *const u8,\n        g2_sh: f32,\n    )")):
+        for kern in (fn, fn + ("_quant" if fn == "moe_fc1" else "_combine")):
+            sig = re.search(rf"pub unsafe fn {kern}\((.*?)\)\s*\{{", src, re.S).group(0)
+            assert sig.rstrip(" {").endswith(tail), kern
 
 
 def test_sweep_verdict_merges_buckets_and_picks_max_m():
@@ -1065,3 +1147,296 @@ def test_sweep_verdict_merges_buckets_and_picks_max_m():
     assert nm.sweep_verdict([(1, f3, 50, 40)])[1:] == (None, [])
     cands = nm.sweep_candidates()
     assert (0, 0, 0, 0) in cands and len(set(cands)) == len(cands) == 60
+
+
+# ---------------------------------------------------------------------------
+# Fused shared expert (SUFFIX_NVFP4_MOE_FUSE_SHARED): the kernel's extra slot
+# ---------------------------------------------------------------------------
+def _bf16_mlp(w_gu, w_dn, x):
+    """vLLM's DeepseekV2MLP on BF16: merged [gate; up] GEMM, SiluAndMul, down."""
+    i = w_gu.shape[0] // 2
+    gu = (x.float() @ w_gu.float().T).bfloat16().float()
+    h = (torch.nn.functional.silu(gu[:, :i]) * gu[:, i:]).bfloat16().float()
+    return (h @ w_dn.float().T).bfloat16()
+
+
+def _shared_problem(e_count, hdim, idim, seed=0, rsf=1.0, wstd=0.05, headroom=4):
+    """make_problem + a BF16 shared MLP of the same per-rank shape, quantized
+    by quant_shared with c from the routed / shared probe."""
+    p = nm.make_problem(e_count, hdim, idim, "silu", seed=seed)
+    g = torch.Generator().manual_seed(1000 + seed)
+    w_gu = (torch.randn(2 * idim, hdim, generator=g) * wstd).bfloat16()
+    w_dn = (torch.randn(hdim, idim, generator=g) * wstd).bfloat16()
+    xp = torch.randn(64, hdim, generator=g).bfloat16().float()
+    gu = xp @ w_gu.float().T
+    h_sh = float((nm.act_ref(gu[:, :idim], 0) * gu[:, idim:]).abs().max())
+    c = nm.shared_c(nm.probe_h_routed(p, xp), h_sh, headroom)
+    p["shared"] = nm.quant_shared(w_gu, w_dn, p["a1g"], p["a2g"], c, rsf)
+    return p, w_gu, w_dn
+
+
+@pytest.mark.parametrize("m,local,e_global,topk,dead", [
+    (1, 4, 4, 2, None), (5, 3, 3, 3, None), (17, 2, 2, 2, None),  # 2 row chunks in the shared slot
+    (9, 4, 16, 3, None),   # EP rank 2/4: rows t%3==1 routed off-rank -> shared only
+    (4, 4, 16, 2, True)])  # every routed pair off-rank: out = the shared rows alone
+def test_lane_emulator_shared_slot_matches_spec_and_every_plan(m, local, e_global, topk, dead):
+    """The shared slot as written (route shared_slot!, fc1 tok_of + own
+    tensors + g1/g1u, fc2 g2 weight 1, combine / fc2_combine adding row P + t
+    after the routed k) == the f64 spec (moe_ref + shared_ref) within
+    REF_TOL, every stage in STAGE_TOL incl. the shared rows, and the fused /
+    front plans bit-identical to legacy incl. the shared hq/hsf rows. A token
+    with no local routed expert gets exactly bf16(its shared row)."""
+    ep_rank = 2 if e_global == 16 else 0
+    base = ep_rank * local
+    p, _, _ = _shared_problem(local, 128, 64, seed=m)
+    ids, tw = nm.rand_routing(m, e_global, topk, "cpu", seed=m, base=base, local=local, dead=dead)
+    x = (torch.randn(m, 128, generator=torch.Generator().manual_seed(m)) * 1.3).bfloat16()
+    ws, out = kernel_lane_emu(p, x, ids, tw, base)
+    acc = kernel_lane_emu.acc
+    lid = nm.to_local(ids, base, local)
+    ok, msg = nm.stages(p, x, lid, tw, ws, out)
+    assert ok, msg
+    assert nm._rel(out.float(), nm.moe_ref(p, x, lid, tw)) <= nm.REF_TOL
+    hq, hsf, facc = kernel_lane_emu_fused(p, x, ids, tw, base)
+    fhq, fhsf, front = kernel_lane_emu_front(p, x, ids, tw, base)
+    assert np.array_equal(facc.view(np.uint32), acc.view(np.uint32))
+    assert np.array_equal(front.view(np.uint32), acc.view(np.uint32))
+    pairs = m * topk
+    rows = np.concatenate([np.nonzero((lid.reshape(-1) >= 0).numpy())[0], np.arange(pairs, pairs + m)])
+    leg_hq = ws[3][:(pairs + m) * 32].view(pairs + m, -1).numpy()
+    leg_hsf = ws[4][:(pairs + m) * 4].view(pairs + m, -1).numpy()
+    for a, b in ((hq, leg_hq), (hsf, leg_hsf), (fhq, leg_hq), (fhsf, leg_hsf)):
+        assert np.array_equal(a[rows], b[rows])
+    dead_rows = (lid < 0).all(1)
+    shared_only = ws[5][:(pairs + m) * 128].view(pairs + m, -1)[pairs:][dead_rows]
+    assert torch.equal(out[dead_rows], shared_only.bfloat16())
+    if dead:
+        assert dead_rows.all()
+
+
+def test_quant_shared_matches_the_bf16_mlp_and_catches_layout_bugs():
+    """quant_shared + shared_ref vs vLLM's BF16 shared MLP: NVFP4 W4A4 noise
+    (<= SHARED_TOL), the 1/rsf the runner restores, and the bugs the load
+    oracle relies on SHARED_TOL to catch (gate/up order, a lost c or rsf
+    factor) are far above it. (The scale layout is swizzle(), pinned against
+    vLLM's above and read by the lane emulator through sf_offset.)"""
+    x = (torch.randn(48, 256, generator=torch.Generator().manual_seed(5))).bfloat16()
+    for rsf in (1.0, 2.5):
+        p, w_gu, w_dn = _shared_problem(4, 256, 128, seed=3, rsf=rsf)
+        sp, mlp = p["shared"], _bf16_mlp(w_gu, w_dn, x).double()
+        assert sp["w13"].shape == (256, 128) and sp["w2"].shape == (256, 64)
+        assert sp["w13_sf"].numel() == 256 * 16 and sp["w2_sf"].numel() == 256 * 8
+        r = nm._rel(nm.shared_ref(p, x) * rsf, mlp)
+        assert 0.02 < r <= nm.SHARED_TOL, r
+        i = 128
+        bugs = {"gate/up swapped": dict(sp, w13=torch.cat([sp["w13"][i:], sp["w13"][:i]])),
+                "g1u without c": dict(sp, g1u=sp["g1u"] / sp["c"] * 4),
+                "g2 off by 2": dict(sp, g2=sp["g2"] * 2.0)}
+        for name, bad in bugs.items():
+            rb = nm._rel(nm.shared_ref(dict(p, shared=bad), x) * rsf, mlp)
+            assert rb > 1.5 * nm.SHARED_TOL, (name, rb)
+
+
+def test_shared_c_is_exact_in_the_normal_range():
+    """c only moves the up alpha (g1u) and g2 by a power of two: while the h
+    block scales stay normal e4m3 the slot's output is the same to f64
+    rounding for any c (precision is c-independent); headroom / degenerate
+    inputs pick the documented power of two."""
+    assert nm.shared_c(80.0, 10.0, 3) == 1.0 and nm.shared_c(100.0, 10.0, 4) == 0.5
+    assert nm.shared_c(10.0, 80.0, 0) == 0.125
+    assert nm.shared_c(0.0, 1.0, 3) == nm.shared_c(1.0, 0.0, 3) == nm.shared_c(float("inf"), 1, 3) == 1.0
+    assert nm.shared_c(1e30, 1e-30, 0) == 2.0 ** 30
+    p, w_gu, w_dn = _shared_problem(4, 256, 128, seed=8)
+    x = torch.randn(16, 256, generator=torch.Generator().manual_seed(2)).bfloat16()
+    outs = [nm.shared_ref(dict(p, shared=nm.quant_shared(w_gu, w_dn, p["a1g"], p["a2g"], c)), x)
+            for c in (p["shared"]["c"], p["shared"]["c"] / 4, p["shared"]["c"] * 2)]
+    assert all(nm._rel(o, outs[0]) < 1e-12 for o in outs[1:])
+
+
+@pytest.mark.parametrize("change,needle", [
+    ({}, None),
+    ({"runner": False}, "MoERunner"),
+    ({"shared": False}, "no shared expert"),
+    ({"shared_gate": True}, "gated"),
+    ({"transform": True}, "latent"),
+    ({"ep": 8}, "expert parallel"),
+    ({"sp": True}, "sequence-parallel"),
+    ({"reduced": True}, "reduced"),
+    ({"mlp": False}, "SiluAndMul"),
+    ({"wdtype": "quantized"}, "BF16 unquantized"),
+    ({"wdtype": "torch.float16"}, "BF16 unquantized"),
+    ({"bias": True}, "biases"),
+    ({"reduce_results": True}, "all-reduces"),
+    ({"routed_act": "gelu_tanh"}, "activation"),
+    ({"I": 512}, "!= routed"),
+    ({"rsf": 0.0}, "routed_scaling_factor"),
+])
+def test_shared_eligibility(change, needle):
+    good = dict(runner=True, shared=True, shared_gate=False, transform=False, ep=1, sp=False,
+                reduced=False, mlp=True, wdtype="torch.bfloat16", bias=False,
+                reduce_results=False, routed_act="silu", I=256, H=6144, routed_I=256,
+                routed_H=6144, rsf=1.0)
+    why = nm.shared_eligibility({**good, **change})
+    assert (why is None) if needle is None else (needle in why), why
+
+
+def test_add_shared_is_stocks_combine():
+    g = torch.Generator().manual_seed(4)
+    routed = torch.randn(6, 64, generator=g).bfloat16()
+    shared = torch.randn(6, 64, generator=g).bfloat16()
+    assert torch.equal(nm.add_shared(routed, shared, 1.0), shared + routed)  # bit for bit
+    got = (nm.add_shared(routed, shared, 2.5).float() * 2.5)  # the runner applies rsf after
+    torch.testing.assert_close(got, shared.float() + routed.float() * 2.5, rtol=2e-2, atol=2e-2)
+
+
+def test_workspace_sizes_with_a_shared_slot():
+    ws = nm.workspace("cpu", 6, 8, 6144, 256, 256, ns=1)
+    rows = 6 * 8 + 6
+    assert [t.numel() for t in ws] == [6 * 3072, 6 * 384, rows * 256, rows * 128, rows * 16,
+                                       rows * 6144, 3 * 257 + rows]
+    assert nm.workspace("cpu", 6, 8, 6144, 256, 256, ws) is ws  # routed-only fits: no realloc
+    assert nm.workspace("cpu", 6, 8, 6144, 256, 256, nm.workspace("cpu", 6, 8, 6144, 256, 256),
+                        ns=1)[2].numel() == rows * 256  # grows for the slot
+
+
+class UnquantizedLinearMethod:  # vLLM's class name is what _sfx_shared_info checks
+    pass
+
+
+class SiluAndMul(torch.nn.Module):
+    def forward(self, x):
+        i = x.shape[-1] // 2
+        return torch.nn.functional.silu(x[..., :i]) * x[..., i:]
+
+
+class _Lin(torch.nn.Module):
+    def __init__(self, w, reduce_results=None):
+        super().__init__()
+        self.weight = torch.nn.Parameter(w, requires_grad=False)
+        self.quant_method = UnquantizedLinearMethod()
+        if reduce_results is not None:
+            self.reduce_results = reduce_results
+
+    def forward(self, x):
+        return x @ self.weight.T, None
+
+
+class _MLP(torch.nn.Module):  # vLLM's DeepseekV2MLP shape
+    def __init__(self, w_gu, w_dn):
+        super().__init__()
+        self.gate_up_proj, self.down_proj = _Lin(w_gu), _Lin(w_dn, False)
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_up_proj(x)[0]))[0]
+
+
+def test_fused_shared_wiring_rewires_the_runner(monkeypatch):
+    """CPU fake of vLLM's RoutedExperts / MoERunner: the runner hook hands
+    our layer its runner; _sfx_fuse_shared quantizes the BF16 MLP into
+    cfg["shared"], runs the (stubbed) oracle, then the runner drops its
+    shared experts and re-selects its forward entry; decode M passes the
+    slot to the host op, larger M adds the MLP's own output (stock's
+    combine); an EP layer keeps vLLM's shared path with the reason."""
+    import types
+    from types import SimpleNamespace
+
+    from suffix_hybrid import oxide_kernels
+
+    class RoutedExperts(torch.nn.Module):
+        def __init__(self, name):
+            super().__init__()
+            self.layer_name = name
+            self.quant_method = SimpleNamespace(process_weights_after_loading=lambda layer: None)
+            self.w13_weight = torch.zeros(1, dtype=torch.uint8)
+
+        def forward_modular(self, x, topk_weights, topk_ids, shared_experts=None,
+                            shared_experts_input=None):
+            return x * 2  # "FlashInfer"
+
+    class Runner(torch.nn.Module):
+        def __init__(self, routed_experts, mlp, rsf=1.0):
+            super().__init__()
+            self.routed_experts = routed_experts
+            self._shared_experts = torch.nn.Module()
+            self._shared_experts._layer = mlp
+            self.routed_scaling_factor = rsf
+            self.moe_config = SimpleNamespace(is_sequence_parallel=False)
+            self.shared_expert_gate = self.routed_input_transform = self.routed_output_transform = None
+            self._fused_output_is_reduced = False
+            self._forward_entry = self._select_forward()
+
+        def _select_forward(self):
+            return "moe_forward" if self._shared_experts is None else "moe_forward_shared"
+
+    calls = []
+    native = SimpleNamespace(nvfp4_moe_cuda=lambda *a, **kw: calls.append(kw))
+    mod = types.ModuleType("vllm.model_executor.layers.fused_moe.routed_experts")
+    mod.RoutedExperts = RoutedExperts
+    for name in ("vllm", "vllm.model_executor", "vllm.model_executor.layers",
+                 "vllm.model_executor.layers.fused_moe"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    monkeypatch.setattr(oxide_kernels, "native", lambda: native)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda dev=None: SimpleNamespace(cuda_stream=0))
+    for k, v in (("shared_fused", 0), ("shared_stock", {}), ("ws", {}), ("in_oracle", False),
+                 ("active_logged", True)):
+        monkeypatch.setitem(nm._state, k, v)
+    cls = nm._make_layer_cls()
+    oracle = []
+    monkeypatch.setattr(cls, "_sfx_shared_oracle", lambda self, *a: oracle.append(a))
+    nm._hook_runner(Runner, cls)
+    p, w_gu, w_dn = _shared_problem(4, 64, 64, seed=1)
+    del p["shared"]
+    cfg = dict(p, H=64, topk=2, max_m=4, id_base=0, E_global=4, tune=nm.tune_table(), fused=True)
+    info = dict(E=4, H=64, I=64, act="silu", ep=1, tp=8)
+
+    layer, mlp = cls("model.layers.3.mlp.experts"), _MLP(w_gu, w_dn)
+    runner = Runner(layer, mlp)
+    assert layer._sfx_runner() is runner
+    layer._sfx_moe = cfg
+    layer._sfx_fuse_shared(cfg, info)
+    assert len(oracle) == 1 and nm._state["shared_fused"] == 1
+    assert runner._shared_experts is None and runner._forward_entry == "moe_forward"
+    assert cfg["shared_mod"] is mlp and cfg["shared_rsf"] == 1.0
+    assert cfg["shared"]["w13"].shape == (128, 32)
+    x = torch.randn(3, 64).bfloat16()
+    layer.forward_modular(x, torch.rand(3, 2), torch.zeros(3, 2, dtype=torch.int32))
+    assert all(a is b for a, b in zip(nm.shared_args(cfg["shared"]), calls[-1]["shared"], strict=True))
+    big = torch.randn(5, 64).bfloat16()  # > max_m: FlashInfer + the module, stock order
+    out = layer.forward_modular(big, torch.rand(5, 2), torch.zeros(5, 2, dtype=torch.int32))
+    assert torch.equal(out, mlp(big) + big * 2) and len(calls) == 1
+
+    ep_layer = cls("model.layers.4.mlp.experts")
+    ep_runner = Runner(ep_layer, _MLP(w_gu, w_dn))
+    ep_layer._sfx_fuse_shared(dict(cfg), dict(info, ep=8))
+    assert ep_runner._shared_experts is not None and ep_runner._forward_entry == "moe_forward_shared"
+    assert any("expert parallel" in k for k in nm._state["shared_stock"])
+    assert nm._state["shared_fused"] == 1 and len(oracle) == 1
+
+
+def test_first_forward_check_waits_out_the_shared_oracle(monkeypatch):
+    """The shared oracle calls the BF16 MLP module (a module forward): the
+    global pre-hook must not decide (nor fail on "no shared expert fused
+    yet") while it runs."""
+    monkeypatch.setenv(nm.GATE, "1")
+    monkeypatch.setenv(nm.FUSE_SHARED_ENV, "1")
+    for k, v in (("checked", False), ("in_oracle", True), ("layers_ours", 1),
+                 ("shared_fused", 0), ("instances", 1)):
+        monkeypatch.setitem(nm._state, k, v)
+    nm._first_forward_check(None, ())
+    assert nm._state["checked"] is False
+    monkeypatch.setitem(nm._state, "in_oracle", False)
+    with pytest.raises(RuntimeError, match="no shared expert fused"):
+        nm._first_forward_check(None, ())
+
+
+def test_fuse_shared_knobs(monkeypatch):
+    monkeypatch.delenv(nm.FUSE_SHARED_ENV, raising=False)
+    monkeypatch.delenv(nm.HEADROOM_ENV, raising=False)
+    assert not nm.fuse_shared_on() and nm.shared_headroom() == 4
+    monkeypatch.setenv(nm.FUSE_SHARED_ENV, "1")
+    monkeypatch.setenv(nm.HEADROOM_ENV, "17")
+    assert nm.fuse_shared_on()
+    with pytest.raises(ValueError):
+        nm.shared_headroom()

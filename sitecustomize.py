@@ -589,6 +589,11 @@ _BOOT_GATES = {
     # M 1..192 for FlashInfer CUTLASS, our NVFP4 kernel and FlashInfer b12x; numerics vs f64; the
     # TP tune table. Lines: [suffix moe-tp].
     "glm_moe_tp_bench": (["-m", "suffix_hybrid.tools.glm_moe_tp"], {}),
+    # Same TP8 rank + its shared expert: our routed kernel + vLLM's BF16 shared MLP (serial and
+    # on a second stream, + the runner's add) vs the fused shared slot
+    # (SUFFIX_NVFP4_MOE_FUSE_SHARED), best tune each, numerics vs f64 / stock / the BF16 MLP,
+    # fused tune table, per-step saving. Lines: [suffix moe-shared].
+    "glm_moe_shared_bench": (["-m", "suffix_hybrid.tools.glm_moe_shared"], {}),
     # GLM-5.3 TP8 dense projections per rank, one GPU, cold L2: BF16 vs FP8 W8A8 cutlass (+act
     # quant) vs Marlin W8A16 vs Marlin W4A16 (SUFFIX_FP8_DENSE_BACKEND) at decode M 1..192,
     # numerics vs fp32, per-step sums, SUFFIX_FP8_DENSE_MARLIN_MAX_M. Lines: [suffix dense-marlin].
