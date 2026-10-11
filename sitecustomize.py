@@ -347,7 +347,7 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
                   "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG",
                   "SUFFIX_ROCM_QK_FUSED", "SUFFIX_ROCM_ACT_QUANT_FUSE",
-                  "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC")) or any(
+                  "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC", "SUFFIX_MTP_MOE_NVFP4")) or any(
         os.environ.get(_g, "").strip() not in ("", "0")
         for _g in ("SUFFIX_ROCM_HC_WQ", "SUFFIX_NVFP4_MOE_BACKEND")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"

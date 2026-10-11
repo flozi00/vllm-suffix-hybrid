@@ -649,6 +649,14 @@ PATCHES = {
         for mod in ("vllm.model_executor.layers.quantization.modelopt",
                     "vllm.model_executor.layers.quantization.compressed_tensors."
                     "compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4")),
+    # NVIDIA GLM 5.3: the MTP draft layer's BF16 routed experts served as NVFP4 like layers 3..77
+    # (suffix_hybrid/mtp_moe_nvfp4.py): quant method + on-load quantization, fail-closed oracles.
+    "SUFFIX_MTP_MOE_NVFP4": (
+        Patch("vllm.model_executor.layers.quantization.modelopt",
+              "MTP draft experts -> ModelOpt NVFP4 MoE", after="suffix_hybrid.mtp_moe_nvfp4:patch_quant"),
+        Patch("vllm.models.deepseek_v32.nvidia.mtp", "MTP draft BF16 experts quantized to NVFP4 on load",
+              after="suffix_hybrid.mtp_moe_nvfp4:patch_mtp"),
+    ),
     "SUFFIX_ROCM_QSA_NOSPEC": tuple(
         Patch("vllm.models.qwen4_exp.amd.ops.qsa", f"QSA {name}: runtime counts not specialized",
               f"@triton.jit\ndef {name}(\n",
