@@ -532,3 +532,12 @@ def test_load_time_code_under_vllm_bf16_default_dtype(fake_vllm, monkeypatch, be
             assert mods[name](x).dtype == torch.bfloat16
     finally:
         torch.set_default_dtype(prev)
+
+
+def test_a8_plans_get_their_own_bound(O):
+    """Silicon: e4m3 x e4m3 tensor-core products sit 1.5-2.2e-3 off the exact emulation of the
+    a8 activation quantization (g14 boot); exact-activation plans keep OURS_BOUND."""
+    a8 = next(c for c in O.configs("w8", 6144, 96) if c.a8)
+    plain = next(c for c in O.configs("w8", 6144, 96) if not c.a8)
+    assert O.bound(a8) == O.A8_BOUND == 4e-3 and O.bound(plain) == O.OURS_BOUND == 1e-3
+    assert O.bound(None) == O.OURS_BOUND

@@ -354,7 +354,7 @@ def _oracle_ours(name, w, mod) -> None:
         path, plan = mod._sfx_ours.lookup(m)
         out = ours_apply(x, mod)
         if path == "ours":
-            ek, kb = _OURS.rel_err(out, _OURS.reference(x, deq, plan.cfg)), _OURS.OURS_BOUND
+            ek, kb = _OURS.rel_err(out, _OURS.reference(x, deq, plan.cfg)), _OURS.bound(plan.cfg)
         elif path == "cutlass":
             ek, kb = rel_frob(out, reference(x, mod.weight, mod.weight_scale)), KERNEL_BOUND
         else:  # Marlin reads the channel scales in the activation dtype
