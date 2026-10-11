@@ -612,6 +612,11 @@ _BOOT_GATES = {
     # quant) vs Marlin W8A16 vs Marlin W4A16 (SUFFIX_FP8_DENSE_BACKEND) at decode M 1..192,
     # numerics vs fp32, per-step sums, SUFFIX_FP8_DENSE_MARLIN_MAX_M. Lines: [suffix dense-marlin].
     "glm_dense_marlin_bench": (["-m", "suffix_hybrid.tools.glm_dense_marlin"], {}),
+    # Our own small-M dense GEMM (fp8_dense_patch/ours.py; SUFFIX_FP8_DENSE_BACKEND=ours|best|
+    # ours_fp4) vs BF16 / cutlass+quant / Marlin W8A16 / Marlin W4A16 at the same shapes + the
+    # batched MLA heads, one GPU, cold L2, graphed, by the serving tuner: per-M us, the winning
+    # tiles, route tables, per-step sums; exit 1 on a numerics bound. Lines: [suffix dense-ours].
+    "glm_dense_ours_bench": (["-m", "suffix_hybrid.tools.glm_dense_ours"], {}),
     # ROCm card facts: arch/CUs, AITER tuned-config coverage for this CU count,
     # HBM bandwidth, BF16 vs MXFP4 GEMM at the qwen3.8-flash TP1 decode shapes.
     "rocm_probe": (["-m", "suffix_hybrid.tools.rocm_probe"], {}),
