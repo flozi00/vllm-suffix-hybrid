@@ -56,7 +56,7 @@ FLAG_BYTES = 64 << 10    # 2 parities x 2 phases x world lines
 BLOCK = 1024             # bf16 per program step (16 B per thread at 4 warps)
 ELEMS_PER_PROGRAM = 1024  # grid = clamp(first round / this, 1, max_blocks)
 MAX_BLOCKS = 128
-TIMEOUT_SPINS = 1 << 27
+TIMEOUT_SPINS = 1 << 30  # minutes of polling: survives profiler exports and JIT stalls on one rank
 WORLDS = (2, 4, 8)
 
 if triton is not None:
