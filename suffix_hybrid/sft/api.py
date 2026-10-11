@@ -240,10 +240,17 @@ class State:
     async def rpc(self, op, payload=None, check=True):
         res = await self.engine.collective_rpc("suffix_sft", timeout=self.cfg.rpc_timeout_s,
                                                args=(op, payload or {}))
-        r = res[0]
-        if check and r.get("error"):
-            raise _http(507 if r.get("oom") else 500, {"message": f"{op} failed: {r['error']}"})
-        return r
+        bad = [r for r in res if r.get("error")]   # any rank failing fails the op
+        if check and bad:
+            raise _http(507 if any(r.get("oom") for r in bad) else 500,
+                        {"message": f"{op} failed: {bad[0]['error']}", "ranks_failed": len(bad)})
+        return bad[0] if bad else res[0]
+
+    async def reset_cache(self):
+        """No KV / GDN prefix state computed with the old adapter may be
+        reused: running requests are preempted and recomputed."""
+        if not await self.engine.reset_prefix_cache(reset_running_requests=True):
+            raise RuntimeError("prefix cache reset refused by the engine")
 
     async def tokenizer(self):
         if self._tok is None:
@@ -376,7 +383,7 @@ class State:
                 f"SFT {run_id}: {steps} steps, {len(data)} examples")
             stage = "serve"
             await self.rpc("commit")
-            await self.engine.reset_prefix_cache()
+            await self.reset_cache()
             post = await self.parity(*data[0])
             result = dict(meta, parity_before=pre, parity_after=post, served=True,
                           commit_sha=getattr(commit, "oid", None),
@@ -386,10 +393,11 @@ class State:
             self.status.pop("error", None)
             return result
         except BaseException as exc:
-            if stage != "serve":
-                await self.rpc("abort", check=False)
+            await self.rpc("abort", check=False)
+            if stage == "serve":   # partial commit: keep every TP rank on the same weights
+                await self.rpc("reset", check=False)
             saved = (run_dir / "metadata.json").is_file()
-            self.status.update(state="failed" if stage != "serve" else "serve_failed", stage=stage,
+            self.status.update(state="failed" if stage != "serve" else "serve_failed_base", stage=stage,
                                error=str(getattr(exc, "detail", exc)))
             if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
                 raise
@@ -420,12 +428,14 @@ class State:
                 await self.rpc("load", {"dir": str(run_dir)})
             commit = await asyncio.to_thread(self.hub.publish, api, parent, meta, None,
                                              f"SFT serve {run_id}")
-            await self.engine.reset_prefix_cache()
+            await self.reset_cache()
             self.status.update(state="idle", checkpoint=_public(meta))
             self.status.pop("error", None)
             return dict(serving=run_id, commit_sha=getattr(commit, "oid", None))
         except BaseException as exc:
-            self.status.update(state="load_failed", error=str(getattr(exc, "detail", exc)))
+            await self.rpc("reset", check=False)   # never leave TP ranks on different adapters
+            self.status.update(state="load_failed", checkpoint={"checkpoint": None},
+                               error=str(getattr(exc, "detail", exc)))
             raise
 
 

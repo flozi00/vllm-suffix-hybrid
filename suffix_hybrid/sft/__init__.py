@@ -57,7 +57,10 @@ touched (text-only SFT; image inputs keep working).
 
 Risks / not proven on silicon (CPU tests: tests/test_sft.py)
   R1 serving cost: two skinny GEMMs per adapted linear per step (B == 0
-     still costs; graphs cannot branch). Measure decode tok/s vs SFT off.
+     still costs; graphs cannot branch), and the bf16 input of every
+     adapted linear now has a second reader, so Inductor norm/act+quant
+     fusions into the GEMM may no longer match (numerics differ slightly
+     from SFT off even at B == 0). Measure decode tok/s vs SFT off.
   R2 a rank raising INSIDE a collective leaves the others blocked (memory
      vote + liveness vote first; not eliminated). Fault-inject before prod.
   R3 the training forward's fidelity to serving (fused paths we disabled,

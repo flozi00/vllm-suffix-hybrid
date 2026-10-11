@@ -55,8 +55,12 @@ Guards per run: the training forward must match serving within
 `SUFFIX_SFT_PARITY_NATS` mean NLL on the first example (else 409); every
 adapter must receive gradient on the first micro-step (else the run fails:
 some op in the forward has no autograd); free VRAM is voted across TP ranks
-before every micro-step; a non-finite loss / grad norm aborts. Failed runs
-never reach serving.
+before every micro-step; a non-finite loss / grad norm aborts; any TP rank
+failing fails the op on all. Failed runs never reach serving; a failure while
+committing / loading resets every rank to the base model (status says so)
+rather than leave TP shards on different adapters. After every commit / load
+the prefix cache is reset with running requests preempted, so no KV or GDN
+state computed under the old adapter is reused.
 
 ## Checkpoints
 
@@ -85,8 +89,9 @@ recurrent layers. Vision towers are not trained and keep working.
 
 0. Dev pool, bundle with this branch, `SUFFIX_SFT=1`, `VLLM_PLUGINS` as above.
    Expect `[suffix sft] installed: N adapters ...` per rank and the routes
-   line. Greedy outputs identical to the same pool without the gate (B = 0).
-1. Decode tok/s and TTFT, gate on vs off (adapter GEMM cost, risk R1).
+   line. Greedy outputs match the same pool without the gate (B = 0; not
+   bitwise: adapters can change Inductor's quant fusions, risk R1).
+1. Decode tok/s and TTFT, gate on vs off (adapter GEMMs + lost fusions, R1).
 2. Train a tiny memorization set (e.g. 4 examples, 30 steps): loss falls,
    `parity_before.delta` small, `parity_after.served_nll` follows
    `trained_nll`, the served model now answers with the trained text.

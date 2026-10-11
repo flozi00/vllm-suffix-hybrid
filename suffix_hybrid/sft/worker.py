@@ -134,7 +134,10 @@ class WorkerSFT:
         mc = getattr(vllm_config, "model_config", None)
         self.mrope = bool(getattr(mc, "uses_mrope", False))
         self.adapters = M.install_adapters(self.lm, cfg.targets, cfg.rank, cfg.alpha,
-                                           self.g.rank_in_group)
+                                           self.g.rank_in_group, getattr(mc, "dtype", None))
+        ac = getattr(vllm_config, "additional_config", None)
+        if isinstance(ac, dict):   # compile-cache key: graphs built for these adapters only
+            ac["suffix_sft"] = dict(rank=cfg.rank, alpha=cfg.alpha, targets=list(cfg.targets))
         if not self.adapters:
             raise RuntimeError(f"no linear matched {cfg.targets}")
         first = next(iter(self.adapters.values()))[1]
@@ -173,18 +176,21 @@ class WorkerSFT:
         ids, segs, rows, tgt = self._batch(p)
         if not tgt.numel():
             raise ValueError("micro-batch without completion tokens")
-        with M.TrainMode(self, self.run.params(), segs, grad=True, offload=self.cfg.offload) as tm:
+        check = bool(p.get("check"))
+        with M.TrainMode(self, self.run.params(), segs, grad=True, offload=self.cfg.offload,
+                         check=check) as tm:
             loss = tm.nll(ids, rows, tgt)
             (loss / float(p["norm"])).backward()
         out = dict(loss_sum=float(loss.detach()), tokens=int(tgt.numel()))
-        if p.get("check"):
+        if check:
             bad = M.grad_reach(self.adapters, self.run.grad_of)
+            bad += [f"op:{c}" for c in dict.fromkeys(tm.cut)]
             flag = torch.tensor([float(len(bad))], device=self.device)
             if self.g.world_size > 1:
                 flag = self.g.all_reduce(flag)
             if float(flag[0]):
-                raise RuntimeError(f"gradient does not reach {len(bad)} adapters (an op in the "
-                                   f"training forward has no autograd), e.g. {bad[:3]}")
+                raise RuntimeError(f"gradient cut in the training forward (an op without "
+                                   f"autograd): {len(bad)} adapters / modules, e.g. {bad[:4]}")
         return out
 
     def step(self, _p=None):
@@ -192,6 +198,7 @@ class WorkerSFT:
 
     def eval(self, p):
         """Summed NLL with the LIVE adapters (what serving computes)."""
+        self._mem_vote()
         ids, segs, rows, tgt = self._batch(p)
         live = {id(layer): (lo.A, lo.B, lo.scale) for layer, lo in self.adapters.values()}
         with M.TrainMode(self, live, segs, grad=False) as tm:
@@ -225,6 +232,11 @@ class WorkerSFT:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            # pinned offload buffers count against the pod's memory limit
+            free_host = (getattr(torch._C, "_accelerator_emptyHostCache", None)
+                         or getattr(torch._C, "_host_emptyCache", None))
+            if free_host is not None:
+                free_host()
         return dict(ok=True)
 
     def load(self, p):
@@ -254,8 +266,10 @@ class WorkerSFT:
         when any rank has less than min_free_gib free (driver free + cached)."""
         ok = 1.0
         if self.device.type == "cuda":
+            # cached blocks may sit in CUDA-graph pools / fragments: count
+            # only what the driver can hand out
+            torch.cuda.empty_cache()
             free, _ = torch.cuda.mem_get_info(self.device)
-            free += torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
             ok = float(free >= self.cfg.min_free_gib * 2**30)
         flag = torch.tensor([1.0 - ok], device=self.device)
         if self.g.world_size > 1:
@@ -275,19 +289,23 @@ def shard_name(rank, world):
 
 
 OPS = ("info", "begin", "micro", "step", "eval", "save", "commit", "abort", "load", "reset")
+RUN_OPS = ("micro", "step", "commit")    # need the run on EVERY rank
 
 
 def rpc(op, payload=None):
     """collective_rpc target (Worker.suffix_sft). Rank-uniform liveness vote
     first, so a rank without SFT never leaves the others in a collective."""
     group = SFT.g if SFT is not None else _tp_group()
-    ok = SFT is not None and op in OPS
+    ok = SFT is not None and op in OPS and (op not in RUN_OPS or SFT.run is not None)
     if group is not None and group.world_size > 1:
         dev = SFT.device if SFT is not None else torch.device("cuda", torch.cuda.current_device())
         if float(group.all_reduce(torch.tensor([0.0 if ok else 1.0], device=dev))[0]):
-            return {"error": f"SFT unavailable on a TP rank ({INSTALL_ERROR if SFT is None else op})"}
+            if SFT is not None and op in RUN_OPS:
+                SFT.abort()
+            return {"error": f"{op} refused: SFT or its run is missing on a TP rank"}
     if not ok:
-        return {"error": INSTALL_ERROR if SFT is None else f"unknown op {op}"}
+        return {"error": INSTALL_ERROR if SFT is None else
+                f"unknown op {op}" if op not in OPS else f"{op} without an active run"}
     t0 = time.perf_counter()
     try:
         out = getattr(SFT, op)(payload or {})
