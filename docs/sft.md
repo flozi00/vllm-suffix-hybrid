@@ -85,6 +85,30 @@ Dense attention + Qwen GDN hybrids (Qwen3.5 / qwen-fable), Gemma-4 dense
 serving untouched: MoE, MLA, pipeline parallel, soft-capped attention, other
 recurrent layers. Vision towers are not trained and keep working.
 
+## Measured on silicon (qwen3.8-27b-fable NVFP4, 1x RTX PRO 6000, v0.30.0, 2026-10-11)
+
+Dev pool `fable-sft-dev` = prod qwen-fable spec (V2 runner, MTP k=2, NVFP4 KV /
+GEMM / lm_head) + SFT, `gpu_memory_utilization` 0.80.
+
+| check | result |
+|---|---|
+| install | 256 adapters (r=16, 97M params); compile + CUDA graphs fine |
+| memorization (6 ex, 30 steps, lr 2e-4) | loss 2.71 -> 4e-5 in 142 s; served answers the trained fact, also paraphrased |
+| served = trained | after commit served NLL 1.7e-5 == trained 2e-5 |
+| parity, <= 1k tokens | mean 0.014-0.035 nats/token (serving vs serving with KV dtype changed: 0.002-0.02) |
+| parity, > 2k tokens | serving's own NLL drifts up (1.22 vs 1.10 at 3.4k) -> parity is measured on 1024 tokens |
+| load base / run, restart restore | ok; restart serves the Hub's latest.json run before traffic |
+| training under 8-client load | 324 requests, 0 errors, p50 1.8 s, max 6.7 s (waits <= one micro-step) |
+| micro-step time | 2.5 s @ 366 tok, 8.75 s @ 3.4k tok (fwd 2.6 s, bwd 6.1 s) |
+| training VRAM on top of serving | 0.8-1.3 GiB short, 6.5 GiB @ 3.4k tokens (17 GiB free at util 0.80) |
+| pinned host | <= SUFFIX_SFT_OFFLOAD_GIB (+1.2 GiB master/AdamW for 97M params) |
+| decode cost of attached adapters (B=0) | c1 96 -> 86 tok/s (-10 %), c8 694 -> 653 (-6 %) |
+| decode with a trained adapter | lower again when the MTP head disagrees with the tuned model (R4) |
+
+Note: the pool gateway (EPP) needs `"prompt"` in POST bodies; long runs use
+`"wait": false` + status polling (300 s route timeout); SFT needs the Python
+frontend (`VLLM_USE_RUST_FRONTEND=0`: the Rust frontend has no endpoint plugins).
+
 ## Pod validation protocol (before any prod use)
 
 0. Dev pool, bundle with this branch, `SUFFIX_SFT=1`, `VLLM_PLUGINS` as above.
