@@ -340,3 +340,95 @@ def test_oracle_inventory_shapes_are_cutlass_aligned():
     assert all(n % 16 == 0 and k % 16 == 0 for _l, n, k, _c in O.INVENTORY)
     names = {row[0] for row in O.INVENTORY}
     assert {"fused_qkv_a_proj", "o_proj", "mtp.eh_proj"} <= names
+
+
+# --- Marlin backends (CPU stand-ins for vLLM's repack + marlin_gemm) ----------
+class FakeMarlin:
+    calls = 0
+
+    @staticmethod
+    def pack(q, s):
+        return dict(marlin_w=q.clone(), marlin_s=s.clone(), marlin_ws=None)
+
+    @classmethod
+    def linear(cls, x2, mod):
+        cls.calls += 1
+        n, k = mod._sfx_fp8d_nk
+        assert x2.dim() == 2 and x2.shape[1] == k
+        w = mod.marlin_w.float() * mod.marlin_s.float()[:, None]
+        return (x2.float() @ w.t()).to(x2.dtype)
+
+
+@pytest.fixture
+def fake_marlin(fake_vllm, monkeypatch):
+    monkeypatch.setattr(R, "marlin_fp8_pack", FakeMarlin.pack)
+    monkeypatch.setattr(R, "marlin_linear", FakeMarlin.linear)
+    monkeypatch.setattr(R, "_LAYERS", {})
+    FakeMarlin.calls = 0
+
+
+def test_backend_env(monkeypatch):
+    monkeypatch.delenv(R.BACKEND_ENV, raising=False)
+    assert R.backend() == "cutlass"
+    monkeypatch.setenv(R.BACKEND_ENV, "marlin_fp4")
+    assert R.backend() == "marlin_fp4"
+    monkeypatch.setenv(R.BACKEND_ENV, "w4a4")
+    with pytest.raises(ValueError):
+        R.backend()
+
+
+def test_marlin_backend_replaces_the_weight_and_routes_every_m(fake_marlin, monkeypatch, capsys):
+    monkeypatch.setenv(R.BACKEND_ENV, "marlin")
+    root = _glm_like()
+    o = root.model.layers["0"].self_attn.o_proj
+    w = o.weight.data.clone()
+    R.convert_model(root)
+    assert o._sfx_fp8d == "marlin" and o.weight is o.marlin_w and not hasattr(o, "weight_fp8_ref")
+    calls = FakeMarlin.calls  # the load self-test ran the Marlin path at ORACLE_MS
+    assert calls >= len(R.ORACLE_MS)
+    for m in (1, 300):
+        x = torch.randn(m, 32).bfloat16()
+        assert R.rel_frob(o(x), nn.functional.linear(x, w)) < R.QUANT_BOUND
+    assert FakeMarlin.calls == calls + 2
+    assert "FP8 W8A16 (Marlin, every M)" in capsys.readouterr().err
+
+
+def test_auto_backend_routes_by_m_inside_the_custom_op(fake_marlin, monkeypatch):
+    monkeypatch.setenv(R.BACKEND_ENV, "auto")
+    monkeypatch.setenv(R.MARLIN_MAX_M_ENV, "8")
+    root = _glm_like()
+    o = root.model.layers["0"].self_attn.o_proj
+    R.convert_model(root)
+    assert o._sfx_fp8d == "auto" and o.weight.dtype == torch.float8_e4m3fn  # cutlass copy kept
+    assert R._LAYERS[o._sfx_fp8d_key] is o
+    FakeMarlin.calls, FakeOps.calls = 0, 0
+    o(torch.randn(8, 32).bfloat16())
+    assert (FakeMarlin.calls, FakeOps.calls) == (1, 0)
+    o(torch.randn(9, 32).bfloat16())
+    assert (FakeMarlin.calls, FakeOps.calls) == (1, 1)
+
+
+def test_marlin_selftest_fails_closed(fake_marlin, monkeypatch):
+    monkeypatch.setenv(R.BACKEND_ENV, "marlin")
+    monkeypatch.setattr(R, "marlin_linear", lambda x2, mod: FakeMarlin.linear(x2, mod) * 1.1)
+    with pytest.raises(RuntimeError, match="Marlin W8A16 self-test FAILED"):
+        R.convert_model(_glm_like())
+
+
+def test_bench_recommends_the_contiguous_marlin_win():
+    sys.path.insert(0, str(REPO))
+    from suffix_hybrid.tools.glm_dense_marlin import recommend_max_m
+
+    step = {1: {"cutlass": 2.0, "marlin8": 1.0}, 6: {"cutlass": 2.0, "marlin8": 1.5},
+            8: {"cutlass": 2.0, "marlin8": 2.5}, 32: {"cutlass": 3.0, "marlin8": 2.0}}
+    assert recommend_max_m(step, ms=(1, 6, 8, 32)) == 6
+    assert recommend_max_m({1: {"cutlass": 1.0}}, ms=(1,)) == 0  # Marlin unavailable
+
+
+def test_fp4_dequant_nibble_order_and_scales():
+    wq = torch.tensor([[0x21, 0xF7] + [0] * 6], dtype=torch.uint8)  # 16 elements, one block
+    wsf = torch.tensor([[2.0]]).to(torch.float8_e4m3fn)
+    out = R.fp4_dequant(wq, wsf, torch.tensor([4.0]))
+    # low nibble first: 0x21 -> 0.5, 1.0; 0xF7 -> 6.0, -6.0; scale 2 / g 4 = 0.5
+    assert out.shape == (1, 16) and out[0, :4].tolist() == [0.25, 0.5, 3.0, -3.0]
+    assert out[0, 4:].abs().sum() == 0

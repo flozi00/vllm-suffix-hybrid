@@ -21,7 +21,16 @@ sm120/tests/fixtures/vllm_0.30.0/model_loader_utils.py):
   The drafter (MTP) model is loaded through the same function.
 
 Runtime per call: dynamic_per_token_scaled_fp8_quant + cutlass_scaled_mm
-(static shapes, no host sync: CUDA-graph and torch.compile safe). A boot
+(static shapes, no host sync: CUDA-graph and torch.compile safe).
+``SUFFIX_FP8_DENSE_BACKEND`` (runtime.BACKENDS): ``cutlass`` (default, the
+above), ``marlin`` (FP8 weight-only W8A16 through vLLM's Marlin repack +
+marlin_gemm for every M: no activation-quant kernel, no extra memory),
+``auto`` (Marlin for M <= ``SUFFIX_FP8_DENSE_MARLIN_MAX_M``, cutlass W8A8
+above, routed inside the custom op ``torch.ops.suffix_fp8d.linear``; both FP8
+layouts stay resident) or ``marlin_fp4`` (NVFP4 weight-only W4A16 Marlin for
+every M; LOSSY, quality-gate first). Marlin layers get their own fail-closed
+self-test at M in runtime.ORACLE_MS vs BF16 and vs the exact dequantized
+weight. Bench: boot gate ``glm_dense_marlin_bench``. A boot
 self-test per (N, K) shape runs each converted shape once at M=6 against the
 BF16 weight before it is freed (fails closed: the SM120 block-scaled
 "cutlass_gemm_caller Invalid status" class of failure dies at load, not in
