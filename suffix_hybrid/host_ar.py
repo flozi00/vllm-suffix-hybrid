@@ -17,16 +17,17 @@ the other partials straight from it:
 Either way the result is the fp32 rank-order sum rounded once (NCCL's ring
 rounds to bf16 at every hop), bit-identical on all ranks.
 
-Synchronization is per program: program b of every rank owns the same slice
-of every chunk, publishes the round's epoch for it (bar.sync, then
-st.release.sys, as vLLM's custom all-reduce does) and polls only the eight
-flags of slice b (one 32 B line, ld.acquire.sys) -- no grid-wide barrier, no
-PCIe atomics. Epochs come from a device counter the kernel advances itself
-(CUDA-graph safe); buffers alternate by epoch parity (program b rewrites a
-slice only after program b of every rank passed the round that read it).
-Messages above one round (ROUND_BYTES per rank) loop rounds in the kernel.
-A program that waits longer than TIMEOUT_SPINS polls traps: a mismatched
-collective fails loudly instead of hanging the pod.
+Barrier: blocks arrive on a device counter after a bar.sync; the last one
+publishes the round's epoch on this rank's own 64 B flag line (st.release.sys,
+cumulative over the arrivals), polls every rank's line (ld.acquire.sys) and
+releases the other blocks through a device word -- one PCIe poller per GPU,
+no PCIe atomics. (Per-program flags in one shared line, measured 2026-10-11:
+2-2.7x slower at 72-576 KiB from flag-line contention.) Epochs come from a
+device counter the kernel advances itself (CUDA-graph safe); buffers alternate
+by epoch parity (a buffer is rewritten only after every rank passed the
+barrier of the round that read it). Messages above one round (ROUND_BYTES per
+rank) loop rounds in the kernel. A wait longer than TIMEOUT_SPINS polls
+traps: a mismatched collective fails loudly instead of hanging the pod.
 
 Page placement: each rank first-touches the slots it writes from a CPU of its
 GPU's NUMA node (pages stay put once pinned), so the writes stay socket-local
@@ -50,10 +51,11 @@ except ImportError:  # CPU CI: the Python side stays importable
 
 MARK = "[suffix har]"
 ROUND_BYTES = 4 << 20    # one round's partial per rank
-MAXB = 128               # programs per launch (flag columns)
-FLAG_BYTES = 64 << 10    # 2 parities x 2 phases x MAXB x world int32
+FLAG_STRIDE = 16         # int32 per flag (one 64 B line per rank: no false sharing)
+FLAG_BYTES = 64 << 10    # 2 parities x 2 phases x world lines
 BLOCK = 1024             # bf16 per program step (16 B per thread at 4 warps)
-ELEMS_PER_PROGRAM = 2048  # grid = clamp(first round / this, 1, max_blocks)
+ELEMS_PER_PROGRAM = 1024  # grid = clamp(first round / this, 1, max_blocks)
+MAX_BLOCKS = 128
 TIMEOUT_SPINS = 1 << 27
 WORLDS = (2, 4, 8)
 
@@ -84,52 +86,84 @@ if triton is not None:
                                   is_pure=False, pack=1)
 
     @triton.jit
-    def _publish_wait(fp, epoch, RANK: tl.constexpr, WORLD: tl.constexpr, TIMEOUT: tl.constexpr):
-        """Every thread's host stores happen before this program's flag; then wait for the
-        same program of every other rank."""
+    def _fence_sys():
+        tl.inline_asm_elementwise("fence.acq_rel.sys;\nmov.u32 $0, 0;", "=r", [],
+                                  dtype=tl.uint32, is_pure=False, pack=1)
+
+    @triton.jit
+    def _barrier(flags, arr_ptr, go_ptr, epoch, ctr_ptr, ctr_new, final,
+                 RANK: tl.constexpr, WORLD: tl.constexpr, FLAG_STRIDE: tl.constexpr,
+                 TIMEOUT: tl.constexpr, LEAN: tl.constexpr):
+        """Grid barrier across all ranks: blocks arrive on a device counter, the last one
+        publishes this rank's epoch (st.release.sys; cumulative over the arrivals), polls every
+        rank's flag line and releases the others through a device word."""
+        if not LEAN:
+            _fence_sys()
         tl.debug_barrier()
-        _st_release(fp + RANK, epoch, True)
-        ranks = tl.arange(0, WORLD)
-        done = tl.zeros([], dtype=tl.int32)
-        spins = tl.zeros([], dtype=tl.int32)
-        while done == 0:
-            f = _ld_acquire(fp + ranks, True)
-            done = tl.min(((f == epoch) | (ranks == RANK)).to(tl.int32), axis=0)
-            spins += 1
-            if spins > TIMEOUT:
-                _trap()
+        old = tl.atomic_add(arr_ptr, 1, sem="acq_rel", scope="gpu")
+        if old == tl.num_programs(0) - 1:
+            tl.atomic_xchg(arr_ptr, 0, sem="relaxed", scope="gpu")
+            if final:
+                tl.store(ctr_ptr, ctr_new)
+            _st_release(flags + RANK * FLAG_STRIDE, epoch, True)
+            fp = flags + tl.arange(0, WORLD) * FLAG_STRIDE
+            done = tl.zeros([], dtype=tl.int32)
+            spins = tl.zeros([], dtype=tl.int32)
+            while done == 0:
+                done = tl.min((_ld_acquire(fp, True) == epoch).to(tl.int32), axis=0)
+                spins += 1
+                if spins > TIMEOUT:
+                    _trap()
+            _st_release(go_ptr, epoch, False)
+        else:
+            done = tl.zeros([], dtype=tl.int32)
+            spins = tl.zeros([], dtype=tl.int32)
+            while done == 0:
+                done = (_ld_acquire(go_ptr, False) == epoch).to(tl.int32)
+                spins += 1
+                if spins > TIMEOUT:
+                    _trap()
+        if not LEAN:
+            _fence_sys()
 
     @triton.jit
     def _har_kernel(x_ptr, out_ptr, data_ptr, red_ptr, flag_ptr, ctr_ptr, arr_ptr, n,
                     RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
-                    MAXB: tl.constexpr, ONESHOT: tl.constexpr, BLOCK: tl.constexpr,
-                    TIMEOUT: tl.constexpr):
+                    FLAG_STRIDE: tl.constexpr, ONESHOT: tl.constexpr, BLOCK: tl.constexpr,
+                    TIMEOUT: tl.constexpr, LEAN: tl.constexpr):
         RCH: tl.constexpr = ROUND // WORLD
-        b = tl.program_id(0)
-        nb = tl.num_programs(0)
+        pid = tl.program_id(0)
+        step = tl.num_programs(0) * BLOCK
         ar = tl.arange(0, BLOCK)
         ctr0 = tl.load(ctr_ptr).to(tl.uint32)
         nrounds = tl.cdiv(n, ROUND)
+        ctr_new = (ctr0 + nrounds.to(tl.uint32)).to(tl.int32)
         for rnd in range(0, nrounds):
             epoch = ctr0 + (rnd + 1).to(tl.uint32)
             par = (epoch & 1).to(tl.int32)
             base = rnd * ROUND
             rn = tl.multiple_of(tl.minimum(n - base, ROUND), 8)
+            final = rnd == nrounds - 1
+            ch = tl.cdiv(tl.cdiv(rn, WORLD), 8) * 8
+            lo = tl.multiple_of(RANK * ch, 8)
+            hi = tl.multiple_of(tl.minimum(lo + ch, rn), 8)
             dat = data_ptr + par * (WORLD * ROUND)
-            f1 = flag_ptr + ((par * 2) * MAXB + b) * WORLD
+            red = red_ptr + par * (WORLD * RCH)
+            flags = flag_ptr + par * (2 * WORLD * FLAG_STRIDE)
+            # phase 1: own partial -> host (two-shot skips the chunk only this rank reads)
+            for s in range(pid * BLOCK, rn, step):
+                o = s + ar
+                m = o < rn
+                if not ONESHOT:
+                    m = m & ((o < lo) | (o >= hi))
+                v = tl.load(x_ptr + base + o, mask=m)
+                tl.store(dat + RANK * ROUND + o, v, mask=m, cache_modifier=".wt")
             if ONESHOT:
-                sub = tl.cdiv(tl.cdiv(rn, nb), 8) * 8
-                lo = tl.multiple_of(b * sub, 8)
-                hi = tl.multiple_of(tl.minimum(lo + sub, rn), 8)
-                for s in range(lo, hi, BLOCK):
+                _barrier(flags, arr_ptr, arr_ptr + 2, epoch, ctr_ptr, ctr_new, final,
+                         RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+                for s in range(pid * BLOCK, rn, step):
                     o = s + ar
-                    m = o < hi
-                    v = tl.load(x_ptr + base + o, mask=m)
-                    tl.store(dat + RANK * ROUND + o, v, mask=m, cache_modifier=".wt")
-                _publish_wait(f1, epoch, RANK, WORLD, TIMEOUT)
-                for s in range(lo, hi, BLOCK):
-                    o = s + ar
-                    m = o < hi
+                    m = o < rn
                     acc = tl.zeros([BLOCK], dtype=tl.float32)
                     for j in tl.static_range(WORLD):
                         if j == RANK:
@@ -139,24 +173,9 @@ if triton is not None:
                         acc += v.to(tl.float32)
                     tl.store(out_ptr + base + o, acc.to(out_ptr.dtype.element_ty), mask=m)
             else:
-                red = red_ptr + par * (WORLD * RCH)
-                ch = tl.cdiv(tl.cdiv(rn, WORLD), 8) * 8
-                sub = tl.cdiv(tl.cdiv(ch, nb), 8) * 8
-                s0 = tl.multiple_of(b * sub, 8)
-                s1 = tl.multiple_of(tl.minimum(s0 + sub, ch), 8)
-                for c in tl.static_range(WORLD):  # phase 1: own partial of the others' chunks
-                    if c != RANK:
-                        lo = tl.multiple_of(c * ch + s0, 8)
-                        hi = tl.multiple_of(tl.minimum(c * ch + s1, rn), 8)
-                        for s in range(lo, hi, BLOCK):
-                            o = s + ar
-                            m = o < hi
-                            v = tl.load(x_ptr + base + o, mask=m)
-                            tl.store(dat + RANK * ROUND + o, v, mask=m, cache_modifier=".wt")
-                _publish_wait(f1, epoch, RANK, WORLD, TIMEOUT)
-                lo = tl.multiple_of(RANK * ch + s0, 8)  # phase 2: reduce own chunk
-                hi = tl.multiple_of(tl.minimum(RANK * ch + s1, rn), 8)
-                for s in range(lo, hi, BLOCK):
+                _barrier(flags, arr_ptr, arr_ptr + 2, epoch, ctr_ptr, ctr_new, False,
+                         RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+                for s in range(lo + pid * BLOCK, hi, step):  # phase 2: reduce own chunk
                     o = s + ar
                     m = o < hi
                     acc = tl.zeros([BLOCK], dtype=tl.float32)
@@ -168,22 +187,18 @@ if triton is not None:
                         acc += v.to(tl.float32)
                     r = acc.to(out_ptr.dtype.element_ty)
                     tl.store(out_ptr + base + o, r, mask=m)
-                    tl.store(red + RANK * RCH + (o - RANK * ch), r, mask=m, cache_modifier=".wt")
-                _publish_wait(f1 + MAXB * WORLD, epoch, RANK, WORLD, TIMEOUT)
-                for c in tl.static_range(WORLD):  # phase 3: the others' reduced chunks
-                    if c != RANK:
-                        lo = tl.multiple_of(c * ch + s0, 8)
-                        hi = tl.multiple_of(tl.minimum(c * ch + s1, rn), 8)
-                        for s in range(lo, hi, BLOCK):
+                    tl.store(red + RANK * RCH + (o - lo), r, mask=m, cache_modifier=".wt")
+                _barrier(flags + WORLD * FLAG_STRIDE, arr_ptr + 1, arr_ptr + 3, epoch, ctr_ptr,
+                         ctr_new, final, RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+                for j in tl.static_range(WORLD):  # phase 3: the others' reduced chunks
+                    if j != RANK:
+                        jl = tl.multiple_of(j * ch, 8)
+                        jh = tl.multiple_of(tl.minimum(jl + ch, rn), 8)
+                        for s in range(jl + pid * BLOCK, jh, step):
                             o = s + ar
-                            m = o < hi
-                            v = tl.load(red + c * RCH + (o - c * ch), mask=m, cache_modifier=".cv")
+                            m = o < jh
+                            v = tl.load(red + j * RCH + (o - jl), mask=m, cache_modifier=".cv")
                             tl.store(out_ptr + base + o, v, mask=m)
-        # Every program read ctr0 above; the last one to finish advances the epoch counter.
-        old = tl.atomic_add(arr_ptr, 1, sem="acq_rel", scope="gpu")
-        if old == nb - 1:
-            tl.store(arr_ptr, 0)
-            tl.store(ctr_ptr, (ctr0 + nrounds.to(tl.uint32)).to(tl.int32))
 
     @triton.jit
     def _copy_kernel(src, dst, n, CV: tl.constexpr, WT: tl.constexpr, BLOCK: tl.constexpr):
@@ -256,7 +271,8 @@ class HostAllReduce:
 
     def __init__(self, cpu_group, device, oneshot_max_bytes: int = 0, max_blocks: int = 64,
                  round_bytes: int = ROUND_BYTES, timeout_spins: int = TIMEOUT_SPINS,
-                 numa: str = "owner", elems_per_program: int = ELEMS_PER_PROGRAM):
+                 numa: str = "owner", elems_per_program: int = ELEMS_PER_PROGRAM,
+                 lean: bool = True):
         import torch
         import torch.distributed as dist
 
@@ -269,7 +285,8 @@ class HostAllReduce:
         if self.round % (self.world * BLOCK):
             raise ValueError(f"round_bytes must be a multiple of {2 * self.world * BLOCK}")
         self.oneshot_max, self.timeout = oneshot_max_bytes, timeout_spins
-        self.max_blocks, self.per_program = min(max_blocks, MAXB), elems_per_program
+        self.max_blocks, self.per_program = min(max_blocks, MAX_BLOCKS), elems_per_program
+        self.lean = lean
         rch = self.round // self.world
         data_bytes = 2 * self.world * self.round * 2
         self.size = FLAG_BYTES + data_bytes + 2 * self.world * rch * 2
@@ -315,7 +332,7 @@ class HostAllReduce:
         self.data = _Ptr(self.addr + FLAG_BYTES, torch.bfloat16)
         self.red = _Ptr(self.addr + FLAG_BYTES + data_bytes, torch.bfloat16)
         self.ctr = torch.zeros(1, dtype=torch.int32, device=self.device)
-        self.arr = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self.arr = torch.zeros(4, dtype=torch.int32, device=self.device)  # arrive x2, go x2
         self.disabled = False
 
     def _touch(self, regions) -> None:
@@ -349,8 +366,9 @@ class HostAllReduce:
             oneshot = n * 2 <= self.oneshot_max
         _har_kernel[(grid or self.grid(n),)](
             x, out, self.data, self.red, self.flags, self.ctr, self.arr, n,
-            RANK=self.rank, WORLD=self.world, ROUND=self.round, MAXB=MAXB,
-            ONESHOT=bool(oneshot), BLOCK=BLOCK, TIMEOUT=self.timeout, num_warps=4)
+            RANK=self.rank, WORLD=self.world, ROUND=self.round, FLAG_STRIDE=FLAG_STRIDE,
+            ONESHOT=bool(oneshot), BLOCK=BLOCK, TIMEOUT=self.timeout, LEAN=self.lean,
+            num_warps=4)
         return out
 
     def destroy(self) -> None:
@@ -382,11 +400,71 @@ def _inputs(rank: int, world: int, n: int, device):
 
 # (name, HostAllReduce kwargs, token counts, grids to sweep (None = policy))
 VARIANTS = (
-    ("owner-4M", {}, (1, 6, 12, 24, 48, 96, 192, 384, 1024, 8192), (None,)),
-    ("owner-4M-grid", {}, (6, 48, 192), (4, 8, 16, 32, 96)),
-    ("rank0-4M", {"numa": "rank0"}, (6, 48, 192, 1024, 8192), (None,)),
-    ("owner-1M", {"round_bytes": 1 << 20}, (48, 192, 1024, 8192), (None,)),
+    ("lean", {}, (1, 6, 12, 24, 48, 96, 192, 384, 1024, 8192), (None,)),
+    ("fenced", {"lean": False}, (1, 6, 48, 192, 1024), (None,)),
+    ("lean-grid", {}, (6, 48, 192), (8, 16, 32, 64, 96)),
 )
+STRESS_TOKENS = (1, 6, 48, 192)
+
+
+def _sysfacts() -> list[str]:
+    def rd(path, n=200):
+        try:
+            return open(path).read().strip()[:n]
+        except OSError:
+            return "-"
+    cpu = next((ln.split(":", 1)[1].strip() for ln in rd("/proc/cpuinfo", 10 ** 6).splitlines()
+                if ln.startswith("model name")), "-")
+    mem = {ln.split(":")[0]: ln.split(":")[1].strip() for ln in rd("/proc/meminfo", 10 ** 5).splitlines()
+           if ln.split(":")[0] in ("MemTotal", "Hugepagesize", "HugePages_Total")}
+    iommu = os.listdir("/sys/class/iommu") if os.path.isdir("/sys/class/iommu") else []
+    groups = len(os.listdir("/sys/kernel/iommu_groups")) if os.path.isdir("/sys/kernel/iommu_groups") else -1
+    return [f"cpu {cpu} x{os.cpu_count()} | {mem}",
+            f"thp {rd('/sys/kernel/mm/transparent_hugepage/enabled')} | shmem "
+            f"{rd('/sys/kernel/mm/transparent_hugepage/shmem_enabled')} | iommu {iommu[:4]} groups {groups}",
+            f"cmdline {rd('/proc/cmdline', 400)}"]
+
+
+def _shared(cpu, rank, size, huge):
+    """A /dev/shm buffer every rank maps and pins; each rank first-touches its 1/world slice."""
+    import torch
+    import torch.distributed as dist
+
+    world = dist.get_world_size(cpu)
+    name = [f"/dev/shm/suffix-har-bw-{uuid.uuid4().hex}" if rank == 0 else None]
+    if rank == 0:
+        fd = os.open(name[0], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.ftruncate(fd, size)
+        os.close(fd)
+    dist.broadcast_object_list(name, src=dist.get_global_rank(cpu, 0), group=cpu)
+    fd = os.open(name[0], os.O_RDWR)
+    mm = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    os.close(fd)
+    if huge:
+        mm.madvise(mmap.MADV_HUGEPAGE)
+    dist.barrier(group=cpu)
+    if rank == 0:
+        os.unlink(name[0])
+    cbuf = ctypes.c_char.from_buffer(mm)
+    addr = ctypes.addressof(cbuf)
+    per = size // world
+    ctypes.memset(addr + rank * per, 0, per)
+    dist.barrier(group=cpu)
+    for r in range(world):
+        if r == rank:
+            assert int(torch.cuda.cudart().cudaHostRegister(addr, size, 3)) == 0
+        dist.barrier(group=cpu)
+    pmd = "?"
+    try:
+        smaps, cur = open("/proc/self/smaps").read().splitlines(), False
+        for ln in smaps:
+            if ln[:1].isalnum() and "-" in ln.split()[0]:
+                cur = int(ln.split("-")[0], 16) == addr
+            elif cur and ("PmdMapped" in ln or "AnonHugePages" in ln) and not ln.split()[1] == "0":
+                pmd = ln.strip()
+    except (OSError, ValueError):
+        pass
+    return mm, cbuf, addr, pmd
 
 
 def _bench_worker(rank, world, port, q, hidden) -> None:
@@ -400,35 +478,47 @@ def _bench_worker(rank, world, port, q, hidden) -> None:
     dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
                             world_size=world, device_id=dev)
     cpu = dist.new_group(backend="gloo")
-    out = {"rank": rank, "rows": [], "probe": {}, "err": None, "node": gpu_numa_node(dev),
-           "pages": {}}
+    out = {"rank": rank, "rows": [], "bw": [], "stress": [], "err": None}
     try:
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
+        # Aggregate host bandwidth: every rank at once, per-rank footprint S, 4 KiB vs THP pages.
+        for huge in (False, True):
+            per = 64 << 20
+            mm, cbuf, addr, pmd = _shared(cpu, rank, per * world, huge)
+            src = torch.randn(per // 2, device=dev).to(torch.bfloat16)
+            dst = torch.empty_like(src)
+            for foot in (1 << 20, 8 << 20, 64 << 20):
+                mine = _Ptr(addr + rank * per, torch.bfloat16)
+                other = _Ptr(addr + ((rank + 1) % world) * per, torch.bfloat16)
+                n = foot // 2
+                row = {"huge": huge, "pmd": pmd, "foot": foot}
+                for label, fn in (
+                        ("write", lambda: _copy_kernel[(128,)](src, mine, n, CV=False, WT=True,
+                                                               BLOCK=BLOCK, num_warps=4)),
+                        ("read", lambda: _copy_kernel[(128,)](other, dst, n, CV=True, WT=False,
+                                                              BLOCK=BLOCK, num_warps=4)),
+                        ("h2h", lambda: _copy_kernel[(128,)](other, mine, n, CV=True, WT=True,
+                                                             BLOCK=BLOCK, num_warps=4))):
+                    dist.barrier(group=cpu)
+                    row[label] = foot / ns.graph_time_us(fn, max(2, (16 << 20) // foot), 5) / 1e3
+                out["bw"].append(row)
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaHostUnregister(addr)
+            del cbuf
+            mm.close()
         nccl = PyNcclCommunicator(group=cpu, device=dev)
         nccl_us = {}
         for vname, kw, toks, grids in VARIANTS:
             har = HostAllReduce(cpu, dev, timeout_spins=1 << 23, **kw)
-            out["pages"][vname] = har.pages
-            if vname == "owner-4M":  # PCIe probes on this rank's own slot
-                nb = 4 << 20
-                src = torch.randn(nb // 2, device=dev).to(torch.bfloat16)
-                dst = torch.empty_like(src)
-                mine = _Ptr(har.data.addr + rank * har.round * 2, torch.bfloat16)
-                other = _Ptr(har.data.addr + ((rank + 1) % world) * har.round * 2, torch.bfloat16)
-                for label, fn in (
-                        ("write", lambda: _copy_kernel[(128,)](src, mine, nb // 2, CV=False, WT=True,
-                                                               BLOCK=BLOCK, num_warps=4)),
-                        ("read", lambda: _copy_kernel[(128,)](other, dst, nb // 2, CV=True, WT=False,
-                                                              BLOCK=BLOCK, num_warps=4))):
-                    for scope in ("alone", "all"):
-                        dist.barrier(group=cpu)
-                        if scope == "alone" and rank != 0:
-                            dist.barrier(group=cpu)
-                            continue
-                        out["probe"][f"{label}-{scope}"] = nb / ns.graph_time_us(fn, 10, 5) / 1e3
-                        if scope == "alone":
-                            dist.barrier(group=cpu)
+            if vname == "lean":  # back-to-back calls, 4 rotating inputs, both modes, every output
+                for t in STRESS_TOKENS:
+                    pairs = [_inputs(rank, world, t * hidden + 8 * k, dev) for k in range(4)]
+                    for one in (False, True):
+                        ys = [har.all_reduce(pairs[i % 4][0], oneshot=one) for i in range(64)]
+                        torch.cuda.synchronize()
+                        out["stress"].append((t, one, all(torch.equal(y, pairs[i % 4][1])
+                                                          for i, y in enumerate(ys))))
             for t in toks:
                 n = t * hidden
                 x, ref = _inputs(rank, world, n, dev)
@@ -442,7 +532,7 @@ def _bench_worker(rank, world, port, q, hidden) -> None:
                         row[f"{mode}_exact"] = bool(torch.equal(y, ref))
                         row[f"{mode}_us"] = ns.graph_time_us(lambda: har.all_reduce(x, oneshot=one, grid=grid))
                     if t not in nccl_us:
-                        y = nccl.all_reduce(x)
+                        nccl.all_reduce(x)
                         torch.cuda.synchronize()
                         nccl_us[t] = ns.graph_time_us(lambda: nccl.all_reduce(x))
                     row["nccl_us"] = nccl_us[t]
@@ -469,10 +559,8 @@ def bench(hidden: int = 6144) -> int:
     if world not in WORLDS:
         print(f"{MARK} SKIP: {world} GPU(s)", flush=True)
         return 0
-    nodes = sorted(int(d[4:]) for d in os.listdir("/sys/devices/system/node") if d[:4] == "node"
-                   and d[4:].isdigit()) if os.path.isdir("/sys/devices/system/node") else []
-    print(f"{MARK} host: {os.cpu_count()} cpus, numa nodes "
-          + ", ".join(f"{nd}: {len(node_cpus(nd))} cpus" for nd in nodes), flush=True)
+    for line in _sysfacts():
+        print(f"{MARK} {line}", flush=True)
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = 29600 + os.getpid() % 1000
@@ -494,12 +582,17 @@ def bench(hidden: int = 6144) -> int:
     if errs or len(res) < world:
         return 1
     res.sort(key=lambda r: r["rank"])
-    print(f"{MARK} GPU numa nodes by rank: {[r['node'] for r in res]}; pages "
-          + " | ".join(f"{v}: {p}" for v, p in res[0]["pages"].items()), flush=True)
-    pr = {k: [r["probe"][k] for r in res if k in r["probe"]] for k in res[0]["probe"]}
-    print(f"{MARK} PCIe GB/s (4 MiB, 128 programs): "
-          + " | ".join(f"{k} min {min(v):.1f} max {max(v):.1f}" for k, v in pr.items()), flush=True)
-    ok = True
+    for i, row in enumerate(res[0]["bw"]):
+        rows = [r["bw"][i] for r in res]
+        cells = " | ".join(f"{k} per-GPU {min(rr[k] for rr in rows):5.1f}..{max(rr[k] for rr in rows):5.1f} "
+                           f"sum {sum(rr[k] for rr in rows):6.1f}" for k in ("write", "read", "h2h"))
+        print(f"{MARK} bw {'thp' if row['huge'] else '4k '} {row['foot'] >> 20:3d} MiB/rank: {cells} GB/s "
+              f"[{row['pmd']}]", flush=True)
+    stress = [all(r["stress"][i][2] for r in res) for i in range(len(res[0]["stress"]))]
+    print(f"{MARK} stress (64 back-to-back calls, 4 rotating inputs, every output exact): "
+          + ", ".join(f"{t}tok {'one' if one else 'two'} {ok}" for (t, one, _), ok in
+                      zip(res[0]["stress"], stress)), flush=True)
+    ok = all(stress)
     for i, row in enumerate(res[0]["rows"]):
         rows = [r["rows"][i] for r in res]
         cell = {k: max(rr[k] for rr in rows) for k in ("two_us", "one_us", "nccl_us") if k in row}
@@ -507,7 +600,7 @@ def bench(hidden: int = 6144) -> int:
         ok &= exact
         best = min(v for k, v in cell.items() if k != "nccl_us")
         one = f"{cell['one_us']:8.1f}" if "one_us" in cell else "       -"
-        print(f"{MARK} {row['v']:13s} {row['tok']:5d} tok ({row['tok'] * hidden * 2 / 1024:8.1f} KiB) "
+        print(f"{MARK} {row['v']:9s} {row['tok']:5d} tok ({row['tok'] * hidden * 2 / 1024:8.1f} KiB) "
               f"grid {row['grid']:3d}: two-shot {cell['two_us']:8.1f} us | one-shot {one} us | nccl "
               f"{cell['nccl_us']:8.1f} us ({cell['nccl_us'] / best:4.2f}x) | exact {exact}", flush=True)
     print(f"{MARK} {'PASS' if ok else 'FAIL'}: every rank bit-exact vs the fp32 rank-order sum", flush=True)
