@@ -172,16 +172,22 @@ class WorkerSFT:
     def micro(self, p):
         if self.run is None:
             raise RuntimeError("micro without begin")
-        self._mem_vote()
+        free = self._mem_vote()
         ids, segs, rows, tgt = self._batch(p)
         if not tgt.numel():
             raise ValueError("micro-batch without completion tokens")
         check = bool(p.get("check"))
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
+            base = torch.cuda.memory_allocated(self.device)
         with M.TrainMode(self, self.run.params(), segs, grad=True, offload=self.cfg.offload,
                          check=check) as tm:
             loss = tm.nll(ids, rows, tgt)
             (loss / float(p["norm"])).backward()
         out = dict(loss_sum=float(loss.detach()), tokens=int(tgt.numel()))
+        if self.device.type == "cuda":   # what training adds on top of serving's resident set
+            out.update(peak_gib=round((torch.cuda.max_memory_allocated(self.device) - base) / 2**30, 3),
+                       free_gib=round(free / 2**30, 2), host_pinned_gib=_pinned_gib())
         if check:
             bad = M.grad_reach(self.adapters, self.run.grad_of)
             bad += [f"op:{c}" for c in dict.fromkeys(tm.cut)]
@@ -271,11 +277,22 @@ class WorkerSFT:
             torch.cuda.empty_cache()
             free, _ = torch.cuda.mem_get_info(self.device)
             ok = float(free >= self.cfg.min_free_gib * 2**30)
+        else:
+            free = 0
         flag = torch.tensor([1.0 - ok], device=self.device)
         if self.g.world_size > 1:
             flag = self.g.all_reduce(flag)
         if float(flag[0]):
             raise MemoryError(f"less than {self.cfg.min_free_gib} GiB free VRAM on a rank")
+        return free
+
+
+def _pinned_gib():
+    try:
+        st = torch.cuda.host_memory_stats()
+        return round(st.get("allocated_bytes.current", st.get("allocated_bytes", 0)) / 2**30, 3)
+    except Exception:  # noqa: BLE001 - telemetry only
+        return None
 
 
 def _sync():
