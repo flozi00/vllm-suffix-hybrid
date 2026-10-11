@@ -806,6 +806,10 @@ def _make_layer_cls():
             self._sfx_moe = cfg
             _state["oracle"].append(self._sfx_oracle(cfg, info))
             _state["layers_ours"] += 1
+            if os.environ.get("SUFFIX_NVFP4_MOE_IMPL", "").strip() not in ("", "oxide"):
+                from suffix_hybrid.kernels import nvfp4_moe_tp  # TP-sharded Triton family
+                nvfp4_moe_tp.prepare(self, cfg, info, lambda x, i, w: run_ours(
+                    native, cfg, x, i, w, _state["ws"][dev], torch.cuda.current_stream(dev).cuda_stream))
 
         def _sfx_run(self, cfg, x, topk_weights, topk_ids):
             if cfg.get("kind") == "fp8":
@@ -813,6 +817,9 @@ def _make_layer_cls():
                 return fp8_moe.run(native, cfg, x, topk_weights, topk_ids)
             dev = x.device
             tw = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
+            tp = cfg.get("tp_impl")  # SUFFIX_NVFP4_MOE_IMPL: a plan per M, None = oxide
+            if tp is not None and tp.plans[x.shape[0]] is not None:
+                return tp(x.contiguous(), topk_ids.contiguous(), tw.contiguous())
             return run_ours(native, cfg, x.contiguous(), topk_ids.contiguous(),
                             tw.contiguous(), _state["ws"][dev],
                             torch.cuda.current_stream(dev).cuda_stream)

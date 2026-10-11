@@ -590,6 +590,11 @@ _BOOT_GATES = {
     # M 1..192 for FlashInfer CUTLASS, our NVFP4 kernel and FlashInfer b12x; numerics vs f64; the
     # TP tune table. Lines: [suffix moe-tp].
     "glm_moe_tp_bench": (["-m", "suffix_hybrid.tools.glm_moe_tp"], {}),
+    # Our TP-sharded NVFP4 MoE in Triton (suffix_hybrid/kernels/nvfp4_moe_tp.py), GLM-5.3 TP8 shard,
+    # one GPU, cold L2, CUDA graphs: oracle of every plan (f64 + oxide, graph replay), then us/layer
+    # per M vs oxide (g10 table) and FlashInfer + % of the weight roofline + the paste-able
+    # SUFFIX_NVFP4_MOE_TP_TABLE / _IMPL. Lines: [suffix moe-tp-kernel].
+    "glm_moe_tp_kernel_bench": (["-m", "suffix_hybrid.kernels.nvfp4_moe_tp", "bench"], {}),
     # GLM-5.3 TP8 dense projections per rank, one GPU, cold L2: BF16 vs FP8 W8A8 cutlass (+act
     # quant) vs Marlin W8A16 vs Marlin W4A16 (SUFFIX_FP8_DENSE_BACKEND) at decode M 1..192,
     # numerics vs fp32, per-step sums, SUFFIX_FP8_DENSE_MARLIN_MAX_M. Lines: [suffix dense-marlin].
