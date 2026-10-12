@@ -14,7 +14,7 @@ except ModuleNotFoundError as error:
         raise
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suffix_hybrid.decider_contract import (
-    checkpoint_contract, configure_model, validate_engine, validate_tokenizer)
+    checkpoint_contract, configure_model, media_enabled, validate_engine, validate_tokenizer)
 from suffix_hybrid.decider_plugin import register
 
 
@@ -76,6 +76,19 @@ class ContractTests(unittest.TestCase):
                 self.write(**changes)
                 with self.assertRaises(ValueError):
                     checkpoint_contract(self.root)
+
+    def test_media_only_for_d3_without_processor_overrides(self):
+        def model(language_model_only=False, kwargs=None):
+            return NS(multimodal_config=NS(language_model_only=language_model_only,
+                                           mm_processor_kwargs=kwargs))
+        pplx, d3 = {"profile": "pplx"}, {"profile": "d3"}
+        self.assertFalse(media_enabled(model(True), pplx))
+        self.assertFalse(media_enabled(NS(multimodal_config=None), d3))
+        self.assertTrue(media_enabled(model(), d3))
+        self.assertTrue(media_enabled(model(kwargs={"device": "cuda"}), d3))
+        for config, saved in ((model(), pplx), (model(kwargs={"size": {}}), d3)):
+            with self.assertRaises(ValueError):
+                media_enabled(config, saved)
 
     def test_updates_outer_and_text_noncausal_without_changing_layer_types(self):
         self.write()

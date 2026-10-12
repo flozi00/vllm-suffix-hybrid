@@ -14,7 +14,7 @@ from vllm.model_executor.models.qwen3_vl import (
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from suffix_hybrid.decider_contract import checkpoint_contract, validate_engine
+from suffix_hybrid.decider_contract import checkpoint_contract, media_enabled, validate_engine
 
 
 class _FloatReadout(ReplicatedLinear):
@@ -22,9 +22,22 @@ class _FloatReadout(ReplicatedLinear):
         return super().forward(hidden_states).float()
 
 
+class DecisionProcessingInfo(Qwen3_5ProcessingInfo):
+    """vLLM's Qwen3.5 processing with d3_runtime's image/video budgets."""
+
+    def get_hf_processor(self, **kwargs):
+        processor = super().get_hf_processor(**kwargs)
+        if not getattr(processor, "_suffix_decider_budgets", False):
+            if checkpoint_contract(self.ctx.model_config.model)["profile"] == "d3":
+                from suffix_hybrid.decider_media import apply_budgets
+                apply_budgets(processor)
+            processor._suffix_decider_budgets = True
+        return processor
+
+
 @default_pooling_type(seq_pooling_type="LAST")
 @MULTIMODAL_REGISTRY.register_processor(
-    Qwen3VLMultiModalProcessor, info=Qwen3_5ProcessingInfo,
+    Qwen3VLMultiModalProcessor, info=DecisionProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder)
 class PplxDeciderForSequenceClassification(
         _create_pooling_model_cls(Qwen3_5ForConditionalGeneration)):
@@ -36,12 +49,14 @@ class PplxDeciderForSequenceClassification(
     def __init__(self, *, vllm_config, prefix=""):
         validate_engine(vllm_config, require_resolved_quantization=True)
         self._decision_saved = checkpoint_contract(vllm_config.model_config.model)
+        media = media_enabled(vllm_config.model_config, self._decision_saved)
         # _init_pooler runs inside super().__init__; d3 scores in FP32.
         self._readout_dtype = getattr(torch, self._decision_saved["readout_dtype"])
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.vllm_config = vllm_config
         print("SUFFIX_PPLX_DECIDER MODEL native hybrid backbone; noncausal full attention; "
-              f"{self._readout_dtype} readout; profile={self._decision_saved['profile']}", flush=True)
+              f"{self._readout_dtype} readout; profile={self._decision_saved['profile']}; "
+              f"media={'images+videos' if media else 'off'}", flush=True)
 
     @staticmethod
     def get_model_state_cls():

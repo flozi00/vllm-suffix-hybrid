@@ -227,10 +227,14 @@ fn request(value: &Value, profile: Profile) -> Result<&Map<String, Value>, Strin
             let items = items
                 .as_array()
                 .ok_or_else(|| format!("{media} must be an array"))?;
-            if !items.is_empty() {
+            // d3 reads media (decoded by the endpoint); pplx is text only.
+            if !d3 && !items.is_empty() {
                 return Err(format!(
                     "this vLLM adapter currently supports text only; {media} are unsupported"
                 ));
+            }
+            if items.iter().any(|item| !item.is_string()) {
+                return Err(format!("{media} must be a list of base64 data URLs"));
             }
         }
     }
@@ -295,7 +299,19 @@ pub fn prepare(body_json: &str, codes_json: &str, profile_name: &str) -> Result<
             }
             Profile::D3 => {
                 prompt.push_str("\n\nReply with only the code of the best option.");
-                json!([{"role":"system","content":D3_SYSTEM},{"role":"user","content":prompt}])
+                // d3_runtime image_messages/video_messages: one placeholder per
+                // image, then per video, before the text; plain text otherwise.
+                let count = |media: &str| body.get(media).and_then(Value::as_array).map_or(0, Vec::len);
+                let (images, videos) = (count("images"), count("videos"));
+                let content = if images + videos == 0 {
+                    json!(prompt)
+                } else {
+                    let mut items = vec![json!({"type":"image"}); images];
+                    items.extend(vec![json!({"type":"video"}); videos]);
+                    items.push(json!({"type":"text","text":prompt}));
+                    Value::Array(items)
+                };
+                json!([{"role":"system","content":D3_SYSTEM},{"role":"user","content":content}])
             }
         };
         rows.push(json!({"messages":messages,"option_count":options.keys.len()}));
@@ -481,6 +497,16 @@ mod tests {
         assert_eq!(response["answers"]["s"]["legend"]["1"], "{\"a\":\"x, y\",\"b\":2}");
         assert_eq!(response["answers"]["c"]["confidence"], 1.0);
         assert!(prepare(body, r#"["A","B"]"#, "pplx").is_err());
+        let media = r#"{"model":"d3","state":"s","images":["a","b"],"videos":["v"],"questions":{"q":{"type":"noul"}}}"#;
+        let prepared: Value =
+            serde_json::from_str(&prepare(media, r#"["A","B"]"#, "d3").unwrap()).unwrap();
+        let content = &prepared["rows"][0]["messages"][1]["content"];
+        assert_eq!(content[0], json!({"type":"image"}));
+        assert_eq!(content[1], json!({"type":"image"}));
+        assert_eq!(content[2], json!({"type":"video"}));
+        assert!(content[3]["text"].as_str().unwrap().starts_with("State:\ns\n"));
+        assert!(prepare(media, r#"["A","B"]"#, "pplx").is_err());
+        assert!(prepare(&media.replace("[\"a\",\"b\"]", "[1]"), r#"["A","B"]"#, "d3").is_err());
     }
     #[test]
     fn arbitrary_size_integers_keep_exact_prompt_digits() {

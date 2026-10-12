@@ -68,8 +68,11 @@ def validate_engine(vllm_config, *, require_resolved_quantization=True):
         raise ValueError("pplx-decider requires --runner pooling")
     if pooler.seq_pooling_type != "LAST":
         raise ValueError("pplx-decider requires LAST pooling")
-    if model.max_model_len > 8192:
-        raise ValueError("pplx-decider's validated input limit is 8192 tokens")
+    # d3 sends images/videos (up to 16,384 video tokens alone); pplx is text.
+    saved = getattr(model, "_suffix_decider_contract", None) or {}
+    limit = 32768 if saved.get("profile") == "d3" else 8192
+    if model.max_model_len > limit:
+        raise ValueError(f"the decision adapter's validated input limit is {limit} tokens")
     if cache.enable_prefix_caching or scheduler.enable_chunked_prefill:
         raise ValueError("noncausal decisions forbid prefix caching/chunked prefill")
     if cache.mamba_cache_mode != "none":
@@ -109,6 +112,19 @@ def validate_engine(vllm_config, *, require_resolved_quantization=True):
             raise ValueError("decision NVFP4 requires a serialized W4A16_NVFP4 checkpoint")
     elif quantization not in (None, "fp8"):
         raise ValueError("decision adapter supports BF16, upstream FP8 or weight-only NVFP4")
+
+
+def media_enabled(model_config, saved):
+    """True when this pool reads images/videos; only d3 with its exact budgets."""
+    multimodal = getattr(model_config, "multimodal_config", None)
+    if multimodal is None or multimodal.language_model_only:
+        return False
+    if saved["profile"] != "d3":
+        raise ValueError("pplx-decider reads text only; serve it with --language-model-only")
+    # The adapter applies d3's own processor budgets; overrides would differ.
+    if any(k != "device" for k in multimodal.mm_processor_kwargs or {}):
+        raise ValueError("d3 media budgets are fixed by the adapter; remove --mm-processor-kwargs")
+    return True
 
 
 def configure_model(model_config):
