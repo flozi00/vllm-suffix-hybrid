@@ -128,8 +128,19 @@ the pooled hidden state is cast to FP32 before it, matching
 pplx release keeps the `pplx` profile and BF16 readout unchanged.
 `tests/test_pplx_decider_reference.py` checks prompts and answers against
 d3's pinned `d3_format.py`/`d3_runtime.py` (revision `5ce995df`). The same
-serve command and `quantize_pplx_nvfp4` apply; image and video inputs are
-still refused (next step: vLLM multimodal inputs with d3's pixel/frame limits).
+serve command and `quantize_pplx_nvfp4` apply.
+
+Images and videos (d3 only): drop `--language-model-only` and serve
+`--mm-processor-kwargs` exactly as `decider_media.D3_MM_PROCESSOR_KWARGS`
+(1.6 MP images; video frames at 0.2 MP, `cap_pixels_per_frame`, 196 tokens
+per frame pair); the model and endpoint refuse to start otherwise. The
+endpoint decodes base64 PNG/JPEG/WebP and MP4/WebM/QuickTime/Matroska like
+`d3_runtime.py` (OpenCV, 2 fps, 4-32 frames, even count, source indices and
+fps as metadata), enforces 16,384 video tokens per request, rejects literal
+placeholder tokens, and passes `multi_modal_data` so vLLM's Qwen3-VL
+processor expands the placeholders (timestamps included). Usage counts the
+expanded prompt. vLLM request errors (over-length media) answer 400. The d3
+input limit is 32,768 tokens; pplx stays text-only at 8,192.
 
 ## Validation and shipping
 

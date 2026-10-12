@@ -57,7 +57,7 @@ def d3_reference(directory):
     exec(compile(sources["d3_format.py"], "d3_format.py", "exec"), env)
     tree = ast.parse(sources["d3_runtime.py"])
     names = {"Question", "_json_value", "normalize_question", "_confidence", "_canonical",
-             "product_answer"}
+             "product_answer", "image_messages", "video_messages"}
     selected = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))
                 and n.name in names]
     assert {n.name for n in selected} == names
@@ -100,7 +100,21 @@ def run_d3(native, ref):
             answer = json.loads(native.decider_answer(raw, json.dumps([logits + [9999.0]]), 1.0, "d3"))
             close(answer["answers"]["q"], expected_answer)
             count += 1
-    print(f"Pinned d3 parity: {count} exact prompt fixtures, {count} answer fixtures passed")
+    media = 0
+    for images, videos in ((1, 0), (3, 0), (0, 1), (2, 2)):
+        for question in questions[:3]:
+            body = {"model": "d3", "state": states[3], "questions": {"q": question},
+                    "images": ["data:image/png;base64,AA=="] * images,
+                    "videos": ["data:video/mp4;base64,AA=="] * videos}
+            got = json.loads(native.decider_prepare(json.dumps(body, ensure_ascii=False),
+                                                    json.dumps(codes), "d3"))
+            rendered = ref["normalize_question"](question).rendered
+            expected = (ref["video_messages"]("d3", states[3], rendered, codes, images, videos) if videos
+                        else ref["image_messages"]("d3", states[3], rendered, codes, images))
+            assert got["rows"][0]["messages"] == expected, (got, expected)
+            media += 1
+    print(f"Pinned d3 parity: {count} exact prompt fixtures, {count} answer fixtures, "
+          f"{media} media layouts passed")
 
 
 def close(actual, expected):

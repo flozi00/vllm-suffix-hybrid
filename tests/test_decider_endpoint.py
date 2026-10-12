@@ -162,6 +162,54 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "unexpected engine failure"):
                 await self.invoke({"model": "decider"})
 
+    async def test_d3_media_rows_carry_multimodal_data_and_expanded_usage(self):
+        self.context["media"] = {"video_processor": None}
+        self.context["pad_ids"] = (100, 101)
+        self.context["tokenizer"].encode = lambda *args, **kwargs: [9, 100, 100, 101, 7]
+        decoded = []
+        def decode(context, images, videos):
+            decoded.append((images, videos))
+            return {"image": ["i1", "i2"], "video": ["v1"]}
+        async def encode(prompt, params, request_id):
+            self.calls.append(("encode", prompt))
+            yield NS(outputs=NS(data=NS(tolist=lambda: [1.0] * 255)), prompt_token_ids=list(range(900)))
+        self.context["engine"].encode = encode
+        with patch.object(endpoint_module, "decode_media", decode):
+            result = await self.invoke({"model": "decider", "images": ["a", "b"], "videos": ["c"]})
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(decoded, [(["a", "b"], ["c"])])
+        prompt = [c for c in self.calls if isinstance(c, tuple) and c[0] == "encode"][0][1]
+        self.assertEqual(prompt, {"prompt_token_ids": [9, 100, 100, 101, 7],
+                                  "multi_modal_data": {"image": ["i1", "i2"], "video": ["v1"]}})
+        self.assertEqual(result.content["usage"]["input_tokens"], 900)
+
+    async def test_literal_placeholder_tokens_are_rejected(self):
+        self.context["pad_ids"] = (100, 101)
+        self.context["tokenizer"].encode = lambda *args, **kwargs: [9, 100, 7]
+        result = await self.invoke({"model": "decider"})
+        self.assertEqual(result.status_code, 400)
+        self.assertNotIn("admitted", self.calls)
+
+    async def test_text_only_pool_refuses_media_before_engine_work(self):
+        result = await self.invoke({"model": "decider", "images": ["data:image/png;base64,AA=="]})
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("text only", result.content["error"])
+        self.assertNotIn("admitted", self.calls)
+
+    async def test_vllm_client_errors_are_client_errors(self):
+        exceptions = ModuleType("vllm.exceptions")
+        class VLLMClientError(Exception):
+            pass
+        exceptions.VLLMClientError = VLLMClientError
+        self.modules["vllm.exceptions"] = exceptions
+        async def encode(*args):
+            raise RuntimeError("wrapped") from VLLMClientError("prompt (length 9000) is longer")
+            yield
+        self.context["engine"].encode = encode
+        result = await self.invoke({"model": "decider"})
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("longer", result.content["error"])
+
     def test_model_aliases_follow_standard_vllm_args(self):
         self.assertEqual(model_names(NS(served_model_name="alias"), NS(model="path")), ["alias"])
         self.assertEqual(model_names(NS(served_model_name=["one", "two"]), NS(model="path")), ["one", "two"])

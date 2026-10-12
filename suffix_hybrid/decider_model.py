@@ -14,7 +14,7 @@ from vllm.model_executor.models.qwen3_vl import (
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from suffix_hybrid.decider_contract import checkpoint_contract, validate_engine
+from suffix_hybrid.decider_contract import checkpoint_contract, media_enabled, validate_engine
 
 
 class _FloatReadout(ReplicatedLinear):
@@ -36,12 +36,14 @@ class PplxDeciderForSequenceClassification(
     def __init__(self, *, vllm_config, prefix=""):
         validate_engine(vllm_config, require_resolved_quantization=True)
         self._decision_saved = checkpoint_contract(vllm_config.model_config.model)
+        media = media_enabled(vllm_config.model_config, self._decision_saved)
         # _init_pooler runs inside super().__init__; d3 scores in FP32.
         self._readout_dtype = getattr(torch, self._decision_saved["readout_dtype"])
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.vllm_config = vllm_config
         print("SUFFIX_PPLX_DECIDER MODEL native hybrid backbone; noncausal full attention; "
-              f"{self._readout_dtype} readout; profile={self._decision_saved['profile']}", flush=True)
+              f"{self._readout_dtype} readout; profile={self._decision_saved['profile']}; "
+              f"media={'images+videos' if media else 'off'}", flush=True)
 
     @staticmethod
     def get_model_state_cls():
