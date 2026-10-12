@@ -319,6 +319,13 @@ mod nvfp4_gemm_oxide;
 #[cfg(feature = "oxide-kernels")]
 mod nvfp4_moe_oxide;
 #[cfg(feature = "oxide-kernels")]
+mod fp8_moe_oxide;
+#[cfg(feature = "oxide-kernels")]
+mod dsa_indexer_oxide;
+mod nvfp4_ds_mla;
+#[cfg(feature = "oxide-kernels")]
+mod nvfp4_ds_mla_oxide;
+#[cfg(feature = "oxide-kernels")]
 mod qgdn_oxide;
 mod qwen_gdn;
 #[cfg(all(feature = "qwen-gdn-kernels", not(feature = "oxide-kernels")))]
@@ -364,8 +371,45 @@ fn nvfp4_attn_plan(
         ("wv".to_string(), p.wv),
         ("cps".to_string(), p.cps),
         ("min_tiles".to_string(), nvfp4_attn::MIN_TILES_PER_SPLIT),
-        ("min_split_tokens".to_string(), nvfp4_attn::MIN_SPLIT_TOKENS),
+        ("split_cost_tokens".to_string(), nvfp4_attn::SPLIT_COST_TOKENS),
         ("slots".to_string(), num_sms * p.cps),
+    ]))
+}
+
+/// K2-NVFP4 device split choice (nvfp4_attn::split_tiles): tiles per split
+/// for a request of `n_t` KV tiles, for the numpy twin's parity test.
+#[pyfunction]
+fn nvfp4_attn_split_tiles(n_t: usize, rows: usize, ns: usize, slots: usize, tn: usize) -> usize {
+    nvfp4_attn::split_tiles(n_t, rows, ns, slots, tn)
+}
+
+/// NVFP4 ds-MLA plan (src/nvfp4_ds_mla.rs) as a dict; ValueError when the
+/// shape is outside the kernel contract (the adapter must refuse, loudly).
+#[pyfunction]
+#[pyo3(signature = (tokens, hq, capacity, num_sms))]
+#[allow(clippy::too_many_arguments)]
+fn nvfp4_ds_mla_plan(
+    tokens: usize,
+    hq: usize,
+    capacity: usize,
+    num_sms: usize,
+) -> PyResult<HashMap<String, usize>> {
+    let p = nvfp4_ds_mla::plan(tokens, hq, capacity, num_sms)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok(HashMap::from([
+        ("hqt".to_string(), p.hqt),
+        ("rows".to_string(), p.rows),
+        ("merge_rows".to_string(), p.merge_rows),
+        ("c_per_split".to_string(), p.c_per_split),
+        ("ns".to_string(), p.ns),
+        (
+            "partial_smem_bytes".to_string(),
+            nvfp4_ds_mla::partial_smem_bytes(),
+        ),
+        (
+            "merge_smem_bytes".to_string(),
+            nvfp4_ds_mla::merge_smem_bytes(p.ns),
+        ),
     ]))
 }
 
@@ -428,9 +472,31 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "oxide-kernels")]
     m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_q_cuda, m)?)?;
     #[cfg(feature = "oxide-kernels")]
-    m.add_function(wrap_pyfunction!(nvfp4_gemm_oxide::nvfp4_gemm_splits, m)?)?;
-    #[cfg(feature = "oxide-kernels")]
     m.add_function(wrap_pyfunction!(nvfp4_moe_oxide::nvfp4_moe_cuda, m)?)?;
+    #[cfg(feature = "oxide-kernels")]
+    m.add_function(wrap_pyfunction!(nvfp4_moe_oxide::nvfp4_moe_attrs, m)?)?;
+    #[cfg(feature = "oxide-kernels")]
+    m.add_function(wrap_pyfunction!(fp8_moe_oxide::fp8_moe_cuda, m)?)?;
+    #[cfg(feature = "oxide-kernels")]
+    m.add_function(wrap_pyfunction!(dsa_indexer_oxide::dsa_indexer_logits_cuda, m)?)?;
+    // NVFP4 ds-MLA (GLM 5.3 sparse-MLA reader cache): plan module always
+    // built (CPU-verified sizes the split workspace); CUDA ops under
+    // oxide-kernels. HAS_NVFP4_DSMLA_CUDA is the startup kernel-path
+    // assertion's probe — armed + absent must refuse to start, never
+    // silently route decode to flashinfer with an fp8-sized cache.
+    m.add_function(wrap_pyfunction!(nvfp4_ds_mla_plan, m)?)?;
+    m.add("HAS_NVFP4_DSMLA_CUDA", cfg!(feature = "oxide-kernels"))?;
+    #[cfg(feature = "oxide-kernels")]
+    {
+        m.add_function(wrap_pyfunction!(
+            nvfp4_ds_mla_oxide::nvfp4_ds_mla_quant_store_cuda,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            nvfp4_ds_mla_oxide::nvfp4_ds_mla_decode_cuda,
+            m
+        )?)?;
+    }
     #[cfg(all(feature = "qwen-gdn-kernels", not(feature = "oxide-kernels")))]
     for f in [
         wrap_pyfunction!(qwen_gdn_gpu::gdn_decode_fused_cuda, m)?,
@@ -462,6 +528,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // is the startup kernel-path assertion's probe — an armed pod without it
     // refuses to start, it never silently keeps the FA2 decode route.
     m.add_function(wrap_pyfunction!(nvfp4_attn_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(nvfp4_attn_split_tiles, m)?)?;
     m.add("HAS_NVFP4_ATTN_CUDA", cfg!(feature = "oxide-kernels"))?;
     // cuda-oxide track (ships): shared cubin loader + probe + K2 host op.
     m.add("HAS_OXIDE_KERNELS", cfg!(feature = "oxide-kernels"))?;

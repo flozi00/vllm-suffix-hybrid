@@ -125,8 +125,9 @@ def build_payload(args, messages, gen, image_b64=None, ignore_eos=False):
         # server echoes prompt_token_ids in the first chunk and per-chunk
         # delta token_ids (vLLM return_token_ids, v0.30.0) — byte-exact
         # ids without a tokenizer on the driver side.
-        **({"return_token_ids": True} if getattr(
-            args, "dump_histories", None) else {}),
+        # Always: spec decode streams several tokens per chunk, so counting
+        # chunks under-reports spec arms; count len(delta token_ids) instead.
+        "return_token_ids": True,
         **({"ignore_eos": True} if ignore_eos else {}),
     }
 
@@ -170,7 +171,10 @@ def stream_one(url, payload, timeout):
             delta = None
             choices = chunk.get("choices") or []
             if choices:
-                delta = (choices[0].get("delta") or {}).get("content")
+                d = choices[0].get("delta") or {}
+                # reasoning models stream thinking as delta.reasoning(_content)
+                delta = (d.get("content") or d.get("reasoning")
+                         or d.get("reasoning_content"))
                 if want_ids:
                     ch = choices[0]
                     if prompt_ids is None:
@@ -193,7 +197,8 @@ def stream_one(url, payload, timeout):
             now = time.monotonic()
             if ttft is None:
                 ttft = now - t0
-            tokens += 1
+            ch_n = len((choices[0].get("token_ids") or ())) if choices else 0
+            tokens += ch_n or 1
             last_t = now
     finally:
         if open_resp is not None:

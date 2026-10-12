@@ -143,6 +143,19 @@ def f16(x):
     return np.asarray(x, dtype=np.float64).astype(np.float16).astype(np.float64)
 
 
+def split_tiles(n_t, rows, ns, slots, tn, min_tiles=2, cost_tokens=64):
+    """Mirror of nvfp4_attn::split_tiles / the kernel's device choice."""
+    c0 = -(-cost_tokens // tn)
+    best, best_per = None, min_tiles
+    for k in range(1, 5):
+        s = ns if k == 4 else min(max(k * slots // rows, 1), ns)
+        per = max(-(-n_t // s), min_tiles)
+        cost = -(-(rows * -(-n_t // per)) // slots) * (per + c0)
+        if best is None or cost < best:
+            best, best_per = cost, per
+    return best_per
+
+
 def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
                 k_scale=1.0, v_scale=1.0, window_left=-1):
     """Transcription of nvfp4_attn_partial + nvfp4_attn_merge (v2 layout:
@@ -174,12 +187,11 @@ def kernel_twin(q, cache, block_table, seq_lens, q_len, sm_scale, plan,
         lo = max(q0 - window_left, 0) if window_left >= 0 else 0
         lo_t, hi_t = lo // tn, -(-hi // tn)
         n_t = max(hi_t - lo_t, 0)
-        per = max(-(-n_t // ns), min_tiles)
-        # kernel: never finer than min_split_tokens unless one wave of CTA
-        # slots needs it (rows x splits >= slots)
-        if "min_split_tokens" in plan:
-            wave = -(-(n_t * rows) // plan["slots"])
-            per = max(per, min(wave, -(-plan["min_split_tokens"] // tn)))
+        if "split_cost_tokens" in plan:  # kernel split_tiles (wave-aware)
+            per = split_tiles(n_t, rows, ns, plan["slots"], tn, min_tiles,
+                              plan["split_cost_tokens"])
+        else:
+            per = max(-(-n_t // ns), min_tiles)
         # rows token-major (i*G + g), padded rows / tokens past q_len = 0
         qm = np.zeros((m_rows, d))
         row_ok = np.zeros(m_rows, dtype=bool)

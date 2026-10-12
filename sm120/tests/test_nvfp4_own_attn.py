@@ -251,6 +251,33 @@ def test_decode_metadata_routing_rules():
         mk(B, bt, sl, qo(2, 2), qo(2, 2), 2)
 
 
+def test_qlens_computed_once_per_step_object():
+    """The 6 KV-group builders of a step share one query_start_loc_cpu
+    object: q lengths are computed once for it, recomputed for the next
+    step's (fresh) object or another num_decodes."""
+    torch = pytest.importorskip("torch")
+    calls = []
+
+    class Impl:
+        K2_Q1_MAX_BATCH = own_attn.K2_Q1_MAX_BATCH
+
+        @staticmethod
+        def row_budget(lens):
+            calls.append(list(lens))
+            return own_attn.row_budget(lens)
+
+    ns = _helper_ns(_nvfp4_own_attn=Impl)
+    q = torch.tensor([0, 1, 4, 5], dtype=torch.int32)
+    for _ in range(6):  # 6 groups x (takes + takes + decode)
+        assert ns["_nvfp4_own_attn_takes"](q, 3) is True
+        assert ns["_nvfp4_own_attn_qlens"](q, 3) == (3, 16)
+    assert calls == [[1, 3, 1]]
+    assert ns["_nvfp4_own_attn_qlens"](q, 1) == (1, 48)  # resplit: fewer rows
+    q2 = torch.tensor([0, 2, 4, 6], dtype=torch.int32)  # next step's object
+    assert ns["_nvfp4_own_attn_qlens"](q2, 3) == (2, 48)
+    assert len(calls) == 3
+
+
 @pytest.mark.parametrize("sms", [1, 188])
 def test_twin_ragged_matches_reference(sms):
     """Ragged q lengths (suffix drafts: misses q_len 1, partial and full
@@ -567,3 +594,37 @@ def test_uniform_graph_lens_inert_cases():
 def test_uniform_graph_lens_kill_switch(monkeypatch):
     monkeypatch.setenv("SUFFIX_SM120_NVP4KV_GRAPH_ALL_WIDTHS", "0")
     assert own_attn.install_uniform_graph_lens() is False
+
+
+def test_twin_split_choice_is_wave_aware():
+    """The twin's split rule (mirror of nvfp4_attn::split_tiles and the
+    kernel's device choice) on the Rust plan-test regressions: gemma hd512
+    b8 / b16 MTP verify at 4k and SWA hd256 b8 no longer spill into a
+    partial extra wave."""
+    def waves(b, hkv, d, n_t):
+        p = _native.nvfp4_attn_plan(b, 9, 16, hkv, d, 64, 188)
+        per = ref.split_tiles(n_t, p["rows"], p["ns"], p["slots"], p["tn"],
+                              p["min_tiles"], p["split_cost_tokens"])
+        assert per >= 2 and -(-n_t // per) <= p["ns"]
+        return -(-(p["rows"] * -(-n_t // per)) // p["slots"])
+    assert waves(8, 2, 512, 129) == 1
+    assert waves(16, 2, 512, 129) == 2
+    assert waves(8, 8, 256, 33) == 1
+
+
+def test_twin_split_tiles_matches_host_and_kernel():
+    """Third copy of split_tiles (numpy twin) == the Rust host one, which
+    cargo test pins to the kernel source token for token
+    (nvfp4_attn::tests::device_split_tiles_copy_is_the_kernel_source)."""
+    if not hasattr(_native, "nvfp4_attn_split_tiles"):
+        pytest.skip("native module predates nvfp4_attn_split_tiles (rebuild)")
+    rng = np.random.default_rng(0)
+    n_ts = list(range(0, 130)) + [255, 256, 257, 1023, 4097, 16384, 16385]
+    for _ in range(3000):
+        rows, ns, slots = (int(rng.integers(1, 4097)), int(rng.integers(1, 257)),
+                           int(rng.integers(1, 377)))
+        tn = int(rng.choice([16, 32, 64]))
+        for n_t in (n_ts[int(rng.integers(len(n_ts)))], int(rng.integers(0, 16386))):
+            assert ref.split_tiles(n_t, rows, ns, slots, tn) == \
+                _native.nvfp4_attn_split_tiles(n_t, rows, ns, slots, tn), \
+                (n_t, rows, ns, slots, tn)

@@ -26,7 +26,7 @@ pub struct Engine {
     stats_interval: u64,
 }
 
-fn ngram(context: &[i64], lo: usize, hi: usize, cap: usize, window: usize) -> (Vec<i64>, f64) {
+pub(crate) fn ngram(context: &[i64], lo: usize, hi: usize, cap: usize, window: usize) -> (Vec<i64>, f64) {
     if cap == 0 {
         return (vec![], 0.0);
     }

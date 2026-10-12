@@ -134,6 +134,19 @@ fp8_fp4_paged_mqa_logits = _fallback_symbol("fp8_fp4_paged_mqa_logits")
 get_paged_mqa_logits_metadata = _fallback_symbol(
     "get_paged_mqa_logits_metadata")
 
+# SUFFIX_SM120_DSA_INDEXER=1 (on top of the fallback): the decode/prefill
+# logits run on our cuda-oxide FP8 tensor-core kernel
+# (suffix_hybrid.kernels.dsa_indexer); shapes outside its contract keep the
+# Triton path. Import failure raises: the operator opted in (fail closed).
+_dsa_indexer = (_use_fallback
+                and os.environ.get("SUFFIX_SM120_DSA_INDEXER", "").strip() == "1"
+                and _is_sm120())
+if _dsa_indexer:
+    from suffix_hybrid.kernels import dsa_indexer as _dsa
+
+    fp8_fp4_paged_mqa_logits = _dsa.wrap_paged(fp8_fp4_paged_mqa_logits)
+    fp8_fp4_mqa_logits = _dsa.wrap_mqa(fp8_fp4_mqa_logits)
+
 
 class _MissingVendor:
     """Proxy for a DeepGEMM symbol with no vendor: resolves nothing, raises
@@ -205,7 +218,10 @@ def _announce():
     importers, never in workers that merely have vllm importable)."""
     if "vllm" not in sys.modules:
         return
-    if _use_fallback and _vendor is not None:
+    if _dsa_indexer:
+        msg = ("suffix deep_gemm shim ACTIVE: oxide FP8 tensor-core DSA "
+               "indexer logits (Triton SM120 fallback for other shapes)")
+    elif _use_fallback and _vendor is not None:
         msg = ("suffix deep_gemm shim ACTIVE: Triton SM120 MQA-logits "
                "fallback overrides the vendored DeepGEMM kernels")
     elif _use_fallback:

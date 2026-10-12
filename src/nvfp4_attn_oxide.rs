@@ -235,6 +235,8 @@ pub fn nvfp4_paged_attn_cuda<'py>(
         u(p.tn),
         Arg::I32(window_left),
         Arg::F32(qk_scale_log2 * SCALE_FIX),
+        // CTA slots the device split choice plans waves against
+        u(num_sms * p.cps),
     ];
     let merge_args = vec![
         Arg::Ptr(oo.ptr),

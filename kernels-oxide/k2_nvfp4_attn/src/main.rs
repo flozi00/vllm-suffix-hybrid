@@ -67,10 +67,9 @@ mod kernels {
     const FULL: u32 = 0xFFFF_FFFF;
     const NEG_INF: f32 = f32::NEG_INFINITY;
     const MIN_TILES_PER_SPLIT: u32 = 2;
-    /// KV tokens a split should cover (fixed per-split cost: Q load, pipeline
-    /// fill, partial-O write + merge read) — relaxed when fewer tokens per
-    /// split are needed to keep one wave of CTAs busy.
-    const MIN_SPLIT_TOKENS: u32 = 512;
+    /// Fixed cost of one split (Q load, pipeline fill, partial-O write +
+    /// merge read) in KV tokens — host mirror nvfp4_attn::SPLIT_COST_TOKENS.
+    const SPLIT_COST_TOKENS: u32 = 64;
 
     #[inline(always)]
     fn ex2(x: f32) -> f32 {
@@ -165,15 +164,36 @@ mod kernels {
         ex2(m_old - m_safe)
     }
 
-    /// Concurrent CTA slots: SMs (%nsmid) x CTAs per SM of this variant
-    /// (the register-capped w1 cubin runs 2 per SM).
+    /// Tiles per split of one request (mirror of nvfp4_attn::split_tiles):
+    /// among the most splits fitting 1, 2, 3 full waves of `rows` CTAs over
+    /// `slots` and the grid cap `ns`, the least waves x (tiles + split cost);
+    /// never a partial extra wave from rounding.
     #[inline(always)]
-    fn sm_slots() -> u32 {
-        let nsm: u32;
-        unsafe {
-            ptx_asm!("mov.u32 %0, %%nsmid;", out("=r") nsm, options(register_only));
+    fn split_tiles(n_t: u32, rows: u32, ns: u32, slots: u32, tn: u32) -> u32 {
+        let c0 = SPLIT_COST_TOKENS.div_ceil(tn);
+        let mut best = u32::MAX;
+        let mut best_per = MIN_TILES_PER_SPLIT;
+        let mut k = 1u32;
+        while k <= 4 {
+            let mut s = if k == 4 { ns } else { k * slots / rows };
+            if s > ns {
+                s = ns;
+            }
+            if s < 1 {
+                s = 1;
+            }
+            let mut per = n_t.div_ceil(s);
+            if per < MIN_TILES_PER_SPLIT {
+                per = MIN_TILES_PER_SPLIT;
+            }
+            let cost = (rows * n_t.div_ceil(per)).div_ceil(slots) * (per + c0);
+            if cost < best {
+                best = cost;
+                best_per = per;
+            }
+            k += 1;
         }
-        nsm * if MTW == 1 { 2 } else { 1 }
+        best_per
     }
 
     /// 16-byte read-only global load (4 x u32).
@@ -293,6 +313,7 @@ mod kernels {
         tn: u32,
         window_left: i32,
         qk_scale_log2: f32,
+        slots: u32,
     ) {
         let tid = thread::threadIdx_x();
         let w = tid / 32;
@@ -345,20 +366,11 @@ mod kernels {
         let lo_t = (lo as u32) / tn;
         let hi_t = (hi as u32).div_ceil(tn);
         let n_t = if hi_t > lo_t { hi_t - lo_t } else { 0 };
-        // Tiles per split: the plan's ns, but never finer than
-        // MIN_SPLIT_TOKENS unless that many splits are needed to fill one
-        // wave (rows x splits >= SM slots); launched splits past the
-        // request's need exit at once (-inf lse, skipped by the merge).
-        let mut per = n_t.div_ceil(ns);
-        if per < MIN_TILES_PER_SPLIT {
-            per = MIN_TILES_PER_SPLIT;
-        }
-        let wave = (n_t * thread::gridDim_x()).div_ceil(sm_slots());
-        let tok_floor = MIN_SPLIT_TOKENS.div_ceil(tn);
-        let floor = if wave < tok_floor { wave } else { tok_floor };
-        if per < floor {
-            per = floor;
-        }
+        // Tiles per split: wave-aware over the launch grid (host-planned CTA
+        // slots, not %nsmid — that can exceed the SM count on harvested
+        // parts); launched splits past the request's need exit at once
+        // (-inf lse, skipped by the merge).
+        let per = split_tiles(n_t, thread::gridDim_x(), ns, slots, tn);
         let t0 = lo_t + s * per;
         let mut t1 = t0 + per;
         if t1 > hi_t {
@@ -387,14 +399,20 @@ mod kernels {
         let l_run: *mut f32 = unsafe { m_run0.add(m_rows as usize) };
         let m_run1: *mut f32 = unsafe { l_run.add(m_rows as usize) };
 
-        let tile_src = |j: u32| -> (u64, u64) {
-            let tok0 = j * tn;
-            let pg = unsafe { *block_table.add((b * bt_stride + tok0 / page_size) as usize) } as u64;
-            (pg * page_bytes as u64, (h * page_size + tok0 % page_size) as u64)
+        // Page ids are loaded one tile AHEAD (tile j+2 while tile j computes):
+        // the cp.async issue of tile j+1 never waits on a block_table round
+        // trip. Same addresses as before -> bitwise-identical staging.
+        let page_of = |j: u32| -> u32 {
+            unsafe { *block_table.add((b * bt_stride + j * tn / page_size) as usize) as u32 }
+        };
+        let tile_src = |j: u32, pg: u32| -> (u64, u64) {
+            (pg as u64 * page_bytes as u64, (h * page_size + (j * tn) % page_size) as u64)
         };
 
         // ---- first tile in flight, then Q -> smem (f16, permuted k) ----------
-        let (po, ht) = tile_src(t0);
+        let pg0 = page_of(t0);
+        let mut pg_nx = if t0 + 1 < t1 { page_of(t0 + 1) } else { 0 };
+        let (po, ht) = tile_src(t0, pg0);
         unsafe { issue_tile(kv0, k_data, k_sf, v_data, v_sf, po, ht, tn, dh, sd, tid) };
         // Q -> smem as f16 in logical (permuted) k order. 16-byte loads of 8
         // physical dims, QB chunks in flight per thread; physical offset
@@ -477,9 +495,12 @@ mod kernels {
             unsafe { cp_async_wait_all() };
             thread::sync_threads();
             if j + 1 < t1 {
-                let (po, ht) = tile_src(j + 1);
+                let (po, ht) = tile_src(j + 1, pg_nx);
                 let dst = unsafe { kv0.add(((st ^ 1) * stage_bytes) as usize) };
                 unsafe { issue_tile(dst, k_data, k_sf, v_data, v_sf, po, ht, tn, dh, sd, tid) };
+            }
+            if j + 2 < t1 {
+                pg_nx = page_of(j + 2);
             }
             let tok0 = j * tn;
             let kd = unsafe { kv0.add((st * stage_bytes) as usize) };

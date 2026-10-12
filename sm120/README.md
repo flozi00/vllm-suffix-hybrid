@@ -30,6 +30,11 @@ strictly a superset of "no vendor", which already hard-fails). With the gate
 unset on a working vendor the shim is inert by design, so shipping it in every
 bundle is safe. `sitecustomize.py` logs the shim state once per process.
 
+`SUFFIX_SM120_DSA_INDEXER=1` (on top of the fallback, default off) serves the
+two logits kernels from our cuda-oxide FP8 tensor-core kernel instead
+(`suffix_hybrid/kernels/dsa_indexer.py`, kernels-oxide/dsa_indexer; boot gates
+`dsa_indexer_oracle` / `dsa_indexer_bench`); other shapes stay on Triton.
+
 ## Layout
 
 - `deep_gemm_shim/` — becomes the top-level `deep_gemm` package in the bundle.

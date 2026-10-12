@@ -69,16 +69,26 @@ def _entry(name: str, directory: str | None = None) -> dict:
 
 
 def ensure_loaded(name: str, device: int | None = None,
-                  directory: str | None = None) -> int:
+                  directory: str | None = None, params: dict | None = None) -> int:
     """Load kernel family ``name`` on ``device`` (idempotent). Returns the
-    number of resolved entries."""
+    number of resolved entries. ``params``: {entry: parameter count the host
+    launches with}; a cubin built for another ABI (or a manifest predating
+    the "params" record) is refused, never launched with misread args."""
     import torch
 
     dev = torch.cuda.current_device() if device is None else device
     key = (name, dev)
+    k = _entry(name, directory)
+    # before the idempotence return: an earlier probe() load has no params
+    for e, n in (params or {}).items():
+        have = (k.get("params") or {}).get(e)
+        if have != n:
+            raise RuntimeError(
+                f"oxide cubin {k['file']}: {e} takes {have} params, the host "
+                f"passes {n} (stale cubin bundle; rebuild with "
+                "scripts/oxide_build.py)")
     if key in _LOADED:
         return 0
-    k = _entry(name, directory)
     with open(os.path.join(directory or cubin_dir(), k["file"]), "rb") as f:
         cubin = f.read()
     if hashlib.sha256(cubin).hexdigest() != k["sha256"]:

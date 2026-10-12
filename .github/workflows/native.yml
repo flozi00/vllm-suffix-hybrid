@@ -95,7 +95,7 @@ jobs:
           cd "$RUNNER_TEMP"
           so=$(python -c "import suffix_hybrid._native as n; print(n.__file__)")
           if readelf -d "$so" | grep -Ei 'NEEDED.*(libcuda|libcudart|libcurand)'; then exit 1; fi
-          python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA and n.HAS_NVFP4_ATTN_CUDA and n.HAS_OXIDE_KERNELS"
+          python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA and n.HAS_NVFP4_ATTN_CUDA and n.HAS_NVFP4_DSMLA_CUDA and n.HAS_OXIDE_KERNELS"
           python -m pytest "$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/sm120/tests" -q --import-mode=importlib
           python "$GITHUB_WORKSPACE/tests/test_pplx_decider_reference.py" --extension "$so"
       - name: Build cuda-oxide kernels -> sm_120 cubins (ptxas 13.0) + SASS/ISA assertions
@@ -106,7 +106,9 @@ jobs:
         # the rest of the bundle, stay visibly red.
         continue-on-error: true
         run: |
-          python scripts/oxide_build.py --out oxide_cubins || { rm -rf oxide_cubins; exit 1; }
+          # per-cubin isolation: a failing crate exits 1 but the manifest
+          # still ships every cubin that built (missing lanes fail closed)
+          python scripts/oxide_build.py --out oxide_cubins
       - name: Create directly mountable runtime bundle
         run: |
           python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA" \

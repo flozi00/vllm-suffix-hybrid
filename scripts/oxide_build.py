@@ -42,10 +42,12 @@ def run(cmd, **kw):
 def ptx_facts(ptx: str):
     ver = re.search(r"^\.version (\d+)\.(\d+)", ptx, re.M)
     tgt = re.search(r"^\.target (\S+)", ptx, re.M)
-    entries = re.findall(r"^\.visible \.entry (\w+)\(", ptx, re.M)
+    sigs = re.findall(r"^\.visible \.entry (\w+)\(([^)]*)\)", ptx, re.M)
     if not ver or not tgt:
         raise SystemExit("PTX without .version/.target")
-    return (int(ver.group(1)), int(ver.group(2))), tgt.group(1), entries
+    # param counts: the host checks them at load (a stale cubin fails closed)
+    params = {e: body.count(".param") for e, body in sigs}
+    return (int(ver.group(1)), int(ver.group(2))), tgt.group(1), [e for e, _ in sigs], params
 
 
 def build_one(crate, var, nightly, ptxas, cuobjdump, out):
@@ -66,7 +68,7 @@ def build_one(crate, var, nightly, ptxas, cuobjdump, out):
     if not ptx_path.is_file():
         raise SystemExit(f"{name}: cargo-oxide produced no {ptx_path.name}")
     ptx = ptx_path.read_text()
-    isa, target, entries = ptx_facts(ptx)
+    isa, target, entries, params = ptx_facts(ptx)
     if target != arch or isa > MAX_PTX_ISA or not entries:
         raise SystemExit(f"{name}: .target {target} .version {isa} entries {entries} "
                          f"(need {arch}, <= {MAX_PTX_ISA}, >= 1 entry)")
@@ -89,6 +91,7 @@ def build_one(crate, var, nightly, ptxas, cuobjdump, out):
         "ptxas_flags": var["ptxas"],
         "arch": arch,
         "entries": entries,
+        "params": params,
     }
 
 
@@ -111,7 +114,7 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     only = {x for x in args.only.split(",") if x}
-    kernels = []
+    kernels, failed = [], []
     for crate in sorted(Path(args.kernels).iterdir()):
         if not (crate / "Cargo.toml").is_file() or (only and crate.name not in only):
             continue
@@ -121,9 +124,17 @@ def main():
         variants = (json.loads(vf.read_text()) if vf.is_file()
                     else [{"suffix": "", "features": "", "ptxas": []}])
         for var in variants:
-            kernels.append(build_one(crate, var, nightly, ptxas, cuobjdump, out))
+            # Per-cubin isolation: one crate's toolchain failure must not
+            # drop every other lane's cubins from the bundle (lanes whose
+            # cubin is missing fail closed at ensure_loaded). Still exit 1.
+            try:
+                kernels.append(build_one(crate, var, nightly, ptxas, cuobjdump, out))
+            except (SystemExit, subprocess.CalledProcessError) as exc:
+                detail = getattr(exc, "stderr", None) or exc
+                print(f"FAILED {crate.name}{var['suffix']}: {detail}", flush=True)
+                failed.append(crate.name + var["suffix"])
     if not kernels:
-        raise SystemExit("no kernel crates found")
+        raise SystemExit(f"no kernel cubins built (failed: {failed})")
     manifest = {
         "arch": ARCH,
         "ptxas_version": ptxas_version,
@@ -133,6 +144,8 @@ def main():
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     print(f"oxide build: {len(kernels)} cubins ({ARCH}, ptxas {ptxas_version}) -> {out}")
+    if failed:
+        raise SystemExit(f"oxide build: FAILED {failed} (manifest lists the rest)")
 
 
 if __name__ == "__main__":

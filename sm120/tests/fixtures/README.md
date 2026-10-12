@@ -17,6 +17,23 @@ that the SM120 NVFP4-KV overlay is a no-op against these exact versions:
   this file; the tests replay the patch over the fixture and byte-verify the
   result.
 
+- `vllm_0.30.0/hisparse_layout.py`, `vllm_0.30.0/gpu_cudagraph_utils.py` —
+  `vllm/v1/hisparse/layout.py`, `vllm/v1/worker/gpu/cudagraph_utils.py` at
+  v0.30.0 (profiling-KV-init host-pool sizing, hisparse_mtp_patch rev .5).
+
+- `vllm_0.30.0/attention_backends_utils.py` — `vllm/v1/attention/backends/utils.py`
+  at v0.30.0 (`split_decodes_and_prefills`, for the HiSparse staging-plan replay).
+
 Do not edit these files; they are regression fixtures. If upstream drifts
 (newer vLLM/FI in the image), the patch layer must fail closed and a new
 fixture + anchor set is required.
+
+- `vllm_0.30.0/model_loader_utils.py` — `vllm/model_executor/model_loader/utils.py`
+  at v0.30.0 (`process_weights_after_loading`, fp8_dense_patch anchor).
+
+- `vllm_0.31.1rc1.dev273/` — the same upstream files at vLLM main 2eb491e18 (image
+  `vllm/vllm-openai:nightly-2eb491e18b1ce5b8a25e4c88f32dbb5d028d525c`, CUDA 13.0.2):
+  sparse_mla_attention.py, hisparse runtime.py / layout.py, mla index_group.py,
+  flashinfer_mla_sparse{,_sm120}.py, model_loader utils.py, cuda_communicator.py.
+  `test_vllm_nightly_anchors.py` replays every GLM-5.3 patch on them (glm pool's
+  "always latest vLLM" lane; other pools stay on 0.30.0).
