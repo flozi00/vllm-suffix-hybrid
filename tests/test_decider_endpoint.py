@@ -55,7 +55,8 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
                 owner.calls.append((text, kwargs))
                 return [9, 8, 7]
         self.context = {"engine": Engine(), "tokenizer": Tokenizer(),
-                        "saved": {"codes": ["A", "B"], "temperature": 1.0087417621345625},
+                        "saved": {"codes": ["A", "B"], "temperature": 1.0087417621345625,
+                                  "profile": "d3"},
                         "max_model_len": 8192, "model_names": ["decider"]}
         self.app = NS(state=NS(suffix_decider=self.context))
         self.app.add_api_route = lambda path, handler, **kwargs: setattr(self, "handler", handler)
@@ -74,12 +75,13 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
                         "vllm.pooling_params": pooling, "vllm.inputs.engine": inputs}
         self.native = NS(decider_prepare=self.prepare, decider_answer=self.answer)
 
-    def prepare(self, request_json, codes_json):
+    def prepare(self, request_json, codes_json, profile):
+        self.calls.append(("prepare", profile))
         return json.dumps({"rows": [{"messages": [{"role": "user", "content": "native prompt"}],
                                      "option_count": 2}]})
 
-    def answer(self, request_json, logits_json, temperature):
-        self.calls.append((json.loads(logits_json), temperature))
+    def answer(self, request_json, logits_json, temperature, profile):
+        self.calls.append((json.loads(logits_json), temperature, profile))
         return json.dumps({"model": "decider", "answers": {},
                            "usage": {"input_tokens": 0, "output_tokens": 0}})
 
@@ -102,18 +104,20 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.content["usage"]["input_tokens"], 3)
         self.assertEqual(result.content["usage"]["output_tokens"], 0)
-        self.assertFalse(self.calls[0]["tokenize"])
-        self.assertEqual(self.calls[1], ("exact rendered prefix", {"add_special_tokens": False}))
-        prompt, params = self.calls[3]
+        self.assertEqual(self.calls[0], ("prepare", "d3"))
+        self.assertFalse(self.calls[1]["tokenize"])
+        self.assertEqual(self.calls[2], ("exact rendered prefix", {"add_special_tokens": False}))
+        prompt, params = self.calls[4]
         self.assertEqual(prompt["prompt_token_ids"], [9, 8, 7])
         self.assertEqual(prompt["type"], "token")
         self.assertEqual(self.token_input_factory_calls, [[9, 8, 7]])
         self.assertIs(prompt["prompt_token_ids"], self.token_input_factory_calls[0])
         self.assertFalse(params.use_activation)
         self.assertEqual(params.task, "classify")
-        raw_logits, temperature = self.calls[-1]
+        raw_logits, temperature, profile = self.calls[-1]
         self.assertEqual(raw_logits[0][:2], [3.0, 2.0])
         self.assertEqual(temperature, self.context["saved"]["temperature"])
+        self.assertEqual(profile, "d3")
 
     async def test_oversized_input_is_rejected_without_truncation(self):
         self.context["max_model_len"] = 2

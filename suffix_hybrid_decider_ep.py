@@ -37,7 +37,8 @@ class DecisionEndpointPlugin:
                     return JSONResponse({"error": "Unknown decision model"}, status_code=404)
                 body_json = json.dumps(body, ensure_ascii=False)
                 prepared = json.loads(_native.decider_prepare(
-                    body_json, json.dumps(context["saved"]["codes"])))
+                    body_json, json.dumps(context["saved"]["codes"]),
+                    context["saved"]["profile"]))
                 prompts, input_tokens = [], 0
                 for row in prepared["rows"]:
                     rendered = context["tokenizer"].apply_chat_template(
@@ -78,7 +79,8 @@ class DecisionEndpointPlugin:
                         raise RuntimeError("decision engine returned no pooling result")
                     logits.append(final.outputs.data.tolist())
                 response = json.loads(_native.decider_answer(
-                    body_json, json.dumps(logits), context["saved"]["temperature"]))
+                    body_json, json.dumps(logits), context["saved"]["temperature"],
+                    context["saved"]["profile"]))
                 response["usage"]["input_tokens"] = input_tokens
                 print("SUFFIX_PPLX_DECIDER REQUEST completed rows=" + str(len(logits)), flush=True)
                 return JSONResponse(response)

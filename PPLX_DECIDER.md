@@ -114,6 +114,23 @@ adapter. Generic `/classify` returns head logits when activation is disabled;
 it cannot perform request-dependent candidate masking, so clients should
 use `/v1/systemone` for calibrated decisions.
 
+## vllm-sr/d3 (Decision 3.0)
+
+`vllm-sr/d3` uses the same backbone shape, 255 codes/token IDs, LAST pooling
+and noncausal full attention. Its `decision_config.json` names `prompt: "d3"`
+and `format_id: "d3-code-readout-v1"`; the contract maps that to the `d3`
+profile: d3's own system prompt and trailing line, `(empty)` for a missing or
+empty state, any JSON value as descriptions/instructions, an optional
+`videos` field, entropy confidence (choice and score) and a canonical score
+legend. The readout is FP32 (`readout_dtype`, default `float32` for d3) and
+the pooled hidden state is cast to FP32 before it, matching
+`hidden.float() @ readout.T` in `d3_runtime.py`. Temperature is 1.0. The
+pplx release keeps the `pplx` profile and BF16 readout unchanged.
+`tests/test_pplx_decider_reference.py` checks prompts and answers against
+d3's pinned `d3_format.py`/`d3_runtime.py` (revision `5ce995df`). The same
+serve command and `quantize_pplx_nvfp4` apply; image and video inputs are
+still refused (next step: vLLM multimodal inputs with d3's pixel/frame limits).
+
 ## Validation and shipping
 
 ```sh

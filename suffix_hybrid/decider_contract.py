@@ -6,6 +6,9 @@ from pathlib import Path
 ARCHITECTURE = "PplxDeciderForSequenceClassification"
 PLUGIN_NAME = "suffix_pplx_decider"
 ENDPOINT_NAME = "suffix_pplx_decider_endpoint"
+# decision_config "prompt" -> (format_id, default readout dtype). Absent prompt
+# is the pplx-decider v1.1 release; "d3" is vllm-sr/d3 (d3_format.py).
+PROFILES = {None: (None, "bfloat16"), "d3": ("d3-code-readout-v1", "float32")}
 
 
 def checkpoint_contract(model_path):
@@ -29,6 +32,15 @@ def checkpoint_contract(model_path):
     if (type(temperature) not in (int, float)
             or not math.isfinite(temperature) or temperature <= 0):
         raise ValueError("decision checkpoint temperature must be finite and positive")
+    if saved.get("prompt") not in PROFILES:
+        raise ValueError("unknown decision prompt family")
+    format_id, readout_dtype = PROFILES[saved.get("prompt")]
+    if saved.get("format_id") != format_id:
+        raise ValueError("decision format_id does not match its prompt family")
+    saved["readout_dtype"] = saved.get("readout_dtype", readout_dtype)
+    if saved["readout_dtype"] not in ("bfloat16", "float32"):
+        raise ValueError("decision readout_dtype must be bfloat16 or float32")
+    saved["profile"] = saved.get("prompt") or "pplx"
     if not (root / "readout.safetensors").is_file():
         raise ValueError("decision checkpoint is missing readout.safetensors")
     return saved

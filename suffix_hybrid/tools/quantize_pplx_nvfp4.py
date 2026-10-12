@@ -69,12 +69,13 @@ def source_layout(src):
 def inspect_source(src, files, row_chunk):
     import torch
     from safetensors import safe_open
+    readout_dtype = getattr(torch, checkpoint_contract(src)["readout_dtype"])
     with safe_open(str(src / "readout.safetensors"), framework="pt", device="cpu") as head:
         if list(head.keys()) != ["weight"]:
             raise ValueError("unexpected decision readout keys")
         weight = head.get_tensor("weight")
-        if weight.shape != (255, 5120) or weight.dtype != torch.bfloat16:
-            raise ValueError("decision readout must remain BF16 255x5120")
+        if weight.shape != (255, 5120) or weight.dtype != readout_dtype:
+            raise ValueError(f"decision readout must remain {readout_dtype} 255x5120")
     amax, key_group = {}, {}
     for name, indexed_keys in sorted(files.items()):
         with safe_open(str(src / name), framework="pt", device="cpu") as shard:
@@ -185,7 +186,7 @@ def convert(src, out, row_chunk=128, shard_mib=256, threads=4):
         stats = write_backbone(src, temporary, files, amax, key_group,
                                row_chunk, shard_mib * 2**20)
         skip = {"config.json", "model.safetensors.index.json", "hf_quant_config.json",
-                "suffix_quant_manifest.json", "release-manifest.json"}
+                "suffix_quant_manifest.json", "release-manifest.json", "MODEL_MANIFEST.json"}
         for file in src.iterdir():
             if (file.is_file() and not file.name.startswith(".")
                     and file.name not in skip
@@ -197,6 +198,8 @@ def convert(src, out, row_chunk=128, shard_mib=256, threads=4):
         # this new set of packed shards and hashes.
         if (src / "release-manifest.json").is_file():
             shutil.copy2(src / "release-manifest.json", temporary / "source-release-manifest.json")
+        if (src / "MODEL_MANIFEST.json").is_file():
+            shutil.copy2(src / "MODEL_MANIFEST.json", temporary / "source-MODEL_MANIFEST.json")
         config["quantization_config"] = quant_config()
         (temporary / "config.json").write_text(json.dumps(config, indent=2))
         (temporary / "hf_quant_config.json").write_text(json.dumps(quant_config(), indent=2))

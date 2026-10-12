@@ -36,9 +36,12 @@ class PplxDeciderForSequenceClassification(
     def __init__(self, *, vllm_config, prefix=""):
         validate_engine(vllm_config, require_resolved_quantization=True)
         self._decision_saved = checkpoint_contract(vllm_config.model_config.model)
+        # _init_pooler runs inside super().__init__; d3 scores in FP32.
+        self._readout_dtype = getattr(torch, self._decision_saved["readout_dtype"])
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.vllm_config = vllm_config
-        print("SUFFIX_PPLX_DECIDER MODEL native hybrid backbone; noncausal full attention; BF16 readout", flush=True)
+        print("SUFFIX_PPLX_DECIDER MODEL native hybrid backbone; noncausal full attention; "
+              f"{self._readout_dtype} readout; profile={self._decision_saved['profile']}", flush=True)
 
     @staticmethod
     def get_model_state_cls():
@@ -50,12 +53,12 @@ class PplxDeciderForSequenceClassification(
         # LM head. FP8 quantization stays on upstream backbone linears, never
         # this small 255-row trained decision head.
         self.readout = _FloatReadout(
-            5120, 255, bias=False, params_dtype=torch.bfloat16,
+            5120, 255, bias=False, params_dtype=self._readout_dtype,
             quant_config=None, return_bias=False, prefix="readout")
         return SequencePooler(
             pooling=LastPool(),
             head=ClassifierPoolerHead(
-                classifier=self.readout, head_dtype=torch.bfloat16,
+                classifier=self.readout, head_dtype=self._readout_dtype,
                 activation=PoolerClassify(num_labels=255)))
 
     def load_weights(self, weights):
@@ -68,9 +71,9 @@ class PplxDeciderForSequenceClassification(
             if list(checkpoint.keys()) != ["weight"]:
                 raise ValueError("unsupported decision readout tensors")
             weight = checkpoint.get_tensor("weight")
-        if tuple(weight.shape) != (255, 5120) or weight.dtype != torch.bfloat16:
-            raise ValueError("expected BF16 255x5120 decision readout")
+        if tuple(weight.shape) != (255, 5120) or weight.dtype != self._readout_dtype:
+            raise ValueError(f"expected {self._readout_dtype} 255x5120 decision readout")
         default_weight_loader(self.readout.weight, weight)
         loaded.add("readout.weight")
-        print("SUFFIX_PPLX_DECIDER READOUT loaded 255x5120 BF16", flush=True)
+        print(f"SUFFIX_PPLX_DECIDER READOUT loaded 255x5120 {self._readout_dtype}", flush=True)
         return loaded

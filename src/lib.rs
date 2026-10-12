@@ -386,15 +386,15 @@ fn cubin_store_driver_check(py: Python<'_>, device_ordinal: usize) -> PyResult<u
 
 /// SystemOne CPU helpers keep per-request algorithms in Rust.
 #[pyfunction]
-fn decider_prepare(py: Python<'_>, request_json: String, codes_json: String) -> PyResult<String> {
+fn decider_prepare(py: Python<'_>, request_json: String, codes_json: String, profile: String) -> PyResult<String> {
     py.detach(|| guard_py("decider_prepare", || {
-        pplx_decider::prepare(&request_json, &codes_json).map_err(pyo3::exceptions::PyValueError::new_err)
+        pplx_decider::prepare(&request_json, &codes_json, &profile).map_err(pyo3::exceptions::PyValueError::new_err)
     }))
 }
 #[pyfunction]
-fn decider_answer(py: Python<'_>, request_json: String, logits_json: String, temperature: f64) -> PyResult<String> {
+fn decider_answer(py: Python<'_>, request_json: String, logits_json: String, temperature: f64, profile: String) -> PyResult<String> {
     py.detach(|| guard_py("decider_answer", || {
-        pplx_decider::answer(&request_json, &logits_json, temperature).map_err(pyo3::exceptions::PyValueError::new_err)
+        pplx_decider::answer(&request_json, &logits_json, temperature, &profile).map_err(pyo3::exceptions::PyValueError::new_err)
     }))
 }
 

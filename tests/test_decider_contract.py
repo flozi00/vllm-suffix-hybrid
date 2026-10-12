@@ -63,6 +63,20 @@ class ContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     checkpoint_contract(self.root)
 
+    def test_prompt_family_selects_profile_format_and_readout_dtype(self):
+        self.write()
+        saved = checkpoint_contract(self.root)
+        self.assertEqual((saved["profile"], saved["readout_dtype"]), ("pplx", "bfloat16"))
+        self.write(prompt="d3", format_id="d3-code-readout-v1", temperature=1.0)
+        saved = checkpoint_contract(self.root)
+        self.assertEqual((saved["profile"], saved["readout_dtype"]), ("d3", "float32"))
+        for changes in (dict(prompt="d3"), dict(prompt="other", format_id="d3-code-readout-v1"),
+                        dict(prompt="d3", format_id="d3-code-readout-v1", readout_dtype="float16")):
+            with self.subTest(changes=changes):
+                self.write(**changes)
+                with self.assertRaises(ValueError):
+                    checkpoint_contract(self.root)
+
     def test_updates_outer_and_text_noncausal_without_changing_layer_types(self):
         self.write()
         text = NS(hidden_size=5120, layer_types=["linear_attention", "full_attention"])

@@ -157,3 +157,18 @@ def test_partial_publish_failure_cleans_own_files_and_leaves_mount_root(tmp_path
                                 "readout.weight", "weight"])
 def test_excluded_parameters_are_not_quantized(key):
     assert quantizer.classify(key) is None
+
+
+def test_d3_keeps_float32_readout_and_manifest_only_as_provenance(tmp_path):
+    source, output = tmp_path / "source", tmp_path / "output"
+    source.mkdir()
+    fixture_checkpoint(source)
+    save_file({"weight": torch.randn(255, 5120, dtype=torch.float32)}, str(source / "readout.safetensors"))
+    saved = json.loads((source / "decision_config.json").read_text())
+    saved.update(prompt="d3", format_id="d3-code-readout-v1", temperature=1.0, readout_dtype="float32")
+    (source / "decision_config.json").write_text(json.dumps(saved))
+    (source / "MODEL_MANIFEST.json").write_text('{"files":"bf16 shards"}')
+    quantizer.convert(source, output, threads=1)
+    assert (output / "readout.safetensors").read_bytes() == (source / "readout.safetensors").read_bytes()
+    assert (output / "source-MODEL_MANIFEST.json").read_bytes() == (source / "MODEL_MANIFEST.json").read_bytes()
+    assert not (output / "MODEL_MANIFEST.json").exists()
