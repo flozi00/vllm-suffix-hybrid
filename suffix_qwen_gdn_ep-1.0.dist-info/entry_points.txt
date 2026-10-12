@@ -1,0 +1,4 @@
+[vllm.general_plugins]
+suffix_qwen_gdn = suffix_hybrid.kernels.qwen_gdn:register
+suffix_nvfp4_gemm = suffix_hybrid.kernels.nvfp4_linear:register
+suffix_nvfp4_moe = suffix_hybrid.kernels.nvfp4_moe:register
