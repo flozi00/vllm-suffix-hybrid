@@ -28,8 +28,10 @@ VIDEO_MAX_TOKENS = 16_384
 VIDEO_SOURCE_FPS = (0.1, 1000.0)
 VIDEO_UNKNOWN_FPS = 24.0
 
-# d3_runtime load_processor / configure_video_processor as vLLM Qwen3-VL
-# mm_processor_kwargs; the pool must serve exactly these (contract-checked).
+# d3_runtime load_processor / configure_video_processor budgets. Applied to
+# the processor vLLM loads (decider_model.DecisionProcessingInfo), never via
+# --mm-processor-kwargs: vLLM 0.30 adds a flat video `size` beside nested
+# images_kwargs and the HF processor rejects the duplicate.
 D3_MM_PROCESSOR_KWARGS = {
     "images_kwargs": {"size": {"shortest_edge": 65_536, "longest_edge": 1_638_400}},
     "videos_kwargs": {"size": {"shortest_edge": VIDEO_MIN_PIXELS,
@@ -151,16 +153,26 @@ def load_video(value):
     return stacked, metadata
 
 
+def apply_budgets(processor):
+    """d3's image/video budgets on a loaded Qwen3-VL processor (idempotent)."""
+    processor.image_processor.size = dict(D3_MM_PROCESSOR_KWARGS["images_kwargs"]["size"])
+    configure_video(processor.video_processor)
+    return processor
+
+
+def configure_video(video):
+    kwargs = D3_MM_PROCESSOR_KWARGS["videos_kwargs"]
+    video.size = dict(kwargs["size"])
+    video.cap_pixels_per_frame = kwargs["cap_pixels_per_frame"]
+    video.max_video_tokens = kwargs["max_video_tokens"]
+    video.do_sample_frames = kwargs["do_sample_frames"]
+    return video
+
+
 def video_processor(model_path):
     """The checkpoint's video processor with d3's budgets, for token planning."""
     from transformers import AutoVideoProcessor
-    processor = AutoVideoProcessor.from_pretrained(model_path)
-    kwargs = D3_MM_PROCESSOR_KWARGS["videos_kwargs"]
-    processor.size = dict(kwargs["size"])
-    processor.cap_pixels_per_frame = kwargs["cap_pixels_per_frame"]
-    processor.max_video_tokens = kwargs["max_video_tokens"]
-    processor.do_sample_frames = False
-    return processor
+    return configure_video(AutoVideoProcessor.from_pretrained(model_path))
 
 
 def check_video_budget(processor, videos):

@@ -130,10 +130,12 @@ pplx release keeps the `pplx` profile and BF16 readout unchanged.
 d3's pinned `d3_format.py`/`d3_runtime.py` (revision `5ce995df`). The same
 serve command and `quantize_pplx_nvfp4` apply.
 
-Images and videos (d3 only): drop `--language-model-only` and serve
-`--mm-processor-kwargs` exactly as `decider_media.D3_MM_PROCESSOR_KWARGS`
-(1.6 MP images; video frames at 0.2 MP, `cap_pixels_per_frame`, 196 tokens
-per frame pair); the model and endpoint refuse to start otherwise. The
+Images and videos (d3 only): drop `--language-model-only` and set no
+`--mm-processor-kwargs`. `DecisionProcessingInfo` applies d3_runtime's
+processor budgets (1.6 MP images; video frames at 0.2 MP,
+`cap_pixels_per_frame`, 196 tokens per frame pair) to the processor vLLM
+loads; passing kwargs is refused (vLLM 0.30 would also clash nested
+`images_kwargs` with its flat video `size`). The
 endpoint decodes base64 PNG/JPEG/WebP and MP4/WebM/QuickTime/Matroska like
 `d3_runtime.py` (OpenCV, 2 fps, 4-32 frames, even count, source indices and
 fps as metadata), enforces 16,384 video tokens per request, rejects literal

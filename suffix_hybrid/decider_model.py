@@ -22,9 +22,22 @@ class _FloatReadout(ReplicatedLinear):
         return super().forward(hidden_states).float()
 
 
+class DecisionProcessingInfo(Qwen3_5ProcessingInfo):
+    """vLLM's Qwen3.5 processing with d3_runtime's image/video budgets."""
+
+    def get_hf_processor(self, **kwargs):
+        processor = super().get_hf_processor(**kwargs)
+        if not getattr(processor, "_suffix_decider_budgets", False):
+            if checkpoint_contract(self.ctx.model_config.model)["profile"] == "d3":
+                from suffix_hybrid.decider_media import apply_budgets
+                apply_budgets(processor)
+            processor._suffix_decider_budgets = True
+        return processor
+
+
 @default_pooling_type(seq_pooling_type="LAST")
 @MULTIMODAL_REGISTRY.register_processor(
-    Qwen3VLMultiModalProcessor, info=Qwen3_5ProcessingInfo,
+    Qwen3VLMultiModalProcessor, info=DecisionProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder)
 class PplxDeciderForSequenceClassification(
         _create_pooling_model_cls(Qwen3_5ForConditionalGeneration)):

@@ -121,11 +121,9 @@ def media_enabled(model_config, saved):
         return False
     if saved["profile"] != "d3":
         raise ValueError("pplx-decider reads text only; serve it with --language-model-only")
-    from suffix_hybrid.decider_media import D3_MM_PROCESSOR_KWARGS
-    kwargs = {k: v for k, v in (multimodal.mm_processor_kwargs or {}).items() if k != "device"}
-    if kwargs != D3_MM_PROCESSOR_KWARGS:
-        raise ValueError("d3 media need --mm-processor-kwargs "
-                         + json.dumps(D3_MM_PROCESSOR_KWARGS, separators=(",", ":")))
+    # The adapter applies d3's own processor budgets; overrides would differ.
+    if any(k != "device" for k in multimodal.mm_processor_kwargs or {}):
+        raise ValueError("d3 media budgets are fixed by the adapter; remove --mm-processor-kwargs")
     return True
 
 
