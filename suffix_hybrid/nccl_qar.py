@@ -19,7 +19,8 @@ QUALITY RISK: error per element <= sum_r amax(block_r)/254 + amax(block_sum)/254
 (int8; see error_bound) -- i.e. relative to the BLOCK max, not to the element.
 Heavy-tailed activations (outlier channels) lose small values next to an
 outlier. Never enable without the pod bench (boot gate allreduce_qar_bench)
-AND a GSM8K / tool-call quality gate on the target model.
+AND the quality A/B gate on the target model (inference-console/benchmarks:
+quality.py A1/B/A2 + compare.py).
 
     python -m suffix_hybrid.nccl_qar   # CPU accuracy report (random + heavy-tailed)
 """

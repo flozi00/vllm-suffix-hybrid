@@ -1,5 +1,9 @@
 # next-spec-dev execution runbook — suffix-hybrid golden-rule pipeline
 
+> Historical (2026-09-23). `bench.py`, `bench_reuse.py` and `golden_rule.py` are
+> removed; every measurement below now runs through `inference-console/benchmarks`
+> (`quality.py`, `speed.py --rounds 5`, A1/B/A2, `compare.py`; see `bench/README.md`).
+
 Status: ALL offline prep complete (2026-09-23). Blocked ONLY on the 10.70/16 route.
 Never touch `qwen-flash-next-fp4` (production). All work targets pool `next-spec-dev`,
 namespace `maas-inference`. Baseline = plugin-inert p18 (~480 c1 / ~1880 c8).
@@ -24,10 +28,11 @@ namespace `maas-inference`. Baseline = plugin-inert p18 (~480 c1 / ~1880 c8).
 4. **BEFORE any bench counts**: run `get_logs` capture →
    `python3 bench/parse_gating.py --window <capture>` — the measured c8-window share
    is mandatory (parse_gating mandate; old parser undercounted 3–9×).
-5. Bench c1×2 + c8×2:
-   `python3 bench/bench.py --endpoint https://next-spec-dev.pl-ai.net/v1 --model next-spec-dev --num-prompts 16 --concurrency 1 --label p24-c1-N`
-   (c8: `--num-prompts 64 --concurrency 8`).
-6. Append rows to `bench/results.jsonl`; run `python3 bench/golden_rule.py`.
+5. Bench A1 (plugin-inert reference) / B (p24) / A2 with the suite, each arm:
+   `uv run benchmarks/quality.py --url https://next-spec-dev.pl-ai.net --arm <arm>` (quick tier) and
+   `python3 benchmarks/speed.py --url https://next-spec-dev.pl-ai.net --arm <arm> --rounds 5`.
+6. Verdict: `python3 benchmarks/compare.py --a runs/<A1> runs/<A2> --b runs/<B>` per kind
+   (quality, speed); the gate is its `VERDICT` line.
 7. ACCEPTANCE (pre-registered): c8-window share 58% → ≤10–15%; c8 ≥ 1800 (baseline 1880).
    Fallback if share > 12%: env-only knob ladder hb=64/cd=1 (sim: 6.5% share), re-bench.
 8. Rollback if acceptance collapse (p20 pattern): bucket → runtime-a4e8f002,
@@ -43,10 +48,10 @@ EXPECTED (mixer never runs); armed = `installed` line + acceptance ~9.8.
 Interpretation pre-registered: c1 ≈ 480 → frozen path wasn't actually taken (engine bug);
 c1 ≈ 410 → residual is hook presence/env → engine-level fix (move mix out of propose).
 
-### 4. bench_reuse A/B (the workload where suffix wins materialize)
-`python3 bench/bench_reuse.py --endpoint ... --concurrency 1 --label reuse-plugin-N`
+### 4. Reuse-workload A/B (the workload where suffix wins materialize)
+`python3 benchmarks/speed.py --url ... --arm <arm> --scenarios multiturn,edit --rounds 5`
 after p24 warm, then again on p23-inert. Unique-prompt bench structurally cannot show
-suffix wins (~0.5% flat); corpus-reuse is where acceptance pays.
+suffix wins (~0.5% flat); shared-prefix and copy-heavy traffic is where acceptance pays.
 
 ### 5. fp8-KV (capacity lever — pre-informed, user's call)
 NOT a golden-rule path alone: pre-loop live revert recorded −27% c1 p50 throughput
