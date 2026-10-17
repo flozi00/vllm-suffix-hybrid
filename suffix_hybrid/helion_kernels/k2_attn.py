@@ -67,7 +67,11 @@ SLIDING_WINDOW_LEFT = 1023
 # Gates of the on-silicon oracle (sm120/nvfp4_kv_patch/oracle.py).
 COS_MIN = 0.9995
 REL_MAX = 2e-2
-SETTINGS = {"index_dtype": torch.int64}  # KV caches exceed 2^31 bytes
+# index_dtype: KV caches exceed 2^31 bytes. autotune_max_generations: LFBO full
+# runs up to 20 generations at ~2 min each for b32 x 32k contexts, past the lab's
+# 30 min case limit (run 20261017T172102Z-rtx-pro-6000-9236); searches converged
+# by generation 7-10 in every run so far.
+SETTINGS = {"index_dtype": torch.int64, "autotune_max_generations": 10}
 MAX_COUNTERS = 1 << 16                   # B * HKV per launch
 
 
