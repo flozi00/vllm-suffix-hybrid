@@ -117,27 +117,25 @@ costs acceptance, a dead engine costs the pod.
 
 ## Benchmarking
 
-`bench/compare.py` records streamed TTFT, request latency, per-request decode
-throughput, aggregate throughput, output hashes, and raw metric snapshots.
-Use identical prompts, concurrency, output budgets, sampling parameters,
-model weights, node and **image digest** across baseline and plugin runs.
+Served-model speed, quality and A/B gating use the suite in
+`inference-console/benchmarks` (its README documents tasks, scenarios and gate
+rules). The old served-model scripts under `bench/` are removed. Gate a
+candidate build against the reference build of the SAME model (same weights,
+node and image digest) on an idle dev pool, never on production or `glm`, in
+blocks A1 -> B -> A2, from the inference-console checkout:
 
 ```sh
-python bench/compare.py --endpoint https://YOUR_ENDPOINT/v1 --model YOUR_MODEL \
-  --num-prompts 32 --concurrency 4 --max-tokens 512 --label rust-warm \
-  --output results/rust-warm.json
+uv run benchmarks/quality.py --url https://<pool>.pl-ai.net --arm A1             # quick tier
+python3 benchmarks/speed.py  --url https://<pool>.pl-ai.net --arm A1 --rounds 5
+# roll the candidate: same two commands with --arm B; roll back: --arm A2
+python3 benchmarks/compare.py --a runs/<A1-quality> runs/<A2-quality> --b runs/<B-quality>
+python3 benchmarks/compare.py --a runs/<A1-speed> runs/<A2-speed> --b runs/<B-speed>
 ```
 
-Run baseline and plugin sequentially on the same dedicated GPU; do not change
-production deployments. Warm each engine before timing. Repeated prompts
-measure corpus reuse; a disjoint prompt-seed run is needed to assess
-same-schema generalization. Server metric deltas are authoritative for draft
-acceptance. Request-rate percentiles cannot establish GPU step time or CPU
-proposer overhead; use direct instrumentation for that.
-
-`bench/bench.py` is retained as the legacy non-streaming benchmark. Its reported
-per-request tok/s includes prefill/network time and should not be interpreted
-as pure decode speed.
+`compare.py` ends with `VERDICT: PASS|FAIL|INCONCLUSIVE`. Request-level
+numbers cannot establish GPU step time or CPU proposer overhead; for the
+plugin's own hot paths use the in-process microbenchmarks in `bench/`
+(`bench/README.md`).
 
 ## License
 

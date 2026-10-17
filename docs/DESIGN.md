@@ -34,7 +34,8 @@ the tokens sent to the target verifier.
   guards define the supported serving modes; do not generalize to untested
   runtime revisions or stochastic samplers.
 - `suffix_hybrid/hybrid_proposer.py`: thin Python custom-class ABI adapter.
-- `bench/compare.py`: measured streaming requests, usage, hashes and metrics.
+- `bench/`: in-process microbenchmarks of the plugin's hot paths; served-model
+  speed/quality A/B gating lives in `inference-console/benchmarks`.
 - `scripts/runtime_bundle.py`: wheel extraction with revision/hash manifest.
 
 ## Learning the allocation

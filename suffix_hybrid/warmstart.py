@@ -44,9 +44,8 @@ Mechanics (vLLM v0.30.0, all seams read from that source):
   validator; a bare {"sequences": ...} body is REJECTED ("must have prompt
   field"). A body carrying "model" (the pool's served model) and "prompt"
   (a carrier string) alongside "sequences" PASSES and is forwarded with the
-  original path intact. The bench driver (bench_gemma.py --warm-start)
-  merges those carrier keys into its POST body; the handler reads ONLY
-  "sequences" and ignores the extras.
+  original path intact. A client must merge those carrier keys into its
+  POST body; the handler reads ONLY "sequences" and ignores the extras.
 
 Gating (default OFF must change NOTHING):
   TWO keys must be on for the route to exist: env VLLM_PLUGINS (naming
