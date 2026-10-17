@@ -472,8 +472,12 @@ def baseline(*args):
         import importlib.util
         import os
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        spec = importlib.util.spec_from_file_location(
-            "_k2_own_attn_baseline", os.path.join(root, "sm120", "nvfp4_kv_patch", "own_attn.py"))
+        # Bundle: runtime_bundle.py ships sm120/nvfp4_kv_patch as <root>/nvfp4_kv_patch;
+        # a repo checkout keeps it under sm120/ (lab run 20261017T121746Z: FileNotFoundError).
+        path = os.path.join(root, "nvfp4_kv_patch", "own_attn.py")
+        if not os.path.isfile(path):
+            path = os.path.join(root, "sm120", "nvfp4_kv_patch", "own_attn.py")
+        spec = importlib.util.spec_from_file_location("_k2_own_attn_baseline", path)
         own = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(own)
         q, k_data = args[0], args[1]
