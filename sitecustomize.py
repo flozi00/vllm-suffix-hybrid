@@ -66,7 +66,9 @@ PYTHONPATH. Each section is independently gated:
   SUFFIX_ROCM_GDN_MIXED=1   -> with _GDN_DEFER: mixed verify + prefill GDN batches on row
                                slices (no gathers / repacks / index_copy; gdn_mtp_rocm.forward_mixed)
   SUFFIX_ROCM_TOPK_GATING=1 -> ROCm: MoE router top-k gating as one Triton program per token
-                               (suffix_hybrid/kernels/topk_gating_rocm.py)
+                              (suffix_hybrid/kernels/topk_gating_rocm.py)
+  SUFFIX_SILU_GRID_CLAMP=1 -> NVIDIA DeepGEMM MoE: the fused SiLU*mul+FP8-quant launch grid
+                              clamped to live tokens (persistent loop; bit-identical)
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -347,7 +349,10 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_ROCM_AITER_FLYDSL_ZBUF", "SUFFIX_ROCM_GDN_DEFER",
                   "SUFFIX_ROCM_TOPK_GATING", "SUFFIX_ROCM_MOE_ROUTE", "SUFFIX_ROCM_HC_BIG",
                   "SUFFIX_ROCM_QK_FUSED", "SUFFIX_ROCM_ACT_QUANT_FUSE",
-                  "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC", "SUFFIX_MTP_MOE_NVFP4")) or any(
+                  "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC", "SUFFIX_MTP_MOE_NVFP4",
+                  "SUFFIX_SILU_GRID_CLAMP", "SUFFIX_SILU_SKIP_PAD",
+                  "SUFFIX_POW2_MIRROR", "SUFFIX_BF16_SKINNY",
+                  "SUFFIX_SHORTCONV_FP8", "SUFFIX_MAMBA_BT_HOST")) or any(
         os.environ.get(_g, "").strip() not in ("", "0")
         for _g in ("SUFFIX_ROCM_HC_WQ", "SUFFIX_NVFP4_MOE_BACKEND")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
