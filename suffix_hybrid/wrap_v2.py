@@ -141,6 +141,14 @@ _ACCEPT_SPECULATORS = frozenset({
     "DSparkSpeculator",
     "MultiModuleMTPSpeculator",
     "Gemma4Speculator",
+    # Drafterless scaffold (lfm2.5-class targets, no native drafter):
+    # vllm's method=ngram builds NgramGPUSpeculator(BaseSpeculator) on the
+    # V2 runner -- greedy (draft_logits=None), same K-wide propose
+    # contract, persistent [max_num_reqs, K] int64 GPU draft buffer
+    # (attribute `drafts`). In SUFFIX-ONLY mode its propose is REPLACED
+    # outright, so the native ngram machinery is never consumed; the
+    # install gate below admits it for suffix-only only.
+    "NgramGPUSpeculator",
 })
 
 # The propose() parameters the wrapper reads. A rename is a contract break:
@@ -172,6 +180,43 @@ def _check_speculator_capability(spec_cls):
             f"suffix hybrid V2 unsupported speculator: "
             f"{spec_cls.__name__}.propose missing params {missing}")
     return propose
+
+
+# vLLM rename drift around the native speculator's propose(): dp_sync ->
+# dp_sync_state (seen at 3f1bcfd), plus the later variable-length-speculation
+# kwarg num_speculative_tokens. The passthrough wraps must accept BOTH shapes
+# (the runner passes keywords) and forward only what the bound original
+# declares - a kwarg the original predates is a TypeError (trial 3cc8 booted
+# into exactly that: dp_sync_state on a pre-rename wrapped signature, and the
+# latent twin: dp_sync= forwarded to a post-rename original).
+_ORIGINAL_FORWARD_CACHE: dict = {}
+
+
+def _call_original(original, *args, **kwargs):
+    """Forward a propose() call to the native speculator across kwarg drift.
+
+    dp_sync / dp_sync_state / num_speculative_tokens are popped from kwargs
+    and re-keyed to whichever name the bound original accepts (inspected
+    once per original, then cached). All other kwargs pass through verbatim.
+    """
+    params = _ORIGINAL_FORWARD_CACHE.get(id(original))
+    if params is None:
+        try:
+            params = frozenset(inspect.signature(original).parameters)
+        except (TypeError, ValueError):
+            params = frozenset()
+        _ORIGINAL_FORWARD_CACHE[id(original)] = params
+    extra = {}
+    dp_state = kwargs.pop("dp_sync_state", None)
+    dp_legacy = kwargs.pop("dp_sync", None)
+    nst = kwargs.pop("num_speculative_tokens", None)
+    if "dp_sync_state" in params:
+        extra["dp_sync_state"] = dp_state if dp_state is not None else dp_legacy
+    elif "dp_sync" in params:
+        extra["dp_sync"] = dp_legacy if dp_legacy is not None else dp_state
+    if nst is not None and "num_speculative_tokens" in params:
+        extra["num_speculative_tokens"] = nst
+    return original(*args, **kwargs, **extra)
 
 
 def _cuda_capturing():
@@ -413,14 +458,48 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
     if width_gate:
         print(f"suffix_hybrid v2 suffix-only EWMA-WIDTH gate k={k} "
               f"(SUFFIX_HYBRID_EWMA_WIDTH=1)", file=sys.stderr, flush=True)
-    draft_tokens = speculator.draft_tokens          # [max_num_reqs, K] GPU
+    # [max_num_reqs, K] GPU draft output buffer. Model-based speculators
+    # (DraftModelSpeculator) name it draft_tokens; the drafterless ngram
+    # scaffold names it drafts (same [max_num_reqs, K] int64 GPU
+    # contract, scattered into req_states.draft_tokens by the runner).
+    draft_tokens = getattr(speculator, "draft_tokens", None)
+    if draft_tokens is None:
+        draft_tokens = getattr(speculator, "drafts", None)
+    if (draft_tokens is None or draft_tokens.dim() != 2
+            or draft_tokens.shape[1] != int(k)
+            or draft_tokens.dtype != torch.int64):
+        raise RuntimeError(
+            f"suffix hybrid V2 suffix-only: speculator "
+            f"{type(speculator).__name__} has no usable [max_num_reqs, "
+            f"k={k}] int64 GPU draft buffer (draft_tokens/drafts)")
     req_states = runner.req_states
     totals_gpu = req_states.total_len.gpu
     # ZERO-COPY host view of the full [max_num_reqs, max_model_len] token
     # buffer (UVA pinned memory, int32). Rust reads rows straight from it;
     # the only GPU traffic per step is the [n] totals D2H that also fences
     # the UVA writes (postprocess_sampled's post_update kernel completed).
-    ats_np = req_states.all_token_ids._uva_buf.np
+    # DENSE-MODE (drafterless ngram scaffold): use_ngram() forces
+    # use_dense_all_token_ids=True, so tokens are GPU-RESIDENT and there
+    # is NO _uva_buf. Keep a PINNED HOST MIRROR of the same layout and
+    # refresh live rows (bounded [n, max_total) gather D2H) right after
+    # each step's totals fence -- the same producer ordering the
+    # zero-copy read relies on (_dense_refresh below). The [n] totals D2H
+    # still fences the post_update kernel before the gather reads rows.
+    _ats = req_states.all_token_ids
+    _mirror = None
+    _ats_gpu = None
+    if hasattr(_ats, "_uva_buf"):
+        ats_np = _ats._uva_buf.np
+    else:
+        _mirror = torch.zeros(
+            (int(req_states.max_num_reqs), int(req_states.max_model_len)),
+            dtype=torch.int32, pin_memory=True)
+        ats_np = _mirror.numpy()
+        _ats_gpu = _ats.gpu
+        print("suffix_hybrid v2 suffix-only DENSE-TOKEN-MIRROR armed "
+              "(ngram scaffold: GPU-resident all_token_ids; per-step "
+              "bounded gather D2H at the totals fence)",
+              file=sys.stderr, flush=True)
     lut = req_states.req_id_to_index
     max_reqs = int(getattr(speculator, "max_num_reqs", 32) or 32)
 
@@ -914,10 +993,32 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
         dst.copy_(totals_gpu[torch.from_numpy(idx_np)], non_blocking=False)
         return dst.numpy()
 
+    def _dense_refresh(idx_np, totals):
+        # DENSE-TOKEN-MIRROR refresh (ngram scaffold only; no-op on the
+        # UVA path). Bounded gather D2H of the live rows' current content
+        # [0, max_total) into the pinned host mirror, so every ats_np
+        # reader below (trace, ledger fingerprints, ghost re-feed, the
+        # Rust proposer) sees row content current to THIS step's totals.
+        # Call AFTER the totals fence/absorb that orders the post_update
+        # writes: _totals_now's blocking copy already fenced them (sync
+        # arm), and under the pipelined arm the staged snapshot's absorb
+        # event did (lagged totals are <= live row lengths, so the
+        # gather window is always in-bounds; content beyond the lagged
+        # total is simply not refreshed and never read past the total).
+        if _mirror is None:
+            return
+        m = int(totals.max()) if int(totals.size) else 0
+        if m <= 0 or int(idx_np.size) == 0:
+            return
+        sub = _ats_gpu[:, :m][torch.from_numpy(idx_np)].detach().to(
+            "cpu", non_blocking=False).numpy()
+        ats_np[idx_np, :m] = sub
+
     @functools.wraps(type(speculator).propose)
     def propose(input_batch, attn_metadata, slot_mappings, last_hidden_states,
                 aux_hidden_states, num_sampled, num_rejected, last_sampled,
                 next_prefill_tokens, temperature, seeds, dp_sync=None,
+                dp_sync_state=None, num_speculative_tokens=None,
                 dummy_run=False, skip_attn_for_dummy_run=False, mm_inputs=None,
                 is_profile=False):
         n = int(input_batch.num_reqs)
@@ -1033,6 +1134,17 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                             np.array([g_idx], dtype=np.int64))[0])
                     else:
                         g_tot = g_tot_rec
+                    if _mirror is not None:
+                        # Dense mirror: the ghost's row was last refreshed
+                        # while it was live; re-refresh [0, g_tot) now so
+                        # the fingerprint + re-feed read CURRENT content
+                        # (the UVA path gets this for free from the live
+                        # buffer). Departures are rare; the extra scalar
+                        # totals D2H above (if any) already fenced the
+                        # row's last post_update write.
+                        _dense_refresh(np.array([g_idx], dtype=np.int64),
+                                       np.array([max(int(g_tot), 1)],
+                                                dtype=np.int64))
                     row = ats_np[g_idx]
                     if (g_tot_rec > 0 and g_tot >= g_tot_rec
                             and g_tot <= row.shape[0]
@@ -1101,6 +1213,13 @@ def _suffix_only_wrap(runner, speculator, mixer, group, k):
                 consume_log["lagged"] = False
                 if m_on:
                     m["t_fence"] += t_d2h
+
+            # Dense-token-mirror refresh: one bounded [n, max_total)
+            # gather D2H into the pinned mirror, AFTER this step's totals
+            # fence/absorb and BEFORE any ats_np reader below (trace,
+            # ledger fingerprints, ghost re-feed, the Rust call). No-op
+            # on the UVA path (zero-copy read stays zero-copy).
+            _dense_refresh(idx_np, totals)
 
             # Draft accounting: compare last step's published drafts against
             # the engine's actual writes at those positions this step. The
@@ -1462,15 +1581,18 @@ def _wrap_propose_sync(runner, original, mixer, group, probabilistic=False):
     def propose(input_batch, attn_metadata, slot_mappings, last_hidden_states,
                 aux_hidden_states, num_sampled, num_rejected, last_sampled,
                 next_prefill_tokens, temperature, seeds, dp_sync=None,
+                dp_sync_state=None, num_speculative_tokens=None,
                 dummy_run=False, skip_attn_for_dummy_run=False, mm_inputs=None,
                 is_profile=False):
-        native = original(input_batch, attn_metadata, slot_mappings,
-                          last_hidden_states, aux_hidden_states, num_sampled,
-                          num_rejected, last_sampled, next_prefill_tokens,
-                          temperature, seeds, dp_sync=dp_sync,
-                          dummy_run=dummy_run,
-                          skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                          mm_inputs=mm_inputs, is_profile=is_profile)
+        native = _call_original(
+            original, input_batch, attn_metadata, slot_mappings,
+            last_hidden_states, aux_hidden_states, num_sampled,
+            num_rejected, last_sampled, next_prefill_tokens, temperature,
+            seeds, dp_sync=dp_sync, dp_sync_state=dp_sync_state,
+            num_speculative_tokens=num_speculative_tokens,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            mm_inputs=mm_inputs, is_profile=is_profile)
         if dummy_run or is_profile or skip_attn_for_dummy_run:
             return native
         try:
@@ -2096,15 +2218,18 @@ def _wrap_propose(runner, original, mixer, group, probabilistic=False, k=0):
     def propose(input_batch, attn_metadata, slot_mappings, last_hidden_states,
                 aux_hidden_states, num_sampled, num_rejected, last_sampled,
                 next_prefill_tokens, temperature, seeds, dp_sync=None,
+                dp_sync_state=None, num_speculative_tokens=None,
                 dummy_run=False, skip_attn_for_dummy_run=False, mm_inputs=None,
                 is_profile=False):
-        native = original(input_batch, attn_metadata, slot_mappings,
-                          last_hidden_states, aux_hidden_states, num_sampled,
-                          num_rejected, last_sampled, next_prefill_tokens,
-                          temperature, seeds, dp_sync=dp_sync,
-                          dummy_run=dummy_run,
-                          skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                          mm_inputs=mm_inputs, is_profile=is_profile)
+        native = _call_original(
+            original, input_batch, attn_metadata, slot_mappings,
+            last_hidden_states, aux_hidden_states, num_sampled,
+            num_rejected, last_sampled, next_prefill_tokens, temperature,
+            seeds, dp_sync=dp_sync, dp_sync_state=dp_sync_state,
+            num_speculative_tokens=num_speculative_tokens,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            mm_inputs=mm_inputs, is_profile=is_profile)
         # CUDA-graph capture / warmup / profile calls run the native forward
         # untouched: no CPU sync, no collectives, no state mutation inside a
         # captured region.
@@ -2186,8 +2311,30 @@ def install_v2():
         result = original_load(self, *args, **kwargs)
         try:
             speculator = getattr(self, "speculator", None)
-            if speculator is None or not isinstance(
-                    speculator, DraftModelSpeculator):
+            if speculator is None:
+                print("suffix_hybrid v2: no speculator after "
+                      "load_model — hook inactive (plain native decode).",
+                      file=sys.stderr, flush=True)
+                return result
+            # Drafterless scaffold (lfm2.5-class, no native drafter):
+            # vllm's method=ngram builds NgramGPUSpeculator — a
+            # BaseSpeculator, NOT a DraftModelSpeculator. Admit it past
+            # this gate ONLY for SUFFIX-ONLY mode: the suffix-only wrap
+            # REPLACES propose outright (the native ngram Triton
+            # machinery is never consumed), while the hybrid/native
+            # arms still require a real DraftModelSpeculator.
+            _scaffold = (not isinstance(speculator, DraftModelSpeculator)
+                         and type(speculator).__name__
+                         == "NgramGPUSpeculator")
+            if _scaffold and os.environ.get(
+                    "SUFFIX_HYBRID_SUFFIX_ONLY", "").strip() != "1":
+                print("suffix_hybrid v2: NgramGPUSpeculator scaffold is "
+                      "supported in SUFFIX-ONLY mode only (set "
+                      "SUFFIX_HYBRID_SUFFIX_ONLY=1) — staying native-only.",
+                      file=sys.stderr, flush=True)
+                return result
+            if not isinstance(speculator, DraftModelSpeculator) \
+                    and not _scaffold:
                 print("suffix_hybrid v2: no DraftModelSpeculator after "
                       "load_model — hook inactive (plain native decode).",
                       file=sys.stderr, flush=True)
