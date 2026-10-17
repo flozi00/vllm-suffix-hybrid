@@ -50,6 +50,8 @@ alone: src/fp8_moe_oxide.rs reads bits 8-13 of `mode` as a skip mask
 (launch i of the plan skipped when bit SKIP_SHIFT + i is set, plan = mode & 0xFF),
 like nvfp4_moe's tune bits 24-29.
 """
+import functools
+
 import torch
 
 from suffix_hybrid import helion_kernels as hk
@@ -415,12 +417,22 @@ def _device():
         else torch.device("cpu")
 
 
+@functools.lru_cache(maxsize=1)
+def _layer(e, hidden, inter, dev):
+    """One layer's weights per case, shared by every rotating copy: the lab
+    makes up to 64 copies to spill L2 and a fresh ~600 MB expert set per
+    seed ran a 32 GB RTX 5090 out of memory (lfm2.5, run
+    20261017T160531Z-rtx-5090-2d59). The weights already exceed L2, so the
+    copies only need their own x / routing."""
+    return fm.make_problem(e, hidden, inter, device=dev, seed=0)
+
+
 def _problem(case, seed):
     """(p, x, ids, tw): fp8_moe.make_problem's layer (vLLM Fp8MoEMethod
     layout, per-block amax scales) + uniform distinct top-k routing."""
     dev = _device()
     m, e, k = case["numtokens"], case["experts"], case["topk"]
-    p = fm.make_problem(e, case["hidden"], case["intermediate"], device=dev, seed=seed)
+    p = _layer(e, case["hidden"], case["intermediate"], dev)
     ids, tw = nm.rand_routing(m, e, k, dev, seed=1000 + seed)
     gen = torch.Generator(device="cpu").manual_seed(2000 + seed)
     x = torch.randn(m, case["hidden"], generator=gen).to(dev, torch.bfloat16)
