@@ -67,23 +67,32 @@ def test_case_key_matches_serving():
 
 
 def test_route_ref_matches_oxide_route_twin():
+    """The workspace route == moe_route's (nvfp4_moe.route_twin, the CPU twin
+    pinned against the kernel source) on what consumers read."""
     ids, _ = nm.rand_routing(7, 8, 3, "cpu", seed=3, base=4, local=4)
-    pl, se, cnt, off = hf.route_ref(ids, 4, 4)
-    se_t, so_t, sc_t, pl_t = nm.route_twin(ids, 4, 4)
-    n = sum(sc_t)
-    assert pl[:n].tolist() == pl_t and se[:len(se_t)].tolist() == se_t
-    assert all(cnt[e] == c and off[e] == o for e, o, c in zip(se_t, so_t, sc_t) if e >= 0)
+    r = hf.route_ref(ids, 4, 4)
+    se, so, sc, pl = nm.route_twin(ids, 4, 4)
+    want = torch.zeros_like(r)
+    want[:4], want[2 * 4:3 * 4] = -1, 0
+    want[:len(se)], want[4:4 + len(so)], want[8:8 + len(sc)] = (torch.tensor(v) for v in (se, so, sc))
+    want[12:12 + len(pl)] = torch.tensor(pl, dtype=torch.int32)
+    assert hf.route_equal(r, want, 4)
 
 
 class _Native:
-    def __init__(self):
+    def __init__(self, skips=True):
         self.calls = []
+        if skips:
+            self.FP8_MOE_SKIP_SHIFT = hf.SKIP_SHIFT
 
     def fp8_moe_cuda(self, *args):
         self.calls.append(args)
 
 
-def _serving(monkeypatch, tuned, mode, max_m=32):
+TAIL = ("out", False, 0, 1, 123)  # out, ue8m0, id_base, mode, stream_ptr
+
+
+def _serving(monkeypatch, tuned, mode, skips=True, max_m=32):
     """tuned(kernel, numtokens) -> bool: which configs are shipped."""
     cfg = {"E": 4, "H": 256, "I": 256, "topk": 2, "max_m": max_m, "fused": True}
     monkeypatch.setattr(hk, "platform", lambda device=0: "gpu")
@@ -91,47 +100,75 @@ def _serving(monkeypatch, tuned, mode, max_m=32):
                         {"num_warps": 4} if tuned(kernel, case["numtokens"]) else None)
     monkeypatch.setattr(hk, "compiled", lambda body, kernel, case, **kw: (kernel, case["numtokens"]))
     calls = []
-    monkeypatch.setattr(hf, "run_plan", lambda kerns, plan, *a: calls.append((kerns, plan, a)))
-    native = _Native()
-    from suffix_hybrid import oxide_kernels
-    monkeypatch.setattr(oxide_kernels, "native", lambda: native)
+    monkeypatch.setattr(hf, "run_launch", lambda name, kern, *a: calls.append((name, kern)))
     monkeypatch.setenv(fm.HELION_ENV, mode)
+    native = _Native(skips)
     return cfg, calls, native
 
 
-def test_auto_dispatches_per_m(monkeypatch):
-    # every kernel tuned at buckets 1 and 16; fc2_combine missing at 8
-    cfg, calls, native = _serving(monkeypatch, lambda k, b: b in (1, 8, 16) and not (
-        k == hf.FC2_COMBINE and b == 8), "auto")
-    op = fm.helion_op(cfg)
-    assert sorted(op.plans) == [1] + list(range(9, 17))
-    assert op.kernel(1)[:2] == (1, "fused3") and op.kernel(12)[:2] == (16, "front4")
-    assert [k for k, _ in op.kernel(12)[2]] == list(hf.PLANS["front4"])
-    assert op.warm_ms == [1, 16]
-    x = torch.zeros(12, 256, dtype=torch.bfloat16)
-    tail = ("aq", "as", "inter", "hq", "hs", "y", "route", "out", False, 0, 1, 123)
-    op(x, "ids", "tw", "w13", "s13", "w2", "s2", *tail)
-    assert calls[-1][1] == "front4" and calls[-1][2][0] is x
-    x5 = x[:5]
-    op(x5, "ids", "tw", "w13", "s13", "w2", "s2", *tail)  # M=5 -> fused3 untuned: oxide
-    want = (x5, "ids", "tw", "w13", "s13", "w2", "s2", *tail)
-    assert len(native.calls) == 1 and all(a is b for a, b in zip(native.calls[0], want, strict=True))
-    assert len(calls) == 1
+def _call(op, m, native, calls):
+    """One op call with a real-sized workspace; -> [(backend, launch or mode word)]."""
+    ws = fm.workspace("cpu", m, 2, 256, 256, 4)
+    x = torch.zeros(m, 256, dtype=torch.bfloat16)
+    ids = torch.zeros(m, 2, dtype=torch.int32)
+    w13 = torch.zeros(4, 512, 256, dtype=torch.float8_e4m3fn)
+    calls.clear()
+    native.calls.clear()
+    seq = []
+    orig_h, orig_n = hf.run_launch, native.fp8_moe_cuda
+    hf.run_launch = lambda name, kern, *a: seq.append(("helion", name))
+    native.fp8_moe_cuda = lambda *a: seq.append(("oxide", a[-2]))
+    try:
+        op(x, ids, "tw", w13, "s13", "w2", "s2", *ws, *TAIL)
+    finally:
+        hf.run_launch, native.fp8_moe_cuda = orig_h, orig_n
+    return seq
+
+
+def test_auto_mixes_per_launch(monkeypatch):
+    # fc1 tuned at buckets 1/2 only (the lab's 2026-10-17 wins), nothing else
+    cfg, calls, native = _serving(monkeypatch, lambda k, b: k == hf.FC1 and b <= 2, "auto")
+    op = hf.ServingOp(cfg, "auto", native)
+    assert sorted(op.plans) == [1, 2] and op.warm_ms == [1, 2]
+    skip = lambda *launches: sum(1 << i for i in launches) << hf.SKIP_SHIFT
+    assert _call(op, 2, native, calls) == [
+        ("oxide", 2 | skip(1, 2)), ("helion", hf.FC1), ("oxide", 2 | skip(0, 1))]
+    # untuned M: the whole oxide op with the lane's own mode word
+    assert _call(op, 5, native, calls) == [("oxide", 1)]
+
+
+def test_front4_runs_of_oxide_launches_share_one_call(monkeypatch):
+    cfg, calls, native = _serving(monkeypatch, lambda k, b: k == hf.COMBINE and b == 16, "auto")
+    op = hf.ServingOp(cfg, "auto", native)
+    skip = lambda *launches: sum(1 << i for i in launches) << hf.SKIP_SHIFT
+    assert _call(op, 12, native, calls) == [("oxide", 1 | skip(3)), ("helion", hf.COMBINE)]
+
+
+def test_host_without_skip_mask_mixes_nothing(monkeypatch):
+    cfg, calls, native = _serving(monkeypatch, lambda k, b: k == hf.FC1 or (
+        b == 16 and k in hf.PLANS["front4"]), "auto", skips=False)
+    op = hf.ServingOp(cfg, "auto", native)
+    assert sorted(op.plans) == list(range(9, 17)) and "mixing off" in op.summary
+    assert _call(op, 12, native, calls) == [("helion", k) for k in hf.PLANS["front4"]]
+    assert _call(op, 1, native, calls) == [("oxide", 1)]
 
 
 def test_auto_without_configs_stays_oxide(monkeypatch):
-    cfg, _, _ = _serving(monkeypatch, lambda k, b: False, "auto")
+    cfg, _, native = _serving(monkeypatch, lambda k, b: False, "auto")
+    from suffix_hybrid import oxide_kernels
+    monkeypatch.setattr(oxide_kernels, "native", lambda: native)
     assert fm.helion_op(cfg) is None
 
 
-def test_helion_missing_bucket_fails_at_load(monkeypatch):
-    cfg, _, _ = _serving(monkeypatch, lambda k, b: k != hf.FC2 or b != 32, "helion")
+def test_helion_missing_launch_fails_at_load(monkeypatch):
+    cfg, _, native = _serving(monkeypatch, lambda k, b: k != hf.FC2 or b != 32, "helion")
     with pytest.raises(RuntimeError, match=r"numtokens 32 front4: fp8_moe_fc2"):
-        fm.helion_op(cfg)
-    cfg, _, _ = _serving(monkeypatch, lambda k, b: True, "helion")
-    op = fm.helion_op(cfg)
-    assert op.native is None and len(op.plans) == 32  # helion: the oxide op is never called
+        hf.ServingOp(cfg, "helion", native)
+    cfg, calls, native = _serving(monkeypatch, lambda k, b: True, "helion")
+    op = hf.ServingOp(cfg, "helion", native)
+    assert len(op.plans) == 32 and all(all(op.plans[m][2]) for m in op.plans)
     assert {hk.bucket(m, hf.BUCKETS) for m in op.warm_ms} == set(hf.BUCKETS[:6])
+    assert all(b == "helion" for b, _ in _call(op, 7, native, calls))
 
 
 def test_oxide_never_imports_helion_module(monkeypatch):
@@ -159,6 +196,9 @@ def test_run_ours_routes_through_the_op():
 @pytest.mark.parametrize("m,ue8m0,ep", [(1, False, False), (3, False, False), (5, True, False),
                                         (6, False, True), (4, True, True)])
 def test_plan_interpret_matches_spec(plan, m, ue8m0, ep):
+    """Every launch of a plan in eager reference mode over the oxide
+    workspace, end to end vs the f64 spec; each stage bit-checked against the
+    spec's quantization (x quant bit-equal, route equal)."""
     helion = pytest.importorskip("helion")
     e_local, hdim, idim, topk = 4, 256, 256, 2
     e_global, base = (8, 4) if ep else (4, 0)
@@ -166,16 +206,22 @@ def test_plan_interpret_matches_spec(plan, m, ue8m0, ep):
     ids, tw = nm.rand_routing(m, e_global, topk, "cpu", seed=m, base=base, local=e_local)
     x = torch.randn(m, hdim, generator=torch.Generator().manual_seed(m)).bfloat16()
     out = torch.full((m, hdim), float("nan"), dtype=torch.bfloat16)
+    ws = fm.workspace("cpu", m, topk, hdim, idim, e_local)
+    views = hf.ws_views(ws, m, topk, hdim, idim, e_local)
     x0 = x.clone()
-    kerns = [helion.kernel(hf.BODIES[k]) for k in hf.PLANS[plan]]
-    got = hf.run_plan(kerns, plan, x, ids, tw, p["w13"], p["w13_s"], p["w2"], p["w2_s"], out,
-                      ue8m0, base)
-    assert got is out and torch.equal(x, x0)
+    for name in hf.PLANS[plan]:
+        hf.run_launch(name, helion.kernel(hf.BODIES[name]), x, ids, tw, p["w13"], p["w13_s"],
+                      p["w2"], p["w2_s"], views, out, ue8m0, base)
+        if name == hf.ROUTE_QUANT:
+            aq_r, as_r = hf._xq_ref(x, ue8m0)
+            assert hf._frac(views[0], aq_r) == 0 and torch.equal(views[1], as_r)
+            assert hf.route_equal(views[5], hf.route_ref(ids, e_local, base), e_local)
+    assert torch.equal(x, x0)
     lid = nm.to_local(ids, base, e_local)
-    ok, msg = hf._check_end(got, fm.moe_ref(p, x, lid, tw))
+    ok, msg = hf._check_end(out, fm.moe_ref(p, x, lid, tw))
     assert ok, msg
     dead = (lid < 0).all(1)
-    assert bool((got[dead] == 0).all())
+    assert bool((out[dead] == 0).all())
     if ep:
         assert bool(dead.any())  # rand_routing EP rows t % 3 == 1 route off-rank
 

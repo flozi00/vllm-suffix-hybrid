@@ -57,9 +57,10 @@ and uses whichever of post/pre is the logical layout.
 
 Helion backend (SUFFIX_HELION_FP8_MOE = oxide | helion | auto, default oxide;
 suffix_hybrid/helion_kernels/fp8_moe.py, docs/helion-kernels.md): inside the
-enabled lane `helion_op` swaps _native.fp8_moe_cuda for a same-signature op
-running the lab-tuned Helion kernel per M bucket (auto: oxide where no config
-is shipped; helion: a missing bucket is a load error). The layer oracle
+enabled lane `helion_op` swaps _native.fp8_moe_cuda for a same-signature op:
+per M each launch of the plan runs the lab-tuned Helion kernel where one is
+shipped for its bucket, else the oxide launch alone on the same workspace
+(auto); helion: any missing (bucket, launch) is a load error. The layer oracle
 judges it like oxide (vs vLLM + the f64 spec + zero contract) on every served
 bucket, which also compiles each before CUDA-graph capture; plan/stage
 readback is oxide-only, Helion gets a bitwise determinism check instead.
@@ -404,8 +405,9 @@ def helion_op(cfg):
     mode = hk.backend(HELION_ENV)
     if mode == "oxide":
         return None
+    from suffix_hybrid import oxide_kernels
     from suffix_hybrid.helion_kernels import fp8_moe as hf
-    op = hf.ServingOp(cfg, mode)
+    op = hf.ServingOp(cfg, mode, oxide_kernels.native())
     _log(f"{HELION_ENV}: {op.summary}")
     return op if op.plans else None
 
