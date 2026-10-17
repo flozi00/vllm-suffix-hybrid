@@ -12,6 +12,11 @@ And ships the sm120 NVFP4-KV patch: sm120/nvfp4_kv_patch/ is copied to
 sitecustomize time (only ever when SUFFIX_SM120_NVP4KV=1). It rewrites the
 vLLM FlashInfer backend IN MEMORY (no site-packages writes); the gate keeps it
 inert everywhere else, so shipping it unconditionally is safe.
+
+And, with --vendor-dir, a pre-installed pure-python tree (CI: Helion and its
+serving-time deps, `pip install --target`) copied to <output>/_vendor/;
+suffix_hybrid.helion_kernels.ensure_vendor() appends it to sys.path, so an
+image that ships the same packages wins. No pip here: the builder stays offline.
 """
 import argparse
 import hashlib
@@ -21,7 +26,7 @@ import zipfile
 
 
 def bundle(wheel, output, revision, qgdn_cubins=None, attn_cubins=None,
-           oxide_cubins=None):
+           oxide_cubins=None, vendor_dir=None):
     output = Path(output)
     hashes = {}
     with zipfile.ZipFile(wheel) as archive:
@@ -202,6 +207,17 @@ def bundle(wheel, output, revision, qgdn_cubins=None, attn_cubins=None,
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
             hashes[str(rel)] = hashlib.sha256(data).hexdigest()
+    if vendor_dir is not None:
+        vendor_root = Path(vendor_dir)
+        for src in sorted(vendor_root.rglob('*')):
+            if src.is_dir() or '__pycache__' in src.parts or src.suffix == '.pyc':
+                continue
+            rel = PurePosixPath('_vendor', *src.relative_to(vendor_root).parts)
+            data = src.read_bytes()
+            dest = output / PurePosixPath(*rel.parts)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            hashes[str(rel)] = hashlib.sha256(data).hexdigest()
     (output / 'BUILD.json').write_text(json.dumps({
         'source_revision': revision,
         'wheel': Path(wheel).name,
@@ -220,6 +236,8 @@ if __name__ == '__main__':
                         help='cuda-oxide cubin dir (scripts/oxide_build.py)')
     parser.add_argument('--attn-cubins', default=None,
                         help='K2-NVFP4 prebuilt cubin dir (manifest.json + cubins)')
+    parser.add_argument('--vendor-dir', default=None,
+                        help='pre-installed pure-python tree -> <output>/_vendor/')
     args = parser.parse_args()
     bundle(args.wheel, args.output, args.revision, args.qgdn_cubins,
-           args.attn_cubins, args.oxide_cubins)
+           args.attn_cubins, args.oxide_cubins, args.vendor_dir)

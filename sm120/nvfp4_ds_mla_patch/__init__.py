@@ -49,6 +49,9 @@ PINNED_VLLM = "0.30.0"
 # + vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18): same anchors.
 SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1")
 GATE_ENV = "SUFFIX_SM120_NVP4DSMLA"
+# Reader backend inside the enabled lane (docs/helion-kernels.md): oxide
+# (default) | helion | auto -> suffix_hybrid/helion_kernels/ds_mla.py.
+HELION_KNOB = "SUFFIX_HELION_DS_MLA"
 MARKER_ATTR = "__suffix_nvfp4_ds_mla_revision__"
 HELPER_TAG = "suffix sm120 nvfp4-ds-mla patch"
 FAMILY = "nvfp4_ds_mla"  # oxide cubin / kernel family
@@ -279,6 +282,7 @@ def _suffix_nvfp4_ds_mla_init(impl) -> None:
     dev = torch.cuda.current_device()
     oxide_kernels.ensure_loaded(FAMILY, dev)
     impl._nvfp4_num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    impl._suffix_helion_ds_mla = _helion_route(impl, dev)  # before the self-test: it runs it too
     if dev not in _SELFTESTED:
         _suffix_nvfp4_ds_mla_selftest(impl, torch.device("cuda", dev))
         _SELFTESTED.add(dev)
@@ -288,6 +292,19 @@ def _suffix_nvfp4_ds_mla_init(impl) -> None:
 
 
 _SELFTESTED = set()
+
+
+def _helion_route(impl, dev):
+    """HELION_KNOB: the Helion reader's route (compiled + oracle-checked per
+    bucket at load, fail closed), or None = the oxide op serves every shape
+    (oxide never imports the port)."""
+    from suffix_hybrid import helion_kernels
+
+    if helion_kernels.backend(HELION_KNOB) == "oxide":
+        return None
+    from suffix_hybrid.helion_kernels import ds_mla
+
+    return ds_mla.load(impl.num_heads, impl.topk_indices_buffer.shape[-1], dev)
 
 
 def _suffix_nvfp4_ds_mla_selftest(impl, dev) -> None:
@@ -345,6 +362,12 @@ def _suffix_nvfp4_ds_mla_decode(impl, q, kv_cache, topk, output):
     t, h = q.shape[0], q.shape[1]
     if t == 0:
         return output
+    route = getattr(impl, "_suffix_helion_ds_mla", None)
+    if route is not None:  # Helion where tuned; None -> oxide (auto)
+        from suffix_hybrid.helion_kernels import ds_mla
+
+        if ds_mla.decode(route, q, kv_cache, topk, output, float(impl.scale)) is not None:
+            return output
     ns = n.nvfp4_ds_mla_plan(t, h, topk.shape[-1], impl._nvfp4_num_sms)["ns"]
     o_part = q.new_empty((t, h, ns, 512), dtype=torch.bfloat16)
     lse_part = q.new_empty((t, h, ns), dtype=torch.float32)

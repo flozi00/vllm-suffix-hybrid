@@ -25,6 +25,18 @@ env:
   OXIDE_NIGHTLY: nightly-2026-08-28
   CUDA_OXIDE_REV: ec4aa4797956534578a1af010f86252a0b6d8626
   PTXAS_WHEEL_VERSION: '13.0.88'
+  # Helion ports (docs/helion-kernels.md): vendored into the bundle's _vendor/
+  # with the pure-python runtime deps the vLLM image lacks (rich + its deps).
+  # Not vendored: numpy/psutil/typing-extensions/torch/triton (image has
+  # them), filecheck (helion never imports it), scikit-learn/scipy (only the
+  # autotuner's surrogate searches use them, behind try/except ImportError;
+  # serving never autotunes).
+  HELION_VENDOR: helion==1.5.0 rich==15.0.0 markdown-it-py==4.2.0 mdurl==0.1.2 pygments==2.21.0
+  # CPU torch has no triton dependency; PyPI torch 2.14.x pins triton~=3.8.0,
+  # so this pair is what serving-style imports see (helion takes its triton
+  # branch at import when triton is importable).
+  TORCH_CPU_VERSION: '2.14.1'
+  TRITON_VERSION: '3.8.0'
 jobs:
   linux:
     runs-on: ubuntu-22.04
@@ -89,7 +101,12 @@ jobs:
       - name: Exercise installed Linux wheel
         run: |
           python -m pip install dist/*.whl numpy pytest safetensors pillow opencv-python-headless
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install torch==$TORCH_CPU_VERSION --index-url https://download.pytorch.org/whl/cpu
+          # Helion interpret-mode CPU checks (tests/test_helion_*.py) must run,
+          # not skip: helion imports without a GPU (no device probe at import).
+          python -m pip install triton==$TRITON_VERSION
+          python -m pip install --no-deps $HELION_VENDOR
+          python -c "import helion, sys; assert 'sklearn' not in sys.modules"
           # Leave the checkout first: its source suffix_hybrid/ (no built .so)
           # would shadow the installed wheel.
           cd "$RUNNER_TEMP"
@@ -109,9 +126,16 @@ jobs:
           # per-cubin isolation: a failing crate exits 1 but the manifest
           # still ships every cubin that built (missing lanes fail closed)
           python scripts/oxide_build.py --out oxide_cubins
+      - name: Vendor Helion (pure python) for the bundle's _vendor/
+        run: |
+          python -m pip install --no-deps --only-binary=:all: --target vendor $HELION_VENDOR
+          # pure python only: a compiled file here would be built for the
+          # runner, not the serving image
+          if find vendor -name '*.so' -o -name '*.pyd' | grep .; then exit 1; fi
       - name: Create directly mountable runtime bundle
         run: |
           python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA" \
+            --vendor-dir vendor \
             $( [ -f oxide_cubins/manifest.json ] && echo --oxide-cubins oxide_cubins )
       - uses: actions/upload-artifact@v4
         with:

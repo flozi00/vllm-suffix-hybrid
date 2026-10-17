@@ -103,6 +103,17 @@ Decode-sized calls (1 <= M <= SUFFIX_NVFP4_MOE_MAX_M, default 32) run ours;
 everything else calls the parent unchanged. Gated on but no layer engaged ->
 startup error naming why.
 
+Helion backend (SUFFIX_HELION_NVFP4_MOE = oxide | helion | auto, default oxide;
+suffix_hybrid/helion_kernels/nvfp4_moe.py, docs/helion-kernels.md): inside the
+enabled lane cfg["op"] swaps _native.nvfp4_moe_cuda for a same-signature op
+running the lab-tuned Helion plan (the TUNE table's mode picks fused3 or
+front4) per M bucket (auto: oxide where a plan kernel has no shipped config;
+helion: any gap is a load error). The layer oracle judges Helion-served Ms like
+oxide (vs FlashInfer + the f64 spec + zero contract) on one M per tuned
+(bucket, plan) after warming every served M, so every kernel compiles before
+CUDA-graph capture; plan/stage readback is oxide-only, Helion gets a bitwise
+determinism check instead.
+
 CLI (in-pod, SM120 + oxide bundle):
   python -m suffix_hybrid.kernels.nvfp4_moe oracle   # ours vs FlashInfer vs f64 ref, per stage
   python -m suffix_hybrid.kernels.nvfp4_moe bench    # us: ours vs FlashInfer (CUDA graphs)
@@ -121,6 +132,7 @@ FUSED_ENV = "SUFFIX_MOE_FUSED"  # "0" -> legacy 6-launch plan (both families)
 FUSED_MAX_M = 8  # token-major fc2+combine up to here (module doc), plan 1 above
 PLANS = {0: "legacy6", 1: "front4", 2: "fused3"}
 TUNE_ENV = "SUFFIX_NVFP4_MOE_TUNE"
+HELION_ENV = "SUFFIX_HELION_NVFP4_MOE"  # helion_kernels.backend knob (module doc)
 LA_FULL = 255  # lookahead >= K/64: the whole weight row prefetched at CTA start
 # unmeasured defaults (whole rows while few experts are hit, a bounded fc1
 # window above); `sweep` prints the measured table to paste into TUNE_ENV
@@ -147,6 +159,7 @@ _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _MID = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 _state = {"armed": False, "instances": 0, "layers_ours": 0, "stock": {},
           "ws": {}, "checked": False, "hook": None, "oracle": [], "active_logged": False,
+          "helion_warm": set(),
           # FP8 block layers (suffix_hybrid/kernels/fp8_moe.py, SUFFIX_FP8_MOE)
           # share this module's single OOT class; their own counters:
           "fp8": {"seen": 0, "ours": 0, "stock": {}, "oracle": []}}
@@ -604,9 +617,10 @@ def run_ours(native, p, x, ids, tw, ws, stream, out=None, mode=None, tune=0):
         out = torch.empty(x.shape[0], p["w2"].shape[1], dtype=torch.bfloat16, device=x.device)
     if mode is None:
         mode, tune = tune_for(x.shape[0], p.get("tune"), p.get("fused", fused_on()))
-    native.nvfp4_moe_cuda(x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"],
-                          p["g2"], *ws, out, float(p["a1g"]), float(p["a2g"]),
-                          int(p["act"]), int(p.get("id_base", 0)), int(mode), int(tune), stream)
+    op = p.get("op") or native.nvfp4_moe_cuda  # the Helion drop-in (HELION_ENV), else oxide
+    op(x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"], p["g2"], *ws, out,
+       float(p["a1g"]), float(p["a2g"]), int(p["act"]), int(p.get("id_base", 0)), int(mode),
+       int(tune), stream)
     return out
 
 
@@ -706,7 +720,7 @@ def eligibility(info: dict) -> str | None:
 def _make_layer_cls():
     import torch
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-    from suffix_hybrid import oxide_kernels
+    from suffix_hybrid import helion_kernels, oxide_kernels
 
     native = oxide_kernels.native()
 
@@ -801,6 +815,17 @@ def _make_layer_cls():
                        act=ACT_CODE[info["act"]], H=info["H"], topk=self.top_k,
                        max_m=max_m(), id_base=info["ep_base"],
                        E_global=self.global_num_experts, fused=fused_on(), tune=tune_table())
+            hb = helion_kernels.backend(HELION_ENV)
+            if hb != "oxide":  # the Helion module is never imported under oxide
+                from suffix_hybrid.helion_kernels import nvfp4_moe as hmoe
+                cfg["op"] = hmoe.serving_op(native, hb)
+                # {M: (bucket, plan)} Helion serves; helion: a gap raises here
+                cfg["helion_ms"] = hmoe.served_ms(
+                    hb, info["E"], info["H"], info["I"], cfg["topk"], cfg["act"], cfg["max_m"],
+                    lambda m: tune_for(m, cfg["tune"], cfg["fused"])[0])
+                _log(f"{HELION_ENV}={hb} layer {self.layer_name}: Helion serves "
+                     f"{len(cfg['helion_ms'])}/{cfg['max_m']} Ms "
+                     f"({sorted(set(cfg['helion_ms'].values()))}), oxide the rest")
             _state["ws"][dev] = workspace(dev, cfg["max_m"], cfg["topk"], info["H"],
                                           info["I"], info["E"], _state["ws"].get(dev))
             self._sfx_moe = cfg
@@ -826,7 +851,20 @@ def _make_layer_cls():
             worst, worst_ref, worst_fi_ref, worst_emu = 0.0, 0.0, 0.0, 0.0
             base, local = cfg["id_base"], info["E"]
             mm = cfg["max_m"]  # workspace capacity: every case M <= max_m
-            cases = [(m, None) for m in sorted({1, min(8, mm), mm})]
+            hm = cfg.get("helion_ms") or {}
+            stream = torch.cuda.current_stream(dev).cuda_stream
+            warm_key = (local, info["H"], info["I"], cfg["topk"], cfg["act"])
+            if hm and warm_key not in _state["helion_warm"]:
+                # every served M once (Triton specializes on sizes): no compile
+                # can happen later, inside CUDA-graph capture
+                _state["helion_warm"].add(warm_key)
+                for m in sorted(hm):
+                    xw = torch.zeros(m, info["H"], dtype=torch.bfloat16, device=dev)
+                    idw, tww = rand_routing(m, cfg["E_global"], cfg["topk"], dev, m, base, local)
+                    run_ours(native, cfg, xw, idw, tww, _state["ws"][dev], stream)
+            # one judged M per tuned (bucket, plan): the largest M it serves
+            reps = {key: max(m for m in hm if hm[m] == key) for key in set(hm.values())}
+            cases = [(m, None) for m in sorted({1, min(8, mm), mm} | set(reps.values()))]
             if local < cfg["E_global"]:
                 cases.append((min(8, mm), True))
             for m, dead in cases:
@@ -843,12 +881,18 @@ def _make_layer_cls():
                 fi = super().forward_modular(x.clone(), tw.clone(), ids.clone()).float()
                 x_fi = _rel(x, x0)
                 xo = x.clone()
-                out, pl_ok, pl = plans_nvfp4(native, cfg, xo, ids, tw, _state["ws"][dev],
-                                             torch.cuda.current_stream(dev).cuda_stream)
-                x_ours = _rel(xo, x0)
                 lid = to_local(ids, base, local)
-                st_ok, st = stages(cfg, x, lid, tw, _state["ws"][dev], out)
-                st_ok, st = st_ok and pl_ok, f"{st} {pl}"
+                if m in hm:  # Helion plan: no oxide workspace to read back
+                    out = run_ours(native, cfg, xo, ids, tw, _state["ws"][dev], stream)
+                    again = run_ours(native, cfg, x.clone(), ids, tw, _state["ws"][dev], stream)
+                    st_ok = bool(torch.equal(out, again))
+                    st = f"helion {hm[m][1]} bucket {hm[m][0]} deterministic={st_ok}"
+                else:
+                    out, pl_ok, pl = plans_nvfp4(native, cfg, xo, ids, tw, _state["ws"][dev],
+                                                 stream)
+                    st_ok, st = stages(cfg, x, lid, tw, _state["ws"][dev], out)
+                    st_ok, st = st_ok and pl_ok, f"{st} {pl}"
+                x_ours = _rel(xo, x0)
                 ours = out.float()
                 ref = moe_ref(cfg, x, lid, tw)
                 emu = moe_ref(cfg, x, lid, tw, fi=True).bfloat16()
@@ -958,6 +1002,9 @@ def arm():
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
     native = oxide_kernels.native()
+    from suffix_hybrid import helion_kernels
+    if gate_on():
+        helion_kernels.backend(HELION_ENV)  # validate the knob now, not at load
     fams = [(g, fn, fam, knob) for on, g, fn, fam, knob in (
         (gate_on(), GATE, "nvfp4_moe_cuda", FAMILY, max_m),
         (fp8_moe.gate_on(), fp8_moe.GATE, fp8_moe.NATIVE_FN, fp8_moe.FAMILY, fp8_moe.max_m))

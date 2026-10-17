@@ -35,6 +35,17 @@ Integration point (no fork, no _custom_ops patching):
     ``input_quant_key() == kNvfp4Dynamic`` inherited) run our GEMM on vLLM's
     packed activation + swizzled scales (kernel asf_mode 1).
 
+Helion backend (``SUFFIX_HELION_NVFP4_GEMM`` = oxide (default) | helion |
+auto; helion_kernels.backend, docs/helion-kernels.md): per (N, K, input
+route, M bucket) the Helion port (suffix_hybrid/helion_kernels/nvfp4_gemm.py)
+replaces the oxide launch where its lab-tuned config is shipped (auto), or
+everywhere (helion: a bucket without a config is a startup error). Same op
+call (``nvfp4_gemm_cuda`` / ``nvfp4_gemm_q_cuda`` twins), same LAYER ORACLE
+(it also runs every Helion bucket's warm M: compiled before any graph
+capture); oxide = this lane unchanged, Helion never imported. The
+AUTOROUTE below times the oxide plan (a Helion bucket only serves where it
+beat that plan in the lab). Line: ``HELION NxK bf16: M1:nvfp4_gemm ...``.
+
 Load-time cold-L2 AUTOROUTE (``SUFFIX_NVFP4_GEMM_AUTOROUTE``, default ON
 with the gate; ``=0`` off): the first layer of every (N, K) not pinned by
 ``SUFFIX_NVFP4_GEMM_ROUTE`` times OUR GEMM vs the parent FlashInfer path on
@@ -91,6 +102,7 @@ GATE = "SUFFIX_NVFP4_GEMM"
 MARKER = "[suffix nvfp4-gemm]"
 FAMILY = "nvfp4_gemm"
 MAX_M_ENV = "SUFFIX_NVFP4_GEMM_MAX_M"
+HELION_ENV = "SUFFIX_HELION_NVFP4_GEMM"  # oxide | helion | auto (helion_kernels.backend)
 ROUTE_ENV = "SUFFIX_NVFP4_GEMM_ROUTE"
 MAX_M = 64  # kernel limit (4 m16 tiles); default of MAX_M_ENV
 ORACLE_REL = 2e-2
@@ -379,16 +391,18 @@ def eligible(n: int, k: int, rows: int, pad_bytes: int) -> str | None:
     return None
 
 
-def _workspace(dev, n: int, k: int, max_m: int = MAX_M):
+def _workspace(dev, n: int, k: int, max_m: int = MAX_M, partial: int = 0):
     """Per-device scratch, grown at LOAD time only (never inside forward):
     aq [16*tiles*K/2] u8, asf [16*tiles*K/16] u8 (tiles = ceil(max_m/16)),
-    split-K partials f32 (worst M bucket of `plan`), split-K ticket
-    counters int32 [ceil(N/32)] (zeroed here, left zeroed by every launch)."""
+    split-K partials f32 (worst M bucket of `plan`, or `partial` elements:
+    the Helion plans' split-K scratch), split-K ticket counters int32
+    [ceil(N/32)] (zeroed here, left zeroed by every launch)."""
     import torch
     from suffix_hybrid.kernels.nvfp4_gemm import partial_elems, tiles_for
     ws = _state["ws"].get(dev)
     rows = 16 * tiles_for(max_m)
-    need = (rows * k // 2, rows * k // 16, max(1, partial_elems(n, k, max_m)), -(-n // 32))
+    need = (rows * k // 2, rows * k // 16, max(1, partial_elems(n, k, max_m), partial),
+            -(-n // 32))
     if ws is None or any(have.numel() < want for have, want in zip(ws, need)):
         old = ws or (None,) * 4
         sizes = [max(want, o.numel() if o is not None else 0)
@@ -414,6 +428,7 @@ def _make_kernel_cls():
         nvfp4_weight_padding_bytes,
     )
     from suffix_hybrid import oxide_kernels
+    from suffix_hybrid.helion_kernels import backend as helion_backend
     import numpy as np
 
     from suffix_hybrid.kernels.nvfp4_gemm import (
@@ -503,6 +518,16 @@ def _make_kernel_cls():
                                             (plan(n, k, m, prequant=q, pf=dec[r][1])
                                              for m in range(1, top + 1))]
                              for q, r in ((False, "bf16"), (True, "prequant"))}
+            hb = helion_backend(HELION_ENV)
+            if hb != "oxide":  # per (route, M): the Helion kernel or None = oxide
+                from suffix_hybrid.helion_kernels import nvfp4_gemm as hx
+                _state["hx"] = hx
+                cfg["hx"] = {q: hx.prepare(n, k, q, top, hb) for q in (False, True)}
+                _workspace(dev, n, k, cap, hx.partial_elems(n, cfg["hx"].values()))
+                if (n, k) not in _state["oracle"]:
+                    for q, r in ((False, "bf16"), (True, "prequant")):
+                        _log(f"HELION {n}x{k} {r} ({HELION_ENV}={hb}): "
+                             f"{hx.describe(cfg['hx'][q])}")
             layer._sfx_nvfp4 = cfg
             cfg["key"] = register_layer(self, layer, getattr(layer, "prefix", ""))
             if (n, k) not in _state["oracle"]:
@@ -565,15 +590,19 @@ def _make_kernel_cls():
                 pl = plan(n, cfg["k"], m, fused=fused, prequant=qa2d is not None)
                 splits, flags = pl["splits"], pl["flags"]
             out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
+            ops = native  # the production plan's Helion bucket, if any (same call)
+            hxp = cfg.get("hx")
+            if hxp is not None and launch is None and fused is None and hxp[qa2d is not None][m]:
+                ops = _state["hx"]
             if qa2d is None:
-                native.nvfp4_gemm_cuda(x2d, cfg["w"], layer.weight_scale, aq, asf,
-                                       partial, out, cfg["g"], cfg["alpha"],
-                                       splits, stream, flags, counters)
+                ops.nvfp4_gemm_cuda(x2d, cfg["w"], layer.weight_scale, aq, asf,
+                                    partial, out, cfg["g"], cfg["alpha"],
+                                    splits, stream, flags, counters)
             else:
                 xq, xsf = qa2d
-                native.nvfp4_gemm_q_cuda(xq, xsf, cfg["w"], layer.weight_scale,
-                                         partial, out, cfg["alpha"], splits, stream,
-                                         flags, counters)
+                ops.nvfp4_gemm_q_cuda(xq, xsf, cfg["w"], layer.weight_scale,
+                                      partial, out, cfg["alpha"], splits, stream,
+                                      flags, counters)
             return out
 
         def _layer_oracle(self, layer, cfg):
@@ -593,6 +622,8 @@ def _make_kernel_cls():
             amp = max(1.0, 448.0 * 6.0 / cfg["g"] / 20.0)
             top = max(cfg["max_m"], cfg["max_m_q"])
             ms = [m for m in ORACLE_MS if m <= top] or [top]
+            if cfg.get("hx"):  # every Helion bucket compiles here, before graph capture
+                ms = sorted(set(ms) | set(_state["hx"].warm_ms(top)))
             aq_ws, asf_ws, _, counters = _state["ws"][dev]
             for m in ms:
                 x = (torch.randn(m, k, generator=gen, device=dev) * amp).bfloat16()
@@ -615,7 +646,7 @@ def _make_kernel_cls():
                 for q, args in ((False, (x,)), (True, (None, (xq, xsf)))):
                     sp, fl = cfg["launch"][q][m]
                     if fl >> PF_SHIFT:
-                        a = self._ours(layer, cfg, *args).view(torch.int16)
+                        a = self._ours(layer, cfg, *args, launch=(sp, fl)).view(torch.int16)
                         b = self._ours(layer, cfg, *args,
                                        launch=(sp, fl & ((1 << PF_SHIFT) - 1))).view(torch.int16)
                         if not torch.equal(a, b):
@@ -842,6 +873,8 @@ def register():
 
     native = oxide_kernels.native()
     max_m, route = max_m_env(), route_table()  # malformed env: fail at startup
+    from suffix_hybrid.helion_kernels import backend as helion_backend
+    hb = helion_backend(HELION_ENV)
     for fn in ("nvfp4_gemm_cuda", "nvfp4_gemm_q_cuda"):
         if not hasattr(native, fn):
             raise RuntimeError(f"{GATE}=1 but _native lacks {fn} (oxide-kernels build)")
@@ -870,7 +903,8 @@ def register():
                if autoroute_on() else "; autoroute OFF")
     _log(f"NVFP4-GEMM armed: SuffixNvFp4LinearKernel registered (M<={max_m} -> "
          f"sm_120a mxf4nvf4 SASS, sha256 {ent[0]['sha256'][:12]}; else FlashInfer "
-         f"CUTLASS; route {routes}); disabled earlier candidates: {','.join(added) or '-'}")
+         f"CUTLASS; route {routes}; {HELION_ENV}={hb}); disabled earlier candidates: "
+         f"{','.join(added) or '-'}")
     return _state
 
 

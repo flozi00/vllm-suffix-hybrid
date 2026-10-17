@@ -55,6 +55,15 @@ tensor, so the OOT class snapshots the pre-processing scale tensors (vLLM's
 UE8M0 requant rewrites weights AND those scales in place, before packing)
 and uses whichever of post/pre is the logical layout.
 
+Helion backend (SUFFIX_HELION_FP8_MOE = oxide | helion | auto, default oxide;
+suffix_hybrid/helion_kernels/fp8_moe.py, docs/helion-kernels.md): inside the
+enabled lane `helion_op` swaps _native.fp8_moe_cuda for a same-signature op
+running the lab-tuned Helion kernel per M bucket (auto: oxide where no config
+is shipped; helion: a missing bucket is a load error). The layer oracle
+judges it like oxide (vs vLLM + the f64 spec + zero contract) on every served
+bucket, which also compiles each before CUDA-graph capture; plan/stage
+readback is oxide-only, Helion gets a bitwise determinism check instead.
+
 CLI (in-pod, SM120 + oxide bundle):
   python -m suffix_hybrid.kernels.fp8_moe oracle   # ours vs vLLM Triton vs f64 ref, per stage
   python -m suffix_hybrid.kernels.fp8_moe bench    # us: ours vs vLLM fused_experts (CUDA graphs)
@@ -69,6 +78,7 @@ from suffix_hybrid.kernels import nvfp4_moe as nm
 
 GATE = "SUFFIX_FP8_MOE"
 MAX_M_ENV = "SUFFIX_FP8_MOE_MAX_M"
+HELION_ENV = "SUFFIX_HELION_FP8_MOE"
 MARKER = "[suffix fp8-moe]"
 FAMILY = "fp8_moe"
 NATIVE_FN = "fp8_moe_cuda"
@@ -317,8 +327,9 @@ def run_ours(native, p, x, ids, tw, ws, stream, out=None, mode=None):
         out = torch.empty(x.shape[0], p["w2"].shape[1], dtype=torch.bfloat16, device=x.device)
     if mode is None:
         mode = nm.launch_mode(x.shape[0], p.get("fused", nm.fused_on()))
-    native.fp8_moe_cuda(x, ids, tw, p["w13"], p["w13_s"], p["w2"], p["w2_s"], *ws, out,
-                        bool(p["ue8m0"]), int(p.get("id_base", 0)), int(mode), stream)
+    op = p.get("op") or native.fp8_moe_cuda  # helion_op's drop-in, else the oxide op
+    op(x, ids, tw, p["w13"], p["w13_s"], p["w2"], p["w2_s"], *ws, out,
+       bool(p["ue8m0"]), int(p.get("id_base", 0)), int(mode), stream)
     return out
 
 
@@ -382,6 +393,21 @@ def resolve_scale(post, pre, shape):
             return t.contiguous(), None
     got = None if post is None else (post.dtype, tuple(post.shape))
     return None, f"weight scales {got} not resolvable to f32 {tuple(shape)} block layout"
+
+
+def helion_op(cfg):
+    """SUFFIX_HELION_FP8_MOE for one prepared layer: None = the oxide op
+    (oxide, or auto with no tuned bucket; the Helion module is never imported
+    under oxide), else helion_kernels.fp8_moe.ServingOp (compiles its tuned
+    buckets now; helion with a missing bucket raises)."""
+    from suffix_hybrid import helion_kernels as hk
+    mode = hk.backend(HELION_ENV)
+    if mode == "oxide":
+        return None
+    from suffix_hybrid.helion_kernels import fp8_moe as hf
+    op = hf.ServingOp(cfg, mode)
+    _log(f"{HELION_ENV}: {op.summary}")
+    return op if op.kernels else None
 
 
 def is_fp8(layer) -> bool:
@@ -456,6 +482,7 @@ def prepare(layer, pre, parent_forward, state):
                ue8m0=e8m0_used(), H=info["H"], I=info["I"], E=info["E"], topk=layer.top_k,
                max_m=max_m(), id_base=info["ep_base"], E_global=layer.global_num_experts,
                fused=nm.fused_on())
+    cfg["op"] = helion_op(cfg)
     _ws[dev] = workspace(dev, cfg["max_m"], cfg["topk"], info["H"], info["I"], info["E"],
                          _ws.get(dev))
     state["oracle"].append(layer_oracle(layer.layer_name, cfg, parent_forward))
@@ -489,7 +516,12 @@ def layer_oracle(name, cfg, parent_forward):
     native = oxide_kernels.native()
     dev = cfg["w13"].device
     base, local, mm = cfg["id_base"], cfg["E"], cfg["max_m"]
-    cases = [(m, None) for m in sorted({1, min(8, mm), mm})]
+    op = cfg.get("op")
+    warm = set()
+    if op is not None:
+        from suffix_hybrid.helion_kernels import fp8_moe as hf
+        warm = set(hf.warm_ms(mm))
+    cases = [(m, None) for m in sorted({1, min(8, mm), mm} | warm)]
     if local < cfg["E_global"]:
         cases.append((min(8, mm), True))
     worst = worst_ref = 0.0
@@ -501,11 +533,18 @@ def layer_oracle(name, cfg, parent_forward):
         ids, tw = nm.rand_routing(m, cfg["E_global"], cfg["topk"], dev, seed, base, local, dead)
         x0 = x.clone()
         stock = parent_forward(x.clone(), tw.clone(), ids.clone()).float()
-        out, pl_ok, pl = plans_fp8(native, cfg, x.clone(), ids.clone(), tw.clone(), _ws[dev],
-                                   torch.cuda.current_stream(dev).cuda_stream)
+        stream = torch.cuda.current_stream(dev).cuda_stream
         lid = nm.to_local(ids, base, local)
-        st_ok, st = stages(cfg, x0, lid, tw, _ws[dev], out)
-        st_ok, st = st_ok and pl_ok, f"{st} {pl}"
+        if op is not None and op.kernel(m) is not None:
+            out = run_ours(native, cfg, x.clone(), ids.clone(), tw.clone(), _ws[dev], stream)
+            again = run_ours(native, cfg, x.clone(), ids.clone(), tw.clone(), _ws[dev], stream)
+            st_ok = bool(torch.equal(out, again))
+            st = f"helion deterministic={st_ok}"
+        else:
+            out, pl_ok, pl = plans_fp8(native, cfg, x.clone(), ids.clone(), tw.clone(), _ws[dev],
+                                       stream)
+            st_ok, st = stages(cfg, x0, lid, tw, _ws[dev], out)
+            st_ok, st = st_ok and pl_ok, f"{st} {pl}"
         ours, ref = out.float(), moe_ref(cfg, x0, lid, tw)
         ok, msg = judge(ours, stock, ref, lid, moe_ref(cfg, x0, lid, tw, vllm=True).bfloat16())
         if stock.norm() > 0:
