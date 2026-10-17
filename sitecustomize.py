@@ -112,6 +112,10 @@ _PRESETS = {
                                  "64:front4/8/255/0",
         "SUFFIX_NCCL_BANDS": "0-inf:har", "SUFFIX_HAR_ONESHOT_MAX_BYTES": "48K",
     },
+    # DeepSeek-V4.1-Flash NVFP4 (MXFP4 Engram tables) on 8x RTX PRO 6000; lanes join after A/B.
+    "dsv41-sm120": {
+        "SUFFIX_DSV41_ENGRAM_MXFP4": "1",
+    },
 }
 # SUFFIX_PRESET is the vendor-neutral spelling (SUFFIX_ROCM_PRESET predates the GLM preset).
 _preset = (os.environ.get("SUFFIX_PRESET", "").strip()
@@ -285,6 +289,12 @@ if (os.environ.get("SUFFIX_FP8_DENSE", "").strip() == "1"
         _fp8d_hook()
     except Exception as exc:
         raise SystemExit(f"suffix fp8-dense installation failed: {exc}") from exc
+
+# DeepSeek-V4.1 MXFP4 Engram tables (vllm#61530 until it lands): exec the PR's
+# engram.py over the stock module on first import; base-hash pinned, fail closed.
+if os.environ.get("SUFFIX_DSV41_ENGRAM_MXFP4", "").strip() == "1":
+    from suffix_hybrid.dsv41_engram import install_post_import_hook as _dsv41_engram_hook
+    _dsv41_engram_hook()
 
 # Hybrid speculator wrap AFTER every sm120 meta_path hook is armed: install_v2
 # imports the V2 model runner, which imports the sparse-MLA backends
