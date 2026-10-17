@@ -16,19 +16,23 @@ dsmla-kernel-contracts-glm53.md §2/§4):
   out    [T, HQ, 512] bf16 = softmax(sm_scale * q.k) . latent (the latent IS
          the value); an all -1 row is exactly 0
 
-ONE body, both oxide launches (attn_partial + attn_merge) as two phases of a
-persistent kernel separated by hl.barrier(): phase 1 = (token, head tile,
-top-k split) programs — every head of the tile shares one gathered latent
-tile, like the oxide CTA's 8 heads — online softmax in the exp2 domain;
-phase 2 = the LSE merge over the splits. The writer (nvfp4_ds_mla_quant_store)
+ONE launch for both oxide entries (attn_partial + attn_merge). Program =
+(token t, top-k split s), grid (T, num_splits): each head tile (all 8/16
+per-rank heads by default) shares one gathered latent tile, like the oxide
+CTA's 8 heads; online softmax in the exp2 domain; each split stores a bf16
+partial + f32 lse. The LAST split of token t to arrive (acq_rel atomic
+counter, no spin-wait: any grid size, any co-running stream) merges the
+splits and resets its counter to 0 (graph-replay safe). The writer (nvfp4_ds_mla_quant_store)
 stays on oxide: one launch-bound 352 B row per token, and its bytes are a
 bit-exact contract (IEEE 1/sf) Triton's default f32 division does not give.
 
 Numerics (within the oracle's 2e-2 row rel-L2 reader gate): e2m1 x e4m3 SF
 products have <= 6 significant bits and |x| <= 2688, so the dequantized
-latent is EXACT in bf16 (QK operand next to the bf16 query: no f16 staging,
-no prescale needed) and in f16 (PV operand, P in f16 like the oxide kernel);
-S, P.V, partials and the merge accumulate in f32. -1 slots are zero-gathered
+latent is EXACT in f16 (PV operand, P in f16 like the oxide kernel) and in
+bf16 (QK operand next to the bf16 query: no f16 staging, no prescale); S,
+P.V and the merge accumulate in f32, partials are bf16 (as oxide). Tiles are
+bounded (top-k tile 16..64 rows, 16-row head tile): every operand tile is
+16-bit, the only f32 tile is the [heads, 512] accumulator. -1 slots are zero-gathered
 (stale NaN SF bytes cannot poison P.V) and masked to S = -inf.
 
 Serving: ``SUFFIX_HELION_DS_MLA`` = oxide (default; this module is never
@@ -64,6 +68,7 @@ ARCHS = ("GlmMoeDsaForCausalLM", "DeepseekV32ForCausalLM")
 # slices up to max-num-batched-tokens 8192 (larger T run the 8192 config)
 BUCKETS = (1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512,
            1024, 2048, 4096, 8192)
+COUNTERS = 16384  # rows of the persistent counter buffer (larger T: per call)
 GATE = 2e-2  # oracle reader gate: max (token, head) row rel-L2
 
 
@@ -72,77 +77,86 @@ GATE = 2e-2  # oracle reader gate: max (token, head) row rel-L2
 # to the shipped config via helion_kernels.compiled)
 # ---------------------------------------------------------------------------
 def ds_mla_decode(q: torch.Tensor, kv: torch.Tensor, topk: torch.Tensor, out: torch.Tensor,
-                  block_size: int, block_stride: int, sm_scale: float) -> torch.Tensor:
+                  counters: torch.Tensor, block_size: int, block_stride: int,
+                  sm_scale: float) -> torch.Tensor:
     """q [T, HQ, 576] bf16, kv = the cache as a flat uint8 byte view, topk
-    [T, C] int32 slots (-1 masked), out [T, HQ, 512] bf16 (filled, returned).
-    Tunables: num_splits (top-k split count), head / top-k / merge tile
-    sizes, num_warps, num_stages, indexing, pid layout (persistent: barrier)."""
+    [T, C] int32 slots (-1 masked), out [T, HQ, 512] bf16 (filled, returned),
+    counters int32 [>= T] all 0 (left 0). Tunables: num_splits, top-k tile
+    (16..64), merge head tile, num_warps, num_stages, indexing, pid layout."""
     n_tok = q.size(0)
     heads, _ = hl.specialize(q.shape[1:])  # q dim 576: constant slices, no masks
-    block_size = hl.specialize(block_size)  # 64 in practice: shift/mask slot math
     cap = hl.specialize(topk.size(1))
-    num_splits = hl.register_tunable("num_splits", PowerOfTwoFragment(1, 64, 8))
-    split = helion.next_power_of_2(helion.cdiv(cap, num_splits))
-    o_part = torch.empty([n_tok, heads, num_splits, 512], dtype=torch.float32, device=q.device)
+    block_size = hl.specialize(block_size)  # 64 in practice: shift/mask slot math
+    num_splits = hl.register_tunable("num_splits", PowerOfTwoFragment(1, 128, 16))
+    bk = hl.register_block_size(16, 64)
+    # top-k columns per split: a power of two, so whole bk tiles once per >= bk
+    per = helion.next_power_of_2(helion.cdiv(cap, num_splits))
+    o_part = torch.empty([n_tok, heads, num_splits, 512], dtype=torch.bfloat16, device=q.device)
     lse_part = torch.empty([n_tok, heads, num_splits], dtype=torch.float32, device=q.device)
-    for tile_t, tile_h, tile_s in hl.tile([n_tok, heads, cap], block_size=[1, None, split]):
-        t = tile_t.begin
-        q_lat = q[t, tile_h, 0:512]
-        q_pe = q[t, tile_h, 512:576]
-        m_i = hl.full([tile_h], float("-inf"), dtype=torch.float32)
-        l_i = hl.zeros([tile_h], dtype=torch.float32)
-        acc = hl.zeros([tile_h, 512], dtype=torch.float32)
-        for tile_k in hl.tile(tile_s.begin, tile_s.end):
-            slot = topk[t, tile_k]
-            valid = (slot >= 0) & (tile_k.index < tile_s.end)
-            keep = valid.to(torch.uint8)
-            s64 = torch.clamp(slot, min=0).to(torch.int64)
-            row = (s64 // block_size) * block_stride + (s64 % block_size) * 352
-            blk = hl.arange(32)
-            # latent bytes [tk, 32 SF blocks, 8 bytes]; -1 rows gather zeros
-            lat_b = kv[row[:, None, None] + (blk * 8)[None, :, None]
-                       + hl.arange(8)[None, None, :]] * keep[:, None, None]
-            codes = hl.join(lat_b & 15, lat_b >> 4)  # [tk, 32, 8, 2]: dim 16b + 2j + {0,1}
-            mag = (codes & 7).to(torch.float32)  # e2m1 |x| = {0,.5,1,1.5,2,3,4,6}
-            val = torch.where(mag < 5.0, mag * 0.5, torch.where(mag == 7.0, mag - 1.0, mag - 2.0))
-            val = torch.where((codes & 8) != 0, -val, val)
-            sf_b = kv[row[:, None] + (320 + 8 * (blk & 3) + (blk >> 2))[None, :]] * keep[:, None]
-            sf = sf_b.view(torch.float8_e4m3fn).to(torch.float32)
-            k_lat = (val * sf[:, :, None, None]).reshape(tile_k, 512).to(torch.bfloat16)
-            pe_b = kv[row[:, None] + (256 + hl.arange(64))[None, :]] * keep[:, None]
-            k_pe = pe_b.view(torch.float8_e4m3fn).to(torch.float32).to(torch.bfloat16)
-            s = hl.dot(q_lat, k_lat.T, out_dtype=torch.float32)
-            s = hl.dot(q_pe, k_pe.T, acc=s)
-            s = torch.where(valid[None, :], s * (sm_scale * 1.4426950408889634),
-                            hl.full([tile_h, tile_k], float("-inf"), dtype=torch.float32))
-            m_new = torch.maximum(m_i, torch.amax(s, dim=1))
-            m_ref = torch.clamp(m_new, min=-3.0e38)  # all-masked so far: exp2(-inf) = 0
-            alpha = torch.exp2(m_i - m_ref)
-            p = torch.exp2(s - m_ref[:, None])
-            l_i = l_i * alpha + torch.sum(p, dim=1)
-            acc = hl.dot(p.to(torch.float16), k_lat.to(torch.float16), acc=acc * alpha[:, None])
-            m_i = m_new
-        l_div = l_i + (l_i == 0.0).to(torch.float32)  # empty split: o 0, lse -inf
-        o_part[t, tile_h, tile_s.id, :] = acc / l_div[:, None]
-        lse_part[t, tile_h, tile_s.id] = m_i + torch.log2(l_div)
-    hl.barrier()
-    # phase 2: fresh names (Helion refuses re-binding phase-1 names on the device)
-    for tile_mt, tile_mh in hl.tile([n_tok, heads]):
-        mrg_m = hl.full([tile_mt, tile_mh], float("-inf"), dtype=torch.float32)
-        mrg_l = hl.zeros([tile_mt, tile_mh], dtype=torch.float32)
-        mrg_o = hl.zeros([tile_mt, tile_mh, 512], dtype=torch.float32)
-        for tile_ms in hl.tile(cap, block_size=split):
-            lse = lse_part[tile_mt, tile_mh, tile_ms.id]
-            mrg_new = torch.maximum(mrg_m, lse)
-            mrg_ref = torch.clamp(mrg_new, min=-3.0e38)
-            mrg_a = torch.exp2(mrg_m - mrg_ref)
-            mrg_w = torch.exp2(lse - mrg_ref)
-            mrg_l = mrg_l * mrg_a + mrg_w
-            mrg_o = (mrg_o * mrg_a[:, :, None]
-                     + o_part[tile_mt, tile_mh, tile_ms.id, :] * mrg_w[:, :, None])
-            mrg_m = mrg_new
-        mrg_div = mrg_l + (mrg_l == 0.0).to(torch.float32)  # all -1 token: exact 0 row
-        out[tile_mt, tile_mh, :] = (mrg_o / mrg_div[:, :, None]).to(out.dtype)
+    for t, s in hl.grid([n_tok, num_splits]):
+        c0 = s * per
+        c1 = min(c0 + per, cap)
+        # 16 q rows per tile (the m16 MMA; HQ 8 = 8 real + 8 masked like the
+        # oxide CTA): fixed, as an autotuned dot dim overshoots to 64 rows
+        for tile_h in hl.tile(heads, block_size=16):
+            q_lat = q[t, tile_h, 0:512]
+            q_pe = q[t, tile_h, 512:576]
+            m_i = hl.full([tile_h], float("-inf"), dtype=torch.float32)
+            l_i = hl.zeros([tile_h], dtype=torch.float32)
+            acc = hl.zeros([tile_h, 512], dtype=torch.float32)
+            for tile_k in hl.tile(c0, c1, block_size=bk):
+                slot = topk[t, tile_k]
+                valid = (slot >= 0) & (tile_k.index < c1)
+                keep = valid.to(torch.uint8)
+                s64 = torch.clamp(slot, min=0).to(torch.int64)
+                row = (s64 // block_size) * block_stride + (s64 % block_size) * 352
+                blk = hl.arange(32)
+                # latent bytes [tk, 32 SF blocks, 8 bytes]; -1 rows gather zeros
+                lat_b = kv[row[:, None, None] + (blk * 8)[None, :, None]
+                           + hl.arange(8)[None, None, :]] * keep[:, None, None]
+                codes = hl.join(lat_b & 15, lat_b >> 4)  # [tk, 32, 8, 2]: dim 16b + 2j + {0,1}
+                mag = (codes & 7).to(torch.float32)  # e2m1 |x| = {0,.5,1,1.5,2,3,4,6}
+                val = torch.where(mag < 5.0, mag * 0.5, torch.where(mag == 7.0, mag - 1.0, mag - 2.0))
+                val = torch.where((codes & 8) != 0, -val, val)
+                sf_b = kv[row[:, None] + (320 + 8 * (blk & 3) + (blk >> 2))[None, :]] * keep[:, None]
+                sf = sf_b.view(torch.float8_e4m3fn).to(torch.float32)
+                k16 = (val * sf[:, :, None, None]).reshape(lat_b.size(0), 512).to(torch.float16)
+                pe_b = kv[row[:, None] + (256 + hl.arange(64))[None, :]] * keep[:, None]
+                k_pe = pe_b.view(torch.float8_e4m3fn).to(torch.float32).to(torch.bfloat16)
+                sc = hl.dot(q_lat, k16.to(torch.bfloat16).T, out_dtype=torch.float32)
+                sc = hl.dot(q_pe, k_pe.T, acc=sc)
+                sc = torch.where(valid[None, :], sc * (sm_scale * 1.4426950408889634),
+                                 float("-inf"))
+                m_new = torch.maximum(m_i, torch.amax(sc, dim=1))
+                m_ref = torch.clamp(m_new, min=-3.0e38)  # all-masked so far: exp2(-inf) = 0
+                alpha = torch.exp2(m_i - m_ref)
+                p = torch.exp2(sc - m_ref[:, None])
+                l_i = l_i * alpha + torch.sum(p, dim=1)
+                acc = hl.dot(p.to(torch.float16), k16, acc=acc * alpha[:, None])
+                m_i = m_new
+            l_div = l_i + (l_i == 0.0).to(torch.float32)  # empty split: o 0, lse -inf
+            o_part[t, tile_h, s, :] = (acc / l_div[:, None]).to(torch.bfloat16)
+            lse_part[t, tile_h, s] = m_i + torch.log2(l_div)
+        old = hl.atomic_add(counters, [t], 1, sem="acq_rel")
+        if old == num_splits - 1:
+            # every split of token t has stored its partial: merge them
+            for tile_g in hl.tile(heads):
+                mg_m = hl.full([tile_g], float("-inf"), dtype=torch.float32)
+                mg_l = hl.zeros([tile_g], dtype=torch.float32)
+                mg_o = hl.zeros([tile_g, 512], dtype=torch.float32)
+                for s2 in hl.grid(num_splits):
+                    lse = lse_part[t, tile_g, s2]
+                    mg_new = torch.maximum(mg_m, lse)
+                    mg_ref = torch.clamp(mg_new, min=-3.0e38)
+                    mg_a = torch.exp2(mg_m - mg_ref)
+                    mg_w = torch.exp2(lse - mg_ref)
+                    mg_l = mg_l * mg_a + mg_w
+                    mg_o = (mg_o * mg_a[:, None]
+                            + o_part[t, tile_g, s2, :].to(torch.float32) * mg_w[:, None])
+                    mg_m = mg_new
+                mg_div = mg_l + (mg_l == 0.0).to(torch.float32)  # all -1 token: exact 0
+                out[t, tile_g, :] = (mg_o / mg_div[:, None]).to(out.dtype)
+            counters[t] = 0
     return out
 
 
@@ -204,7 +218,11 @@ def load(heads: int, topk: int, device) -> dict | None:
                for b in BUCKETS if b not in missing}
     dev = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
     key = (str(dev), heads, topk)
-    route = {"mode": mode, "heads": heads, "topk": topk, "kernels": kernels}
+    # last-arriver counters: all 0 between launches (each merge resets its
+    # token's); one buffer per route, sized for max-num-batched-tokens
+    counters = torch.zeros(COUNTERS, dtype=torch.int32, device=dev) if kernels else None
+    route = {"mode": mode, "heads": heads, "topk": topk, "kernels": kernels,
+             "counters": counters}
     if key not in _VERIFIED:  # once per device (vLLM builds one impl per layer)
         if kernels:
             _verify(route, dev)
@@ -219,7 +237,8 @@ _VERIFIED: set = set()
 
 def decode(route: dict, q, kv_cache, topk, out, sm_scale: float):
     """The serving op (oxide op semantics minus its o_part/lse_part workspace
-    and stream: Helion allocates its own and runs on torch's current stream).
+    and stream: Helion allocates its own and runs on torch's current stream;
+    one serving stream per worker shares the route's counter buffer).
     Returns `out`, or None when this shape has no tuned kernel (auto: the
     caller runs the oxide op)."""
     t, h, c = q.shape[0], q.shape[-2], topk.shape[-1]
@@ -235,7 +254,10 @@ def decode(route: dict, q, kv_cache, topk, out, sm_scale: float):
                                f"{route['topk']})")
         return None
     q3, flat, tk, o3, bs, stride = views(q, kv_cache, topk, out)
-    kern(q3, flat, tk, o3, bs, stride, float(sm_scale))
+    cnt = route["counters"]
+    if t > cnt.numel():
+        cnt = torch.zeros(t, dtype=torch.int32, device=cnt.device)
+    kern(q3, flat, tk, o3, cnt, bs, stride, float(sm_scale))
     return out
 
 
@@ -319,7 +341,8 @@ def _cache_view(kv, block_size, block_stride):
 def make(c: dict, seed: int):
     """A realistic cache (64k slots written by the oracle's row recipe =
     the oxide/vLLM writer bytes), top-k rows with -1 tails / holes / one all
-    -1 padding row, q and out — the body's args (dense 64-row blocks)."""
+    -1 padding row, q, out and zeroed counters — the body's args (dense
+    64-row blocks)."""
     O = _oracle()
     t, h, cap = c["numtokens"], c["heads"], c["topk"]
     g = torch.Generator(device="cpu").manual_seed(1000 + seed)
@@ -337,16 +360,17 @@ def make(c: dict, seed: int):
         topk[5] = -1  # padding row
     q = torch.randn(t, h, DIM + PE, generator=g).bfloat16().cuda()
     out = torch.empty(t, h, DIM, dtype=torch.bfloat16, device="cuda")
-    return q, flat, topk.cuda(), out, bs, bs * ROW, SCALE
+    counters = torch.zeros(t, dtype=torch.int32, device="cuda")
+    return q, flat, topk.cuda(), out, counters, bs, bs * ROW, SCALE
 
 
-def reference(q, kv, topk, out, block_size, block_stride, sm_scale):
+def reference(q, kv, topk, out, counters, block_size, block_stride, sm_scale):
     O = _oracle()
     lat, rope = O.dequant_rows_ref(_cache_view(kv, block_size, block_stride).reshape(-1, ROW))
     return O.attention_ref(q.float(), lat, rope, topk, sm_scale)
 
 
-def baseline(q, kv, topk, out, block_size, block_stride, sm_scale):
+def baseline(q, kv, topk, out, counters, block_size, block_stride, sm_scale):
     """The oxide op exactly as the patch launches it (plan-sized workspace)."""
     from suffix_hybrid import _native, oxide_kernels
 

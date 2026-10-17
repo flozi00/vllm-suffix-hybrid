@@ -57,7 +57,8 @@ def problem(seed=0, t=4, h=4, cap=40, bs=16, nb=6, pad=32):
 
 def args_of(q, cache, topk):
     out = torch.empty(q.shape[0], q.shape[1], D.DIM, dtype=torch.bfloat16)
-    return (*D.views(q, cache, topk, out), O.SCALE)
+    q3, flat, tk, o3, bs, stride = D.views(q, cache, topk, out)
+    return q3, flat, tk, o3, torch.zeros(q.shape[0], dtype=torch.int32), bs, stride, O.SCALE
 
 
 # ---- pure python -----------------------------------------------------------
@@ -96,7 +97,7 @@ def test_check_is_the_reader_gate():
 
 def test_views_flat_byte_geometry():
     q, cache, topk = problem()
-    q3, flat, tk, o3, bs, stride = args_of(q, cache, topk)[:6]
+    q3, flat, tk, o3, _, bs, stride, _ = args_of(q, cache, topk)
     assert (bs, stride) == (16, 16 * D.ROW + 32)
     assert flat.numel() == 5 * stride + 16 * D.ROW and flat.data_ptr() == cache.data_ptr()
     for s in (0, 15, 16, 95):
@@ -149,7 +150,8 @@ def test_knob_oxide_helion_auto(knob):
     out = torch.empty(4, 4, D.DIM, dtype=torch.bfloat16)
     assert D.decode(route, q[:1], cache, topk[:1], out[:1], 0.5) is not None
     (b, a), = knob.calls
-    assert b == 1 and a[0].shape == (1, 4, 576) and a[4:] == (16, 16 * D.ROW + 32, 0.5)
+    assert b == 1 and a[0].shape == (1, 4, 576) and a[5:] == (16, 16 * D.ROW + 32, 0.5)
+    assert a[4] is route["counters"] and a[4].dtype == torch.int32
     assert D.decode(route, q, cache, topk, out, 0.5) is None  # T=4 -> bucket 4: untuned
     assert D.decode(route, q[:1, :2], cache, topk[:1], out[:1, :2], 0.5) is None  # heads
     knob.mp.setenv(D.KNOB, "helion")
@@ -178,7 +180,10 @@ def test_patch_dispatch_and_auto_fallback(knob, monkeypatch):
     assert P._helion_route(impl, 0) is None  # knob unset: oxide, port untouched
     knob.mp.setenv(D.KNOB, "auto")
     knob.tuned.add(1)
+    real, seen = D.load, []
+    monkeypatch.setattr(D, "load", lambda h, c, dev: seen.append((h, c, dev)) or real(h, c, "cpu"))
     impl._suffix_helion_ds_mla = P._helion_route(impl, 0)
+    assert seen == [(4, 40, 0)]  # per-rank heads, the indexer's top-k width, the device
     assert sorted(impl._suffix_helion_ds_mla["kernels"]) == [1]
     q, cache, topk = problem()
     out = torch.empty(4, 4, D.DIM, dtype=torch.bfloat16)
@@ -194,12 +199,13 @@ def test_patch_dispatch_and_auto_fallback(knob, monkeypatch):
 
 
 def test_load_time_oracle_accepts_exact_rejects_nan():
-    def exact(q3, flat, tk, o3, bs, stride, scale):
-        o3.copy_(D.reference(q3, flat, tk, o3, bs, stride, scale))
+    def exact(*a):
+        a[3].copy_(D.reference(*a))
 
-    def stale(q3, flat, tk, o3, bs, stride, scale):
+    def stale(q3, flat, tk, o3, cnt, bs, stride, scale):
         o3.fill_(float("nan"))
-    route = {"mode": "auto", "heads": 2, "topk": 40, "kernels": {1: exact, 6: exact}}
+    route = {"mode": "auto", "heads": 2, "topk": 40, "kernels": {1: exact, 6: exact},
+             "counters": torch.zeros(8, dtype=torch.int32)}
     torch.set_default_dtype(torch.bfloat16)  # as under vLLM model init
     try:
         D._verify(route, torch.device("cpu"))
@@ -230,13 +236,15 @@ def interp(monkeypatch):
     return helion
 
 
-@pytest.mark.parametrize("num_splits", [1, 4, 64])  # 1 / 3 (16,16,8) / 40 of 64 splits
+# reference mode runs the max top-k tile (64): C=200 -> 4 tiles (64,64,64,8);
+# 1 split of 4 tiles / 4 splits of 1 / 4 used + 60 empty of 64
+@pytest.mark.parametrize("num_splits", [1, 4, 64])
 def test_body_matches_oracle_reference(interp, num_splits):
-    q, cache, topk = problem(seed=num_splits)
+    q, cache, topk = problem(seed=num_splits, cap=200)
     a = args_of(q, cache, topk)
     kern = interp.kernel(D.ds_mla_decode, config=interp.Config(num_splits=num_splits))
     out = kern(*a)
-    assert out is a[3]
+    assert out is a[3] and not bool(a[4].any())  # counters reset by the last arrivers
     ok, msg = D.check(out, D.reference(*a))
     assert ok, msg
     assert bool((out[1] == 0).all())  # all -1 token
@@ -244,5 +252,6 @@ def test_body_matches_oracle_reference(interp, num_splits):
 
 def test_load_time_oracle_runs_the_body(interp):
     kern = interp.kernel(D.ds_mla_decode, config=interp.Config(num_splits=4))
-    route = {"mode": "helion", "heads": 2, "topk": 40, "kernels": {1: kern, 2: kern, 6: kern}}
+    route = {"mode": "helion", "heads": 2, "topk": 40, "kernels": {1: kern, 2: kern, 6: kern},
+             "counters": torch.zeros(8, dtype=torch.int32)}
     D._verify(route, torch.device("cpu"))

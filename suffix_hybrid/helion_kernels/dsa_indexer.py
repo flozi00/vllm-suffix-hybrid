@@ -335,16 +335,20 @@ def decode_make_baseline(case, seed):
     return (out, pr["q"], pr["cache"], pr["w"], pr["cl"], pr["bt"], case["rows"] // case["numtokens"])
 
 
-def decode_baseline(out, q, cache, w, cl, bt, group):
+def _oxide(out, q, w, kv, k_scale, bt, lo, hi, group):
     """The oxide kernel with the lane's launch plan (no backend routing)."""
     dev = q.device
-    rows = out.shape[0]
-    p = di.plan(rows, group, out.shape[1], di._sms(dev), di._min_tiles())
+    rows, n = out.shape
+    p = di.plan(rows, group, n, di._sms(dev), di._min_tiles())
     di._native(dev).dsa_indexer_logits_cuda(
-        out, q.reshape(rows, q.shape[-2], 128), w, cache.squeeze(2), None, bt, None,
-        cl.reshape(-1).to(torch.int32), out.shape[1], p["group"], p["slices"], 1, p["splits"],
+        out, q, w, kv, k_scale, bt, lo, hi, n, p["group"], p["slices"], 1, p["splits"],
         p["min_tiles"], torch.cuda.current_stream(dev).cuda_stream)
     return out
+
+
+def decode_baseline(out, q, cache, w, cl, bt, group):
+    return _oxide(out, q.reshape(out.shape[0], q.shape[-2], 128), w, cache.squeeze(2), None, bt,
+                  None, cl.reshape(-1).to(torch.int32), group)
 
 
 def prefill_problem(heads, m, n, dev, seed=0):
@@ -386,13 +390,33 @@ def prefill_reference(q, kv, ks, w, lo, hi, out, splits):
 
 
 def prefill_baseline(q, kv, ks, w, lo, hi, out, splits):
-    dev = q.device
-    m, n = out.shape
-    p = di.plan(m, di.PREFILL_GROUP, n, di._sms(dev), di._min_tiles())
-    di._native(dev).dsa_indexer_logits_cuda(
-        out, q, w, kv, ks, None, lo, hi, n, p["group"], p["slices"], 1, p["splits"],
-        p["min_tiles"], torch.cuda.current_stream(dev).cuda_stream)
-    return out
+    return _oxide(out, q, w, kv, ks, None, lo, hi, di.PREFILL_GROUP)
+
+
+# Helion's autotuner checks every candidate against a baseline run over the
+# WHOLE output; the windows are the only defined part (the kernel never writes
+# elsewhere). Lab-only settings (serving never autotunes): the baseline is the
+# oxide kernel on the body's own args, and the comparison is restricted to the
+# columns the baseline wrote (finite), like the consumer. The lab's check()
+# still proves the winner wrote nothing outside the windows.
+def _decode_tune_baseline(q, w, kv, ks, bt, cl, out, splits):
+    return _oxide(out, q, w, kv.view(torch.uint8).view(-1, PAGE, 132), None, bt, None, cl, 1)
+
+
+def _prefill_tune_baseline(q, kv, ks, w, lo, hi, out, splits):
+    return prefill_baseline(q, kv, ks, w, lo, hi, out, splits)
+
+
+def _tune_check(actual, expected):
+    """Autotuner accuracy check: float tensors compared where `expected` is
+    finite (rtol 1e-3, atol 1e-3 x its RMS); raises AssertionError."""
+    from torch.utils._pytree import tree_flatten
+    for a, e in zip(tree_flatten(actual)[0], tree_flatten(expected)[0], strict=True):
+        if isinstance(e, torch.Tensor) and e.dtype == torch.float32:
+            m = torch.isfinite(e)
+            ef = e[m]
+            rms = float(ef.double().square().mean().sqrt()) if ef.numel() else 0.0
+            torch.testing.assert_close(a[m], ef, rtol=1e-3, atol=1e-3 * max(rms, 1e-6))
 
 
 def check(out, ref):
@@ -424,12 +448,16 @@ KERNELS = [
     {"name": DECODE, "body": dsa_decode_logits, "cases": _cases(DECODE),
      "make": decode_make, "reference": decode_reference, "check": check,
      "make_baseline": decode_make_baseline, "baseline": decode_baseline,
-     "baseline_name": "oxide dsa_indexer", "replaces": [r"dsa_logits"]},
+     "baseline_name": "oxide dsa_indexer", "replaces": [r"dsa_logits"],
+     "settings": {"autotune_baseline_fn": _decode_tune_baseline,
+                  "autotune_baseline_accuracy_check_fn": _tune_check}},
     # the oxide entry is ONE kernel for decode and prefill: the decode-dominated
     # profile op is credited to the decode port only (no double count)
     {"name": PREFILL, "body": dsa_prefill_logits, "cases": _cases(PREFILL),
      "make": prefill_make, "reference": prefill_reference, "check": check,
-     "baseline": prefill_baseline, "baseline_name": "oxide dsa_indexer", "replaces": []},
+     "baseline": prefill_baseline, "baseline_name": "oxide dsa_indexer", "replaces": [],
+     "settings": {"autotune_baseline_fn": _prefill_tune_baseline,
+                  "autotune_baseline_accuracy_check_fn": _tune_check}},
 ]
 
 

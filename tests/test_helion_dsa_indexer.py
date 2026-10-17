@@ -299,3 +299,16 @@ def test_triton_codegen(body, make, static):
     bound = helion.kernel(body, static_shapes=static, ref_mode=RefMode.OFF).bind(make())
     code = bound.to_triton_code(bound.config_spec.default_config())
     assert "tl.dot" in code and "tl.float8e4nv" in code
+
+
+def test_tune_check_compares_only_the_windows():
+    args = decode_problem(32, [100], 1, 200)
+    val, _ = hdi.decode_reference(*args)
+    base = torch.where(torch.isnan(val), NEG, val).float()
+    junk = base.clone()
+    junk[0, 150:] = 7.0                       # outside the window: ignored
+    hdi._tune_check((junk, 3), (base, 3))
+    junk[0, 5] += 1.0                         # inside: rejected
+    with pytest.raises(AssertionError):
+        hdi._tune_check(junk, base)
+    assert all("autotune_baseline_fn" in k["settings"] for k in hdi.KERNELS)

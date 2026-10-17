@@ -21,11 +21,13 @@ shipped config via helion_kernels.compiled):
                             (the oxide FUSE_QUANT prologue: each N tile
                             quantizes its rows in registers)
   nvfp4_gemm_q_body         prequant route
-  nvfp4_gemm_splitk_body    the same two with split-K: phase 1 writes fp32
-  nvfp4_gemm_q_splitk_body  partials [split, M, N] per (M, N, K-split) tile,
-                            hl.barrier(), phase 2 sums them in split order
-                            0..S-1 (deterministic, like the oxide
-                            nvfp4_splitk_reduce / FUSE_REDUCE fixup)
+  nvfp4_gemm_splitk_body    the same two with split-K: each (M, N, K-split)
+  nvfp4_gemm_q_splitk_body  program writes its fp32 partial [split, M, N],
+                            draws an acq_rel ticket per (M, N) tile; the LAST
+                            arriver sums the splits in order 0..S-1 and
+                            re-zeroes the counter (the oxide FUSE_REDUCE
+                            fixup: deterministic, no spin -> no residency
+                            deadlock, graph-replay safe)
 tl.dot_scaled only takes e8m0 block-32 (MX) scales, so NVFP4's e4m3 block-16
 scales are applied in registers: e2m1 x e4m3 is exact in bf16, hl.dot
 accumulates fp32. One k step = BKB 16-element blocks: weight bytes
@@ -86,8 +88,10 @@ def nvfp4_gemm_body(x: torch.Tensor, w: torch.Tensor, wsf: torch.Tensor, out: to
     n = hl.specialize(w.size(0))
     nkb = hl.specialize(w.size(1))
     kb_pad = (nkb + 3) // 4 * 4
-    bkb = hl.register_block_size(1, 32)
-    for tile_m, tile_n in hl.tile([m, n]):
+    bm = hl.register_block_size(16, 64)
+    bn = hl.register_block_size(16, 128)
+    bkb = hl.register_block_size(1, 16)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[bm, bn]):
         rn = torch.clamp(tile_n.index, max=n - 1)[:, None]  # N tail: stay inside w_sf
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_kb in hl.tile(nkb, block_size=bkb):
@@ -119,15 +123,17 @@ def nvfp4_gemm_body(x: torch.Tensor, w: torch.Tensor, wsf: torch.Tensor, out: to
 
 def nvfp4_gemm_q_body(xq: torch.Tensor, xsf: torch.Tensor, w: torch.Tensor, wsf: torch.Tensor,
                       out: torch.Tensor, alpha: float) -> torch.Tensor:
-    """xq uint8 [M, K/16, 8] + xsf e4m3 flat swizzled (rows padded to 128:
-    M-tail rows < 128 stay in bounds), w / wsf as nvfp4_gemm_body."""
+    """xq uint8 [M, K/16, 8] + xsf e4m3 flat swizzled (rows padded to 128,
+    M <= 64), w / wsf as nvfp4_gemm_body."""
     m = xq.size(0)
     n = hl.specialize(w.size(0))
     nkb = hl.specialize(w.size(1))
     kb_pad = (nkb + 3) // 4 * 4
-    bkb = hl.register_block_size(1, 32)
-    for tile_m, tile_n in hl.tile([m, n]):
-        rm = tile_m.index[:, None]
+    bm = hl.register_block_size(16, 64)
+    bn = hl.register_block_size(16, 128)
+    bkb = hl.register_block_size(1, 16)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[bm, bn]):
+        rm = torch.clamp(tile_m.index, max=127)[:, None]  # xsf rows: padded to 128
         rn = torch.clamp(tile_n.index, max=n - 1)[:, None]
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_kb in hl.tile(nkb, block_size=bkb):
@@ -152,10 +158,11 @@ def nvfp4_gemm_q_body(xq: torch.Tensor, xsf: torch.Tensor, w: torch.Tensor, wsf:
 
 
 def nvfp4_gemm_splitk_body(x: torch.Tensor, w: torch.Tensor, wsf: torch.Tensor, out: torch.Tensor,
-                           partial: torch.Tensor, g: float, g6: float,
+                           partial: torch.Tensor, counters: torch.Tensor, g: float, g6: float,
                            alpha: float) -> torch.Tensor:
     """nvfp4_gemm_body with split-K: partial fp32 [cap, M, N] scratch, cap =
-    the largest split_k tried (a power of two; serving passes the tuned one)."""
+    the largest split_k tried (a power of two; serving passes the tuned one);
+    counters int32 zeros >= (M tiles x N tiles) (`counter_elems`), left zero."""
     m = x.size(0)
     n = hl.specialize(w.size(0))
     nkb = hl.specialize(w.size(1))
@@ -163,8 +170,10 @@ def nvfp4_gemm_splitk_body(x: torch.Tensor, w: torch.Tensor, wsf: torch.Tensor, 
     cap = hl.specialize(partial.size(0))
     split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, cap, min(4, cap)))
     kb_split = helion.next_power_of_2(helion.cdiv(nkb, split_k))
-    bkb = hl.register_block_size(1, 32)
-    for tile_m, tile_n, tile_s in hl.tile([m, n, nkb], block_size=[None, None, kb_split]):
+    bm = hl.register_block_size(16, 64)
+    bn = hl.register_block_size(16, 128)
+    bkb = hl.register_block_size(1, 16)
+    for tile_m, tile_n, tile_s in hl.tile([m, n, nkb], block_size=[bm, bn, kb_split]):
         rn = torch.clamp(tile_n.index, max=n - 1)[:, None]
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_kb in hl.tile(tile_s.begin, tile_s.end, block_size=bkb):
@@ -188,18 +197,22 @@ def nvfp4_gemm_splitk_body(x: torch.Tensor, w: torch.Tensor, wsf: torch.Tensor, 
             wv = (torch.where(c > 7, -v, v) * sb[:, :, None, None]).to(torch.bfloat16)
             acc = hl.dot(av.reshape(av.size(0), -1), wv.reshape(wv.size(0), -1).T, acc=acc)
         partial[tile_s.id, tile_m, tile_n] = acc
-    hl.barrier()
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_r in hl.tile(nkb, block_size=kb_split):  # fixed split order
-            acc = acc + partial[tile_r.id, tile_m, tile_n]
-        out[tile_m, tile_n] = (acc * alpha).to(torch.bfloat16)
+        # last arriver of this (M, N) tile sums every split in order 0..S-1
+        # (no spin, any residency) and re-zeroes its counter (graph replay)
+        tid = tile_m.id * tile_n.count + tile_n.id
+        old = hl.atomic_add(counters, [tid], 1, sem="acq_rel")
+        if old == tile_s.count - 1:
+            red = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_r in hl.tile(nkb, block_size=kb_split):
+                red = red + partial[tile_r.id, tile_m, tile_n]
+            out[tile_m, tile_n] = (red * alpha).to(torch.bfloat16)
+            counters[tid] = 0
     return out
 
 
 def nvfp4_gemm_q_splitk_body(xq: torch.Tensor, xsf: torch.Tensor, w: torch.Tensor,
                              wsf: torch.Tensor, out: torch.Tensor, partial: torch.Tensor,
-                             alpha: float) -> torch.Tensor:
+                             counters: torch.Tensor, alpha: float) -> torch.Tensor:
     """nvfp4_gemm_q_body with split-K (partial as nvfp4_gemm_splitk_body)."""
     m = xq.size(0)
     n = hl.specialize(w.size(0))
@@ -208,9 +221,11 @@ def nvfp4_gemm_q_splitk_body(xq: torch.Tensor, xsf: torch.Tensor, w: torch.Tenso
     cap = hl.specialize(partial.size(0))
     split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, cap, min(4, cap)))
     kb_split = helion.next_power_of_2(helion.cdiv(nkb, split_k))
-    bkb = hl.register_block_size(1, 32)
-    for tile_m, tile_n, tile_s in hl.tile([m, n, nkb], block_size=[None, None, kb_split]):
-        rm = tile_m.index[:, None]
+    bm = hl.register_block_size(16, 64)
+    bn = hl.register_block_size(16, 128)
+    bkb = hl.register_block_size(1, 16)
+    for tile_m, tile_n, tile_s in hl.tile([m, n, nkb], block_size=[bm, bn, kb_split]):
+        rm = torch.clamp(tile_m.index, max=127)[:, None]  # xsf rows: padded to 128
         rn = torch.clamp(tile_n.index, max=n - 1)[:, None]
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_kb in hl.tile(tile_s.begin, tile_s.end, block_size=bkb):
@@ -231,17 +246,27 @@ def nvfp4_gemm_q_splitk_body(xq: torch.Tensor, xsf: torch.Tensor, w: torch.Tenso
             wv = (torch.where(c > 7, -v, v) * sb[:, :, None, None]).to(torch.bfloat16)
             acc = hl.dot(av.reshape(av.size(0), -1), wv.reshape(wv.size(0), -1).T, acc=acc)
         partial[tile_s.id, tile_m, tile_n] = acc
-    hl.barrier()
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_r in hl.tile(nkb, block_size=kb_split):
-            acc = acc + partial[tile_r.id, tile_m, tile_n]
-        out[tile_m, tile_n] = (acc * alpha).to(torch.bfloat16)
+        # last arriver of this (M, N) tile sums every split in order 0..S-1
+        # (no spin, any residency) and re-zeroes its counter (graph replay)
+        tid = tile_m.id * tile_n.count + tile_n.id
+        old = hl.atomic_add(counters, [tid], 1, sem="acq_rel")
+        if old == tile_s.count - 1:
+            red = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_r in hl.tile(nkb, block_size=kb_split):
+                red = red + partial[tile_r.id, tile_m, tile_n]
+            out[tile_m, tile_n] = (red * alpha).to(torch.bfloat16)
+            counters[tid] = 0
     return out
 
 
 BODIES = {"nvfp4_gemm": nvfp4_gemm_body, "nvfp4_gemm_splitk": nvfp4_gemm_splitk_body,
           "nvfp4_gemm_q": nvfp4_gemm_q_body, "nvfp4_gemm_q_splitk": nvfp4_gemm_q_splitk_body}
+
+
+def counter_elems(n: int) -> int:
+    """Split-K arrival counters a split body may index: (M tiles) x (N tiles)
+    at the smallest blocks (16) and M <= MAX_M."""
+    return -(-MAX_M // 16) * -(-n // 16)
 
 
 def max_splits(n: int) -> int:
@@ -256,6 +281,17 @@ def max_splits(n: int) -> int:
 # serving: per-M plan at load + the oxide op's call signatures
 # ---------------------------------------------------------------------------
 _PLANS: dict = {}  # (prequant, n, k) -> [None, entry for M = 1..max_m]
+_COUNTERS: dict = {"need": 0}  # device -> int32 zeros (split-K tickets; launches leave 0)
+
+
+def _counters(device) -> torch.Tensor:
+    """The split bodies' counters, sized for every prepared plan. First used
+    by the lanes' load-time oracle / warm-up, i.e. before graph capture."""
+    buf = _COUNTERS.get(device)
+    if buf is None or buf.numel() < _COUNTERS["need"]:
+        buf = _COUNTERS[device] = torch.zeros(_COUNTERS["need"], dtype=torch.int32,
+                                              device=device)
+    return buf
 
 
 def prepare(n: int, k: int, prequant: bool, max_m: int, mode: str) -> list:
@@ -282,6 +318,8 @@ def prepare(n: int, k: int, prequant: bool, max_m: int, mode: str) -> list:
                 f"for {hk.case_key(case)} on {hk.platform()} (tune it in the autotune lab and "
                 f"ship configs/helion/<kernel>/<platform>.json, or set {ENV}=auto)")
     plan = [None] + [per[hk.bucket(m, BUCKETS)] for m in range(1, max_m + 1)]
+    if any(e is not None and e[2] for e in plan):
+        _COUNTERS["need"] = max(_COUNTERS["need"], counter_elems(n))
     key = (prequant, n, k)
     if len(plan) > len(_PLANS.get(key, ())):
         _PLANS[key] = plan
@@ -348,7 +386,8 @@ def nvfp4_gemm_cuda(x, w, w_sf, aq, asf, partial, out, gscale, alpha, splits, st
     g6 = float(np.float32(gscale) / np.float32(6.0))
     args = (x.view(m, k // 16, 16), w.view(n, k // 16, 8), _sf_flat(w_sf), out)
     if split:
-        return kern(*args, partial[: split * m * n].view(split, m, n), gscale, g6, alpha)
+        return kern(*args, partial[: split * m * n].view(split, m, n), _counters(x.device),
+                    gscale, g6, alpha)
     return kern(*args, gscale, g6, alpha)
 
 
@@ -361,7 +400,8 @@ def nvfp4_gemm_q_cuda(xq, xsf, w, w_sf, partial, out, alpha, splits, stream_ptr,
     _, kern, split, _ = _entry(True, n, 2 * kh, m)
     args = (xq.view(m, kh // 8, 8), _sf_flat(xsf), w.view(n, kh // 8, 8), _sf_flat(w_sf), out)
     if split:
-        return kern(*args, partial[: split * m * n].view(split, m, n), alpha)
+        return kern(*args, partial[: split * m * n].view(split, m, n), _counters(xq.device),
+                    alpha)
     return kern(*args, alpha)
 
 
@@ -448,11 +488,13 @@ def problem(case: dict, seed: int, device="cuda", prequant: bool = False) -> dic
 
 
 def body_args(p: dict, split: bool) -> tuple:
-    """A problem as a body's arguments (split: + the [max_splits, M, N] scratch)."""
+    """A problem as a body's arguments (split: + the [max_splits, M, N] scratch
+    and zeroed counters)."""
     m, n, k = p["m"], p["n"], p["k"]
     w3 = p["w"].view(n, k // 16, 8)
-    part = (torch.empty(max_splits(n), m, n, dtype=torch.float32, device=p["w"].device),) \
-        if split else ()
+    dev = p["w"].device
+    part = (torch.empty(max_splits(n), m, n, dtype=torch.float32, device=dev),
+            torch.zeros(counter_elems(n), dtype=torch.int32, device=dev)) if split else ()
     if "xq" in p:
         return (p["xq"].view(m, k // 16, 8), p["xsf"], w3, p["wsf"], p["out"], *part, p["alpha"])
     return (p["x"].view(m, k // 16, 16), w3, p["wsf"], p["out"], *part, p["g"], p["g6"],

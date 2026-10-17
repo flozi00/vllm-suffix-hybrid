@@ -407,7 +407,7 @@ def helion_op(cfg):
     from suffix_hybrid.helion_kernels import fp8_moe as hf
     op = hf.ServingOp(cfg, mode)
     _log(f"{HELION_ENV}: {op.summary}")
-    return op if op.kernels else None
+    return op if op.plans else None
 
 
 def is_fp8(layer) -> bool:
@@ -517,11 +517,7 @@ def layer_oracle(name, cfg, parent_forward):
     dev = cfg["w13"].device
     base, local, mm = cfg["id_base"], cfg["E"], cfg["max_m"]
     op = cfg.get("op")
-    warm = set()
-    if op is not None:
-        from suffix_hybrid.helion_kernels import fp8_moe as hf
-        warm = set(hf.warm_ms(mm))
-    cases = [(m, None) for m in sorted({1, min(8, mm), mm} | warm)]
+    cases = [(m, None) for m in sorted({1, min(8, mm), mm} | set(op.warm_ms if op else ()))]
     if local < cfg["E_global"]:
         cases.append((min(8, mm), True))
     worst = worst_ref = 0.0

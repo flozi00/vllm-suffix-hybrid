@@ -138,7 +138,9 @@ def test_twins_pass_body_layouts(shipped):
     xq = torch.zeros(m, k // 2, dtype=torch.uint8)
     hx.nvfp4_gemm_q_cuda(xq, wsf, w, wsf, partial, out, 0.25, 1, 0)
     name, b, args = calls[-1]
-    assert name == "nvfp4_gemm_q_splitk" and args[5].shape == (4, m, n) and args[6] == 0.25
+    assert name == "nvfp4_gemm_q_splitk" and args[5].shape == (4, m, n) and args[7] == 0.25
+    assert args[6].dtype == torch.int32 and args[6].numel() >= hx.counter_elems(n)
+    assert not args[6].any()
     with pytest.raises(RuntimeError, match="no Helion plan"):
         hx.nvfp4_gemm_q_cuda(xq[:1].repeat(9, 1), wsf, w, wsf, partial, out, 0.25, 1, 0)
 
@@ -170,6 +172,11 @@ def test_body_interpret_vs_reference(name, case, monkeypatch):
     args = hx.body_args(hx.problem(case, 0, "cpu", q), split)
     ref = (hx.reference_q if q else hx.reference)(*args)
     kw = {"config": helion.Config(split_k=2)} if split else {"autotune_effort": "none"}
-    out = helion.kernel(hx.BODIES[name], **kw)(*args)
-    ok, msg = hx.check(out, ref)
-    assert ok, msg
+    kern = helion.kernel(hx.BODIES[name], **kw)
+    for _ in range(2):  # a replay: the split-K tickets must be back at zero
+        out = kern(*args)
+        ok, msg = hx.check(out, ref)
+        assert ok, msg
+        if split:
+            cnt = [a for a in args if torch.is_tensor(a) and a.dtype == torch.int32]
+            assert len(cnt) == 1 and not cnt[0].any(), "split-K counters not reset"
