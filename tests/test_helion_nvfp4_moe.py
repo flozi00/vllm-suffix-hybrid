@@ -46,6 +46,8 @@ def test_kernels_abi():
         assert k["baseline_name"].startswith("oxide nvfp4_moe ")
         oxide = [e for e in nm.PARAMS if any(re.search(r, e) for r in k["replaces"])]
         assert len(oxide) == 1 and oxide[0] in k["baseline_name"]
+        st = k["settings"]  # lab-only: eager baseline, lab check as the tuner's check
+        assert st["autotune_baseline_fn"] is k["reference"] and "autotune_log_level" in st
 
 
 def test_baseline_runs_the_prod_tune(monkeypatch):
@@ -129,14 +131,17 @@ def _case(m, e=6, hd=128, i=64, k=3, act="silu"):
 
 
 @pytest.mark.parametrize("case", [_case(5), _case(1, act="gelu_tanh"),
-                                  _case(24, e=3, k=2, i=128, act="gelu_tanh")])
+                                  _case(24, e=3, k=2, i=128, act="gelu_tanh"),
+                                  _case(3, e=8, hd=2816, i=704, k=8, act="gelu_tanh")])  # gemma H, I
 @pytest.mark.parametrize("name", [k["name"] for k in hm.KERNELS])
 def test_body_matches_reference(helion, case, name):
     kern = next(k for k in hm.KERNELS if k["name"] == name)
     args = kern["make"](case, 0)
     ref = kern["reference"](*args)
-    ok, msg = kern["check"](helion.kernel(kern["body"])(*args), ref)
+    out = helion.kernel(kern["body"])(*args)
+    ok, msg = kern["check"](out, ref)
     assert ok, msg
+    kern["settings"]["autotune_baseline_accuracy_check_fn"](out, ref)  # the tuner accepts it
 
 
 @pytest.mark.parametrize("plan", sorted(hm.PLANS))

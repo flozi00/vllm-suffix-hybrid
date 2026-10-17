@@ -17,7 +17,7 @@ g1/g2 alphas [E], one activation gscale per GEMM; pair p = token*topk + k):
   nvfp4_moe_fc1          (= moe_fc1_quant) per (sorted position, 16-col
       blocks of I): that expert's rows, up/gate tiles share the A operand,
       h = act(g1*gate) * g1*up in f32, NVFP4 requant (a2 gscale) in the
-      epilogue -> h bf16 [P+1, I] dequantized (row P = trash for masked rows)
+      epilogue -> h bf16 [P, I] dequantized
   nvfp4_moe_fc2          (= moe_fc2) y[p] = g2[e] * tw[p] * (h[p] . w2[e]) f32
   nvfp4_moe_combine      (= moe_combine) out[t] = bf16(sum_k y[t*topk+k]),
       k ascending over local experts (0 for a token with no local expert)
@@ -47,6 +47,7 @@ back to the oxide op per M, helion makes a gap a load-time error, see
 from __future__ import annotations
 
 import functools
+import logging
 
 import torch
 
@@ -78,7 +79,7 @@ PLANS = {"front4": (ROUTE_QUANT, FC1, FC2, COMBINE), "fused3": (ROUTE_QUANT, FC1
 # ---------------------------------------------------------------------------
 def nvfp4_moe_route_quant(x: torch.Tensor, topk_ids: torch.Tensor, g: float, g6: float,
                           e_count: int, id_base: int):
-    """(xdq bf16 [M, H], pair_sorted, seg, seg_e int32 [P+1]). Key of pair p
+    """(xdq bf16 [M, H], pair_sorted, seg, seg_e int32 [P]). Key of pair p
     = topk_ids[p] - id_base when in [0, E) else E (off-rank, sorts last);
     its sorted position = #{q: (key_q, q) < (key_p, p)}. g6 = f32(g)/f32(6)
     computed IEEE on the host (the kernel's g / 6)."""
@@ -88,9 +89,9 @@ def nvfp4_moe_route_quant(x: torch.Tensor, topk_ids: torch.Tensor, g: float, g6:
     x3 = x.view(m, hdim // 16, 16)
     xdq = torch.empty([m, hdim], dtype=torch.bfloat16, device=x.device)
     xq3 = xdq.view(m, hdim // 16, 16)
-    pair_sorted = torch.empty([pairs + 1], dtype=torch.int32, device=x.device)
-    seg = torch.empty([pairs + 1], dtype=torch.int32, device=x.device)
-    seg_e = torch.empty([pairs + 1], dtype=torch.int32, device=x.device)
+    pair_sorted = torch.empty([pairs], dtype=torch.int32, device=x.device)
+    seg = torch.empty([pairs], dtype=torch.int32, device=x.device)
+    seg_e = torch.empty([pairs], dtype=torch.int32, device=x.device)
     for tile_p in hl.tile(pairs):
         kp = ids[tile_p].to(torch.int32) - id_base
         kp = torch.where((kp >= 0) & (kp < e_count), kp, e_count)
@@ -107,10 +108,11 @@ def nvfp4_moe_route_quant(x: torch.Tensor, topk_ids: torch.Tensor, g: float, g6:
             pos = pos + torch.sum(less.to(torch.int32), dim=1).to(torch.int32)
             before = before + torch.sum(earlier.to(torch.int32), dim=1).to(torch.int32)
             same = same + torch.sum(eq.to(torch.int32), dim=1).to(torch.int32)
-        dst = torch.where(tile_p.index < pairs, pos, pairs)  # tail lanes -> trash slot P
-        pair_sorted[dst] = tile_p.index
-        seg[dst] = torch.where((before == 0) & (kp < e_count), same, 0)
-        seg_e[dst] = kp
+        # every output fully written (the autotuner compares all of it); the
+        # tile's tail lanes are masked off these scatters
+        pair_sorted[pos] = tile_p.index
+        seg[pos] = torch.where((before == 0) & (kp < e_count), same, 0)
+        seg_e[pos] = kp
     for tile_m, tile_b in hl.tile([m, hdim // 16]):
         v = x3[tile_m, tile_b, :].to(torch.float32)
         amax = torch.amax(torch.abs(v), dim=-1)
@@ -133,13 +135,14 @@ def nvfp4_moe_route_quant(x: torch.Tensor, topk_ids: torch.Tensor, g: float, g6:
 def nvfp4_moe_fc1(xdq: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tensor,
                   seg_e: torch.Tensor, w13: torch.Tensor, w13_sf: torch.Tensor,
                   g1: torch.Tensor, a2g: float, a2g6: float, act: int, topk: int):
-    """h bf16 [P+1, I]: NVFP4-dequantized act(g1*gate) * g1*up per routed pair
-    (rows of off-rank pairs unwritten, row P = trash). Grid (sorted position,
-    blocks of 16 I-columns: whole NVFP4 blocks for the requant)."""
+    """h bf16 [P, I]: NVFP4-dequantized act(g1*gate) * g1*up per routed pair
+    (rows of off-rank pairs unwritten). Grid (sorted position, blocks of 16
+    I-columns: whole NVFP4 blocks for the requant). Block caps keep the 4 dot
+    operands + reshape scratch inside sm_120's ~99 KB smem (N <= 64, K <= 128)."""
     m, hdim = xdq.size()
     e_count, two_i, kh = w13.size()
     idim = two_i // 2
-    pairs = pair_sorted.size(0) - 1
+    pairs = pair_sorted.size(0)
     nb = idim // 16
     nkb = hdim // 16
     cp = (nkb + 3) // 4 * 4
@@ -147,10 +150,11 @@ def nvfp4_moe_fc1(xdq: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tenso
     x4 = xdq.view(m, nkb, 8, 2)
     w4 = w13.view(e_count * 2 * nb, 16, nkb, 8)  # row block (e, up|gate, nb)
     sf = w13_sf.view(-1)
-    h = torch.empty([pairs + 1, idim], dtype=torch.bfloat16, device=xdq.device)
-    h3 = h.view(pairs + 1, nb, 16)
-    bkb = hl.register_block_size(2, nkb)  # dot K = 8 * bkb >= 16
-    for tile_s, tile_b in hl.tile([pairs, nb], block_size=[1, None]):
+    h = torch.empty([pairs, idim], dtype=torch.bfloat16, device=xdq.device)
+    h3 = h.view(pairs, nb, 16)
+    bkb = hl.register_block_size(2, 16)  # dot K = 8 * bkb in [16, 128]
+    bnb = hl.register_block_size(1, 4)   # dot N = 16 * bnb in [16, 64]
+    for tile_s, tile_b in hl.tile([pairs, nb], block_size=[1, bnb]):
         s = tile_s.begin
         cnt = seg[s]
         e = torch.clamp(seg_e[s], max=e_count - 1)
@@ -219,29 +223,29 @@ def nvfp4_moe_fc1(xdq: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tenso
                         + (a > 1.25).to(torch.float32) + (a >= 1.75).to(torch.float32))
                  + (a > 2.5).to(torch.float32) + (a >= 3.5).to(torch.float32)
                  + 2.0 * (a > 5.0).to(torch.float32))
-            dst = torch.where(tile_r.index < cnt, pair, pairs)
-            h3[dst, tile_b, :] = (torch.where(sv < 0.0, -q, q) * sfh[:, :, None]).to(torch.bfloat16)
+            h3[pair, tile_b, :] = (torch.where(sv < 0.0, -q, q) * sfh[:, :, None]).to(torch.bfloat16)
     return h
 
 
 def nvfp4_moe_fc2(h: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tensor,
                   seg_e: torch.Tensor, topk_w: torch.Tensor, w2: torch.Tensor,
                   w2_sf: torch.Tensor, g2: torch.Tensor):
-    """y f32 [P+1, H] = g2[e] * topk_w[p] * (h[p] . w2[e]) per routed pair
-    (off-rank rows unwritten, row P = trash). Grid (sorted position, H tile)."""
+    """y f32 [P, H] = g2[e] * topk_w[p] * (h[p] . w2[e]) per routed pair
+    (off-rank rows unwritten). Grid (sorted position, H tile)."""
     e_count, hdim, kh = w2.size()
     idim = kh * 2
-    pairs = pair_sorted.size(0) - 1
+    pairs = pair_sorted.size(0)
     nkb = idim // 16
     cp = (nkb + 3) // 4 * 4
     estride = (hdim + 127) // 128 * 128 * cp
-    h4 = h.view(pairs + 1, nkb, 8, 2)
+    h4 = h.view(pairs, nkb, 8, 2)
     w3 = w2.view(e_count * hdim, nkb, 8)
     tw = topk_w.view(-1)
     sf = w2_sf.view(-1)
-    y = torch.empty([pairs + 1, hdim], dtype=torch.float32, device=h.device)
-    bkb = hl.register_block_size(2, nkb)
-    for tile_s, tile_h in hl.tile([pairs, hdim], block_size=[1, None]):
+    y = torch.empty([pairs, hdim], dtype=torch.float32, device=h.device)
+    bkb = hl.register_block_size(2, 16)  # dot K = 8 * bkb in [16, 128]
+    bh = hl.register_block_size(16, 128)
+    for tile_s, tile_h in hl.tile([pairs, hdim], block_size=[1, bh]):
         s = tile_s.begin
         cnt = seg[s]
         e = torch.clamp(seg_e[s], max=e_count - 1)
@@ -272,8 +276,7 @@ def nvfp4_moe_fc2(h: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tensor,
                 w_hi = v.to(torch.bfloat16).reshape(v.size(0), -1)
                 acc = hl.dot(a_lo, w_lo.T, acc=acc)
                 acc = hl.dot(a_hi, w_hi.T, acc=acc)
-            dst = torch.where(tile_r.index < cnt, pair, pairs)
-            y[dst, tile_h] = acc * (alpha * tw[pair])[:, None]
+            y[pair, tile_h] = acc * (alpha * tw[pair])[:, None]
     return y
 
 
@@ -482,8 +485,7 @@ def _device():
 
 
 def route_ref(topk_ids, e_count: int, id_base: int):
-    """Torch twin of the route root: (pair_sorted, seg, seg_e) int32 [P+1]
-    (slot P = trash, 0 here)."""
+    """Torch twin of the route root: (pair_sorted, seg, seg_e) int32 [P]."""
     pairs = topk_ids.numel()
     dev = topk_ids.device
     loc = topk_ids.reshape(-1).long() - id_base
@@ -494,8 +496,7 @@ def route_ref(topk_ids, e_count: int, id_base: int):
     start[1:] = sk[1:] != sk[:-1]
     counts = torch.bincount(key, minlength=e_count + 1)
     seg = torch.where(start & (sk < e_count), counts[sk], torch.zeros_like(sk))
-    pad = lambda t: torch.cat([t.int(), torch.zeros(1, dtype=torch.int32, device=dev)])
-    return pad(order), pad(seg), pad(sk)
+    return order.int(), seg.int(), sk.int()
 
 
 def _problem(case, seed):
@@ -513,12 +514,12 @@ def _problem(case, seed):
 
 
 def _h_ref(p, xdq, ps, seg, seg_e, topk):
-    """(h bf16 [P+1, I] = spec requant of the f64 fc1 output, valid rows)."""
+    """(h bf16 [P, I] = spec requant of the f64 fc1 output, valid rows)."""
     from suffix_hybrid.kernels import nvfp4_moe as nm
-    pairs = ps.numel() - 1
+    pairs = ps.numel()
     idim = p["w13"].shape[1] // 2
-    h = torch.zeros(pairs + 1, idim, dtype=torch.float64, device=xdq.device)
-    valid = torch.zeros(pairs + 1, dtype=torch.bool, device=xdq.device)
+    h = torch.zeros(pairs, idim, dtype=torch.float64, device=xdq.device)
+    valid = torch.zeros(pairs, dtype=torch.bool, device=xdq.device)
     for s in torch.nonzero(seg[:pairs] > 0).reshape(-1).tolist():
         cnt, e = int(seg[s]), int(seg_e[s])
         pr = ps[s:s + cnt].long()
@@ -530,11 +531,11 @@ def _h_ref(p, xdq, ps, seg, seg_e, topk):
 
 
 def _y_ref(h, ps, seg, seg_e, tw, w2, w2_sf, g2):
-    """(y f64 [P+1, H] = g2 * tw * (h . w2), valid rows)."""
+    """(y f64 [P, H] = g2 * tw * (h . w2), valid rows)."""
     from suffix_hybrid.kernels import nvfp4_moe as nm
-    pairs = ps.numel() - 1
-    y = torch.zeros(pairs + 1, w2.shape[1], dtype=torch.float64, device=h.device)
-    valid = torch.zeros(pairs + 1, dtype=torch.bool, device=h.device)
+    pairs = ps.numel()
+    y = torch.zeros(pairs, w2.shape[1], dtype=torch.float64, device=h.device)
+    valid = torch.zeros(pairs, dtype=torch.bool, device=h.device)
     for s in torch.nonzero(seg[:pairs] > 0).reshape(-1).tolist():
         cnt, e = int(seg[s]), int(seg_e[s])
         pr = ps[s:s + cnt].long()
@@ -636,8 +637,7 @@ def _check_route_quant(out, ref):
     """Routing exact (the counting sort is integer math); x quant like the
     lane's xq stage (STAGE_TOL: rare rounding ties)."""
     from suffix_hybrid.kernels import nvfp4_moe as nm
-    pairs = ref[1].numel() - 1
-    route = all(torch.equal(o[:pairs].int(), r[:pairs]) for o, r in zip(out[1:], ref[1:]))
+    route = all(torch.equal(o.int(), r) for o, r in zip(out[1:], ref[1:]))
     fx = _frac(out[0].float(), ref[0].float())
     return route and fx <= nm.STAGE_TOL["xq"], f"route exact={route} xq differing={fx:.1e}"
 
@@ -713,13 +713,30 @@ def _oxide_baseline(*args):
     return oxide_kernels.native().nvfp4_moe_cuda(*args, torch.cuda.current_stream().cuda_stream)
 
 
+def _tune_check(check):
+    """Autotuner accuracy check = the lab gate (defined rows only, requant-flip
+    tolerant); raises AssertionError like torch.testing."""
+    def tune_check(actual, expected):
+        ok, msg = check(actual, expected)
+        if not ok:
+            raise AssertionError(msg)
+    return tune_check
+
+
 def _entry(name, body, make, reference, check, mode, keep, oxide_entry):
+    # Lab-only settings (serving never autotunes): the autotuner's baseline is
+    # the exact eager reference (the oxide launches write packed/slot formats,
+    # not these outputs), so a failing reference config cannot abort a case;
+    # candidates are judged by the lab check; DEBUG logs show real errors.
     return {"name": name, "body": body, "cases": cases, "make": make, "reference": reference,
             "check": check, "baseline": _oxide_baseline,
             "make_baseline": lambda case, seed: _oxide_args(case, seed, mode, keep),
             "baseline_name": f"oxide nvfp4_moe {oxide_entry} (glm prod tune; env "
                              f"SUFFIX_NVFP4_MOE_TUNE wins; else lane default tune)",
-            "replaces": [rf"^{oxide_entry}$"]}
+            "replaces": [rf"^{oxide_entry}$"],
+            "settings": {"autotune_baseline_fn": reference,
+                         "autotune_baseline_accuracy_check_fn": _tune_check(check),
+                         "autotune_log_level": logging.DEBUG}}
 
 
 KERNELS = [
