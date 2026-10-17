@@ -9,6 +9,9 @@
 //!     combine
 //!   2 fused, 3: route+quant(x), fc1+silu_and_mul+quant(h), token-major
 //!     fc2+combine
+//! Bits 8-13 of `mode` are a skip mask (launch i of the plan is skipped when
+//! bit 8+i is set): the Helion port's lab times each oxide launch alone, like
+//! nvfp4_moe's tune bits 24-29.
 //! Oracle/bench + vLLM wiring: suffix_hybrid/kernels/fp8_moe.py.
 
 use crate::nvfp4_moe_oxide::{info, need};
@@ -62,8 +65,9 @@ pub fn fp8_moe_cuda<'py>(
     mode: u32,
     stream_ptr: usize,
 ) -> PyResult<()> {
-    if mode > 2 {
-        return Err(PyValueError::new_err(format!("mode {mode} not in 0..=2")));
+    let (mode, skip) = (mode & 0xFF, mode >> 8);
+    if mode > 2 || skip > 0x3F {
+        return Err(PyValueError::new_err(format!("mode {mode} not in 0..=2 or skip mask {skip:#x} > 0x3f")));
     }
     let x = info("x", x)?;
     let ids = info("topk_ids", topk_ids)?;
@@ -301,6 +305,12 @@ pub fn fp8_moe_cuda<'py>(
     };
     let plan: Vec<(&str, (u32, u32), u32, u32, &[Arg])> =
         if mode == 0 { legacy.to_vec() } else { front.iter().cloned().chain(tail).collect() };
+    let plan: Vec<_> = plan
+        .into_iter()
+        .enumerate()
+        .filter(|(n, _)| skip >> n & 1 == 0)
+        .map(|(_, l)| l)
+        .collect();
     let ordinal = x.device;
     py.detach(move || {
         crate::guard_py("fp8_moe_cuda", move || {

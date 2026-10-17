@@ -8,7 +8,10 @@ Gate ``SUFFIX_SM120_DSA_INDEXER=1`` (default off; needs the shim's own
 (decode) and ``fp8_fp4_mqa_logits`` (prefill) are served here; shapes outside
 the kernel contract fall back to the Triton path (sm120_fallback) with one log
 line per reason. A gate that is on but whose cubin/native op is missing fails
-closed (raises at first call).
+closed (raises at first call). ``SUFFIX_HELION_DSA_INDEXER`` = oxide (default)
+| helion | auto picks the implementation behind the same gate: the Helion port
+(suffix_hybrid/helion_kernels/dsa_indexer.py, same op signature) per rows
+bucket, docs/helion-kernels.md; the GROUP / MIN_TILES knobs tune oxide only.
 
 vLLM 0.30 contract (read from v0.30.0 sources):
 * decode ``fp8_fp4_paged_mqa_logits(q [B, next_n, H, 128] e4m3, cache uint8
@@ -38,6 +41,7 @@ import sys
 GATE = "SUFFIX_SM120_DSA_INDEXER"
 GROUP_ENV = "SUFFIX_SM120_DSA_INDEXER_GROUP"
 MIN_TILES_ENV = "SUFFIX_SM120_DSA_INDEXER_MIN_TILES"
+HELION_ENV = "SUFFIX_HELION_DSA_INDEXER"
 MARKER = "[suffix dsa-indexer]"
 FAMILY = "dsa_indexer"
 PARAMS = {"dsa_logits": 24}  # = the #[kernel] parameter count (tests pin it)
@@ -140,6 +144,20 @@ def _native(dev):
     return nat
 
 
+def _backend() -> str:
+    from suffix_hybrid.helion_kernels import backend
+    return backend(HELION_ENV)
+
+
+def _logits_op(dev):
+    """The logits op (oxide signature): the native oxide op, or the Helion
+    port's entry when SUFFIX_HELION_DSA_INDEXER != oxide (never imported else)."""
+    if _backend() == "oxide":
+        return _native(dev).dsa_indexer_logits_cuda
+    from suffix_hybrid.helion_kernels import dsa_indexer as hdi
+    return hdi.dsa_indexer_logits_cuda
+
+
 def paged_ineligible(qv, kv_cache, weights, block_tables, q_scale, indices) -> str | None:
     import torch
     if q_scale is not None or qv.dtype != torch.float8_e4m3fn:
@@ -188,7 +206,7 @@ def paged_logits(qv, kv_cache, weights, context_lens, block_tables, max_model_le
         return out
     p = plan(rows, group or decode_group(next_n), max_model_len, _sms(dev),
              min_tiles or _min_tiles())
-    _native(dev).dsa_indexer_logits_cuda(
+    _logits_op(dev)(
         out, qv.reshape(rows, h, d).contiguous(), weights, kc, None, block_tables,
         None, cl, max_model_len, p["group"], p["slices"], next_n, p["splits"],
         p["min_tiles"], torch.cuda.current_stream(dev).cuda_stream)
@@ -222,7 +240,7 @@ def mqa_logits(qv, kv_v, kv_scale, weights, ks, ke, clean_logits=False, out=None
     if m == 0 or n == 0:
         return out
     p = plan(m, PREFILL_GROUP, n, _sms(dev), _min_tiles())
-    _native(dev).dsa_indexer_logits_cuda(
+    _logits_op(dev)(
         out, qv.contiguous(), weights, kv_v, kv_scale.reshape(-1).to(torch.float32).contiguous(),
         None, ks.to(torch.int32).contiguous(), ke.to(torch.int32).contiguous(), n,
         p["group"], p["slices"], 1, p["splits"], p["min_tiles"],
@@ -244,7 +262,7 @@ def wrap_paged(fallback):
             return fallback(q, kv_cache, weights, context_lens, block_tables,
                             schedule_metadata, max_model_len, clean_logits, indices)
         nn = qv.shape[1] if qv.dim() == 4 else 1
-        _once("paged", f"paged logits ACTIVE (oxide e4m3 mma, H={qv.shape[-2]}, "
+        _once("paged", f"paged logits ACTIVE ({_backend()} e4m3 mma, H={qv.shape[-2]}, "
                        f"rows/CTA group={decode_group(nn)})")
         return paged_logits(qv, kv_cache, weights, context_lens, block_tables,
                             max_model_len, clean_logits)
@@ -258,7 +276,7 @@ def wrap_mqa(fallback):
         if why is not None:
             _once("mqa:" + why, f"prefill logits -> Triton fallback: {why}")
             return fallback(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits)
-        _once("mqa", f"prefill logits ACTIVE (oxide e4m3 mma, H={qv.shape[1]})")
+        _once("mqa", f"prefill logits ACTIVE ({_backend()} e4m3 mma, H={qv.shape[1]})")
         return mqa_logits(qv, kv_v, kv_scale, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits)
     return fp8_fp4_mqa_logits
 
@@ -539,6 +557,9 @@ def oracle(cases=ORACLE_CASES):
         _log(lines[-1])
         if not ok:
             raise RuntimeError(f"{MARKER} DSA-INDEXER ORACLE FAIL: {lines[-1]}")
+    if _backend() != "oxide":  # every shipped Helion case on its compiled config
+        from suffix_hybrid.helion_kernels import dsa_indexer as hdi
+        lines += hdi.oracle_lines()
     return f"{MARKER} DSA-INDEXER ORACLE PASS ({len(lines)} cases, sm_120a e4m3 m16n8k32 mma)"
 
 

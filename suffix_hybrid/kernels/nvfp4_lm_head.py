@@ -61,6 +61,14 @@ nearest timed M >= it (ties -> ours). Line: ``BACKEND M=1: flashinfer a us
 vs ours b us -> ...``. The load oracle and the graph check run on every
 backend in use.
 
+Helion (``SUFFIX_HELION_NVFP4_GEMM`` = oxide (default) | helion | auto, the
+nvfp4_linear knob): "ours" per M runs the Helion port's prequant GEMM
+(suffix_hybrid/helion_kernels/nvfp4_gemm.py, same call) where its tuned
+config is shipped (auto) or everywhere (helion: a missing bucket is a load
+error). The backend timing, LOAD ORACLE and graph check above all see it;
+every Helion bucket's warm M runs before graph capture. oxide = unchanged,
+Helion never imported. Line: ``HELION NxK: M1:nvfp4_gemm_q ...``.
+
 Markers: ``[suffix nvfp4-lmhead] armed`` / ``BACKEND`` / ``LOAD ORACLE PASS`` /
 ``ACTIVE``.
 CLI (in-pod, no model): ``python -m suffix_hybrid.kernels.nvfp4_lm_head
@@ -261,8 +269,15 @@ def _device_ops(native):
     from suffix_hybrid.kernels.nvfp4_gemm import _graph_us
     from suffix_hybrid.kernels.nvfp4_linear import AUTOROUTE_REPS
 
+    from suffix_hybrid.helion_kernels import backend as helion_backend
+    from suffix_hybrid.kernels.nvfp4_linear import HELION_ENV
+    hb = helion_backend(HELION_ENV)
+    hx = None
+    if hb != "oxide":
+        from suffix_hybrid.helion_kernels import nvfp4_gemm as hx
+
     def prepare(w):
-        """bf16 [N, K] -> dict(wq, wsf, g_w, launch, partial). Load time only."""
+        """bf16 [N, K] -> dict(wq, wsf, g_w, launch, partial, hx). Load time only."""
         n, k = w.shape
         amax = float(torch.linalg.vector_norm(w, float("inf")).float())  # no |W| copy
         g_w = FP4_RANGE / max(amax, 1e-12)
@@ -273,11 +288,16 @@ def _device_ops(native):
         # (splits, flags) per M, fixed at load (no planning in the hot path)
         launch = [(0, 0)] + [(pl["splits"], pl["flags"]) for pl in
                              (plan(n, k, m, prequant=True) for m in range(1, max_m + 1))]
-        return dict(n=n, k=k, w=w, wq=wq, wsf=wsf, g_w=g_w, max_m=max_m,
+        # per M: the Helion kernel (helion_kernels.nvfp4_gemm.prepare) or None = oxide
+        hxp = hx.prepare(n, k, True, max_m, hb) if hx is not None else None
+        if hxp is not None:
+            _log(f"HELION {n}x{k} ({HELION_ENV}={hb}): {hx.describe(hxp)}")
+        return dict(hx=hxp, n=n, k=k, w=w, wq=wq, wsf=wsf, g_w=g_w, max_m=max_m,
                     splits=launch[max_m][0], launch=launch,
                     backend=[None] + ["ours"] * max_m,  # select() sets it
                     alpha_w=torch.full((1,), 1.0 / g_w, dtype=torch.float32, device=w.device),
-                    partial=torch.empty(max(1, partial_elems(n, k, max_m)),
+                    partial=torch.empty(max(1, partial_elems(n, k, max_m),
+                                            hx.partial_elems(n, [hxp]) if hxp else 0),
                                         dtype=torch.float32, device=w.device),
                     counters=torch.zeros(-(-n // 32), dtype=torch.int32, device=w.device))
 
@@ -296,10 +316,11 @@ def _device_ops(native):
                     xq, st["wq"].t(), xsf, st["wsf"].t(), st["alpha_w"], out=o,
                     out_dtype=torch.bfloat16, use_8x4_sf_layout=False, backend="cutlass")
             splits, flags = st["launch"][xq.shape[0]]
-            native.nvfp4_gemm_q_cuda(xq, xsf, st["wq"], st["wsf"], st["partial"], o,
-                                     alpha, splits,
-                                     torch.cuda.current_stream(dev).cuda_stream,
-                                     flags, st["counters"])
+            ops = hx if st.get("hx") and st["hx"][xq.shape[0]] else native  # same call
+            ops.nvfp4_gemm_q_cuda(xq, xsf, st["wq"], st["wsf"], st["partial"], o,
+                                  alpha, splits,
+                                  torch.cuda.current_stream(dev).cuda_stream,
+                                  flags, st["counters"])
             return o
         return logits_nvfp4(x2, st["w"], st["g_w"], quant, gemm)
 
@@ -347,6 +368,10 @@ def _device_ops(native):
             mode = "ours"
             _log("BACKEND: FlashInfer not installed -> ours")
         gen = torch.Generator(device=dev).manual_seed(n + k)
+        if st.get("hx"):  # compile every Helion bucket (once per shape) before any capture
+            for m in hx.warm_ms(max_m):
+                run(st, torch.randn(m, k, generator=gen, device=dev, dtype=torch.bfloat16),
+                    backend="ours")
         xs = {m: torch.randn(m, k, generator=gen, device=dev, dtype=torch.bfloat16)
               for m in autoroute_ms(max_m)}
         if mode != "ours":
@@ -534,6 +559,9 @@ def register():
     native = oxide_kernels.native()
     max_m = max_m_env()  # malformed env: fail at startup
     backend_env()
+    from suffix_hybrid.helion_kernels import backend as helion_backend
+    from suffix_hybrid.kernels.nvfp4_linear import HELION_ENV
+    hb = helion_backend(HELION_ENV)
     for fn in ("nvfp4_gemm_q_cuda",):
         if not hasattr(native, fn):
             raise RuntimeError(f"{GATE}=1 but _native lacks {fn} (oxide-kernels build)")
@@ -549,7 +577,7 @@ def register():
         _first_forward_check)
     _state["armed"] = True
     _log(f"armed: ParallelLMHead OOT-registered (M<={max_m} -> NVFP4 decode GEMM, "
-         "else stock bf16)")
+         f"else stock bf16; {HELION_ENV}={hb})")
     return _state
 
 
