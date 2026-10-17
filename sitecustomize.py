@@ -115,6 +115,7 @@ _PRESETS = {
     # DeepSeek-V4.1-Flash NVFP4 (MXFP4 Engram tables) on 8x RTX PRO 6000; lanes join after A/B.
     "dsv41-sm120": {
         "SUFFIX_DSV41_ENGRAM_MXFP4": "1",
+        "SUFFIX_DSV41_SM120_BLOCK64": "1",
     },
 }
 # SUFFIX_PRESET is the vendor-neutral spelling (SUFFIX_ROCM_PRESET predates the GLM preset).
@@ -295,6 +296,10 @@ if (os.environ.get("SUFFIX_FP8_DENSE", "").strip() == "1"
 if os.environ.get("SUFFIX_DSV41_ENGRAM_MXFP4", "").strip() == "1":
     from suffix_hybrid.dsv41_engram import install_post_import_hook as _dsv41_engram_hook
     _dsv41_engram_hook()
+# DeepSeek-V4.1 SM120 64-token kernel blocks (vllm#60762 until it lands).
+if os.environ.get("SUFFIX_DSV41_SM120_BLOCK64", "").strip() == "1":
+    from suffix_hybrid.dsv41_block64 import install_post_import_hook as _dsv41_b64_hook
+    _dsv41_b64_hook()
 
 # Hybrid speculator wrap AFTER every sm120 meta_path hook is armed: install_v2
 # imports the V2 model runner, which imports the sparse-MLA backends
