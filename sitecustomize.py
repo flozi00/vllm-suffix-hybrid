@@ -352,7 +352,7 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC", "SUFFIX_MTP_MOE_NVFP4",
                   "SUFFIX_SILU_GRID_CLAMP", "SUFFIX_SILU_SKIP_PAD",
                   "SUFFIX_POW2_MIRROR", "SUFFIX_BF16_SKINNY",
-                  "SUFFIX_SHORTCONV_FP8")) or any(
+                  "SUFFIX_SHORTCONV_FP8", "SUFFIX_MAMBA_BT_HOST")) or any(
         os.environ.get(_g, "").strip() not in ("", "0")
         for _g in ("SUFFIX_ROCM_HC_WQ", "SUFFIX_NVFP4_MOE_BACKEND")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
