@@ -127,6 +127,40 @@ SUFFIX_JIT_LOG=1: one "[suffix jit]" line per Triton compile (kernel, wall ms): 
 SUFFIX_ROCM_QSA_NOSPEC=1: vLLM's QSA sparse split-K and merge kernels stop specializing their
   runtime counts (num_rows / num_cache_blocks / num_requests): new ==1 / %16 variants compiled
   mid-serving (k40 JIT log, 0.1-0.6 s engine stalls). Same code, one compile per shape class.
+SUFFIX_SILU_GRID_CLAMP=1: NVIDIA DeepGEMM MoE (SM120 fp8 block) - the fused SiLU*mul+FP8-quant
+  launch grid is sized for the PADDED grouped workspace (up to (3, 32, 64) = 6144 CTAs at
+  decode) whose per-expert row-blocks are mostly empty; the token count clamps it to full
+  live parallelism (persistent loop, bit-identical outputs). Profile e038 (lfm2.5-24b-a2b-fp8,
+  RTX 5090): 31.3 us per call at c32 vs ~0.87 MB live bytes = 28 GB/s, 21.55% of the step.
+SUFFIX_SILU_SKIP_PAD=1: same fused SiLU*mul+FP8-quant, DENSE branch (the one SM120
+  runs: use_psum_layout needs family(90)/(100)+UE8M0 and fails on SM120): thread
+  deepgemm_moe_permute's m_indices (grouped_layout) in as row_experts and skip the
+  m_indices<0 padding rows, so the ~8256-row padded workspace at c32 (128 live
+  tokens, 31.3 us, 21.55% of the step) only stores live rows. Bit-identical on live
+  rows; padding goes stale like every other workspace padding GEMM1 leaves behind.
+  Supersedes SUFFIX_SILU_GRID_CLAMP (arming both fails the anchor check at boot).
+SUFFIX_BF16_SKINNY=1: LFM2.5-24B-A2B-FP8 short-conv projections (30 layers,
+  in_proj 6144x2048 + out_proj 2048x2048 BF16, ~1008 MB streamed per decode
+  step - the checkpoint's FP8 ignore list keeps the whole short_conv block
+  BF16). Profile e038 (RTX 5090): 33.1% of c1 / 36.3% of c8 / 23.8% of c32
+  decode step at 0.82-1.13 TB/s vs the 1.62 TB/s this GPU shows on skinny
+  cuBLAS (run f190). kernels/bf16_skinny.py (byte-exact from the PRO lineage
+  a540a55c / dbg base 4919d047) wraps UnquantizedLinearMethod.apply with a
+  Triton skinny GEMM for M <= SUFFIX_BF16_SKINNY_MAX_M (default 32); per-layer
+  load-time oracle vs F.linear, fail-closed. Globs via SUFFIX_BF16_SKINNY_LAYERS
+  (default *.short_conv.in_proj,*.short_conv.out_proj).
+SUFFIX_MAMBA_BT_HOST=1: mamba_get_block_table_tensor (vllm/v1/attention/backends/utils.py,
+  align mode) builds its gather indices on the host from the pinned CPU mirror
+  seq_lens_cpu_upper_bound instead of GPU seq_lens: 6 tiny dispatches (sub,
+  floordiv, clamp_, arange, add, int64 cast) -> numpy math + 1 pinned H2D +
+  the same gather. Mirror == GPU seq_lens row-for-row by construction
+  (gpu_model_runner computes both from num_computed_tokens +
+  num_scheduled_tokens; the align sync copies the same buffer both ways).
+  The mirror rides BaseMambaAttentionMetadata as the declared field
+  _suffix_seq_lens_cpu (dataclasses.replace() carries it) so the second
+  call site, update_block_table, reuses it. Bit-identical indices; EXACT.
+  Profile c22eca (lfm2.5-24b-a2b-fp8, RTX 5090): the 6 dispatches run at
+  both call sites every decode step.
 """
 import glob
 import importlib.util
@@ -334,7 +368,287 @@ _AQ_QSA = (
     "        output, _ = self.o_proj(flat_output)\n"
     "        return output\n")
 
+from suffix_hybrid.silu_grid_clamp import (
+    _SGC_SIG_OLD, _SGC_SIG_NEW, _SGC_GRID_OLD, _SGC_GRID_NEW,
+    _SGC_DEF_OLD, _SGC_DEF_NEW, _SGC_CALL_OLD, _SGC_CALL_NEW,
+    _SGC_FUSED_OLD, _SGC_FUSED_NEW,
+)
+from suffix_hybrid.silu_skip_pad import (
+    _SSP_SIG_OLD, _SSP_SIG_NEW, _SSP_CE_OLD, _SSP_CE_NEW,
+    _SSP_MASK_OLD, _SSP_MASK_NEW, _SSP_WRAP_OLD, _SSP_WRAP_NEW,
+    _SSP_ELSE_OLD, _SSP_ELSE_NEW, _SSP_LAUNCH_OLD, _SSP_LAUNCH_NEW,
+    _SSP_LCONST_OLD, _SSP_LCONST_NEW, _SSP_DEF_OLD, _SSP_DEF_NEW,
+    _SSP_FUSED_OLD, _SSP_FUSED_NEW, _SSP_CALL_OLD, _SSP_CALL_NEW,
+)
+from suffix_hybrid.pow2_mirror import (
+    _P2M_ORACLE_OLD, _P2M_ORACLE_NEW, _P2M_ACT_OLD, _P2M_ACT_NEW,
+    _P2M_WDEF_OLD, _P2M_WDEF_NEW, _P2M_MOE_OLD, _P2M_MOE_NEW,
+)
+
+# LFM2.5-24B-A2B-FP8 (RTX 5090): append process_weights_after_loading to
+# Lfm2MoeForCausalLM so the loader's model-level post-load hook
+# (model_loader/utils.py: "if hasattr(model, 'process_weights_after_loading'):
+# model.process_weights_after_loading()", verified at image commit
+# 2eb491e18b) can wrap the BF16 short-conv projections'
+# UnquantizedLinearMethod.apply with the Triton skinny GEMM (SUFFIX_BF16_SKINNY,
+# kernels/bf16_skinny.py: per-layer load-time oracle vs F.linear, fail-closed
+# on no layer matched). Anchor: the CausalLM's unique hf_to_vllm_mapper comment
+# block, verified exactly once in vllm/model_executor/models/lfm2_moe.py at the
+# image commit (== 3f1bcfd's text, wake-52 byte check; re-verified against
+# the v0.31.0 tag by w100). SUFFIX_SHORTCONV_FP8 (re-added from the PRO
+# lineage 1b60182f, wake 100) appends its own process_weights_after_loading
+# after the SAME anchor: arm at most ONE of the two conv gates per trial.
+_SHORTCONV_SKINNY_OLD = (
+    '    # HF uses .conv. but vLLM uses .short_conv. to avoid LoRA regex collision\n'
+    '    # with the inner .conv.conv child (ShortConv has a child self.conv, so\n'
+    '    # naming the container .conv too makes _match_target_modules match both)\n'
+    '    hf_to_vllm_mapper = WeightsMapper(\n'
+    '        orig_to_new_substr={".conv.": ".short_conv."},\n'
+    '    )'
+)
+_SHORTCONV_SKINNY_NEW = _SHORTCONV_SKINNY_OLD + (
+    '\n\n    def process_weights_after_loading(self) -> None:\n'
+    '        # suffix SUFFIX_BF16_SKINNY: loader calls this once, no args,\n'
+    '        # after weights are loaded; kernels/bf16_skinny.py is inert\n'
+    '        # unless the gate is set and fail-closed otherwise (per-layer\n'
+    '        # load-time oracle vs F.linear; refuses to serve on no match).\n'
+    '        # Globs/M cap: SUFFIX_BF16_SKINNY_LAYERS / _MAX_M (defaults\n'
+    '        # *.short_conv.in_proj,*.short_conv.out_proj / 32).\n'
+    '        from suffix_hybrid.kernels import bf16_skinny\n'
+    '        bf16_skinny.install(self)'
+)
+
+# LFM2.5: append process_weights_after_loading to Lfm2MoeForCausalLM so the
+# loader's model-level post-load hook (model_loader/utils.py:210, no args)
+# can move the short_conv in_proj/out_proj linears from BF16 to the stock
+# FP8-block path at load (SUFFIX_SHORTCONV_FP8, kernels/shortconv_fp8.py:
+# amax/448 block scales, dequant + eager-GEMM oracles, fail-closed).
+# Anchor: the CausalLM's unique hf_to_vllm_mapper comment block @ 3f1bcfd
+# (verified exactly once in vllm/model_executor/models/lfm2_moe.py).
+_SHORTCONV_FP8_OLD = (
+    '    # HF uses .conv. but vLLM uses .short_conv. to avoid LoRA regex collision\n'
+    '    # with the inner .conv.conv child (ShortConv has a child self.conv, so\n'
+    '    # naming the container .conv too makes _match_target_modules match both)\n'
+    '    hf_to_vllm_mapper = WeightsMapper(\n'
+    '        orig_to_new_substr={".conv.": ".short_conv."},\n'
+    '    )'
+)
+_SHORTCONV_FP8_NEW = _SHORTCONV_FP8_OLD + (
+    '\n\n    def process_weights_after_loading(self) -> None:\n'
+    '        # suffix SUFFIX_SHORTCONV_FP8: loader calls this once, no args,\n'
+    '        # after weights are loaded; inert unless the gate is set and\n'
+    '        # fail-closed otherwise (kernels/shortconv_fp8.py).\n'
+    '        from suffix_hybrid.kernels import shortconv_fp8\n'
+    '        shortconv_fp8.convert(self)'
+)
+
+
 # gate -> Patch, or a tuple of Patches the gate applies together.
+
+# --- SUFFIX_MAMBA_BT_HOST (w109): mamba block-table gather indices on the host
+_BT_HOST_UTILS_OLD = (
+    'def mamba_get_block_table_tensor(\n'
+    '    block_table: torch.Tensor,\n'
+    '    seq_lens: torch.Tensor,\n'
+    '    kv_cache_spec: KVCacheSpec,\n'
+    '    mamba_cache_mode: str,\n'
+    ') -> torch.Tensor:\n'
+    '    """Get the block table tensor for mamba kernels from the input\n'
+    '    common_attn_metadata.block_table_tensor given different mamba cache modes.\n'
+    '\n'
+    '    - "all":   input  (#requests, cdiv(max_model_len, block_size)\n'
+    '                        + num_speculative_blocks);\n'
+    '               output (#requests, cdiv(max_model_len, block_size)\n'
+    '                        + num_speculative_blocks).\n'
+    '\n'
+    '    - "none":  input  (#requests, 1 + num_speculative_blocks);\n'
+    '               output (#requests, 1 + num_speculative_blocks).\n'
+    '\n'
+    '    - "align": input  (#requests, cdiv(max_model_len, block_size));\n'
+    '               output (#requests, 1 + num_speculative_blocks), which are the last\n'
+    '               1 + num_speculative_blocks of each request.\n'
+    '    """\n'
+    '    if mamba_cache_mode in ("all", "none"):\n'
+    '        return block_table\n'
+    '    else:\n'
+    '        assert isinstance(kv_cache_spec, MambaSpec)\n'
+    '        # NOTE: For 0-length requests in CUDA graph, use a start_index of 0\n'
+    '        # to handle the invalid block table.\n'
+    '        start_indices = (seq_lens - 1) // kv_cache_spec.block_size\n'
+    '        start_indices.clamp_(min=0)\n'
+    '        # Use int32 for arithmetic to avoid dtype promotion overhead,\n'
+    '        # then convert to int64 for gather (which requires Long indices)\n'
+    '        offsets = torch.arange(\n'
+    '            1 + kv_cache_spec.num_speculative_blocks,\n'
+    '            device=block_table.device,\n'
+    '            dtype=torch.int32,\n'
+    '        )\n'
+    '        indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)\n'
+    '        return torch.gather(block_table, 1, indices_to_gather)\n'
+)
+_BT_HOST_UTILS_NEW = (
+    'def mamba_get_block_table_tensor(\n'
+    '    block_table: torch.Tensor,\n'
+    '    seq_lens: torch.Tensor,\n'
+    '    kv_cache_spec: KVCacheSpec,\n'
+    '    mamba_cache_mode: str,\n'
+    '    seq_lens_cpu: torch.Tensor | None = None,\n'
+    ') -> torch.Tensor:\n'
+    '    """Get the block table tensor for mamba kernels from the input\n'
+    '    common_attn_metadata.block_table_tensor given different mamba cache modes.\n'
+    '\n'
+    '    - "all":   input  (#requests, cdiv(max_model_len, block_size)\n'
+    '                        + num_speculative_blocks);\n'
+    '               output (#requests, cdiv(max_model_len, block_size)\n'
+    '                        + num_speculative_blocks).\n'
+    '\n'
+    '    - "none":  input  (#requests, 1 + num_speculative_blocks);\n'
+    '               output (#requests, 1 + num_speculative_blocks).\n'
+    '\n'
+    '    - "align": input  (#requests, cdiv(max_model_len, block_size));\n'
+    '               output (#requests, 1 + num_speculative_blocks), which are the last\n'
+    '               1 + num_speculative_blocks of each request.\n'
+    '    """\n'
+    '    if mamba_cache_mode in ("all", "none"):\n'
+    '        return block_table\n'
+    '    else:\n'
+    '        assert isinstance(kv_cache_spec, MambaSpec)\n'
+    '        # NOTE: For 0-length requests in CUDA graph, use a start_index of 0\n'
+    '        # to handle the invalid block table.\n'
+    '        if seq_lens_cpu is not None:\n'
+    '            # suffix mamba-bt-host: seq_lens_cpu is the pinned CPU mirror\n'
+    '            # of seq_lens (seq_lens_cpu_upper_bound; == GPU seq_lens\n'
+    '            # row-for-row by construction - gpu_model_runner computes\n'
+    '            # both from num_computed_tokens + num_scheduled_tokens).\n'
+    '            # Build the gather indices on the host: 6 tiny GPU dispatches\n'
+    '            # become 1 pinned H2D + the same gather. Same integer math\n'
+    '            # (int32 floor div, clamp min=0, int32 offsets, int64 cast):\n'
+    '            # bit-identical indices.\n'
+    '            sl = seq_lens_cpu.numpy()\n'
+    '            start = (sl - 1) // kv_cache_spec.block_size\n'
+    '            np.maximum(start, 0, out=start)\n'
+    '            offs = np.arange(\n'
+    '                1 + kv_cache_spec.num_speculative_blocks, dtype=np.int32\n'
+    '            )\n'
+    '            idx64 = (start[:, None] + offs).astype(np.int64)\n'
+    '            pin = torch.empty(\n'
+    '                tuple(idx64.shape), dtype=torch.int64, pin_memory=True\n'
+    '            )\n'
+    '            pin.copy_(torch.from_numpy(idx64))\n'
+    '            indices_to_gather = pin.to(block_table.device, non_blocking=True)\n'
+    '            return torch.gather(block_table, 1, indices_to_gather)\n'
+    '        start_indices = (seq_lens - 1) // kv_cache_spec.block_size\n'
+    '        start_indices.clamp_(min=0)\n'
+    '        # Use int32 for arithmetic to avoid dtype promotion overhead,\n'
+    '        # then convert to int64 for gather (which requires Long indices)\n'
+    '        offsets = torch.arange(\n'
+    '            1 + kv_cache_spec.num_speculative_blocks,\n'
+    '            device=block_table.device,\n'
+    '            dtype=torch.int32,\n'
+    '        )\n'
+    '        indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)\n'
+    '        return torch.gather(block_table, 1, indices_to_gather)\n'
+)
+_BT_HOST_FIELD_OLD = (
+    '    # the FlashInfer ReplaySSM backend is selected.\n'
+    '    write_pos_d: torch.Tensor | None = None\n'
+    '    is_flush_d: torch.Tensor | None = None\n'
+    '    bc_pre_scratch: torch.Tensor | None = None\n'
+    '    # ReplaySSM — FlashInfer checkpointing_ssu two-kernel scratch.\n'
+    '    replayssm_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None\n'
+    '\n'
+)
+_BT_HOST_FIELD_NEW = (
+    '    # the FlashInfer ReplaySSM backend is selected.\n'
+    '    write_pos_d: torch.Tensor | None = None\n'
+    '    is_flush_d: torch.Tensor | None = None\n'
+    '    bc_pre_scratch: torch.Tensor | None = None\n'
+    '    # ReplaySSM — FlashInfer checkpointing_ssu two-kernel scratch.\n'
+    '    replayssm_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None\n'
+    '    # suffix mamba-bt-host: CPU mirror (seq_lens_cpu_upper_bound) the\n'
+    '    # block-table gather uses instead of GPU seq_lens; a declared field\n'
+    '    # so dataclasses.replace() carries it through to update_block_table.\n'
+    '    _suffix_seq_lens_cpu: torch.Tensor | None = None\n'
+    '\n'
+)
+_BT_HOST_CTOR_OLD = (
+    '            block_idx_last_scheduled_token=block_idx_last_scheduled_token,\n'
+    '            block_idx_first_scheduled_token_p=block_idx_first_scheduled_token_p,\n'
+    '            num_state_writes_p=num_state_writes_p,\n'
+    '            block_idx_last_computed_token=block_idx_last_computed_token,\n'
+    '            block_idx_last_scheduled_token_prev_step=(\n'
+    '                block_idx_last_scheduled_token_prev_step\n'
+    '            ),\n'
+    '            num_computed_tokens_p=num_computed_tokens_p,\n'
+    '            num_reqs=num_reqs,\n'
+    '            seq_lens=common_attn_metadata.seq_lens,\n'
+    '            nums_dict=nums_dict,\n'
+    '            batch_ptr=batch_ptr,\n'
+    '            token_chunk_offset_ptr=token_chunk_offset_ptr,\n'
+    '        )\n'
+    '\n'
+    '        return self._update_metadata_for_cudagraph_capture(metadata)\n'
+)
+_BT_HOST_CTOR_NEW = (
+    '            block_idx_last_scheduled_token=block_idx_last_scheduled_token,\n'
+    '            block_idx_first_scheduled_token_p=block_idx_first_scheduled_token_p,\n'
+    '            num_state_writes_p=num_state_writes_p,\n'
+    '            block_idx_last_computed_token=block_idx_last_computed_token,\n'
+    '            block_idx_last_scheduled_token_prev_step=(\n'
+    '                block_idx_last_scheduled_token_prev_step\n'
+    '            ),\n'
+    '            num_computed_tokens_p=num_computed_tokens_p,\n'
+    '            num_reqs=num_reqs,\n'
+    '            seq_lens=common_attn_metadata.seq_lens,\n'
+    '            _suffix_seq_lens_cpu=common_attn_metadata.seq_lens_cpu_upper_bound,\n'
+    '            nums_dict=nums_dict,\n'
+    '            batch_ptr=batch_ptr,\n'
+    '            token_chunk_offset_ptr=token_chunk_offset_ptr,\n'
+    '        )\n'
+    '\n'
+    '        return self._update_metadata_for_cudagraph_capture(metadata)\n'
+)
+_BT_HOST_SITE1_OLD = (
+    '            state_indices_tensor = mamba_get_block_table_tensor(\n'
+    '                common_attn_metadata.block_table_tensor,\n'
+    '                common_attn_metadata.seq_lens,\n'
+    '                self.kv_cache_spec,\n'
+    '                self.vllm_config.cache_config.mamba_cache_mode,\n'
+    '            )\n'
+)
+_BT_HOST_SITE1_NEW = (
+    '            state_indices_tensor = mamba_get_block_table_tensor(\n'
+    '                common_attn_metadata.block_table_tensor,\n'
+    '                common_attn_metadata.seq_lens,\n'
+    '                self.kv_cache_spec,\n'
+    '                self.vllm_config.cache_config.mamba_cache_mode,\n'
+    '                seq_lens_cpu=common_attn_metadata.seq_lens_cpu_upper_bound,\n'
+    '            )\n'
+)
+_BT_HOST_SITE2_OLD = (
+    '        slot_mapping: torch.Tensor,\n'
+    '    ) -> M:\n'
+    '        state_indices_tensor = mamba_get_block_table_tensor(\n'
+    '            blk_table,\n'
+    '            metadata.seq_lens,\n'
+    '            self.kv_cache_spec,\n'
+    '            self.vllm_config.cache_config.mamba_cache_mode,\n'
+    '        )\n'
+    '        if state_indices_tensor.dim() == 1:\n'
+)
+_BT_HOST_SITE2_NEW = (
+    '        slot_mapping: torch.Tensor,\n'
+    '    ) -> M:\n'
+    '        state_indices_tensor = mamba_get_block_table_tensor(\n'
+    '            blk_table,\n'
+    '            metadata.seq_lens,\n'
+    '            self.kv_cache_spec,\n'
+    '            self.vllm_config.cache_config.mamba_cache_mode,\n'
+    '            seq_lens_cpu=getattr(metadata, "_suffix_seq_lens_cpu", None),\n'
+    '        )\n'
+    '        if state_indices_tensor.dim() == 1:\n'
+)
+
 PATCHES = {
     "SUFFIX_ROCM_AITER_PAD": Patch(
         "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe",
@@ -657,6 +971,106 @@ PATCHES = {
         Patch("vllm.models.deepseek_v32.nvidia.mtp", "MTP draft BF16 experts quantized to NVFP4 on load",
               after="suffix_hybrid.mtp_moe_nvfp4:patch_mtp"),
     ),
+    # NVIDIA DeepGEMM MoE (SM120 fp8 block): the fused SiLU*mul+FP8-quant launch
+    # grid is sized for the PADDED grouped workspace, not the token count; the
+    # persistent loop keeps every live row processed exactly once at any grid_m,
+    # so clamping to the token count only drops empty CTAs (bit-identical).
+    "SUFFIX_SILU_GRID_CLAMP": (
+        Patch("vllm.model_executor.layers.quantization.utils.fp8_utils",
+              "fused SiLU*mul+FP8-quant: keyword-only live_rows parameter",
+              _SGC_SIG_OLD, _SGC_SIG_NEW),
+        Patch("vllm.model_executor.layers.quantization.utils.fp8_utils",
+              "fused SiLU*mul+FP8-quant: expert grid clamped to live tokens",
+              _SGC_GRID_OLD, _SGC_GRID_NEW),
+        Patch("vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe",
+              "DeepGemmExperts._act_mul_quant: num_tokens parameter",
+              _SGC_DEF_OLD, _SGC_DEF_NEW),
+        Patch("vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe",
+              "DeepGemmExperts._act_mul_quant: fused call passes live_rows",
+              _SGC_FUSED_OLD, _SGC_FUSED_NEW),
+        Patch("vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe",
+              "DeepGemmExperts.apply: token count plumbed to the fused quant",
+              _SGC_CALL_OLD, _SGC_CALL_NEW),
+    ),
+    # DeepGEMM MoE, dense branch of the fused SiLU*mul+quant (the SM120 path:
+    # use_psum_layout is false, expert_ends is None). The kernel stores every row
+    # of the padded workspace - ~8256 rows for 128 live tokens at c32 (31.3 us,
+    # 21.55% of the decode step, profile e038). Thread m_indices in as row_experts
+    # and skip m_indices<0: padding rows are never read downstream (GEMM2 skips
+    # them), live outputs bit-identical.
+    "SUFFIX_SILU_SKIP_PAD": (
+        Patch("vllm.model_executor.layers.quantization.utils.fp8_utils",
+              "SiLU*mul+FP8-quant kernel: row_experts pointer arg",
+              _SSP_SIG_OLD, _SSP_SIG_NEW),
+        Patch("vllm.model_executor.layers.quantization.utils.fp8_utils",
+              "SiLU*mul+FP8-quant kernel: HAS_ROW_EXPERTS constexpr",
+              _SSP_CE_OLD, _SSP_CE_NEW),
+        Patch("vllm.model_executor.layers.quantization.utils.fp8_utils",
+              "SiLU*mul+FP8-quant kernel: skip m_indices<0 rows in the dense loop",
+              _SSP_MASK_OLD, _SSP_MASK_NEW),
+        Patch("vllm.model_executor.layers.quantization.utils.fp8_utils",
+              "silu_mul_quant_fp8_packed_triton: row_experts kwarg",
+              _SSP_WRAP_OLD, _SSP_WRAP_NEW),
+        Patch("vllm.model_executor.layers.quantization.utils.fp8_utils",
+              "silu_mul_quant_fp8_packed_triton: dense-branch row_experts validation",
+              _SSP_ELSE_OLD, _SSP_ELSE_NEW),
+        Patch("vllm.model_executor.layers.quantization.utils.fp8_utils",
+              "kernel launch: pass row_experts",
+              _SSP_LAUNCH_OLD, _SSP_LAUNCH_NEW),
+        Patch("vllm.model_executor.layers.quantization.utils.fp8_utils",
+              "kernel launch: HAS_ROW_EXPERTS constexpr",
+              _SSP_LCONST_OLD, _SSP_LCONST_NEW),
+        Patch("vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe",
+              "DeepGemmExperts._act_mul_quant: take row_experts",
+              _SSP_DEF_OLD, _SSP_DEF_NEW),
+        Patch("vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe",
+              "DeepGemmExperts._act_mul_quant: pass row_experts into the fused call",
+              _SSP_FUSED_OLD, _SSP_FUSED_NEW),
+        Patch("vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe",
+              "DeepGemmExperts.apply: m_indices plumbed to the fused quant",
+              _SSP_CALL_OLD, _SSP_CALL_NEW),
+    ),
+    # Value-level E8M0 mirror on the VLLM_USE_DEEP_GEMM=0 arm: the baseline's
+    # pow2-ceiled quant VALUES (activations via the flipped oracle and CUTLASS's
+    # QuantFP8, weights via the same requant_weight_ue8m0_inplace the DeepGemm
+    # kernel runs) with the arm's CUTLASS/Triton GEMMs. Isolates scale rounding
+    # from the GEMM backend as ad7b's drift cause (de KL 0.1182, ppl 0.9587).
+    # Packed-scale paths stay unreachable: QuantFP8 packs only under
+    # is_deep_gemm_supported(), the deepgemm_post_process_* packing only runs
+    # from the DeepGemm kernel / DEEPGEMM-family MoE backends (pruned under
+    # DG=0), and flashinfer/cutlass is_supported never consult e8m0.
+    "SUFFIX_POW2_MIRROR": (
+        Patch("vllm.utils.deep_gemm",
+              "is_deep_gemm_e8m0_used: True under SUFFIX_POW2_MIRROR (oracle flip)",
+              _P2M_ORACLE_OLD, _P2M_ORACLE_NEW),
+        Patch("vllm.model_executor.kernels.linear.scaled_mm.cutlass",
+              "CutlassFp8BlockScaledMMKernel: QuantFP8 use_ue8m0=True (ceiled act scales)",
+              _P2M_ACT_OLD, _P2M_ACT_NEW),
+        Patch("vllm.model_executor.kernels.linear.scaled_mm.cutlass",
+              "CutlassFp8BlockScaledMMKernel: ADD pad+ue8m0 weight requant",
+              _P2M_WDEF_OLD, _P2M_WDEF_NEW),
+        Patch("vllm.model_executor.layers.quantization.fp8",
+              "Fp8MoEMethod: requant w13/w2 in place before _setup_kernel",
+              _P2M_MOE_OLD, _P2M_MOE_NEW),
+    ),
+    # LFM2.5-24B-A2B-FP8 (RTX 5090): the BF16 short-conv projections are the
+    # biggest decode-step share cuBLAS serves badly there (e038: 33.1% of c1 /
+    # 36.3% of c8 / 23.8% of c32 at 0.82-1.13 TB/s vs 1.62 TB/s demonstrable).
+    # The hook append anchors on the stock hf_to_vllm_mapper block (verified
+    # once at the image commit); the kernel module reads SUFFIX_BF16_SKINNY /
+    # _LAYERS / _MAX_M itself and is fail-closed (oracle + no-match refusal).
+    "SUFFIX_BF16_SKINNY": Patch(
+        "vllm.model_executor.models.lfm2_moe",
+        "Lfm2MoeForCausalLM post-load hook -> bf16_skinny.install (short-conv projections)",
+        _SHORTCONV_SKINNY_OLD,
+        _SHORTCONV_SKINNY_NEW,
+    ),
+"SUFFIX_SHORTCONV_FP8": Patch(
+        "vllm.model_executor.models.lfm2_moe",
+        "Lfm2MoeForCausalLM post-load hook -> shortconv_fp8.convert",
+        _SHORTCONV_FP8_OLD,
+        _SHORTCONV_FP8_NEW,
+    ),
     "SUFFIX_ROCM_QSA_NOSPEC": tuple(
         Patch("vllm.models.qwen4_exp.amd.ops.qsa", f"QSA {name}: runtime counts not specialized",
               f"@triton.jit\ndef {name}(\n",
@@ -685,6 +1099,24 @@ PATCHES = {
         Patch("vllm.model_executor.layers.fused_moe.router.aiter_shared_routed_fused_moe_router",
               "MoE top-k deferred to the fused sort (router)",
               after="suffix_hybrid.kernels.moe_route_rocm:install_router"),
+    ),
+    "SUFFIX_MAMBA_BT_HOST": (
+        Patch("vllm.v1.attention.backends.utils",
+              "mamba block-table gather indices from the pinned CPU mirror"
+              " (6 GPU dispatches -> 1 pinned H2D + the same gather)",
+              _BT_HOST_UTILS_OLD, _BT_HOST_UTILS_NEW),
+        Patch("vllm.v1.attention.backends.mamba_attn",
+              "BaseMambaAttentionMetadata._suffix_seq_lens_cpu declared field",
+              _BT_HOST_FIELD_OLD, _BT_HOST_FIELD_NEW),
+        Patch("vllm.v1.attention.backends.mamba_attn",
+              "metadata ctor stashes seq_lens_cpu_upper_bound",
+              _BT_HOST_CTOR_OLD, _BT_HOST_CTOR_NEW),
+        Patch("vllm.v1.attention.backends.mamba_attn",
+              "build() passes the CPU mirror to the block-table gather",
+              _BT_HOST_SITE1_OLD, _BT_HOST_SITE1_NEW),
+        Patch("vllm.v1.attention.backends.mamba_attn",
+              "update_block_table() reuses the stashed mirror",
+              _BT_HOST_SITE2_OLD, _BT_HOST_SITE2_NEW),
     ),
 }
 _MARK = "_suffix_rocm_patch"

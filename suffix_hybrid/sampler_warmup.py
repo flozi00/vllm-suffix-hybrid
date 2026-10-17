@@ -25,6 +25,13 @@ batch-dependent specialization and V2 warmup_kernels already runs min_p.
 
 Gate: SUFFIX_SAMPLER_WARMUP (default ON, =0 disables). Fail-soft: a failure
 is a logged line, serving proceeds (first requests then JIT as before).
+
+Extension: this wrapper also hands off to suffix_hybrid.prefill_warmup
+(SUFFIX_PREFILL_WARMUP=1, default off), which prefires the prefill-shaped
+Triton JITs (fused_moe prefill-M configs, the long-sequence causal-conv
+variant, the gumbel sampler path) through vLLM's own
+run_mixed_prefill_decode_warmup at serving token counts; see that module's
+docstring for the run-9409 / trial-4871 evidence and its fail-soft contract.
 """
 import functools
 import importlib.util
@@ -36,14 +43,11 @@ GATE = "SUFFIX_SAMPLER_WARMUP"
 TARGET = "vllm.v1.worker.gpu_worker"
 _MARK = "_suffix_sampler_warmup"
 
-
 def _say(msg: str) -> None:
     print(f"[suffix sampler-warmup] {msg}", file=sys.stderr, flush=True)
 
-
 def enabled() -> bool:
     return os.environ.get(GATE, "1").strip() != "0"
-
 
 def _kernels():
     from vllm.platforms import current_platform
@@ -55,7 +59,6 @@ def _kernels():
     if current_platform.is_cuda_alike():
         ks += [t._topp_split_stats, t._topp_split_step, t._topp_split_mask]
     return ks
-
 
 def warm(model_runner, kernels=None) -> None:
     """Compile every sampler variant serving can hit. Raises on failure."""
@@ -73,7 +76,6 @@ def warm(model_runner, kernels=None) -> None:
     _say(f"warmed: {','.join(names)} ({n} variants) in "
          f"{(time.perf_counter() - t0) * 1e3:.0f} ms")
 
-
 def _patch(mod) -> None:
     orig = mod.warmup_kernels
     if getattr(orig, _MARK, False):
@@ -86,11 +88,21 @@ def _patch(mod) -> None:
             warm(model_runner)
         except Exception as exc:  # noqa: BLE001 - latency-only feature
             _say(f"FAILED (serving unaffected; first requests may JIT): {exc!r}")
+        try:
+            # Prefill-shape warmup (separate module, gate
+            # SUFFIX_PREFILL_WARMUP=1, default off): replays vLLM's own
+            # mixed prefill+decode warmup at serving token counts plus one
+            # temperature>0 sample, so the prefill-M fused_moe configs, the
+            # long-sequence causal-conv variant and the gumbel sampler path
+            # compile at boot instead of stalling the first requests.
+            from suffix_hybrid.prefill_warmup import maybe_run
+            maybe_run(model_runner, a)
+        except Exception as exc:  # noqa: BLE001 - latency-only feature
+            _say(f"prefill-warmup FAILED (serving unaffected): {exc!r}")
         return out
 
     setattr(warmup_kernels, _MARK, True)
     mod.warmup_kernels = warmup_kernels
-
 
 def install_post_import_hook() -> None:
     """Patch gpu_worker.warmup_kernels when that module loads. Never raises."""
