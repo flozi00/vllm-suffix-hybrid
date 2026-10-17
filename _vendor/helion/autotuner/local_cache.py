@@ -1,0 +1,475 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from collections.abc import Sequence
+import dataclasses
+import enum
+import hashlib
+import inspect
+import itertools
+import json
+import logging
+import os
+from pathlib import Path
+import platform
+import textwrap
+from typing import TYPE_CHECKING
+import uuid
+
+import torch
+from torch._inductor.runtime.cache_dir_utils import cache_dir
+
+from .._compat import extract_device
+from .._compat import get_device_name
+from ..runtime.config import Config
+from ..runtime.cute_structural_config import bound_structural_policy
+from ..runtime.cute_structural_config import decode_structural_policy
+from ..runtime.cute_structural_config import require_same_structural_policy
+from .base_cache import AutotuneCacheBase
+from .base_cache import LooseAutotuneCacheKey
+from .base_cache import StrictAutotuneCacheKey
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from typing import Callable
+
+    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from .base_search import BaseSearch
+
+log: logging.Logger = logging.getLogger(__name__)
+
+
+class _UncacheableSearchPolicy(TypeError):
+    pass
+
+
+def _uncacheable_search_policy(autotuner: BaseSearch) -> dict[str, str]:
+    autotuner._search_policy_cacheable = False
+    nonce = getattr(autotuner, "_uncacheable_search_policy_nonce", None)
+    if nonce is None:
+        nonce = str(uuid.uuid4())
+        autotuner._uncacheable_search_policy_nonce = nonce
+    return {"uncacheable_nonce": nonce}
+
+
+def _search_policy_json_value(
+    value: object, active_containers: set[int] | None = None
+) -> object:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, type):
+        return {"type": f"{value.__module__}.{value.__qualname__}"}
+
+    active = set() if active_containers is None else active_containers
+    value_id = id(value)
+    if value_id in active:
+        raise _UncacheableSearchPolicy("recursive policy value")
+    active.add(value_id)
+    try:
+        if isinstance(value, Config):
+            return {
+                "type": "helion.runtime.config.Config",
+                "fields": _search_policy_json_value(value.config, active),
+            }
+        if isinstance(value, enum.Enum):
+            return {
+                "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                "value": _search_policy_json_value(value.value, active),
+            }
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return {
+                "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                "fields": {
+                    field.name: _search_policy_json_value(
+                        getattr(value, field.name), active
+                    )
+                    for field in dataclasses.fields(value)
+                },
+            }
+        if isinstance(value, Mapping):
+            if not all(isinstance(key, str) for key in value):
+                raise _UncacheableSearchPolicy("mapping keys must be strings")
+            return {
+                key: _search_policy_json_value(item, active)
+                for key, item in sorted(value.items())
+            }
+        if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            return [_search_policy_json_value(item, active) for item in value]
+        raise _UncacheableSearchPolicy(
+            "unsupported policy value "
+            f"{type(value).__module__}.{type(value).__qualname__}"
+        )
+    finally:
+        active.remove(value_id)
+
+
+def _cute_flash_search_policy_hash(
+    autotuner: BaseSearch, *, cute_flash_search_enabled: bool
+) -> str:
+    """Hash the effective built-in search policy for CuTe flash caches.
+
+    A cached quick or explicitly truncated search must not satisfy a later full
+    request. Unknown/custom policies get a unique one-shot key; other kernels
+    retain their historical cache keys.
+    """
+    if not cute_flash_search_enabled:
+        return ""
+
+    policy = autotuner.cache_policy()
+    if policy is None:
+        log.warning(
+            "CuTe-flash autotune cache reuse is disabled for unsupported search "
+            "policy %s",
+            type(autotuner).__qualname__,
+        )
+        policy = _uncacheable_search_policy(autotuner)
+    try:
+        canonical_policy = _search_policy_json_value(policy)
+        encoded = json.dumps(
+            canonical_policy,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        log.warning("CuTe-flash autotune cache reuse is disabled: %s", error)
+        encoded = json.dumps(
+            _uncacheable_search_policy(autotuner),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def get_helion_cache_dir() -> Path:
+    """Return the root directory for all Helion caches."""
+    if (user_path := os.environ.get("HELION_CACHE_DIR")) is not None:
+        return Path(user_path)
+    return Path(cache_dir()) / "helion"
+
+
+def helion_triton_cache_dir(device_index: int) -> str:
+    """Return per-device Triton cache directory under Helion's cache root."""
+    return str(get_helion_cache_dir() / "triton" / str(device_index))
+
+
+def helion_cute_cache_dir(device_index: int) -> str:
+    """Return per-device CuTe DSL cache directory under Helion's cache root."""
+    return str(get_helion_cache_dir() / "cute" / str(device_index))
+
+
+@dataclasses.dataclass(frozen=True)
+class SavedBestConfig:
+    """A parsed cache entry from a .best_config file."""
+
+    hardware: str
+    specialization_key: str
+    config: Config
+    config_spec_hash: str
+    flat_config: tuple[object, ...] | None
+    cute_structural_policy: CuteStructuralPolicy | None = None
+
+    def to_mutable_flat_config(self) -> list[object]:
+        """Return the stored flat_config as a mutable list."""
+        assert self.flat_config is not None
+        return list(self.flat_config)
+
+
+def parse_cache_entry(raw: str) -> SavedBestConfig:
+    """Parse a serialized .best_config JSON string into a SavedBestConfig.
+
+    Raises:
+        ValueError: if the payload is malformed or missing required fields.
+    """
+    try:
+        data = json.loads(raw)
+        fields = data["key"]["fields"]
+        raw_flat = data.get("flat_config")
+        if isinstance(raw_flat, str):
+            flat_config: tuple[object, ...] | None = tuple(json.loads(raw_flat))
+        elif raw_flat is not None:
+            flat_config = tuple(raw_flat)
+        else:
+            flat_config = None
+        return SavedBestConfig(
+            hardware=fields.get("hardware", ""),
+            specialization_key=fields.get("specialization_key", ""),
+            config=Config.from_json(data["config"]),
+            config_spec_hash=fields.get("config_spec_hash", ""),
+            flat_config=flat_config,
+            cute_structural_policy=(
+                decode_structural_policy(data["cute_structural_policy"])
+                if "cute_structural_policy" in data
+                else None
+            ),
+        )
+    except (KeyError, TypeError, json.JSONDecodeError) as e:
+        raise ValueError(f"malformed cache entry: {e}") from e
+
+
+def iter_cache_entries(
+    cache_path: Path, *, max_scan: int | None = None
+) -> Iterator[SavedBestConfig]:
+    """Yield parsed cache entries from *cache_path*, newest first.
+
+    Corrupt or unparsable files are skipped with a warning.
+    """
+    if not cache_path.exists():
+        return
+
+    files = list(cache_path.glob("*.best_config"))
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    for p in itertools.islice(files, max_scan):
+        # parse_cache_entry consolidates KeyError/TypeError/JSONDecodeError into ValueError.
+        try:
+            yield parse_cache_entry(p.read_text())
+        except (OSError, ValueError) as e:
+            log.warning("Skipping corrupt cache file %s: %s", p.name, e)
+
+
+class LocalAutotuneCache(AutotuneCacheBase):
+    """
+    This class implements the local autotune cache, storing the
+    best config artifact on the local file system either by default
+    on torch's cache directory, or at a user specified HELION_CACHE_DIR
+    directory.
+    It uses the LooseAutotuneCacheKey implementation for the cache key
+    which takes into account device and source code properties, but does
+    not account for library level code changes such as Triton, Helion or
+    PyTorch. Use StrictLocalAutotuneCache to consider these properties.
+    """
+
+    def __init__(
+        self,
+        autotuner: BaseSearch,
+        *,
+        autotuner_factory: Callable[[], BaseSearch] | None = None,
+    ) -> None:
+        super().__init__(autotuner, autotuner_factory=autotuner_factory)
+        self.key = self._generate_key()
+
+    def _generate_key(self) -> LooseAutotuneCacheKey:
+        from .benchmark_provider import _MultiShapeAutotuneArgs
+
+        multi_args = (
+            self.args if isinstance(self.args, _MultiShapeAutotuneArgs) else None
+        )
+        if multi_args is None:
+            in_memory_cache_key = self.kernel.kernel._create_bound_kernel_cache_key(
+                self.kernel,
+                tuple(self.args),
+                self.kernel.kernel._base_specialization_key(self.args),
+            )
+            specialization_key = in_memory_cache_key.specialization_key
+            extra_results = in_memory_cache_key.extra_results
+            compiler_seed_results = in_memory_cache_key.compiler_seed_results
+            dev = extract_device(self.args)
+        else:
+            specialization_key = multi_args.workload_key
+            extra_results = ()
+            compiler_seed_results = ()
+            dev = multi_args.cases[0][0].env.device
+        kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
+        kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
+
+        assert dev is not None
+
+        hardware = get_device_name(dev)
+        runtime_name = None
+
+        if (
+            dev.type == "xpu"
+            and getattr(torch, "xpu", None) is not None
+            and torch.xpu.is_available()
+        ):
+            runtime_name = torch.xpu.get_device_properties(dev).driver_version
+        elif dev.type == "cuda" and torch.cuda.is_available():
+            if torch.version.cuda is not None:
+                runtime_name = str(torch.version.cuda)
+            elif torch.version.hip is not None:
+                runtime_name = torch.version.hip
+        elif dev.type == "mps":
+            # Include OS version as Metal runtime is part of OS
+            runtime_name = platform.mac_ver()[0] or "mps"
+        elif dev.type == "tpu":
+            hardware = "tpu"
+            try:
+                import torch_tpu  # type: ignore[import-not-found]
+
+                runtime_name = getattr(torch_tpu, "__version__", "unknown")
+            except ImportError:
+                runtime_name = "unknown"
+        elif dev.type == "cpu" and self.kernel.kernel.settings.backend == "pallas":
+            hardware = "pallas_interpret"
+            runtime_name = "interpret"
+        elif dev.type == "mtia":
+            hardware = hardware or "mtia"
+            try:
+                runtime_name = str(torch.mtia.get_device_properties(dev))
+            except Exception:
+                runtime_name = "unknown"
+
+        assert hardware is not None and runtime_name is not None
+        config_spec_hash = self.kernel.config_spec.cache_fingerprint_hash(
+            advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
+        )
+        search_policy_hash = _cute_flash_search_policy_hash(
+            self.autotuner,
+            cute_flash_search_enabled=bool(
+                getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
+            ),
+        )
+        return LooseAutotuneCacheKey(
+            specialization_key=specialization_key,
+            extra_results=extra_results,
+            compiler_seed_results=compiler_seed_results,
+            kernel_source_hash=kernel_source_hash,
+            hardware=hardware,
+            runtime_name=runtime_name,
+            backend=self.kernel.env.backend.name,
+            config_spec_hash=config_spec_hash,
+            extra_cache_key=self.kernel.extra_cache_key(),
+            best_of_k=self.autotuner.settings.autotune_best_of_k,
+            search_policy_hash=search_policy_hash,
+        )
+
+    def _get_local_cache_path(self) -> Path:
+        return get_helion_cache_dir() / f"{self.key.stable_hash()}.best_config"
+
+    def get(self) -> Config | None:
+        path = self._get_local_cache_path()
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        self._validate_config_policy(data)
+        try:
+            return Config.from_json(data["config"])
+        except Exception:
+            return None
+
+    def _validate_config_policy(self, data: dict[str, object]) -> None:
+        policy = (
+            decode_structural_policy(data["cute_structural_policy"])
+            if "cute_structural_policy" in data
+            else None
+        )
+        require_same_structural_policy(
+            policy, bound_structural_policy(self.kernel), context="Cached config"
+        )
+
+    def put(self, config: Config) -> None:
+        path = self._get_local_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save both config and key for better debugging
+        # Store key as dict for safer reconstruction (avoids eval)
+        key_dict = {
+            "type": type(self.key).__name__,
+            "fields": {
+                k: str(v)
+                for k, v in vars(self.key).items()
+                if k != "search_policy_hash" or v
+            },
+        }
+
+        data: dict[str, object] = {
+            "config": config.to_json(),
+            "key": key_dict,
+        }
+        if (policy := bound_structural_policy(self.kernel)) is not None:
+            data["cute_structural_policy"] = policy.to_dict()
+
+        config_gen = self.kernel.config_spec.create_config_generation(
+            advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
+        )
+        data["flat_config"] = json.dumps(config_gen.flatten(config))
+
+        backend_cache_key = self.kernel.backend_cache_key(config)
+        if backend_cache_key is None:
+            # Config may have been minimized (default values stripped),
+            # so it won't match the full config in _compile_cache.
+            # Expand it back by merging with defaults.
+            default = self.kernel.config_spec.default_config()
+            # pyrefly: ignore [bad-argument-type]
+            full_config = Config(**(default.config | config.config))
+            backend_cache_key = self.kernel.backend_cache_key(full_config)
+        if backend_cache_key is not None:
+            data["backend_cache_key"] = backend_cache_key
+
+        # Atomic write
+        tmp = path.parent / f"tmp.{uuid.uuid4()!s}"
+        tmp.write_text(json.dumps(data, indent=2))
+        os.rename(str(tmp), str(path))
+
+    def _get_cache_info_message(self) -> str:
+        cache_dir = self._get_local_cache_path().parent
+        return f"Cache directory: {cache_dir}. To re-tune and update the cache, set HELION_FORCE_AUTOTUNE=1."
+
+    def _get_cache_key(self) -> LooseAutotuneCacheKey:
+        return self.key
+
+    def _list_cache_entries(self) -> Sequence[tuple[str, LooseAutotuneCacheKey]]:
+        """List all cache entries in the cache directory."""
+        cache_dir = self._get_local_cache_path().parent
+        if not cache_dir.exists():
+            return []
+
+        current_key_hash = self.key.stable_hash()
+        entries: list[tuple[str, LooseAutotuneCacheKey]] = []
+        for cache_file in cache_dir.glob("*.best_config"):
+            try:
+                data = json.loads(cache_file.read_text())
+                file_hash = cache_file.stem
+
+                if file_hash == current_key_hash:
+                    continue
+
+                key_data = data["key"]
+
+                # Create a simple namespace object that has the same attributes
+                # for comparison purposes (we don't need the full key object)
+                class CachedKey:
+                    def __init__(self, fields: dict[str, str]) -> None:
+                        for name, value in fields.items():
+                            setattr(self, name, value)
+
+                cached_key = CachedKey(key_data["fields"])
+                entries.append((cache_file.name, cached_key))  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+        return entries
+
+
+class StrictLocalAutotuneCache(LocalAutotuneCache):
+    """
+    Stricter implementation of the local autotune cache, which takes into
+    account library level code changes such as Triton, Helion or PyTorch.
+    """
+
+    def _generate_key(self) -> StrictAutotuneCacheKey:
+        loose_key = super()._generate_key()
+        return StrictAutotuneCacheKey(**vars(loose_key))
+
+
+def stable_autotune_hash(autotuner: BaseSearch) -> str | None:
+    """Return the autotuner's stable local-cache hash for this run.
+
+    This is the same hash used as the ``.best_config`` cache filename stem, so
+    artifacts keyed by it line up with the cache entry and differ per
+    kernel/shape. Best-effort: returns ``None`` if the kernel is not cacheable
+    or the key can't be built, so callers must tolerate ``None``.
+    """
+    try:
+        if not autotuner.kernel.is_cacheable():
+            return None
+        return LocalAutotuneCache(autotuner)._generate_key().stable_hash()
+    except Exception:
+        log.debug("Could not compute autotune cache hash", exc_info=True)
+        return None
