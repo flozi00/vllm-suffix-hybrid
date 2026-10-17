@@ -41,6 +41,7 @@ the bucketed tuned kernel or returns None (auto -> the oxide op).
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
@@ -64,10 +65,9 @@ ROW, DIM, PE = 352, 512, 64
 TOPK = 2048  # GLM 5.3 / DeepSeek-V3.2 index_topk
 SCALE = 256 ** -0.5  # GLM 5.3 bmm1 scale (qk_head_dim 192 + 64)
 ARCHS = ("GlmMoeDsaForCausalLM", "DeepseekV32ForCausalLM")
-# decode rows: batch x (MTP k + 1), k <= 5 -> 6/12/24/48/96/192; prefill
-# slices up to max-num-batched-tokens 8192 (larger T run the 8192 config)
-BUCKETS = (1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512,
-           1024, 2048, 4096, 8192)
+# decode rows: batch x (MTP k + 1), k <= 5 -> 6/12/24/48/96/192, plus short
+# prefill slices; T > 1024 (long prefill) stays on oxide in every mode
+BUCKETS = (1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 COUNTERS = 16384  # rows of the persistent counter buffer (larger T: per call)
 GATE = 2e-2  # oracle reader gate: max (token, head) row rel-L2
 
@@ -76,6 +76,14 @@ GATE = 2e-2  # oracle reader gate: max (token, head) row rel-L2
 # Helion body (module level, undecorated: the lab wraps it, serving binds it
 # to the shipped config via helion_kernels.compiled)
 # ---------------------------------------------------------------------------
+def _e2m1_f16(code):
+    """e2m1 codes (int32 0..15, sign bit 3) -> exact float16 by bit
+    construction (|x| = 0, .5, 1, 1.5, 2, 3, 4, 6): no f32 tile."""
+    m = code & 7
+    bits = torch.where(m >= 2, (m << 9) + 0x3800, m * 0x3800) | ((code & 8) << 12)
+    return bits.to(torch.int16).view(torch.float16)
+
+
 def ds_mla_decode(q: torch.Tensor, kv: torch.Tensor, topk: torch.Tensor, out: torch.Tensor,
                   counters: torch.Tensor, block_size: int, block_stride: int,
                   sm_scale: float) -> torch.Tensor:
@@ -115,14 +123,12 @@ def ds_mla_decode(q: torch.Tensor, kv: torch.Tensor, topk: torch.Tensor, out: to
                 lat_b = kv[row[:, None, None] + (blk * 8)[None, :, None]
                            + hl.arange(8)[None, None, :]] * keep[:, None, None]
                 codes = hl.join(lat_b & 15, lat_b >> 4)  # [tk, 32, 8, 2]: dim 16b + 2j + {0,1}
-                mag = (codes & 7).to(torch.float32)  # e2m1 |x| = {0,.5,1,1.5,2,3,4,6}
-                val = torch.where(mag < 5.0, mag * 0.5, torch.where(mag == 7.0, mag - 1.0, mag - 2.0))
-                val = torch.where((codes & 8) != 0, -val, val)
+                val = _e2m1_f16(codes.to(torch.int32))
                 sf_b = kv[row[:, None] + (320 + 8 * (blk & 3) + (blk >> 2))[None, :]] * keep[:, None]
-                sf = sf_b.view(torch.float8_e4m3fn).to(torch.float32)
-                k16 = (val * sf[:, :, None, None]).reshape(lat_b.size(0), 512).to(torch.float16)
+                sf = sf_b.view(torch.float8_e4m3fn).to(torch.float16)
+                k16 = (val * sf[:, :, None, None]).reshape(lat_b.size(0), 512)  # exact f16
                 pe_b = kv[row[:, None] + (256 + hl.arange(64))[None, :]] * keep[:, None]
-                k_pe = pe_b.view(torch.float8_e4m3fn).to(torch.float32).to(torch.bfloat16)
+                k_pe = pe_b.view(torch.float8_e4m3fn).to(torch.float16).to(torch.bfloat16)
                 sc = hl.dot(q_lat, k16.to(torch.bfloat16).T, out_dtype=torch.float32)
                 sc = hl.dot(q_pe, k_pe.T, acc=sc)
                 sc = torch.where(valid[None, :], sc * (sm_scale * 1.4426950408889634),
@@ -239,11 +245,13 @@ def decode(route: dict, q, kv_cache, topk, out, sm_scale: float):
     """The serving op (oxide op semantics minus its o_part/lse_part workspace
     and stream: Helion allocates its own and runs on torch's current stream;
     one serving stream per worker shares the route's counter buffer).
-    Returns `out`, or None when this shape has no tuned kernel (auto: the
-    caller runs the oxide op)."""
+    Returns `out`, or None when this shape has no tuned kernel (auto) or
+    T > the largest bucket (any mode): the caller runs the oxide op."""
     t, h, c = q.shape[0], q.shape[-2], topk.shape[-1]
     if t == 0:
         return out
+    if t > BUCKETS[-1]:
+        return None  # long prefill: oxide (owner decision 2026-10-17)
     kern = None
     if (h, c) == (route["heads"], route["topk"]):
         kern = route["kernels"].get(hk.bucket(t, BUCKETS))
@@ -387,6 +395,20 @@ def baseline(q, kv, topk, out, counters, block_size, block_stride, sm_scale):
     return out
 
 
+def _tune_check(actual, expected):
+    """Autotuner accuracy check against the oxide op's output (the tuning
+    baseline): both sit within the 2e-2 reader gate of the reference, so
+    rows may differ by up to twice that; masked rows are exactly 0 in both.
+    Raises AssertionError (Helion's contract)."""
+    keep = expected.float().norm(dim=-1) > 0
+    d = (actual.float() - expected.float()).norm(dim=-1)
+    rel = d / expected.float().norm(dim=-1).clamp_min(1e-30)
+    if not bool(torch.isfinite(actual.float()).all()) or bool((actual[~keep] != 0).any()) \
+            or (bool(keep.any()) and float(rel[keep].max()) > 2 * GATE):
+        raise AssertionError(f"ds_mla vs oxide: max row rel-L2 "
+                             f"{float(rel[keep].max()) if bool(keep.any()) else 0.0:.2e}")
+
+
 def check(out, ref):
     """The oracle's reader gate: max (token, head) row rel-L2 <= 2e-2, all
     rows finite, masked (all -1) tokens exactly 0."""
@@ -403,5 +425,11 @@ KERNELS = [
     {"name": KERNEL, "body": ds_mla_decode, "cases": cases, "make": make,
      "reference": reference, "baseline": baseline, "baseline_name": "oxide nvfp4_ds_mla",
      "check": check,
-     "replaces": [r"nvfp4_ds_mla_attn_partial", r"nvfp4_ds_mla_attn_merge"]},
+     "replaces": [r"nvfp4_ds_mla_attn_partial", r"nvfp4_ds_mla_attn_merge"],
+     # lab only: the accuracy baseline is the oxide op on the body's args (no
+     # in-process, no-timeout compile of Helion's reference config, like
+     # dsa_indexer); DEBUG shows every autotuner step in the run log
+     "settings": {"autotune_baseline_fn": baseline,
+                  "autotune_baseline_accuracy_check_fn": _tune_check,
+                  "autotune_log_level": logging.DEBUG}},
 ]

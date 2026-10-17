@@ -69,7 +69,9 @@ def test_cases_and_lab_abi():
     assert D.cases({**GLM, "architecture": "DeepseekV32ForCausalLM", "heads": 16})[0]["heads"] == 16
     assert D.cases({**GLM, "architecture": "Qwen3ForCausalLM"}) == []
     assert D.cases({**GLM, "heads": None}) == []
+    assert D.BUCKETS[-1] == 1024  # long prefill stays on oxide
     k, = D.KERNELS
+    assert k["settings"]["autotune_baseline_fn"] is D.baseline  # no in-process reference compile
     assert re.fullmatch(r"[a-z0-9_]{1,40}", k["name"]) and k["name"] == D.KERNEL
     for key in ("body", "cases", "make", "reference", "baseline", "check"):
         assert callable(k[key]), key
@@ -79,6 +81,15 @@ def test_cases_and_lab_abi():
     entries = re.findall(r"pub fn (nvfp4_ds_mla_\w+)\(", src)
     hit = {e for e in entries if any(re.search(r, e, re.I) for r in k["replaces"])}
     assert hit == {"nvfp4_ds_mla_attn_partial", "nvfp4_ds_mla_attn_merge"}, entries
+
+
+def test_tune_check_vs_oxide():
+    ref = torch.randn(3, 2, D.DIM)
+    ref[1] = 0
+    D._tune_check(ref.bfloat16(), ref)
+    for bad in (ref * 1.05, ref + (ref == 0) * 1e-3):
+        with pytest.raises(AssertionError):
+            D._tune_check(bad.bfloat16(), ref)
 
 
 def test_check_is_the_reader_gate():
@@ -161,6 +172,9 @@ def test_knob_oxide_helion_auto(knob):
     route = D.load(4, 40, "cpu")
     assert sorted(route["kernels"]) == list(D.BUCKETS)
     assert D.decode(route, q, cache, topk, out, 0.5) is out and knob.calls[-1][0] == 4
+    big = torch.zeros(1025, 4, 576, dtype=torch.bfloat16)
+    assert D.decode(route, big, cache, torch.zeros(1025, 40, dtype=torch.int32),
+                    torch.empty(1025, 4, 512, dtype=torch.bfloat16), 0.5) is None  # oxide
     with pytest.raises(RuntimeError, match="helion: no ds_mla_decode kernel"):
         D.decode(route, q, cache, topk[:, :20], out, 0.5)
     knob.mp.setenv(D.KNOB, "triton")
