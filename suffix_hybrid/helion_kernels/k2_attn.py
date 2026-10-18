@@ -335,11 +335,15 @@ def prepare(served, q_max, device) -> str:
             i = BATCHES.index(nb)
             kern = kernel_for(c)
             for batch in sorted({nb, BATCHES[i - 1] + 1 if i else 1}):  # bucket edges
-                args = _problem(d, hq, hkv, page, wl, batch, w, 0, device,
-                                ctx=lambda j, n: 300 + 397 * j, pad=3)
-                ok, msg = check(kern(*args), reference(*args))
-                if not ok:
-                    raise RuntimeError(f"{MARKER} load-time oracle FAILED for {c} batch {batch}: {msg}")
+                # Gemma4 uses 1.0; retain coverage of standard attention too.
+                for sm_scale in (1 / math.sqrt(d), 1.0):
+                    args = _problem(d, hq, hkv, page, wl, batch, w, 0, device,
+                                    ctx=lambda j, n: 300 + 397 * j, pad=3,
+                                    sm_scale=sm_scale)
+                    ok, msg = check(kern(*args), reference(*args))
+                    if not ok:
+                        raise RuntimeError(f"{MARKER} load-time oracle FAILED for {c} batch {batch} "
+                                           f"scale {sm_scale}: {msg}")
             on.append(f"b{nb}w{w}")
     _PREPARED[key] = (f"Helion K2 d{d} {hq}/{hkv} wl={wl}: helion {on or '-'}"
                       + (f", oxide {off}" if off else ""))
@@ -412,7 +416,8 @@ def _ctx(i, n):
     return 8192 if n == 1 else int(2048 * 16 ** (i / (n - 1)))
 
 
-def _problem(d, hq, hkv, page, window_left, batch, width, seed, device, ctx=_ctx, pad=0):
+def _problem(d, hq, hkv, page, window_left, batch, width, seed, device, ctx=_ctx, pad=0,
+             sm_scale=None):
     """Random paged NVFP4 cache in vLLM's HND byte layout (page = [K data |
     K sf | V data | V sf], head-major), shuffled page table, uniform q width,
     `pad` graph-padding tokens -> body args."""
@@ -447,8 +452,9 @@ def _problem(d, hq, hkv, page, window_left, batch, width, seed, device, ctx=_ctx
     i32 = dict(dtype=torch.int32, device=device)
     qo = torch.arange(batch + 1, **i32) * width
     cnt = counters(device) if torch.device(device).type == "cuda" else torch.zeros(MAX_COUNTERS, **i32)
+    sm_scale = 1 / math.sqrt(d) if sm_scale is None else float(sm_scale)
     return body_args(q, k_data, k_sf, v_data, v_sf, bt.to(device), torch.tensor(lens, **i32), qo,
-                     out, cnt, window_left, LOG2E / math.sqrt(d), 1.0)
+                     out, cnt, window_left, LOG2E * sm_scale, 1.0)
 
 
 # ---- lab ABI (inference-console api/autotune_kernels.py) ----------------------
@@ -495,8 +501,9 @@ def working_set_bytes(args):
 
 
 def make(c, seed):
+    # cases() is Gemma4-only; its Q/K normalization uses scale=1.0.
     return _problem(c["head_dim"], c["heads"], c["kv_heads"], c["page"], c["window"],
-                    c["numtokens"], c["width"], seed, "cuda")
+                    c["numtokens"], c["width"], seed, "cuda", sm_scale=1.0)
 
 
 def make_baseline(c, seed):

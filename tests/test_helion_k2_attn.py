@@ -102,18 +102,38 @@ def test_body_args_round_trip_and_contract():
     (256, 4, 1, 32, 20, (3, 0, 1, 2)),
     (512, 8, 2, 16, -1, (4,)),
 ])
-def test_reference_matches_numpy_float64(d, hq, hkv, page, wl, lens):
+@pytest.mark.parametrize("sm_scale", [None, 1.0])
+def test_reference_matches_numpy_float64(d, hq, hkv, page, wl, lens, sm_scale):
     args = _with_qo(_problem(d, hq, hkv, page, wl, len(lens), max(lens), pad=2), lens)
+    if sm_scale is not None:
+        args = (*args[:14], sm_scale * K.LOG2E, *args[15:])
     k_data, pb = K.natural_views(args)[0], args[12]
     p = k_data.shape[0]
     raw = torch.as_strided(k_data, (p, pb), (pb, 1), k_data.storage_offset())
     cache = ref.Cache(raw.numpy().reshape(p, 2 * hkv, page, d // 2 + d // 16), hkv, page, d)
     q = args[0][:sum(lens)].float().numpy().astype(np.float64)
     want = ref.reference(q, cache, args[5].numpy(), args[6].numpy(), list(lens),
-                         1 / math.sqrt(d), window_left=wl)
+                         1 / math.sqrt(d) if sm_scale is None else sm_scale, window_left=wl)
     got = K.reference(*args)
     assert np.allclose(got[:sum(lens)].numpy(), want, atol=1e-4, rtol=1e-4)
     assert bool((got[sum(lens):] == 0).all())
+
+
+def test_gemma_lab_and_native_control_use_model_attention_scale(monkeypatch):
+    problem = K._problem
+
+    def on_cpu(*args, **kwargs):
+        args = list(args)
+        args[8] = "cpu"
+        kwargs["ctx"] = lambda i, n: 128
+        return problem(*args, **kwargs)
+
+    monkeypatch.setattr(K, "_problem", on_cpu)
+    c = K.case(256, 16, 8, 64, 1023, 1, 2)
+    args = K.make(c, 13)
+    native = K.make_baseline(c, 13)
+    assert args[14] == K.LOG2E and native[-2] == 1.0
+    assert torch.isfinite(K.reference(*args)).all()
 
 
 def test_knob_routing(monkeypatch, tmp_path):
@@ -169,8 +189,11 @@ def body():
     (512, 8, 2, 16, -1, (1, 4, 0, 2), 3),     # hd512 ragged + empty request
     (256, 4, 2, 16, 33, (2, 0, 1), 1),        # window on ragged rows
 ])
-def test_body_matches_reference(body, d, hq, hkv, page, wl, lens, pad):
+@pytest.mark.parametrize("sm_scale", [None, 1.0])
+def test_body_matches_reference(body, d, hq, hkv, page, wl, lens, pad, sm_scale):
     args = _with_qo(_problem(d, hq, hkv, page, wl, len(lens), max(lens), pad=pad), lens)
+    if sm_scale is not None:
+        args = (*args[:14], sm_scale * K.LOG2E, *args[15:])
     want = K.reference(*args)
     ok, msg = K.check(body(*args), want)
     assert ok, msg

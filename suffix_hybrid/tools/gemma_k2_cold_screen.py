@@ -116,6 +116,7 @@ def screen():
                 seed,
                 "cuda",
                 ctx=selected_context,
+                sm_scale=1.0,
             )
 
         args = make(0)
@@ -140,6 +141,7 @@ def screen():
             rec = {
                 "case": c,
                 "actual_width": width,
+                "sm_scale": 1.0,
                 "config_id": idx,
                 "config": config,
                 "copies": copies,
