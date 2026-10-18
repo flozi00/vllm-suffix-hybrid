@@ -35,6 +35,7 @@ import importlib.abc
 import importlib.machinery
 import importlib.util
 import os
+import re
 import sys
 import threading
 import time
@@ -43,6 +44,15 @@ from pathlib import Path
 _TARGET_MODULE = "vllm.model_executor.warmup.flashinfer_autotune_cache"
 _DUMP_PREFIX = "SUFFIX_FICACHE_DUMP"
 _SEEDS_DIR = Path("/plugins/ficache/seeds")
+_CACHE_NAME = re.compile(r"autotune_configs(?:_dp[0-9]+_rank[0-9]+)?\.json\Z")
+
+
+def _cache_key(path: Path) -> str:
+    """Preserve legacy keys and keep rank-specific receipts/seeds distinct."""
+    if not _CACHE_NAME.fullmatch(path.name):
+        raise ValueError(f"unrecognized FlashInfer cache filename: {path.name}")
+    return (path.parent.name if path.name == "autotune_configs.json"
+            else f"{path.parent.name}__{path.stem}")
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -120,7 +130,7 @@ def _patch_resolve(module) -> None:
 def _seed_if_missing(path: Path) -> None:
     if path.exists():
         return
-    seed = _SEEDS_DIR / f"{path.parent.name}.json.gz"
+    seed = _SEEDS_DIR / f"{_cache_key(path)}.json.gz"
     if not seed.is_file():
         return
     data = gzip.decompress(seed.read_bytes())
@@ -158,7 +168,7 @@ def _cache_roots() -> list[Path]:
 
 def encode_dump(path: Path) -> str:
     payload = base64.b64encode(gzip.compress(path.read_bytes(), 9)).decode()
-    return f"{_DUMP_PREFIX} {path.parent.name} {payload}"
+    return f"{_DUMP_PREFIX} {_cache_key(path)} {payload}"
 
 
 def _scan_once(seen: dict[Path, tuple[int, int]], repeat: bool = False) -> None:
@@ -168,7 +178,9 @@ def _scan_once(seen: dict[Path, tuple[int, int]], repeat: bool = False) -> None:
         # Current vLLM nests version / architecture / config-hash; older
         # versions used only workspace / config-hash. Restrict the recursive
         # scan to the dedicated autotune roots and the exact cache filename.
-        for cfg in root.rglob("autotune_configs.json"):
+        for cfg in root.rglob("autotune_configs*.json"):
+            if not _CACHE_NAME.fullmatch(cfg.name):
+                continue
             try:
                 st = cfg.stat()
                 key = (st.st_mtime_ns, st.st_size)
