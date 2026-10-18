@@ -7,6 +7,7 @@ must first pass K2's independent dequantized reference.
 """
 
 import hashlib
+import importlib.metadata
 import json
 import math
 from pathlib import Path
@@ -62,6 +63,9 @@ def screen():
 
     K.hk.ensure_vendor()
     import helion
+    import triton
+
+    helion_version = importlib.metadata.version("helion")
 
     device = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device)
@@ -134,7 +138,9 @@ def screen():
                 "max_copies": 256,
                 "gpu": props.name,
                 "torch": torch.__version__,
-                "helion": getattr(helion, "__version__", None),
+                "helion": helion_version,
+                "triton": triton.__version__,
+                "cuda_runtime": torch.version.cuda,
                 "static_shapes": False,
                 "source_sha256": hashlib.sha256(
                     Path(K.__file__).read_bytes()
@@ -158,6 +164,37 @@ def screen():
                     native_check=native_check,
                 )
                 del q0, cache0, out
+                checks = [
+                    {
+                        "seed": 0,
+                        "correct": rec["correct"],
+                        "check": check,
+                        "native_check": native_check,
+                    }
+                ]
+                # Distinct data and page permutations, before accepting timing.
+                # The seed-zero check alone cannot establish layout correctness.
+                for seed in (13, 37):
+                    probe = make(seed)
+                    oracle = K.reference(*probe)
+                    inputs = [probe[0], *K.natural_views(probe)]
+                    saved = [t.clone() for t in inputs]
+                    ok, msg = K.check(kernel(*probe).clone(), oracle)
+                    native_ok, native_msg = K.check(oxide(*probe).clone(), oracle)
+                    assert all(torch.equal(t, old) for t, old in zip(inputs, saved)), (
+                        "input mutation"
+                    )
+                    checks.append(
+                        {
+                            "seed": seed,
+                            "correct": ok and native_ok,
+                            "check": msg,
+                            "native_check": native_msg,
+                        }
+                    )
+                    del probe, oracle, inputs, saved
+                rec["oracle_checks"] = checks
+                rec["correct"] = all(c["correct"] for c in checks)
                 if rec["correct"]:
                     hs, ns = [], []
                     for first in [True, False]:
