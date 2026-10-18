@@ -165,7 +165,10 @@ def _scan_once(seen: dict[Path, tuple[int, int]], repeat: bool = False) -> None:
     for root in _cache_roots():
         if not root.is_dir():
             continue
-        for cfg in root.glob("*/*/autotune_configs.json"):
+        # Current vLLM nests version / architecture / config-hash; older
+        # versions used only workspace / config-hash. Restrict the recursive
+        # scan to the dedicated autotune roots and the exact cache filename.
+        for cfg in root.rglob("autotune_configs.json"):
             try:
                 st = cfg.stat()
                 key = (st.st_mtime_ns, st.st_size)
