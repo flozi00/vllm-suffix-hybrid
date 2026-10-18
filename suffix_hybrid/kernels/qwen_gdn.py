@@ -35,6 +35,12 @@ Startup kernel-path assertion (log markers, see the dossier §6 protocol):
   ``suffix qwen-gdn K-GDN1 prebuilt SASS loaded, ptxas 13.0``  driver-load check
   ``suffix qwen-gdn K-GDN1 oracle PASS``      on-GPU identity check at profile run
   ``suffix qwen-gdn K-GDN1 decode-launch``    first real decode launch (graph capture)
+
+Backend knob ``SUFFIX_HELION_KGDN1`` = oxide (default; Helion never imported)
+| helion | auto (docs/helion-kernels.md): picks the kernel inside the armed
+lane, per numtokens bucket (suffix_hybrid/helion_kernels/kgdn1.py). Gates,
+contract and oracle are the same for both; the oracle warms every Helion
+bucket before capture.
 """
 from __future__ import annotations
 
@@ -42,6 +48,7 @@ import os
 import sys
 
 GATE = "SUFFIX_QWEN_GDN"
+HELION_ENV = "SUFFIX_HELION_KGDN1"
 LAYER_NAME = "QwenGatedDeltaNetAttention"
 ACT_CODES = {"silu": 0, "swish": 0, "sigmoid": 1}
 # Numerics gate (oracle): out is bf16 (1 ulp ~ 7.8e-3 relative); the state
@@ -155,15 +162,22 @@ def make_inputs(T, H, HV, K, slots, device="cpu", seed=0, idx=None, page_pad=0):
 # ---------------------------------------------------------------------------
 # on-GPU oracle (runs once per process at the profile run, before capture)
 # ---------------------------------------------------------------------------
-def run_gpu_oracle(native, H, HV, K, act, norm_eps, row_stride=None):
+def run_gpu_oracle(native, H, HV, K, act, norm_eps, row_stride=None, op=None, extra_T=()):
     """JIT/load the kernel at the serving shape and check it against the
     torch reference on the GPU, plus a CUDA-graph capture/replay round.
-    Raises RuntimeError on any mismatch (the gate is fail-closed)."""
+    Raises RuntimeError on any mismatch (the gate is fail-closed).
+    ``op`` = the lane's launcher (decode_op; default the oxide op); every T in
+    ``extra_T`` (its Helion buckets) runs too, compiling it before capture —
+    plus bucket-1 above 16: Triton specializes int args (T) on %16."""
     import torch
 
+    op = op or native.gdn_decode_fused_cuda
     dev = torch.device("cuda", torch.cuda.current_device())
     worst = {"out": 0.0, "state": 0.0}
     cases = [(1, [1]), (3, [2, 0, 5]), (16, None)]
+    # 23 live distinct slots (the oracle pool), NULL rows beyond
+    cases += [(T, [t + 1 if t < 23 else 0 for t in range(T)])
+              for b in extra_T for T in ((b - 1, b) if b > 16 else (b,))]
     for T, idx in cases:
         inp = make_inputs(T, H, HV, K, slots=24, device=dev, seed=T, idx=idx,
                           page_pad=4096)
@@ -177,7 +191,7 @@ def run_gpu_oracle(native, H, HV, K, act, norm_eps, row_stride=None):
             inp["norm_w"], ref_state, inp["state_idx"].cpu(), H, K ** -0.5,
             norm_eps, act, round_o_bf16=True)
         out = torch.empty(T, HV, K, dtype=torch.bfloat16, device=dev)
-        native.gdn_decode_fused_cuda(
+        op(
             inp["mixed_qkv"], inp["z"], inp["ba"], inp["a_log"], inp["dt_bias"],
             inp["norm_w"], inp["state"], inp["state_idx"], out, H, K ** -0.5,
             norm_eps, act, torch.cuda.current_stream(dev).cuda_stream)
@@ -193,9 +207,8 @@ def run_gpu_oracle(native, H, HV, K, act, norm_eps, row_stride=None):
     out_graph = torch.empty_like(out_eager)
     args = [inp["mixed_qkv"], inp["z"], inp["ba"], inp["a_log"], inp["dt_bias"],
             inp["norm_w"]]
-    native.gdn_decode_fused_cuda(*args, s_eager, inp["state_idx"], out_eager, H,
-                                 K ** -0.5, norm_eps, act,
-                                 torch.cuda.current_stream(dev).cuda_stream)
+    op(*args, s_eager, inp["state_idx"], out_eager, H, K ** -0.5, norm_eps, act,
+       torch.cuda.current_stream(dev).cuda_stream)
     s_graph = inp["state"].clone()
     s_graph0 = s_graph.clone()
     graph = torch.cuda.CUDAGraph()
@@ -203,9 +216,8 @@ def run_gpu_oracle(native, H, HV, K, act, norm_eps, row_stride=None):
     side.wait_stream(torch.cuda.current_stream(dev))
     with torch.cuda.stream(side):
         with torch.cuda.graph(graph, stream=side):
-            native.gdn_decode_fused_cuda(*args, s_graph, inp["state_idx"], out_graph,
-                                         H, K ** -0.5, norm_eps, act,
-                                         side.cuda_stream)
+            op(*args, s_graph, inp["state_idx"], out_graph, H, K ** -0.5, norm_eps, act,
+               side.cuda_stream)
     torch.cuda.current_stream(dev).wait_stream(side)
     s_graph.copy_(s_graph0)  # capture may or may not have executed the kernel
     graph.replay()
@@ -271,6 +283,42 @@ def load_prebuilt(H, HV, K, device=None) -> str:
         _state["sass_logged"] = True
         _log(f"K-GDN1 {tag}")
     return tag
+
+
+def decode_op(native, H, HV, K):
+    """(op, helion_buckets): the K-GDN1 launcher for this layer shape under
+    SUFFIX_HELION_KGDN1. oxide -> the native op itself and Helion is never
+    imported; helion|auto -> helion_kernels.kgdn1.decode_op (a missing config
+    under helion raises here, at load)."""
+    from suffix_hybrid import helion_kernels
+    if helion_kernels.backend(HELION_ENV) == "oxide":
+        return native.gdn_decode_fused_cuda, ()
+    from suffix_hybrid.helion_kernels import kgdn1
+    return kgdn1.decode_op(native, H, HV, K, K)
+
+
+def stock_decode_fused(mixed_qkv, z, ba, a_log, dt_bias, norm_w, state, state_idx, out,
+                       num_k_heads, scale, norm_eps, act):
+    """vLLM's stock chain for the same step, into ``out`` [T, HV, V] bf16:
+    ba.chunk -> 2x .contiguous() + FLA packed recurrent decode + FLA
+    layer_norm_fwd (qwen_gdn_linear_attn.py:1657-1709, 1842-1874, 1912-1913).
+    The bench's and the Helion lab's reference point."""
+    from vllm.third_party.flash_linear_attention.ops import (
+        fused_recurrent_gated_delta_rule_packed_decode,
+    )
+    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import layer_norm_fwd
+
+    V = state.shape[2]
+    b, a = ba.chunk(2, dim=-1)
+    b, a = b.contiguous(), a.contiguous()
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv=mixed_qkv, a=a, b=b, A_log=a_log, dt_bias=dt_bias, scale=scale,
+        initial_state=state, out=out.unsqueeze(1), ssm_state_indices=state_idx,
+        use_qk_l2norm_in_kernel=True)
+    x2 = out.reshape(-1, V)
+    layer_norm_fwd(x2, norm_w, None, norm_eps, z=z.reshape(-1, V), out=x2, group_size=V,
+                   norm_before_gate=True, is_rms_norm=True,
+                   activation="silu" if act == 0 else "sigmoid")
 
 
 # ---------------------------------------------------------------------------
@@ -360,11 +408,14 @@ def _make_layer_cls(native):
             self._kgdn_params = None
             self._kgdn_sass = load_prebuilt(self.num_k_heads, self.num_v_heads,
                                             self.head_k_dim)
+            self._kgdn_op, self._kgdn_helion = decode_op(
+                native, self.num_k_heads, self.num_v_heads, self.head_k_dim)
             _state["active_layers"] += 1
             if _state["active_layers"] == 1:
                 _log(f"K-GDN1 ACTIVE: {LAYER_NAME} -> SuffixQwenGDN (first layer "
                      f"{self.prefix}; H={self.num_k_heads} HV={self.num_v_heads} "
-                     f"K={self.head_k_dim} act={self.norm.activation})")
+                     f"K={self.head_k_dim} act={self.norm.activation}; "
+                     f"helion buckets {list(self._kgdn_helion) or 'none (oxide)'})")
 
         def _kgdn_f32(self):
             # fp32 copies of the per-head params, made once (outside capture:
@@ -387,7 +438,8 @@ def _make_layer_cls(native):
                     _state["oracle"] = run_gpu_oracle(
                         native, self.num_k_heads, self.num_v_heads, self.head_k_dim,
                         self._kgdn_act, self.layer_norm_epsilon,
-                        row_stride=mixed_qkvz.stride(0))
+                        row_stride=mixed_qkvz.stride(0), op=self._kgdn_op,
+                        extra_T=self._kgdn_helion)
                     _log(f"K-GDN1 oracle PASS max|d_out|={_state['oracle']['out']:.3e} "
                          f"max|d_state|={_state['oracle']['state']:.3e} (+graph replay) "
                          f"{self._kgdn_sass}")
@@ -409,7 +461,7 @@ def _make_layer_cls(native):
                 self.activation, conv_state_indices=idx, validate_data=False)
             z = mixed_qkvz[:n, qkv_size:].unflatten(-1, (-1, self.head_v_dim))
             a_log, dt_bias, norm_w = self._kgdn_f32()
-            native.gdn_decode_fused_cuda(
+            self._kgdn_op(
                 mixed_qkv, z, ba[:n], a_log, dt_bias, norm_w, self.kv_cache[1], idx,
                 core_attn_out[:n], self.num_k_heads // self.tp_size,
                 self.head_k_dim ** -0.5, self.layer_norm_epsilon, self._kgdn_act,
@@ -446,19 +498,15 @@ def register():
 def bench(Ts=(1, 4, 8, 16), layers=48, iters=50, H=16, HV=48, K=128, eps=1e-6):
     """Per-decode-step GPU time of the 48-layer GDN non-GEMM chain, stock vs
     K-GDN1, each captured in ONE CUDA graph (= how decode replays in vLLM).
-    Stock = ba.chunk -> 2x .contiguous() + FLA packed recurrent decode + FLA
-    layer_norm_fwd (qwen_gdn_linear_attn.py:1657-1709, 1842-1874, 1912-1913).
-    causal_conv1d_update is identical in both arms and excluded.
-    Returns {T: (stock_us, kgdn1_us)}."""
+    Stock = stock_decode_fused; K-GDN1 = decode_op (SUFFIX_HELION_KGDN1 picks
+    oxide | helion | auto). causal_conv1d_update is identical in both arms and
+    excluded. Returns {T: (stock_us, kgdn1_us)}."""
     import torch
-    from vllm.third_party.flash_linear_attention.ops import (
-        fused_recurrent_gated_delta_rule_packed_decode,
-    )
-    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import layer_norm_fwd
 
     native = _native()
     check_sm120()
     load_prebuilt(H, HV, K)
+    op, _ = decode_op(native, H, HV, K)
     dev = torch.device("cuda", torch.cuda.current_device())
     res = {}
     for T in Ts:
@@ -469,20 +517,12 @@ def bench(Ts=(1, 4, 8, 16), layers=48, iters=50, H=16, HV=48, K=128, eps=1e-6):
         scale = K ** -0.5
 
         def stock():
-            b, a = inp["ba"].chunk(2, dim=-1)
-            b, a = b.contiguous(), a.contiguous()
-            fused_recurrent_gated_delta_rule_packed_decode(
-                mixed_qkv=inp["mixed_qkv"], a=a, b=b, A_log=inp["a_log"],
-                dt_bias=dt_bf16, scale=scale, initial_state=inp["state"],
-                out=core.unsqueeze(1), ssm_state_indices=inp["state_idx"],
-                use_qk_l2norm_in_kernel=True)
-            x2 = core.reshape(-1, K)
-            layer_norm_fwd(x2, inp["norm_w"], None, eps, z=inp["z"].reshape(-1, K),
-                           out=x2, group_size=K, norm_before_gate=True,
-                           is_rms_norm=True, activation="silu")
+            stock_decode_fused(inp["mixed_qkv"], inp["z"], inp["ba"], inp["a_log"],
+                               dt_bf16, inp["norm_w"], inp["state"], inp["state_idx"],
+                               core, H, scale, eps, 0)
 
         def ours():
-            native.gdn_decode_fused_cuda(
+            op(
                 inp["mixed_qkv"], inp["z"], inp["ba"], inp["a_log"], inp["dt_bias"],
                 inp["norm_w"], inp["state"], inp["state_idx"], out, H, scale, eps, 0,
                 torch.cuda.current_stream(dev).cuda_stream)
@@ -520,8 +560,9 @@ def main(argv=None):
         native = _native()
         check_sm120()
         tag = load_prebuilt(16, 48, 128)
+        op, extra = decode_op(native, 16, 48, 128)
         for act in (0, 1):
-            w = run_gpu_oracle(native, 16, 48, 128, act, 1e-6)
+            w = run_gpu_oracle(native, 16, 48, 128, act, 1e-6, op=op, extra_T=extra)
             _log(f"K-GDN1 oracle PASS act={act} max|d_out|={w['out']:.3e} "
                  f"max|d_state|={w['state']:.3e} (+graph replay) {tag}")
     else:

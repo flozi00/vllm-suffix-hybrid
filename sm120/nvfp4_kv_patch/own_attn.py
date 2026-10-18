@@ -147,7 +147,27 @@ def prepare(nat, served, q_lens) -> str:
     if dev not in _PROBED:
         print(oxide_kernels.probe(dev), file=sys.stderr, flush=True)
         _PROBED.add(dev)
-    return "cuda-oxide sm_120 cubin driver-loaded + probe PASS, no JIT"
+    how = "cuda-oxide sm_120 cubin driver-loaded + probe PASS, no JIT"
+    h = helion_port()
+    if h is not None:
+        # compile + gate every Helion case of this layer before graph capture
+        how += "; " + h.prepare(served, max(q_lens), dev)
+    return how
+
+
+HELION_ENV = "SUFFIX_HELION_K2_ATTN"
+
+
+def helion_port():
+    """The Helion K2 port (suffix_hybrid.helion_kernels.k2_attn) when
+    SUFFIX_HELION_K2_ATTN = helion | auto, else None (oxide: never imported)."""
+    from suffix_hybrid import helion_kernels
+
+    if helion_kernels.backend(HELION_ENV) == "oxide":
+        return None
+    from suffix_hybrid.helion_kernels import k2_attn
+
+    return k2_attn
 
 
 _PROBED: set = set()
@@ -333,7 +353,21 @@ def run(q, k_data, k_sf, v_data, v_sf, block_table, seq_lens, qo_indptr,
         out, q_max, window_left, sm_scale, v_scale, max_rows=48):
     """out[qo_indptr[b] + i] = attention of request b's q row i over its
     paged NVFP4 KV (causal, q at the tail, optional window). Ragged q
-    lengths (each <= q_max; padding requests have length 0)."""
+    lengths (each <= q_max; padding requests have length 0). Helion port
+    per SUFFIX_HELION_K2_ATTN (auto: oxide where no tuned config ships)."""
+    h = helion_port()
+    if h is not None and h.run(q, k_data, k_sf, v_data, v_sf, block_table,
+                               seq_lens, qo_indptr, out, q_max, window_left,
+                               sm_scale, v_scale, max_rows) is not None:
+        return out
+    return run_oxide(q, k_data, k_sf, v_data, v_sf, block_table, seq_lens,
+                     qo_indptr, out, q_max, window_left, sm_scale, v_scale,
+                     max_rows)
+
+
+def run_oxide(q, k_data, k_sf, v_data, v_sf, block_table, seq_lens, qo_indptr,
+              out, q_max, window_left, sm_scale, v_scale, max_rows=48):
+    """run() on the cuda-oxide kernels (also the Helion lab's baseline)."""
     import torch
 
     tokens, hq, d = q.shape

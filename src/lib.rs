@@ -532,6 +532,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("HAS_NVFP4_ATTN_CUDA", cfg!(feature = "oxide-kernels"))?;
     // cuda-oxide track (ships): shared cubin loader + probe + K2 host op.
     m.add("HAS_OXIDE_KERNELS", cfg!(feature = "oxide-kernels"))?;
+    // fp8_moe_cuda reads `mode` bits 8-13 as a launch skip mask: the Helion
+    // port mixes its launches with single oxide launches only when it sees this.
+    m.add("FP8_MOE_SKIP_SHIFT", 8u32)?;
     #[cfg(feature = "oxide-kernels")]
     {
         m.add_function(wrap_pyfunction!(oxide::oxide_load_cubin, m)?)?;
