@@ -1,0 +1,4077 @@
+{
+  "source_revision": "f877f6d32e9f57a2660c16d6e9884919581c2c4f",
+  "physical_gpu_uuid": "GPU-df42cd59-339d-d1e2-b954-4a62a0f96ce8",
+  "date_utc": "2026-10-18",
+  "protocol": "Fixed configurations, exact query widths, Gemma scale1.0, 4 independent oracle inputs incl128k, immutability, estimated3L2 active-page rotation, <=6GiB allocation, both timing orders",
+  "serving_configs_added": [
+    {
+      "head_dim": 256,
+      "heads": 16,
+      "kv_heads": 8,
+      "numtokens": 1,
+      "page": 64,
+      "width": 1,
+      "window": 1023
+    }
+  ],
+  "withheld": "D512/b32/w4 wins4.3% but bucket covers9..32; measure intermediate batches before shipping. Width6 loses. K5/K6 still pending; no end-to-end gain established.",
+  "report": {
+    "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+    "rows": [
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 1,
+          "page": 64,
+          "width": 4,
+          "window": 1023
+        },
+        "config_id": 0,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.47883807022241487,
+          0.4787742873630212
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            64,
+            16,
+            16,
+            8
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "first",
+            "",
+            "last",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1,
+              2
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null,
+            false,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 1,
+          "page": 64,
+          "width": 4,
+          "window": 1023
+        },
+        "config_id": 1,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.9897071693261833,
+          0.9897839560636509
+        ],
+        "config": {
+          "atomic_indexing": [
+            "tensor_descriptor"
+          ],
+          "block_sizes": [
+            32,
+            16,
+            16,
+            2
+          ],
+          "host_tensor_descriptors": true,
+          "indexing": [
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            4
+          ],
+          "load_eviction_policies": [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              1,
+              0,
+              2
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 4,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            true,
+            true,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            false,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            1,
+            1,
+            1
+          ],
+          "range_unroll_factors": [
+            0,
+            4,
+            3,
+            3
+          ],
+          "range_warp_specializes": [
+            null,
+            false,
+            false,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 1,
+          "page": 64,
+          "width": 4,
+          "window": 1023
+        },
+        "config_id": 2,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.618027171531368,
+          0.6165619973679525
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            64,
+            16,
+            16,
+            16
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1,
+              2
+            ]
+          ],
+          "num_stages": 1,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            null,
+            false
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 1,
+          "page": 64,
+          "width": 2,
+          "window": 1023
+        },
+        "config_id": 0,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.47232611764206567,
+          0.4725304430807255
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            64,
+            16,
+            16,
+            8
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "first",
+            "",
+            "last",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1,
+              2
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null,
+            false,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 1,
+          "page": 64,
+          "width": 2,
+          "window": 1023
+        },
+        "config_id": 1,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.9796703681039286,
+          0.9795623357605813
+        ],
+        "config": {
+          "atomic_indexing": [
+            "tensor_descriptor"
+          ],
+          "block_sizes": [
+            32,
+            16,
+            16,
+            2
+          ],
+          "host_tensor_descriptors": true,
+          "indexing": [
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            4
+          ],
+          "load_eviction_policies": [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              1,
+              0,
+              2
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 4,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            true,
+            true,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            false,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            1,
+            1,
+            1
+          ],
+          "range_unroll_factors": [
+            0,
+            4,
+            3,
+            3
+          ],
+          "range_warp_specializes": [
+            null,
+            false,
+            false,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 1,
+          "page": 64,
+          "width": 2,
+          "window": 1023
+        },
+        "config_id": 2,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.6068158088443724,
+          0.60552118072298
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            64,
+            16,
+            16,
+            16
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1,
+              2
+            ]
+          ],
+          "num_stages": 1,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            null,
+            false
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 1,
+          "page": 64,
+          "width": 1,
+          "window": 1023
+        },
+        "config_id": 0,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.44685370957509907,
+          0.44689254239970744
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            64,
+            16,
+            16,
+            8
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "first",
+            "",
+            "last",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1,
+              2
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null,
+            false,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 1,
+          "page": 64,
+          "width": 1,
+          "window": 1023
+        },
+        "config_id": 1,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.9385334342447588,
+          0.940388762030241
+        ],
+        "config": {
+          "atomic_indexing": [
+            "tensor_descriptor"
+          ],
+          "block_sizes": [
+            32,
+            16,
+            16,
+            2
+          ],
+          "host_tensor_descriptors": true,
+          "indexing": [
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            4
+          ],
+          "load_eviction_policies": [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              1,
+              0,
+              2
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 4,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            true,
+            true,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            false,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            1,
+            1,
+            1
+          ],
+          "range_unroll_factors": [
+            0,
+            4,
+            3,
+            3
+          ],
+          "range_warp_specializes": [
+            null,
+            false,
+            false,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 1,
+          "page": 64,
+          "width": 1,
+          "window": 1023
+        },
+        "config_id": 2,
+        "eligible": true,
+        "reasons": [],
+        "order_speedups": [
+          1.0365836094337613,
+          1.0370661559320145
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            64,
+            16,
+            16,
+            16
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1,
+              2
+            ]
+          ],
+          "num_stages": 1,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            null,
+            false
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 8,
+          "page": 64,
+          "width": 1,
+          "window": 1023
+        },
+        "config_id": 0,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.3612732619069637,
+          0.3605775827707693
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            64,
+            16,
+            16,
+            8
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "first",
+            "",
+            "last",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1,
+              2
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null,
+            false,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 8,
+          "page": 64,
+          "width": 1,
+          "window": 1023
+        },
+        "config_id": 1,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.8064001634650658,
+          0.8066920754499769
+        ],
+        "config": {
+          "atomic_indexing": [
+            "tensor_descriptor"
+          ],
+          "block_sizes": [
+            32,
+            16,
+            16,
+            2
+          ],
+          "host_tensor_descriptors": true,
+          "indexing": [
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            4
+          ],
+          "load_eviction_policies": [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              1,
+              0,
+              2
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 4,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            true,
+            true,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            false,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            1,
+            1,
+            1
+          ],
+          "range_unroll_factors": [
+            0,
+            4,
+            3,
+            3
+          ],
+          "range_warp_specializes": [
+            null,
+            false,
+            false,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 8,
+          "page": 64,
+          "width": 1,
+          "window": 1023
+        },
+        "config_id": 2,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.6474729152274542,
+          0.6475306617572197
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            64,
+            16,
+            16,
+            16
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1,
+              2
+            ]
+          ],
+          "num_stages": 1,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            null,
+            false
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 512,
+          "heads": 16,
+          "kv_heads": 2,
+          "numtokens": 32,
+          "page": 64,
+          "width": 4,
+          "window": -1
+        },
+        "config_id": 0,
+        "eligible": true,
+        "reasons": [],
+        "order_speedups": [
+          1.0478067633754797,
+          1.0435420662830854
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            16,
+            32,
+            32,
+            1
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer"
+          ],
+          "l2_groupings": [
+            16
+          ],
+          "load_eviction_policies": [
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first"
+          ],
+          "loop_orders": [
+            [
+              0,
+              2,
+              1
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            true,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            false,
+            false,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            2,
+            0,
+            4
+          ],
+          "range_unroll_factors": [
+            0,
+            3,
+            2,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            false,
+            false,
+            false
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 512,
+          "heads": 16,
+          "kv_heads": 2,
+          "numtokens": 32,
+          "page": 64,
+          "width": 6,
+          "window": -1
+        },
+        "config_id": 0,
+        "eligible": false,
+        "reasons": [
+          "less than 1% gain in at least one timing order"
+        ],
+        "order_speedups": [
+          0.6756817456447178,
+          0.6787833437419535
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            16,
+            32,
+            32,
+            1
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer"
+          ],
+          "l2_groupings": [
+            16
+          ],
+          "load_eviction_policies": [
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first"
+          ],
+          "loop_orders": [
+            [
+              0,
+              2,
+              1
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            true,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            false,
+            false,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            2,
+            0,
+            4
+          ],
+          "range_unroll_factors": [
+            0,
+            3,
+            2,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            false,
+            false,
+            false
+          ]
+        }
+      }
+    ],
+    "complete": true,
+    "eligible_candidates": [
+      {
+        "case": {
+          "head_dim": 256,
+          "heads": 16,
+          "kv_heads": 8,
+          "numtokens": 1,
+          "page": 64,
+          "width": 1,
+          "window": 1023
+        },
+        "config_id": 2,
+        "eligible": true,
+        "reasons": [],
+        "order_speedups": [
+          1.0365836094337613,
+          1.0370661559320145
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            64,
+            16,
+            16,
+            16
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer",
+            "pointer"
+          ],
+          "l2_groupings": [
+            1
+          ],
+          "load_eviction_policies": [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "loop_orders": [
+            [
+              0,
+              1,
+              2
+            ]
+          ],
+          "num_stages": 1,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            null,
+            false
+          ],
+          "range_multi_buffers": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_unroll_factors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      {
+        "case": {
+          "head_dim": 512,
+          "heads": 16,
+          "kv_heads": 2,
+          "numtokens": 32,
+          "page": 64,
+          "width": 4,
+          "window": -1
+        },
+        "config_id": 0,
+        "eligible": true,
+        "reasons": [],
+        "order_speedups": [
+          1.0478067633754797,
+          1.0435420662830854
+        ],
+        "config": {
+          "atomic_indexing": [
+            "pointer"
+          ],
+          "block_sizes": [
+            16,
+            32,
+            32,
+            1
+          ],
+          "host_tensor_descriptors": false,
+          "indexing": [
+            "pointer",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer"
+          ],
+          "l2_groupings": [
+            16
+          ],
+          "load_eviction_policies": [
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first",
+            "first"
+          ],
+          "loop_orders": [
+            [
+              0,
+              2,
+              1
+            ]
+          ],
+          "num_stages": 2,
+          "num_warps": 8,
+          "pid_type": "flat",
+          "range_flattens": [
+            null,
+            null,
+            true,
+            null
+          ],
+          "range_multi_buffers": [
+            null,
+            false,
+            false,
+            null
+          ],
+          "range_num_stages": [
+            0,
+            2,
+            0,
+            4
+          ],
+          "range_unroll_factors": [
+            0,
+            3,
+            2,
+            0
+          ],
+          "range_warp_specializes": [
+            null,
+            false,
+            false,
+            false
+          ]
+        }
+      }
+    ],
+    "status": "K4 screen only; K5/K6 and exact-head CI still required"
+  },
+  "raw_rows": [
+    {
+      "actual_width": 4,
+      "allocated_bytes": 19497488,
+      "baseline_samples_us": [
+        17.11793834880247,
+        17.117749230336333
+      ],
+      "baseline_us": 17.1178437895694,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 1,
+        "page": 64,
+        "width": 4,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "pointer"
+        ],
+        "block_sizes": [
+          64,
+          16,
+          16,
+          8
+        ],
+        "host_tensor_descriptors": false,
+        "indexing": [
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          1
+        ],
+        "load_eviction_policies": [
+          "",
+          "first",
+          "",
+          "last",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "num_stages": 2,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_unroll_factors": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_warp_specializes": [
+          null,
+          null,
+          false,
+          null
+        ]
+      },
+      "config_id": 0,
+      "copies": 118,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        35.74890847933494,
+        35.753275984424654
+      ],
+      "helion_us": 35.751092231879795,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 8196,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8196,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.92e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8196,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.92e-03 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.70e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.70e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.015955924987793,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.4788061768447219,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 2572848,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 4,
+      "allocated_bytes": 19497488,
+      "baseline_samples_us": [
+        17.3861147993702,
+        17.389423564328986
+      ],
+      "baseline_us": 17.387769181849592,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 1,
+        "page": 64,
+        "width": 4,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "tensor_descriptor"
+        ],
+        "block_sizes": [
+          32,
+          16,
+          16,
+          2
+        ],
+        "host_tensor_descriptors": true,
+        "indexing": [
+          "pointer",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          4
+        ],
+        "load_eviction_policies": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            1,
+            0,
+            2
+          ]
+        ],
+        "num_stages": 2,
+        "num_warps": 4,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          true,
+          true,
+          null
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          false,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          1,
+          1,
+          1
+        ],
+        "range_unroll_factors": [
+          0,
+          4,
+          3,
+          3
+        ],
+        "range_warp_specializes": [
+          null,
+          false,
+          false,
+          null
+        ]
+      },
+      "config_id": 1,
+      "copies": 118,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        17.56692821696653,
+        17.568908303470934
+      ],
+      "helion_us": 17.567918260218732,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 8196,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8196,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.92e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8196,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.92e-03 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.70e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.70e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.015955924987793,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.9897455648585823,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 2572848,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 4,
+      "allocated_bytes": 19497488,
+      "baseline_samples_us": [
+        17.40688873549639,
+        17.396420947575972
+      ],
+      "baseline_us": 17.401654841536182,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 1,
+        "page": 64,
+        "width": 4,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "pointer"
+        ],
+        "block_sizes": [
+          64,
+          16,
+          16,
+          16
+        ],
+        "host_tensor_descriptors": false,
+        "indexing": [
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          1
+        ],
+        "load_eviction_policies": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "num_stages": 1,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          null,
+          null,
+          false
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_unroll_factors": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_warp_specializes": [
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "config_id": 2,
+      "copies": 118,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        28.165248288946636,
+        28.215201426360565
+      ],
+      "helion_us": 28.1902248576536,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 8196,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8196,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.92e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8196,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.92e-03 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.70e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.70e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.015955924987793,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.6172939353767397,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 2572848,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 2,
+      "allocated_bytes": 19464720,
+      "baseline_samples_us": [
+        16.838668374454272,
+        16.841505355193835
+      ],
+      "baseline_us": 16.840086864824052,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 1,
+        "page": 64,
+        "width": 2,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "pointer"
+        ],
+        "block_sizes": [
+          64,
+          16,
+          16,
+          8
+        ],
+        "host_tensor_descriptors": false,
+        "indexing": [
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          1
+        ],
+        "load_eviction_policies": [
+          "",
+          "first",
+          "",
+          "last",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "num_stages": 2,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_unroll_factors": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_warp_specializes": [
+          null,
+          null,
+          false,
+          null
+        ]
+      },
+      "config_id": 0,
+      "copies": 119,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        35.650512951762735,
+        35.64110122808889
+      ],
+      "helion_us": 35.64580708992581,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 8194,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8194,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8194,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.002777894337972,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.4724282668741532,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 2540080,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 2,
+      "allocated_bytes": 19464720,
+      "baseline_samples_us": [
+        16.948356948980763,
+        16.949095846224232
+      ],
+      "baseline_us": 16.9487263976025,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 1,
+        "page": 64,
+        "width": 2,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "tensor_descriptor"
+        ],
+        "block_sizes": [
+          32,
+          16,
+          16,
+          2
+        ],
+        "host_tensor_descriptors": true,
+        "indexing": [
+          "pointer",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          4
+        ],
+        "load_eviction_policies": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            1,
+            0,
+            2
+          ]
+        ],
+        "num_stages": 2,
+        "num_warps": 4,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          true,
+          true,
+          null
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          false,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          1,
+          1,
+          1
+        ],
+        "range_unroll_factors": [
+          0,
+          4,
+          3,
+          3
+        ],
+        "range_warp_specializes": [
+          null,
+          false,
+          false,
+          null
+        ]
+      },
+      "config_id": 1,
+      "copies": 119,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        17.30006081717355,
+        17.302723091189602
+      ],
+      "helion_us": 17.301391954181575,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 8194,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8194,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8194,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.002777894337972,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.979616347776351,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 2540080,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 2,
+      "allocated_bytes": 19464720,
+      "baseline_samples_us": [
+        16.950023875517005,
+        16.939751440737428
+      ],
+      "baseline_us": 16.944887658127215,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 1,
+        "page": 64,
+        "width": 2,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "pointer"
+        ],
+        "block_sizes": [
+          64,
+          16,
+          16,
+          16
+        ],
+        "host_tensor_descriptors": false,
+        "indexing": [
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          1
+        ],
+        "load_eviction_policies": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "num_stages": 1,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          null,
+          null,
+          false
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_unroll_factors": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_warp_specializes": [
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "config_id": 2,
+      "copies": 119,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        27.93273284655659,
+        27.975489512211134
+      ],
+      "helion_us": 27.95411117938386,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 8194,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8194,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.41e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8194,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.002777894337972,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.6061679997403766,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 2540080,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 1,
+      "allocated_bytes": 19448336,
+      "baseline_samples_us": [
+        16.4983336130778,
+        16.497467358907063
+      ],
+      "baseline_us": 16.49790048599243,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 1,
+        "page": 64,
+        "width": 1,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "pointer"
+        ],
+        "block_sizes": [
+          64,
+          16,
+          16,
+          8
+        ],
+        "host_tensor_descriptors": false,
+        "indexing": [
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          1
+        ],
+        "load_eviction_policies": [
+          "",
+          "first",
+          "",
+          "last",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "num_stages": 2,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_unroll_factors": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_warp_specializes": [
+          null,
+          null,
+          false,
+          null
+        ]
+      },
+      "config_id": 0,
+      "copies": 120,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        36.92110697428385,
+        36.91596031188965
+      ],
+      "helion_us": 36.91853364308675,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 8193,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 6.82e-11 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8193,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.15e-13 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8193,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.0084800720214844,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.44687312463402185,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 2523696,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 1,
+      "allocated_bytes": 19448336,
+      "baseline_samples_us": [
+        16.541026433308918,
+        16.54520034790039
+      ],
+      "baseline_us": 16.543113390604653,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 1,
+        "page": 64,
+        "width": 1,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "tensor_descriptor"
+        ],
+        "block_sizes": [
+          32,
+          16,
+          16,
+          2
+        ],
+        "host_tensor_descriptors": true,
+        "indexing": [
+          "pointer",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          4
+        ],
+        "load_eviction_policies": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            1,
+            0,
+            2
+          ]
+        ],
+        "num_stages": 2,
+        "num_warps": 4,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          true,
+          true,
+          null
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          false,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          1,
+          1,
+          1
+        ],
+        "range_unroll_factors": [
+          0,
+          4,
+          3,
+          3
+        ],
+        "range_warp_specializes": [
+          null,
+          false,
+          false,
+          null
+        ]
+      },
+      "config_id": 1,
+      "copies": 120,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        17.62433369954427,
+        17.594000498453777
+      ],
+      "helion_us": 17.609167098999023,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 8193,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.15e-13 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8193,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.15e-13 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8193,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.0084800720214844,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.9394602991498122,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 2523696,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 1,
+      "allocated_bytes": 19448336,
+      "baseline_samples_us": [
+        16.5531063079834,
+        16.558987299601238
+      ],
+      "baseline_us": 16.55604680379232,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 1,
+        "page": 64,
+        "width": 1,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "pointer"
+        ],
+        "block_sizes": [
+          64,
+          16,
+          16,
+          16
+        ],
+        "host_tensor_descriptors": false,
+        "indexing": [
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          1
+        ],
+        "load_eviction_policies": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "num_stages": 1,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          null,
+          null,
+          false
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_unroll_factors": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_warp_specializes": [
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "config_id": 2,
+      "copies": 120,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        15.968906084696451,
+        15.967146555582682
+      ],
+      "helion_us": 15.968026320139566,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 8193,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.24e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 6.82e-11 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8193,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.15e-13 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 8193,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 9.39e-04 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.35e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.0084800720214844,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 1.0368248693898454,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 2523696,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 1,
+      "allocated_bytes": 222478436,
+      "baseline_samples_us": [
+        43.566932678222656,
+        43.53877385457357
+      ],
+      "baseline_us": 43.55285326639812,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 8,
+        "page": 64,
+        "width": 1,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "pointer"
+        ],
+        "block_sizes": [
+          64,
+          16,
+          16,
+          8
+        ],
+        "host_tensor_descriptors": false,
+        "indexing": [
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          1
+        ],
+        "load_eviction_policies": [
+          "",
+          "first",
+          "",
+          "last",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "num_stages": 2,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_unroll_factors": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_warp_specializes": [
+          null,
+          null,
+          false,
+          null
+        ]
+      },
+      "config_id": 0,
+      "copies": 15,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        120.59274037679036,
+        120.74731190999348
+      ],
+      "helion_us": 120.67002614339192,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 32769,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 32769,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.59e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 32769,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.59e-03 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.78e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.78e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.01030695438385,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.36092519955738106,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 20201828,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 1,
+      "allocated_bytes": 222478436,
+      "baseline_samples_us": [
+        43.759358723958336,
+        43.838186264038086
+      ],
+      "baseline_us": 43.798772493998214,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 8,
+        "page": 64,
+        "width": 1,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "tensor_descriptor"
+        ],
+        "block_sizes": [
+          32,
+          16,
+          16,
+          2
+        ],
+        "host_tensor_descriptors": true,
+        "indexing": [
+          "pointer",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          4
+        ],
+        "load_eviction_policies": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            1,
+            0,
+            2
+          ]
+        ],
+        "num_stages": 2,
+        "num_warps": 4,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          true,
+          true,
+          null
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          false,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          1,
+          1,
+          1
+        ],
+        "range_unroll_factors": [
+          0,
+          4,
+          3,
+          3
+        ],
+        "range_warp_specializes": [
+          null,
+          false,
+          false,
+          null
+        ]
+      },
+      "config_id": 1,
+      "copies": 15,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        54.26506678263346,
+        54.34314727783203
+      ],
+      "helion_us": 54.30410703023274,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 32769,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 32769,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.59e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 32769,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.59e-03 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.78e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.78e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.01030695438385,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.8065462243880396,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 20201828,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 1,
+      "allocated_bytes": 222478436,
+      "baseline_samples_us": [
+        43.785813649495445,
+        43.87370745340983
+      ],
+      "baseline_us": 43.82976055145264,
+      "case": {
+        "head_dim": 256,
+        "heads": 16,
+        "kv_heads": 8,
+        "numtokens": 8,
+        "page": 64,
+        "width": 1,
+        "window": 1023
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "pointer"
+        ],
+        "block_sizes": [
+          64,
+          16,
+          16,
+          16
+        ],
+        "host_tensor_descriptors": false,
+        "indexing": [
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer",
+          "pointer"
+        ],
+        "l2_groupings": [
+          1
+        ],
+        "load_eviction_policies": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "loop_orders": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "num_stages": 1,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          null,
+          null,
+          false
+        ],
+        "range_multi_buffers": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_unroll_factors": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "range_warp_specializes": [
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "config_id": 2,
+      "copies": 15,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        67.62570699055989,
+        67.75541305541992
+      ],
+      "helion_us": 67.6905600229899,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 32769,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 32769,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 1.38e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.59e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 32769,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.59e-03 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.78e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.78e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.01030695438385,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.6475018161552606,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 20201828,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 4,
+      "allocated_bytes": 179151236,
+      "baseline_samples_us": [
+        789.8375988006592,
+        789.296817779541
+      ],
+      "baseline_us": 789.5672082901001,
+      "case": {
+        "head_dim": 512,
+        "heads": 16,
+        "kv_heads": 2,
+        "numtokens": 32,
+        "page": 64,
+        "width": 4,
+        "window": -1
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 2.76e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "pointer"
+        ],
+        "block_sizes": [
+          16,
+          32,
+          32,
+          1
+        ],
+        "host_tensor_descriptors": false,
+        "indexing": [
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "pointer"
+        ],
+        "l2_groupings": [
+          16
+        ],
+        "load_eviction_policies": [
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first"
+        ],
+        "loop_orders": [
+          [
+            0,
+            2,
+            1
+          ]
+        ],
+        "num_stages": 2,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          null,
+          true,
+          null
+        ],
+        "range_multi_buffers": [
+          null,
+          false,
+          false,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          2,
+          0,
+          4
+        ],
+        "range_unroll_factors": [
+          0,
+          3,
+          2,
+          0
+        ],
+        "range_warp_specializes": [
+          null,
+          false,
+          false,
+          false
+        ]
+      },
+      "config_id": 0,
+      "copies": 2,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        753.8008213043213,
+        756.3632011413574
+      ],
+      "helion_us": 755.0820112228394,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 3.15e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.76e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 16388,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 3.15e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.76e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 16388,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 3.51e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.77e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 16388,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.77e-03 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.78e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 3.17e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.5527471701304116,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 1.0456707967541337,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 178815620,
+      "triton": "3.7.1"
+    },
+    {
+      "actual_width": 6,
+      "allocated_bytes": 181395844,
+      "baseline_samples_us": [
+        954.5680046081543,
+        955.5879592895508
+      ],
+      "baseline_us": 955.0779819488525,
+      "case": {
+        "head_dim": 512,
+        "heads": 16,
+        "kv_heads": 2,
+        "numtokens": 32,
+        "page": 64,
+        "width": 6,
+        "window": -1
+      },
+      "check": "cos 1.000000 (>= 0.9995), rel 2.77e-03 (<= 0.02)",
+      "config": {
+        "atomic_indexing": [
+          "pointer"
+        ],
+        "block_sizes": [
+          16,
+          32,
+          32,
+          1
+        ],
+        "host_tensor_descriptors": false,
+        "indexing": [
+          "pointer",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "pointer",
+          "pointer",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "pointer",
+          "tensor_descriptor",
+          "tensor_descriptor",
+          "pointer"
+        ],
+        "l2_groupings": [
+          16
+        ],
+        "load_eviction_policies": [
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first",
+          "first"
+        ],
+        "loop_orders": [
+          [
+            0,
+            2,
+            1
+          ]
+        ],
+        "num_stages": 2,
+        "num_warps": 8,
+        "pid_type": "flat",
+        "range_flattens": [
+          null,
+          null,
+          true,
+          null
+        ],
+        "range_multi_buffers": [
+          null,
+          false,
+          false,
+          null
+        ],
+        "range_num_stages": [
+          0,
+          2,
+          0,
+          4
+        ],
+        "range_unroll_factors": [
+          0,
+          3,
+          2,
+          0
+        ],
+        "range_warp_specializes": [
+          null,
+          false,
+          false,
+          false
+        ]
+      },
+      "config_id": 0,
+      "copies": 2,
+      "correct": true,
+      "cuda_runtime": "13.0",
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "helion": "1.5.0",
+      "helion_samples_us": [
+        1412.7479553222656,
+        1407.795238494873
+      ],
+      "helion_us": 1410.2715969085693,
+      "l2_bytes": 100663296,
+      "max_copies": 256,
+      "native_check": "cos 1.000000 (>= 0.9995), rel 4.50e-03 (<= 0.02)",
+      "oracle_checks": [
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.77e-03 (<= 0.02)",
+          "correct": true,
+          "max_context": 16390,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 4.50e-03 (<= 0.02)",
+          "seed": 0
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.78e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 16390,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.78e-03 (<= 0.02)",
+          "seed": 13
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.77e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": false,
+          "max_context": 16390,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 2.78e-03 (<= 0.02)",
+          "seed": 37
+        },
+        {
+          "check": "cos 1.000000 (>= 0.9995), rel 2.92e-03 (<= 0.02)",
+          "correct": true,
+          "long_context": true,
+          "max_context": 128000,
+          "native_check": "cos 1.000000 (>= 0.9995), rel 3.74e-03 (<= 0.02)",
+          "seed": 101
+        }
+      ],
+      "rotation_l2_ratio": 3.5973435242970786,
+      "sm_scale": 1.0,
+      "source_sha256": "a946ca307de3d397c936dad003f992475aaee2a4802fc6eaddb07897752d9208",
+      "speedup": 0.67722982157654,
+      "static_shapes": false,
+      "torch": "2.13.0+cu130",
+      "touched_bytes": 181060228,
+      "triton": "3.7.1"
+    }
+  ]
+}
