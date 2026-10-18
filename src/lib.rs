@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use pyo3::prelude::*;
 mod pplx_decider;
+mod multimodel;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -446,6 +447,10 @@ fn decider_answer(py: Python<'_>, request_json: String, logits_json: String, tem
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decider_prepare, m)?)?;
     m.add_function(wrap_pyfunction!(decider_answer, m)?)?;
+    // SUFFIX_MULTIMODEL router (dossiers/multimodel-serving.md); inert unless
+    // the suffix_hybrid.multimodel launcher calls it.
+    m.add_function(wrap_pyfunction!(multimodel::multimodel_serve, m)?)?;
+    m.add_function(wrap_pyfunction!(multimodel::multimodel_shutdown, m)?)?;
     m.add_class::<SuffixCache>()?;
     m.add_class::<engine::Engine>()?;
     m.add_class::<mixer::HybridMixer>()?;
