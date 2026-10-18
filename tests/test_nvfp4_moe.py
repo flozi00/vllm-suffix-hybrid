@@ -1065,3 +1065,13 @@ def test_sweep_verdict_merges_buckets_and_picks_max_m():
     assert nm.sweep_verdict([(1, f3, 50, 40)])[1:] == (None, [])
     cands = nm.sweep_candidates()
     assert (0, 0, 0, 0) in cands and len(set(cands)) == len(cands) == 60
+
+
+def test_gemma_sweep_cli_runs_the_real_sweep_for_mtp_shapes(monkeypatch):
+    calls = []
+    monkeypatch.setattr(nm, "sweep", lambda **kwargs: calls.append(kwargs) or "measured")
+    assert nm.main(["sweep-gemma"]) == 0
+    assert len(calls) == 1
+    (case, ms), = calls[0]["cases"]
+    assert case == nm.GEMMA_MOE
+    assert {4, 32, 128} <= set(ms) and max(ms) == 128

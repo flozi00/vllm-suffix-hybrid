@@ -951,6 +951,18 @@ PATCHES = {
               + _AQ_QSA.split("\n", 1)[1],
               "suffix_hybrid.kernels.act_quant_rocm:install_qsa"),
     ),
+    # FlashInfer's NVFP4 fused finalize sums expert outputs with atomics.
+    # Opt-in ordered reduction for reproducible prompt scoring (vLLM #54945).
+    # OOT oxide/Helion decode is independent; other quantization paths retain
+    # FlashInfer's default fused finalize. Off unless explicitly requested.
+    "SUFFIX_NVFP4_MOE_ORDERED_FINALIZE": Patch(
+        "vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe",
+        "ordered FlashInfer NVFP4 expert finalize",
+        "        _ = flashinfer_cutlass_fused_moe(\n"
+        "            input=hidden_states,\n",
+        "        _ = flashinfer_cutlass_fused_moe(\n"
+        "            use_fused_finalize=(self.quant_dtype != \"nvfp4\"),\n"
+        "            input=hidden_states,\n"),
     "SUFFIX_JIT_LOG": Patch("triton.runtime.jit", "log every Triton compile",
                             after="suffix_hybrid.jit_log:install"),
     # NVIDIA: the NVFP4 routed experts on one MoE backend while --moe-backend stays auto for

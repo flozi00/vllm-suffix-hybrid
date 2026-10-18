@@ -1,0 +1,41 @@
+{
+  "experiment_id": "gemma4-helion-20261018",
+  "scope": "development only; production changes forbidden",
+  "objective": ">=10% geometric-mean output throughput gain, no judged speed loss or quality regression",
+  "reference": "vLLM0.30.0 + 88925ecc plugin + common image-padding correctness fix",
+  "candidate": "vLLM0.32.0 + db8dac5f latest Helion plugin + v032 integration adapter + common image-padding fix",
+  "semantic_class": "bounded_reordering; no new quantization or model approximation",
+  "model": "existing gemma-4-26b-a4b-nvfp4 weights; TP1, MTP k3, context128000, maxseq32, page64",
+  "io_contract": {
+    "layouts": "head-major [page,2*HKV,64,D/2+D/16] uint8; K/V FP4 data with E4M3 block scales; V scales use C++ writer 4-token swizzle",
+    "attention_groups": [
+      "D256 Hq16 Hkv8 sliding window_left1023",
+      "D512 Hq16 Hkv2 full window_left-1"
+    ],
+    "ownership": "upstream KV cache/slot mapping and output buffers; exact real request flags may be shorter than padded query offsets",
+    "mutations": "original C++ cache writer, original oxide/Helion attention readers; no native linear-V-scale writer mixing",
+    "multimodal": "retain packed masks, real short-image-prefill resplit, prefill exclusion from FULL decode graphs"
+  },
+  "fallback": "Helion auto per shipped shape; oxide for missing/losing configurations; FA2 masked prefill. XQA disabled for retained swizzled cache format. No live autotuning. Version/source/header drift fails startup.",
+  "correctness": [
+    "pinned source transform checks",
+    "actual transformed cache-writer dispatch test",
+    "31/32,7/8,0/1 padded mixed-image regression",
+    "existing independent FP64 attention oracle, both D256/D512, ragged rows, graph padding, prefix and image masks",
+    "quality.py quick tier + image + explicit gemma4-assistant drift framing on both arms; same corpus and selfcheck/comparison tolerances; raw untemplated Gemma IT fails selfcheck and is retained separately"
+  ],
+  "performance": [
+    "profile c1/c8/c32 separately from measurement",
+    "same idle5090 pool A1/B/A2",
+    "quality per arm; 5 rounds of six speed scenarios at c1/c8/c32,30s per cell",
+    "speed and quality compare.py PASS; report per-cell ratio, errors and latency",
+    "missing GPU evidence never treated as PASS"
+  ],
+  "rollout": "no production deployment; immutable plugin overlays for dev, preserve baseline specs and failures",
+  "artifacts": "inference-console/benchmarks/runs/gemma4-helion-20261018",
+  "status": "v032 serves full-feature Gemma4 + drafter on one5090, but no10% gain demonstrated. Both ordered arms repeat exactly; same-card cross-version strict drift FAIL (KL .071-.218, top1 85.9-95.3%). Fresh isolated A1/B/A2 underway on GPUdf42 after earlier card migration; original failures retained.",
+  "graph_contract": "v0.32 gather_batch_req_state is pinned by source SHA256; its wrapper clears decode graph eligibility and uniform width for any real prefill, preserving original classification. Pure decode/dummy graphs are unchanged. Unsupported source disables FULL verify.",
+  "tuning_budget": "K2 LFBO10 generations +900s overall including polish; exact query widths1..8; no5090 configs shipped. Corrected cold-cache results require independent oracle, >=3L2 achieved rotation, >=1% gain in both orders, then serving engagement and end-to-end gates. No serving autotuning.",
+  "numeric_diagnostic": "SUFFIX_NVFP4_MOE_ORDERED_FINALIZE=1 (defaultoff) setsuse_fused_finalize=False onlyforNVFP4upstreamFIexperts. Upstream54945; sameoptionalcorrectionpreparedforA/B. Mustproverepeatability, no thresholdrelaxation; originalA1speedreferencepreserved.",
+  "cpu_additional": "Full local suite1297passed103skipped (3 multiprocessing cases rechecked from an importable file runner). Focused exact-width/cold-preflight checks31passed6skipped. Linux exact-head Native plugin CI remains required."
+}

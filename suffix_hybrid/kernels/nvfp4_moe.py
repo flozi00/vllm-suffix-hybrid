@@ -1246,6 +1246,10 @@ def bench(cases=BENCH_CASES, iters=200):
 
 
 SWEEP_MS = (1, 2, 5, 8, 10, 16, 24, 32, 48, 64)
+# Gemma TP1 with MTP k=3 reaches 4/32/128 token rows at c1/c8/c32.
+# Probe the native/oxide crossover beyond the production ceiling of 64;
+# this is an offline diagnostic, never a serving default or a live search.
+GEMMA_SERVING_SWEEP_MS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
 SWEEP_CASES = ((QWEN_EP0, SWEEP_MS), (GEMMA_MOE, SWEEP_MS), (GLM_EP, SWEEP_MS),
                (GLM_TP8, SWEEP_MS))
 
@@ -1360,6 +1364,8 @@ def main(argv=None):
             bench()
         if mode in ("sweep",):
             _log(sweep())
+        if mode == "sweep-gemma":
+            _log(sweep(cases=((GEMMA_MOE, GEMMA_SERVING_SWEEP_MS),)))
         return 0
     except Exception as exc:
         print(f"{MARKER} NVFP4-MOE {mode.upper()} FAIL: {type(exc).__name__}: {exc}",

@@ -798,6 +798,19 @@ def test_mm_resplit_routes_short_extends_to_prefill():
         rs(_cm([4, 4], None, r), 2)
 
 
+@pytest.mark.parametrize("real,padded", [(31, 32), (7, 8), (0, 1)])
+def test_mm_resplit_graph_padding_is_not_a_real_image_request(real, padded):
+    # Reproduces the mixed-image quality-run crash: query offsets and the
+    # decode count include graph padding, is_prefilling includes real rows.
+    rs = PATCH.mm_helper_namespace()["_nvfp4_kv_mm_resplit"]
+    cm = _cm([4] * real + [0] * (padded - real), [False] * real, {0: [(0, 9)]})
+    assert rs(cm, padded) is None
+    if real:
+        cm.is_prefilling[-1] = True
+        first = real - 1
+        assert rs(cm, padded) == (first, padded - first, 4 * first, 4)
+
+
 def _mode_cfg(layers, *, mm=True, bidi="vision", layer_types=None):
     import types as _t
     text = _t.SimpleNamespace(use_bidirectional_attention=bidi,

@@ -47,7 +47,7 @@ def _with_qo(args, lens):
 def test_cases_cover_gemma4_layouts_only():
     for model in (GEMMA26, GEMMA31_TP2):
         cs = K.cases(model)
-        assert len(cs) == 12 <= 64
+        assert len(cs) == 48 <= 64
         assert {(c["head_dim"], c["kv_heads"], c["window"]) for c in cs} == {
             (256, 8, 1023), (512, 2, -1)}
         assert {(c["width"], c["numtokens"]) for c in cs} == {
@@ -62,8 +62,11 @@ def test_cases_cover_gemma4_layouts_only():
 
 def test_serving_case_buckets_batch_and_width():
     c = K.case(512, 16, 2, 64, -1, 5, 3)
-    assert (c["numtokens"], c["width"], c["window"]) == (8, 4, -1)
+    assert (c["numtokens"], c["width"], c["window"]) == (8, 3, -1)
+    assert K.case(256, 16, 8, 64, 1023, 1, 2)["width"] == 2
+    assert K.case(512, 16, 2, 64, -1, 32, 6)["width"] == 6
     assert K.case(256, 16, 8, 64, 1023, 40, 9)["numtokens"] == 32
+    assert K.case(256, 16, 8, 64, 1023, 40, 9)["width"] == 9  # missing config: native
     assert K.case(256, 16, 8, 64, 1023, 1, 1)["width"] == 1
     assert K.cases(GEMMA26)[0] == K.case(256, 16, 8, 64, 1023, 1, 1)
 
@@ -189,3 +192,29 @@ def test_body_ignores_stale_nan_scales_past_kv_len(body):
     want = K.reference(*args)
     ok, msg = K.check(body(*args), want)
     assert ok, msg
+
+
+def test_lab_working_set_counts_shared_views_and_only_active_swa_pages():
+    def problem(ctx, window):
+        return K._problem(128, 4, 2, 16, window, 1, 4, 0, 'cpu', ctx=lambda i,n:ctx)
+    short, long = problem(2048, 1023), problem(8192, 1023)
+    # Same page alignment and active window: allocation length must not
+    # change the estimated KV footprint (only the small block-table grows).
+    a, b = K.working_set_bytes(short), K.working_set_bytes(long)
+    assert b - a == (long[5].numel() - short[5].numel()) * 4
+    naive = sum(t.numel()*t.element_size() for t in long if hasattr(t,'element_size'))
+    assert naive > b * 50  # row-view holes/aliasing cannot masquerade as cold data
+    full = problem(8192, -1)
+    assert K.working_set_bytes(full) > b * 7
+
+
+def test_lab_working_set_deduplicates_shared_physical_pages():
+    args = K._problem(128, 4, 2, 16, 15, 2, 1, 0, 'cpu', ctx=lambda i,n:64)
+    before = K.working_set_bytes(args)
+    bt = args[5].clone()
+    bt[1] = bt[0]
+    changed = (*args[:5],bt,*args[6:])
+    # Each request touches its final two 16-token pages. Sharing them must
+    # halve KV bytes, while q/output/metadata remain the same.
+    page_bytes = 2*2*16*(128//2+128//16)
+    assert before-K.working_set_bytes(changed) == 2*page_bytes
