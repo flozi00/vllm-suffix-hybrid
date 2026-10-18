@@ -101,9 +101,21 @@ def screen():
         def context(i, n):
             return K._ctx(i, n) if dim == 256 else int(512 * 32 ** (i / max(1, n - 1)))
 
-        def make(seed):
+        def make(seed, long_context=False):
+            def selected_context(i, n):
+                return 128000 - width if long_context and i == 0 else context(i, n)
+
             return K._problem(
-                dim, 16, kv_heads, 64, window, batch, width, seed, "cuda", ctx=context
+                dim,
+                16,
+                kv_heads,
+                64,
+                window,
+                batch,
+                width,
+                seed,
+                "cuda",
+                ctx=selected_context,
             )
 
         args = make(0)
@@ -167,6 +179,7 @@ def screen():
                 checks = [
                     {
                         "seed": 0,
+                        "max_context": int(args[6].max()),
                         "correct": rec["correct"],
                         "check": check,
                         "native_check": native_check,
@@ -174,8 +187,8 @@ def screen():
                 ]
                 # Distinct data and page permutations, before accepting timing.
                 # The seed-zero check alone cannot establish layout correctness.
-                for seed in (13, 37):
-                    probe = make(seed)
+                for seed, long_context in ((13, False), (37, False), (101, True)):
+                    probe = make(seed, long_context)
                     oracle = K.reference(*probe)
                     inputs = [probe[0], *K.natural_views(probe)]
                     saved = [t.clone() for t in inputs]
@@ -187,6 +200,8 @@ def screen():
                     checks.append(
                         {
                             "seed": seed,
+                            "long_context": long_context,
+                            "max_context": int(probe[6].max()),
                             "correct": ok and native_ok,
                             "check": msg,
                             "native_check": native_msg,
