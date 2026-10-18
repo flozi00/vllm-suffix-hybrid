@@ -20,6 +20,12 @@ sm120/tests/fixtures/vllm_0.30.0/model_loader_utils.py):
   swapped), BF16 weight, N % 16 == K % 16 == 0. BF16 weights are freed.
   The drafter (MTP) model is loaded through the same function.
 
+``SUFFIX_WEIGHT_RECEIPT=1`` optionally hashes every loaded parameter/buffer
+before and after these conversions. It emits compressed JSON receipts with
+names, shapes, dtypes and full SHA256 hashes, without tensor values. This
+startup-only diagnostic also works without enabling a conversion; it adds
+no forward hooks. Leave it off for ordinary deployment startup.
+
 Runtime per call: dynamic_per_token_scaled_fp8_quant + cutlass_scaled_mm
 (static shapes, no host sync: CUDA-graph and torch.compile safe).
 ``SUFFIX_FP8_DENSE_BACKEND`` (runtime.BACKENDS): ``cutlass`` (default, the
@@ -126,9 +132,13 @@ def amax_record_enabled() -> bool:
     return bool(os.environ.get("SUFFIX_ACT_AMAX_RECORD", "").strip())
 
 
+def weight_receipt_enabled() -> bool:
+    return os.environ.get("SUFFIX_WEIGHT_RECEIPT", "").strip() == "1"
+
+
 def gate_enabled() -> bool:
     """Any mode arms the (shared) anchor."""
-    return fp8_enabled() or nvfp4_enabled() or amax_record_enabled()
+    return fp8_enabled() or nvfp4_enabled() or amax_record_enabled() or weight_receipt_enabled()
 
 
 def _patterns(env, default) -> tuple:
@@ -191,6 +201,10 @@ def patch_source(src: str) -> tuple[str, list[str]]:
 
 
 def _suffix_fp8_dense_convert(model) -> None:
+    if weight_receipt_enabled():
+        from . import weight_receipt
+
+        weight_receipt.emit(model, "before_dense_conversion")
     if nvfp4_enabled():  # first: FP8 then skips what became NVFP4
         from . import nvfp4  # torch/vllm: worker side only
 
@@ -203,6 +217,8 @@ def _suffix_fp8_dense_convert(model) -> None:
         from . import amax_record
 
         amax_record.attach(model)
+    if weight_receipt_enabled():
+        weight_receipt.emit(model, "after_dense_conversion")
 
 
 def apply(module) -> bool:
