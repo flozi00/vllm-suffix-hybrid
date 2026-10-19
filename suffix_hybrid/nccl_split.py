@@ -32,7 +32,8 @@ communicator) or "<NCCL_ALGO>[/<NCCL_PROTO>]", e.g. "allreduce:ring/Simple".
       through to the default communicator. SUFFIX_HAR_Q8_MIN_BYTES (default inf):
       two-shot messages from this size use int8 transport (LOSSY, quality-gate first).
       SUFFIX_HAR_ALLGATHER=1 (tp group): all-gathers of 2/4-byte tensors (the vocab
-      logits) go through the same host buffer (exact bytes).
+      logits) go through the same host buffer (exact bytes). SUFFIX_HAR_L2_PREFETCH=1:
+      suffix_hybrid/har_prefetch.py (L2 weight prefetch while the barrier waits).
   SUFFIX_NCCL_QAR=int8|fp8 (tp group only, default off): bf16/fp16 all-reduces
       in [SUFFIX_NCCL_QAR_MIN_BYTES (4 MiB), SUFFIX_NCCL_QAR_MAX_BYTES (inf))
       go through suffix_hybrid/nccl_qar.py (LOSSY -- quality-gate first).
@@ -142,9 +143,20 @@ def bands_str(bands) -> str:
     return ",".join(f"{fmt_size(lo)}-{fmt_size(hi)}:{spec}" for lo, hi, spec in bands)
 
 
-def make_pick(routes, qar=None, qar_lo: int = 0, qar_hi: int = INF):
-    """routes: [(lo, hi, comm)]; returns pick(x, default_comm) -> object with .all_reduce."""
+def make_pick(routes, qar=None, qar_lo: int = 0, qar_hi: int = INF, log=None):
+    """routes: [(lo, hi, comm)]; returns pick(x, default_comm) -> object with .all_reduce.
+
+    log (rank 0 only): one line per band at its first use and one per distinct fallback
+    (dtype/contiguity/alignment the band's communicator refused) -- never per call, so the
+    boot log shows which path the captured all-reduces took (K5) without per-size spam."""
     import torch
+
+    seen = set()
+
+    def note(key, msg):
+        if log is not None and key not in seen:
+            seen.add(key)
+            log(msg)
 
     def pick(x, default):
         nbytes = x.numel() * x.element_size()
@@ -153,7 +165,14 @@ def make_pick(routes, qar=None, qar_lo: int = 0, qar_hi: int = INF):
         for lo, hi, comm in routes:
             if lo <= nbytes < hi:
                 ok = getattr(comm, "supports", None)
-                return comm if ok is None or ok(x) else default
+                if ok is None or ok(x):
+                    note(("band", lo, hi), f"route [{fmt_size(lo)}, {fmt_size(hi)}) -> {type(comm).__name__} "
+                                           f"(first {fmt_size(nbytes)} {x.dtype})")
+                    return comm
+                note(("fallback", x.dtype, x.is_contiguous(), x.numel() % 8),
+                     f"FALLBACK to the default communicator: {fmt_size(nbytes)} {x.dtype} "
+                     f"contiguous={x.is_contiguous()} numel%8={x.numel() % 8}")
+                return default
         return default
     return pick
 
@@ -306,9 +325,14 @@ def make_comm(spec: str, cpu_group, device):
         from suffix_hybrid.host_ar import HostAllReduce
 
         one = {"har1": INF, "har2": 0}.get(spec, parse_size(_env("SUFFIX_HAR_ONESHOT_MAX_BYTES", "0")))
-        return HostAllReduce(cpu_group, device, oneshot_max_bytes=one,
-                             max_blocks=int(_env("SUFFIX_HAR_BLOCKS", "64")),
-                             q8_min_bytes=parse_size(_env("SUFFIX_HAR_Q8_MIN_BYTES", "inf")))
+        har = HostAllReduce(cpu_group, device, oneshot_max_bytes=one,
+                            max_blocks=int(_env("SUFFIX_HAR_BLOCKS", "64")),
+                            q8_min_bytes=parse_size(_env("SUFFIX_HAR_Q8_MIN_BYTES", "inf")))
+        from suffix_hybrid import har_prefetch
+
+        if har_prefetch.enabled():  # SUFFIX_HAR_L2_PREFETCH: proves itself exact first (raises)
+            har_prefetch.attach(har)
+        return har
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
     env = spec_env(spec)
@@ -370,6 +394,87 @@ def _hidden() -> int | None:
         return int(get_current_vllm_config_or_none().model_config.get_hidden_size())
     except Exception:  # noqa: BLE001 - log2 sizes alone still cover the range
         return None
+
+
+# ------------------------------------------------- size estimates (CPU, no GPU)
+# ESTIMATES, not measurements of the model they are asked for. Points are bf16 all-reduces on
+# worker-06 (8x RTX PRO 6000, no P2P), graphed us per call, keyed by message BYTES so another
+# hidden size reads the same curve (latency floor below ~100 KiB, bandwidth above it):
+#   har / nccl(best algorithm) / q8 = GLM-5.3 g4-g8q bench, tokens x 6144
+#     (plugin-harness/dossiers/glm53-speed-2026-10-11.md; q8 = int8 transport, LOSSY);
+#   default = stock NCCL communicator (2026-09-29, vLLM 0.30.0, tests/test_nccl_split.py),
+#     whose 384 KiB..1.5 MiB band is 2-3x slower than its own tree algorithm.
+# NCCL 2.30.7 (nightly 39983a5e) was never measured on these sizes: re-measure with
+# `python -m suffix_hybrid.tools.ar_bench --matrix` before trusting a "default" row.
+GLM_HIDDEN = 6144
+GLM_BENCH = {
+    "har": {1: 9.8, 6: 20.5, 48: 86.0, 192: 322.0, 8192: 13800.0},
+    "nccl": {1: 37.0, 6: 45.0, 48: 126.0, 192: 410.0, 8192: 17000.0},
+    "q8": {48: 57.0, 192: 195.0, 8192: 7800.0},
+}
+K, M_ = 1 << 10, 1 << 20
+NCCL_DEFAULT_US = {48 * K: 42.0, 192 * K: 113.0, 384 * K: 280.0, 768 * K: 784.0,
+                   1536 * K: 1595.0, 3 * M_: 534.0, 6 * M_: 1056.0}
+
+
+def _points(kind: str) -> dict[int, float]:
+    if kind == "default":
+        return NCCL_DEFAULT_US
+    return {t * GLM_HIDDEN * 2: us for t, us in GLM_BENCH[kind].items()}
+
+
+def estimate_us(kind: str, nbytes: int) -> float:
+    """Log-log interpolation between the measured points; flat below the first (latency
+    floor), straight line through the last two above the last."""
+    pts = sorted(_points(kind).items())
+    if nbytes <= pts[0][0]:
+        return pts[0][1]
+    for (b0, t0), (b1, t1) in zip(pts, pts[1:]):
+        if nbytes <= b1:
+            return math.exp(math.log(t0) + (math.log(t1) - math.log(t0))
+                            * (math.log(nbytes) - math.log(b0)) / (math.log(b1) - math.log(b0)))
+    (b0, t0), (b1, t1) = pts[-2:]
+    return t1 + (t1 - t0) * (nbytes - b1) / (b1 - b0)
+
+
+def estimate_table(hidden: int, tokens=TOKENS) -> list[dict]:
+    """One row per token count: bytes and the estimated us of default / nccl / har / q8
+    (q8 only from its first measured size: 48 tokens x 6144)."""
+    rows = []
+    for t in tokens:
+        n = t * hidden * 2
+        rows.append({"tokens": t, "bytes": n, "default": estimate_us("default", n),
+                     "nccl": estimate_us("nccl", n), "har": estimate_us("har", n),
+                     "q8": estimate_us("q8", n) if n >= min(_points("q8")) else None})
+    return rows
+
+
+def estimate_bands(hidden: int, margin: float = 0.05, tokens=TOKENS) -> list[tuple[int, int, str]]:
+    """SUFFIX_NCCL_BANDS for `hidden`: build_bands() over the estimated default vs har curves."""
+    rows = estimate_table(hidden, tokens)
+    sizes = [r["bytes"] for r in rows]
+    return build_bands(sizes, {"default": [r["default"] for r in rows], "har": [r["har"] for r in rows]},
+                       margin)
+
+
+def _table_main(argv=None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="python -m suffix_hybrid.nccl_split table",
+                                 description="ESTIMATED all-reduce us per size, scaled by bytes from the GLM bench")
+    ap.add_argument("cmd", choices=["table"])
+    ap.add_argument("--hidden", type=int, default=5120)
+    ap.add_argument("--ars-per-step", type=int, default=81, help="V4.1: 2 x 40 layers + embedding")
+    a = ap.parse_args(argv)
+    print(f"ESTIMATE (not measured on this model): hidden {a.hidden} bf16, us per all-reduce")
+    print(f"{'tokens':>6} {'bytes':>8} {'default':>9} {'nccl':>8} {'har':>8} {'q8':>8} {'ms/step har':>12} {'ms/step default':>16}")
+    for r in estimate_table(a.hidden):
+        q8 = "-" if r["q8"] is None else f"{r['q8']:.0f}"
+        print(f"{r['tokens']:>6} {fmt_size(r['bytes']):>8} {r['default']:>9.0f} {r['nccl']:>8.0f} "
+              f"{r['har']:>8.0f} {q8:>8} {a.ars_per_step * r['har'] / 1e3:>12.2f} "
+              f"{a.ars_per_step * r['default'] / 1e3:>16.2f}")
+    print(f"SUFFIX_NCCL_BANDS={bands_str(estimate_bands(a.hidden))}")
+    return 0
 
 
 # ---------------------------------------------------------------- install
@@ -478,7 +583,8 @@ def setup(self, bands, autotune_on: bool, qar: str) -> None:
         qar_lo = parse_size(_env("SUFFIX_NCCL_QAR_MIN_BYTES", "4M"))
         qar_hi = parse_size(_env("SUFFIX_NCCL_QAR_MAX_BYTES", "inf"))
     if routes or qar_obj is not None:
-        self._suffix_pick = make_pick(routes, qar_obj, qar_lo, qar_hi)
+        self._suffix_pick = make_pick(routes, qar_obj, qar_lo, qar_hi,
+                                      _say if self.rank == 0 else None)
     self._suffix_hag = None
     if tp and _env(HAR_AG_ENV) == "1":
         self._suffix_hag = next((c for sp, c in comms.items() if sp in HAR_SPECS), None)
@@ -558,3 +664,7 @@ def install_post_import_hook() -> None:
             return spec
 
     sys.meta_path.insert(0, _Finder())
+
+
+if __name__ == "__main__":
+    sys.exit(_table_main())
