@@ -345,8 +345,10 @@ def test_probe_cli_ptx_helper(tmp_path, capsys):
 # P0 script + bake-off harness (pure parts)
 # ---------------------------------------------------------------------------
 def test_p0_script_selftest_runs_without_triton():
+    # No SUFFIX_* from other tests (a leaked SUFFIX_HYBRID_WRAP=1 arms the installed sitecustomize in the child).
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SUFFIX_")}
     r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "fp4mma_p0_probe.py"), "--selftest"],
-                       capture_output=True, text=True, env={**os.environ, "PYTHONPATH": ROOT})
+                       capture_output=True, text=True, env={**env, "PYTHONPATH": ROOT})
     assert r.returncode == 0 and "selftest OK" in r.stdout, r.stderr[-800:]
 
 

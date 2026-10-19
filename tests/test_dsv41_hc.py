@@ -295,9 +295,10 @@ def test_bodies_lower_to_triton_without_cross_cta_sync(t, aux, quant):
         code = lower_to_triton(body, args, hc.default_config(c, name))
         for banned in ("atomic", "grid_barrier", "while ", "semaphore", "spin", "gdc_", "cluster"):
             assert banned not in code, (name, banned)       # MINED-LESSONS: no cross-CTA sync
-        # Helion itself puts a CTA-level tl.debug_barrier() between a store and the re-read of
-        # the same buffer (rc in the resident kernel): __syncthreads, not a grid barrier
-        assert (code.count("tl.debug_barrier()") > 0) == (name == hc.K_RES), name
+        # Helion itself puts a CTA-level tl.debug_barrier() between a store and the re-read of the same
+        # buffer (rc in the resident kernel; Helion 1.5.0 also in the epilogue): __syncthreads, not a grid
+        # barrier (their count is a performance detail). The resident kernel must have at least one.
+        assert name != hc.K_RES or code.count("tl.debug_barrier()") > 0, name
         assert ("tl.float8e4nv" in code) == (quant and name != hc.K_POST)
 
 

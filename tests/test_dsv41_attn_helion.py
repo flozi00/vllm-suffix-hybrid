@@ -319,7 +319,9 @@ def test_helion_compiles_each_body_to_one_triton_kernel(kernel, recs, topk):
     swa = 192 if topk == 0 else 128
     code, bound = triton_code(D._BODY[kernel], body_args(kernel, swa=swa, topk=topk, recs=recs))
     assert code.count("@triton.jit") == 1                    # one launch per Helion function: no hidden barrier stage
-    low = code.lower()
+    # Helion 1.5.0 puts one CTA-level tl.debug_barrier() (__syncthreads) between a store and a re-read of the
+    # same buffer; that is not cross-CTA sync (1.5.1 does not always emit it). Everything else stays banned.
+    low = code.lower().replace("tl.debug_barrier()", "")
     assert not any(w in low for w in ("atomic", "barrier", "signal", "semaphore", "spin"))
     assert code.count("tl.dot(") == 4                        # (QK, PV) x (SWA loop, compressed loop)
     assert not re.search(r"tl\.cast\(k16[_0-9a-z]*, tl\.float32", code)    # no f32 [bk, 512] K tile

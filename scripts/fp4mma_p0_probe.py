@@ -473,7 +473,9 @@ def run_helion(args) -> list:
     returns True (no launch), call the generated host function with CPU tensors, restore."""
     import importlib.util
     import triton
-    import triton.runtime.driver as drv
+    import triton.runtime as _rt
+    drv = _rt.driver                     # Triton >= 3.6: the DriverConfig instance itself
+    drv = getattr(drv, "driver", drv)     # older Triton: a module whose `driver` is the DriverConfig
     from triton import knobs
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
@@ -503,8 +505,8 @@ def run_helion(args) -> list:
             got["ck"] = triton.compile(src, target=target, options=opts)
             return True
 
-        old_driver, old_hook = drv.driver._active, knobs.runtime.jit_cache_hook
-        drv.driver.set_active(fake)
+        old_driver, old_hook = drv._active, knobs.runtime.jit_cache_hook
+        drv.set_active(fake)
         knobs.runtime.jit_cache_hook = hook
         t0 = time.time()
         try:
@@ -520,7 +522,7 @@ def run_helion(args) -> list:
                          "native": False, "problems": [], "bm": 0, "bn": 0, "bk": 0, "warps": 0,
                          "stages": 0})
         finally:
-            drv.driver._active = old_driver
+            drv._active = old_driver
             knobs.runtime.jit_cache_hook = old_hook
     return rows
 

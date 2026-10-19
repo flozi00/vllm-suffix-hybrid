@@ -105,8 +105,10 @@ def test_body_lowers_to_triton_without_cross_cta_sync(t):
     code = lower_to_triton(sw.dsv41_swiglu_quant, (sw.make_problem(t, 288, 0), 10.0),
                            sw.default_config(sw.case(t)))
     assert "tl.float8e4nv" in code and "libdevice.exp" in code      # accurate expf, like the CUDA op
+    # a CTA-level tl.debug_barrier() (__syncthreads, emitted by Helion 1.5.0) is not cross-CTA sync
+    stripped = code.replace("tl.debug_barrier()", "")
     for banned in ("atomic", "barrier", "while ", "semaphore", "spin", "gdc_"):
-        assert banned not in code, banned
+        assert banned not in stripped, banned
 
 
 def test_search_space_abi_and_cases():
