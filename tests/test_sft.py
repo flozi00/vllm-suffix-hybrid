@@ -1079,3 +1079,37 @@ def test_parity_guard_allows_noise_but_not_a_real_divergence(tmp_path):
         assert asyncio.run(s.train(dict(examples=CHATS, steps=1)))["served"]
     finally:
         W.SFT = None
+
+
+def test_trainmode_lets_locked_workspace_create_persistent_resources(monkeypatch):
+    import sys
+    import types
+
+    class WM:       # the slice of vLLM's WorkspaceManager the swap touches
+        def __init__(self):
+            self._locked, self._persistent_resources = True, {0: {}}
+
+        def _get_workspace_id(self):
+            return 0
+
+        def get_persistent_resource(self, key, factory):
+            res = self._persistent_resources[0]
+            if key not in res:
+                if self._locked:
+                    raise AssertionError("Workspace is locked")
+                res[key] = factory()
+            return res[key]
+    wm = WM()
+    mod = types.ModuleType("vllm.v1.worker.workspace")
+    mod.current_workspace_manager = lambda: wm
+    for name in ("vllm", "vllm.v1", "vllm.v1.worker"):
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name) or types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.workspace", mod)
+    with pytest.raises(AssertionError):
+        wm.get_persistent_resource("k", lambda: 1)
+    sft = sft_for(build())
+    sft.begin(dict(lr=1e-2))
+    with M.TrainMode(sft, {}, [(0, 2)], grad=False) as tm:
+        assert wm.get_persistent_resource("marlin_locks", lambda: 7) == 7 and wm._locked
+    with pytest.raises(AssertionError):     # restored on exit
+        wm.get_persistent_resource("other", lambda: 1)

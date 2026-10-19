@@ -485,6 +485,7 @@ class TrainMode(contextlib.ContextDecorator):
                 raw = _Raw(self.g, self.g.all_reduce)
                 self._set(self.g, "all_reduce", lambda x: _ReduceFromTP.apply(x, raw))
             self._native_ir(st)
+            self._workspace()
             if self.s.vllm_config is not None:
                 from vllm.forward_context import set_forward_context
                 st.enter_context(set_forward_context(None, self.s.vllm_config))
@@ -508,6 +509,30 @@ class TrainMode(contextlib.ContextDecorator):
         if (torch.is_grad_enabled() and any(t.requires_grad for t in flat(args))
                 and any(t.is_floating_point() and not t.requires_grad for t in flat(out))):
             self.cut.append(type(m).__name__)
+
+    def _workspace(self):
+        """Serving kernels (Marlin FP8: a per-CUDA-stream lock tensor) register
+        small PERSISTENT workspace resources lazily; after warmup the manager is
+        locked and refuses a key it has not seen on this stream. Training runs
+        on another stream: let missing persistent resources be created (they
+        never touch captured graphs). Scratch growth stays locked (it would
+        reallocate storage the CUDA graphs captured) and fails loudly."""
+        try:
+            from vllm.v1.worker.workspace import current_workspace_manager
+            wm = current_workspace_manager()
+        except Exception:  # noqa: BLE001 - vLLM without a workspace manager
+            return
+        orig = wm.get_persistent_resource
+
+        def lenient(key, factory):
+            if getattr(wm, "_locked", False) and key not in wm._persistent_resources[wm._get_workspace_id()]:
+                wm._locked = False
+                try:
+                    return orig(key, factory)
+                finally:
+                    wm._locked = True
+            return orig(key, factory)
+        self._set(wm, "get_persistent_resource", lenient)
 
     @staticmethod
     def _native_ir(st):
