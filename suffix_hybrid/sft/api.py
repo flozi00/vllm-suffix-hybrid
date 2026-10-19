@@ -467,18 +467,23 @@ class State:
     async def load(self, run_id):
         if not isinstance(run_id, str) or not run_id or "/" in run_id or ".." in run_id:
             raise _http(400, "run_id: a published run id or 'base'")
+        keep = {k: self.status.get(k) for k in ("state", "run_id", "error")}
         self.status.update(state="loading", run_id=run_id)
+        stage = "prepare"     # nothing served has been touched yet
         try:
             api, parent = await asyncio.to_thread(self.hub.private_repo)
             if run_id == "base":
                 meta = {"checkpoint": None}
-                await self.rpc("reset")
             else:
                 meta = await asyncio.to_thread(self.hub.run_meta, run_id)
                 if meta.get("fingerprint") != (self.info or {}).get("fingerprint"):
                     raise _http(409, f"run {run_id} was trained for a different model / TP / "
                                      "adapter config")
                 run_dir = await asyncio.to_thread(self.hub.fetch, meta)
+            stage = "apply"
+            if run_id == "base":
+                await self.rpc("reset")
+            else:
                 await self.rpc("load", {"dir": str(run_dir)})
             commit = await asyncio.to_thread(self.hub.publish, api, parent, meta, None,
                                              f"SFT serve {run_id}")
@@ -487,6 +492,12 @@ class State:
             self.status.pop("error", None)
             return dict(serving=run_id, commit_sha=getattr(commit, "oid", None))
         except BaseException as exc:
+            if stage == "prepare":   # unknown / foreign / unfetchable run: keep serving what we serve
+                self.status.update(keep, state=keep["state"] if keep["state"] in ("idle", "restore_failed")
+                                   else "idle",
+                                   rejected=dict(code=getattr(exc, "status_code", 500),
+                                                 error=str(getattr(exc, "detail", exc))))
+                raise
             await self.rpc("reset", check=False)   # never leave TP ranks on different adapters
             self.status.update(state="load_failed", checkpoint={"checkpoint": None},
                                error=str(getattr(exc, "detail", exc)))

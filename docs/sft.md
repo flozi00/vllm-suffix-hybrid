@@ -113,6 +113,38 @@ Note: the pool gateway (EPP) needs `"prompt"` in POST bodies; long runs use
 `"wait": false` + status polling (300 s route timeout); SFT needs the Python
 frontend (`VLLM_USE_RUST_FRONTEND=0`: the Rust frontend has no endpoint plugins).
 
+## Measured on silicon (LFM2.5-24B-A2B-FP8, 1x RTX PRO 6000 Workstation, v0.32.0, 2026-10-19)
+
+Dev pool `lfm25-sft-dev` = prod LFM env (DeepGEMM off, `SUFFIX_FP8_MOE`, `SHORTCONV_FP8`, `NVFP4_LMHEAD`)
++ SFT, `gpu_memory_utilization` 0.80, 64 seqs. 84 adapters (30 short-conv x in/out, 10 attention x qkv/out,
+2 dense MLP x w13/w2), r=16, 8.6M params. Routed experts (FP8, frozen) and the router are not adapted.
+
+| check | result |
+|---|---|
+| memorization (6 facts, 30 steps, lr 2e-4) | loss 3.20 -> 0.0004 in 51 s; served answers all 6, a paraphrase, arithmetic intact |
+| served = trained | after commit served NLL 0.0005 == trained 0.0007 |
+| parity, 327 tokens | 0.026 +- 0.017 nats; on 11-26 tokens the SE is 0.12-0.3 (see below) |
+| stack / load | run 2 on top of run 1 keeps both facts; `load base` -> base, `load r1` -> only r1, `load r2` -> both |
+| training under 8-client load | 266 requests, 0 errors, p50 0.42 s (idle 0.44 s), max 3.6 s |
+| micro-step @ ~3.9k tokens | 2.8 s, +1.8 GiB peak VRAM over serving (18.8 GiB free at util 0.80) |
+| client disconnect mid-run | the run finishes, publishes and is served; a second run meanwhile gets 409 |
+
+Facts found on the way (all fixed in the code):
+- The LFM2 chat template opens `<think>` in the generation prompt and renders a final assistant message
+  without reasoning as plain content. `encode` trains `</think>` + answer (an empty reasoning block). Serve
+  with the default chat kwargs: `enable_thinking: false` switches the reasoning parser off and the
+  `</think>` leaks into `content`.
+- LFM2 FP8 is numerically very sensitive: swapping bf16 for fp32 SDPA alone moves the per-token NLL by
+  sd 0.87 nats (mean ~0). The parity guard therefore refuses at `SUFFIX_SFT_PARITY_NATS` + 3 standard
+  errors of the per-token difference, not at a fixed mean.
+- Serving kernels register per-stream workspace resources lazily (Marlin FP8 lock tensor); the training
+  stream may create them under the locked workspace. Scratch growth stays locked.
+- A `wait:false` request that fails before its run starts used to vanish; it is now `status.rejected`.
+  `load` of an unknown / foreign run used to reset the served model to base; it now leaves serving untouched.
+
+Needs a card with ~20 GiB free after serving: a 32 GB RTX 5090 pool (prod LFM today) cannot train; use a
+PRO 6000 pool.
+
 ## Pod validation protocol (before any prod use)
 
 0. Dev pool, bundle with this branch, `SUFFIX_SFT=1`, `VLLM_PLUGINS` as above.

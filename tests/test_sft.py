@@ -1113,3 +1113,26 @@ def test_trainmode_lets_locked_workspace_create_persistent_resources(monkeypatch
         assert wm.get_persistent_resource("marlin_locks", lambda: 7) == 7 and wm._locked
     with pytest.raises(AssertionError):     # restored on exit
         wm.get_persistent_resource("other", lambda: 1)
+
+
+def test_load_of_an_unknown_or_foreign_run_keeps_serving_the_current_adapter(tmp_path):
+    from fastapi import HTTPException
+    lm = build()
+    s = _state(tmp_path, sft_for(lm, rank=4))
+    try:
+        res = asyncio.run(s.train(dict(examples=CHATS, steps=3, batch_size=3, learning_rate=5e-2)))
+        trained = _served(lm)
+        before = dict(s.status)
+        with pytest.raises(HTTPException) as e:
+            asyncio.run(s.load("does-not-exist"))
+        assert e.value.status_code == 404
+        assert torch.equal(_served(lm), trained)                       # still the trained adapter
+        assert s.status["state"] == "idle" and s.status["checkpoint"] == before["checkpoint"]
+        assert s.status["run_id"] == before["run_id"] and s.status["rejected"]["code"] == 404
+        meta = s.hub.directory / "runs" / res["run_id"] / "metadata.json"
+        meta.write_text(json.dumps(dict(json.loads(meta.read_text()), fingerprint="other")))
+        with pytest.raises(HTTPException) as e:
+            asyncio.run(s.load(res["run_id"]))
+        assert e.value.status_code == 409 and torch.equal(_served(lm), trained)
+    finally:
+        W.SFT = None
