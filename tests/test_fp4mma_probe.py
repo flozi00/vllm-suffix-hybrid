@@ -152,20 +152,20 @@ def test_k5_fails_closed_on_decomposition_missing_kernel_and_missing_recorder(fa
     with pytest.raises(probe.Fp4mmaError, match="recorder is not installed"):
         probe.assert_native(["x"])
     probe.install_recorder()
-    with pytest.raises(probe.Fp4mmaError, match="no compiled kernel recorded for '_helion_dsv41_fp4mma_fc1'"):
-        probe.assert_native(["_helion_dsv41_fp4mma_fc1"])
+    with pytest.raises(probe.Fp4mmaError, match="no compiled kernel recorded for '_helion_dsv41_moe_fc1'"):
+        probe.assert_native(["_helion_dsv41_moe_fc1"])
     fake_launcher["ck"] = FakeCK(DECOMPOSED_PTX, "h2")
-    hrt.default_launcher(FakeJit("_helion_dsv41_fp4mma_fc1"), (1,))
+    hrt.default_launcher(FakeJit("_helion_dsv41_moe_fc1"), (1,))
     with pytest.raises(probe.Fp4mmaError, match="decomposed tl.dot_scaled"):
-        probe.assert_native(["_helion_dsv41_fp4mma_fc1"])
+        probe.assert_native(["_helion_dsv41_moe_fc1"])
     # one bad specialization among good ones still fails (EVERY compile is judged)
     fake_launcher["ck"] = FakeCK(NATIVE_PTX, "h3")
-    hrt.default_launcher(FakeJit("_helion_dsv41_fp4mma_fc2"), (1,))
-    probe.assert_native(["_helion_dsv41_fp4mma_fc2"])
+    hrt.default_launcher(FakeJit("_helion_dsv41_moe_fc2"), (1,))
+    probe.assert_native(["_helion_dsv41_moe_fc2"])
     fake_launcher["ck"] = FakeCK(MX_PTX, "h4")
-    hrt.default_launcher(FakeJit("_helion_dsv41_fp4mma_fc2"), (1,))
+    hrt.default_launcher(FakeJit("_helion_dsv41_moe_fc2"), (1,))
     with pytest.raises(probe.Fp4mmaError, match="fc2"):
-        probe.assert_native(["_helion_dsv41_fp4mma_fc2"])
+        probe.assert_native(["_helion_dsv41_moe_fc2"])
 
 
 def test_spills_warn_in_serving_but_fail_in_the_lab_gate(fake_launcher):
@@ -273,11 +273,65 @@ def test_boot_gate_argv_parses_with_the_gates_own_parser():
     assert argv[:2] == ["-m", "suffix_hybrid.kernels.fp4mma_probe"]
     ns = probe.parser().parse_args(argv[2:])  # a flag typo cannot ship
     assert ns.cmd == "capture_replay"
-    assert env == {"SUFFIX_HELION_NVFP4_GEMM_FP4MMA": "1", "SUFFIX_HELION_NVFP4_MOE_FP4MMA": "1"}
+    assert env == {}  # no enable knob exists: the gate builds the kernels itself, the MoE variant is data-selected
     assert probe.main(["capture_replay"]) == 2  # no CUDA here -> NOT RUN, not a crash
     # the bytes-mode gate: the same run, the scale-read mode in the child's env (sitecustomize strips SUFFIX_*)
     argv_b, env_b = probe.BOOT_GATES["fp4mma_capture_replay_bytes"]
-    assert argv_b == argv and env_b == {**env, "SUFFIX_FP4MMA_MOE_SCALE_READ": "bytes"}
+    assert argv_b == argv and env_b == {"SUFFIX_FP4MMA_MOE_SCALE_READ": "bytes"}
+
+
+def test_a_k5_refusal_inside_the_eager_step_is_a_fail_not_a_not_run():
+    """The MoE run_plan judges its own PTX at the launch that compiled it: that refusal is the finding."""
+    def build_with(exc):
+        def build(pr, dev):
+            def run(static, out=None):
+                raise exc
+            return probe.Case(inputs=[{"x": torch.zeros(2)}] * 3, run=run, copy_in=lambda st, x: None,
+                              exact=lambda x, o: (True, ""), out_shape=(2, 2))
+        return build
+    args = (probe.EagerRuntime, "cpu", 2, 1, False, False)
+    rec = probe.run_probe(probe.Probe("p", "moe"), build_with(probe.Fp4mmaError("K5: decomposed")), *args)
+    assert rec["status"] == "FAIL" and "decomposed" in rec["detail"]
+    rec = probe.run_probe(probe.Probe("p", "moe"), build_with(RuntimeError("no helion kernel built")), *args)
+    assert rec["status"] == "NOT RUN"  # anything else before a judgement stays 'could not run'
+
+
+def test_gate_k5_judges_the_ptx_of_every_body_the_gate_ran(fake_launcher):
+    """The boot gate used to claim K5 and never assert it: gate_k5 now judges the compiled PTX of every
+    dense dot_scaled body and MoE fc1 / fc2 that ran (lab strictness: spills fail), the cvt control by its cvt."""
+    import helion.runtime as hrt
+    from suffix_hybrid.helion_kernels import dsv41_moe_fp4mma as fe
+    from suffix_hybrid.helion_kernels import nvfp4_gemm_fp4mma as fm
+    plist = fm.probes("tiny") + fe.probes("tiny")
+    recs = [{"label": p.label, "status": "PASS"} for p in plist]
+    cvt_ptx = NATIVE_PTX.replace(probe.NATIVE_MMA, "cvt.rn.f16x2.e2m1x2 %r1, %rs1;\n    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32")
+    probe.install_recorder()
+
+    def launch(name, ptx, h):
+        fake_launcher["ck"] = FakeCK(ptx, h)
+        hrt.default_launcher(FakeJit(name), (1,))
+    for i, body in enumerate((fm.WORDS, fm.BYTES, fm.LIN)):
+        launch(fm.TRITON_NAMES[body], NATIVE_PTX, f"d{i}")
+    launch(fm.TRITON_NAMES[fm.CVT], cvt_ptx, "cvt")
+    for i, k in enumerate(fe.NATIVE_KERNELS):
+        launch(fe.TRITON_NAMES[k], NATIVE_PTX, f"m{i}")
+    lines = []
+    rec = probe.gate_k5(plist, recs, log=lines.append)
+    assert rec["status"] == "PASS" and "5 native kernels + 1 cvt" in rec["detail"], rec
+    assert sum(ln.startswith("K5 ok") for ln in lines) == 6
+    # a bodies that did not run (NOT RUN) is not judged and needs no record
+    rec = probe.gate_k5(plist, [{**r, "status": "NOT RUN"} for r in recs], log=lines.append)
+    assert rec["status"] == "PASS" and "0 native" in rec["detail"]
+    # one decomposed fc2 compile fails the gate, naming the kernel
+    launch(fe.TRITON_NAMES[fe.FC2], DECOMPOSED_PTX, "bad")
+    rec = probe.gate_k5(plist, recs, log=lines.append)
+    assert rec["status"] == "FAIL" and "dsv41_moe_fc2" in rec["detail"] and "decomposed" in rec["detail"]
+    # lab strictness: a spilling hot entry fails the gate (serving only warns)
+    probe.clear_records()
+    launch(fm.TRITON_NAMES[fm.WORDS], SPILL_PTX, "sp")
+    only_words = [p for p in plist if p.label == "tiny.words.s1"]
+    rec = probe.gate_k5(only_words, [{"label": "tiny.words.s1", "status": "PASS"}], log=lines.append)
+    assert rec["status"] == "FAIL" and "local memory" in rec["detail"]
 
 
 def test_probe_cli_ptx_helper(tmp_path, capsys):
@@ -330,33 +384,31 @@ def test_p0_mirror_cvt_asm_is_helions_asm():
 
 def test_p0_helion_mode_generates_every_real_body_for_gemm_and_moe():
     """`--helion` compiles Helion's generated Triton for sm_120a (Linux). Its CPU half runs here: the
-    front end must lower all nine real bodies (4 dense GEMM + 5 MoE) at an explicit config to parseable
-    Triton source with the dot_scaled calls K5 will look for, and flag exactly fc1 / fc2 / the e2m1 GEMM
-    bodies as native-expected."""
+    front end must lower all nine real bodies (4 dense GEMM + the 3 MoE bodies, fc1 / fc2 in both scale-read
+    modes) at an explicit config to parseable Triton source with the dot_scaled calls K5 will look for, and
+    flag exactly the e2m1 GEMM bodies and fc1 / fc2 as native-expected."""
     import ast
     import types
     pytest.importorskip("helion")
     p0 = load_p0()
     ns = types.SimpleNamespace(helion_families="gemm,moe", n=64, k=256, moe_e=4, moe_h=256, moe_i=128)
     rows = {label: (code, want) for label, _kind, code, _args, want in p0.helion_bodies(ns)}
-    moe = {"moe.dsv41_fp4mma_route_quant", "moe.dsv41_fp4mma_quant", "moe.dsv41_fp4mma_fc1",
-           "moe.dsv41_fp4mma_fc2", "moe.dsv41_fp4mma_combine"}
-    assert set(rows) == {"gemm.nvfp4_gemm_q_fp4mma", "gemm.nvfp4_gemm_q_fp4mma_b", "gemm.nvfp4_gemm_q_fp4mma_lin",
-                         "gemm.nvfp4_gemm_q_fp4cvt"} | moe | {"moe.dsv41_fp4mma_fc1[bytes]",
-                                                              "moe.dsv41_fp4mma_fc2[bytes]"}
+    dense = {"gemm.nvfp4_gemm_q_fp4mma", "gemm.nvfp4_gemm_q_fp4mma_b", "gemm.nvfp4_gemm_q_fp4mma_lin",
+             "gemm.nvfp4_gemm_q_fp4cvt"}
+    moe = {"moe.dsv41_moe_route_quant", "moe.dsv41_moe_fc1", "moe.dsv41_moe_fc2"}
+    both = {"moe.dsv41_moe_fc1[bytes]", "moe.dsv41_moe_fc2[bytes]"}
+    assert set(rows) == dense | moe | both
     dots = lambda code: sum(1 for ln in code.splitlines() if "tl.dot_scaled(" in ln and not ln.strip().startswith("#"))
+    native = (dense - {"gemm.nvfp4_gemm_q_fp4cvt"}) | {l for l in moe | both if "fc" in l}
     for label, (code, want) in rows.items():
         ast.parse(code)
-        n_dot = {"moe.dsv41_fp4mma_fc1": 2, "moe.dsv41_fp4mma_fc2": 1, "moe.dsv41_fp4mma_fc1[bytes]": 2,
-                 "moe.dsv41_fp4mma_fc2[bytes]": 1}.get(label, 1 if want else 0)
+        n_dot = 2 if "fc1" in label else 1 if "fc2" in label else 1 if want else 0
         assert dots(code) == n_dot, (label, dots(code))
-        assert want == (label in ("gemm.nvfp4_gemm_q_fp4mma", "gemm.nvfp4_gemm_q_fp4mma_b",
-                                  "gemm.nvfp4_gemm_q_fp4mma_lin", "moe.dsv41_fp4mma_fc1", "moe.dsv41_fp4mma_fc2",
-                                  "moe.dsv41_fp4mma_fc1[bytes]", "moe.dsv41_fp4mma_fc2[bytes]"))
+        assert want == (label in native), label
         # the two scale-read modes really are two different programs (join/bitcast unpack vs plain e4m3 loads)
         if label.endswith("[bytes]"):
             assert "tl.join" not in code and "bitcast=True" not in code, label
-        elif label in ("moe.dsv41_fp4mma_fc1", "moe.dsv41_fp4mma_fc2"):
+        elif label in ("moe.dsv41_moe_fc1", "moe.dsv41_moe_fc2"):
             assert "tl.join" in code and "bitcast=True" in code, label
     ns.helion_families = "gemm"
     assert len(p0.helion_bodies(ns)) == 4

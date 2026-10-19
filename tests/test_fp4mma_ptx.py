@@ -69,7 +69,7 @@ def test_cvt_mirror_assembles_for_sm120a(p0, tmp_path):
 
 
 def test_real_helion_bodies_compile_for_sm120a_with_the_native_mma(p0):
-    """The P0 `--helion` mode as a test: Helion's REAL generated kernels (4 dense GEMM bodies, the 5 MoE bodies,
+    """The P0 `--helion` mode as a test: Helion's REAL generated kernels (4 dense GEMM bodies, the 3 MoE bodies,
     fc1 / fc2 in both scale-read modes) go through JITFunction.run with a duck-typed driver and are compiled for
     GPUTarget("cuda", 120, 32): every dot_scaled body must carry the native instruction. Register spills are
     printed (-s), not failed: they are a tuning fact of the probe config, not a lowering bug."""
@@ -78,7 +78,7 @@ def test_real_helion_bodies_compile_for_sm120a_with_the_native_mma(p0):
     ns = types.SimpleNamespace(arch=120, n=4096, k=5120, helion_families="gemm,moe", moe_e=4, moe_h=5120,
                                moe_i=2304)
     rows = p0.run_helion(ns)
-    assert len(rows) == 11, [r["variant"] for r in rows]
+    assert len(rows) == 9, [r["variant"] for r in rows]
     for r in rows:
         assert not r.get("error"), f"{r['variant']}: {r['error']}"
         problems = [x for x in r["problems"] if not x.startswith("local memory")]

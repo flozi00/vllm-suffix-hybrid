@@ -5,8 +5,6 @@ file has run on silicon: the pure parts (case lists, winner table, config shippi
 
     python -m suffix_hybrid.kernels.fp4mma_bench dense --screen 21 --tune quick --out /tmp/fp4
     python -m suffix_hybrid.kernels.fp4mma_bench dense --screen dsv41 --tune full --out /tmp/fp4
-    python -m suffix_hybrid.kernels.fp4mma_bench moe --m 1,6,16,48,192 --tune quick --out /tmp/fp4
-    SUFFIX_FP4MMA_MOE_SCALE_READ=bytes python -m suffix_hybrid.kernels.fp4mma_bench moe ...   # the fallback mode
     python -m suffix_hybrid.kernels.fp4mma_bench report /tmp/fp4        # re-render tables from the records
     python -m suffix_hybrid.kernels.fp4mma_bench selftest               # CPU
 
@@ -31,11 +29,10 @@ stock arms (flashinfer, oxide) by >= --margin (default 3 %, the autoroute's) is 
 docs/helion-kernels.md (copy the files into suffix_hybrid/configs/helion/ for the winners only; the
 pull keeps one body per case: the fastest).
 
-MOE (`moe`): whole-layer cold-L2 time at the V4.1 EP8 rank (48 of 384 experts, H 5120, I 2304, top-6, clamp
-10) per M and per load distribution (balanced / skewed / hot): FlashInfer CUTLASS (the stock path), lane B's
-Helion plan (front4 / fused3 per its tune table), and this family's plan (fp4mma4 / fp4mma4t). A bucket ships
-only if the family wins on EVERY distribution (lane B's rule); the largest M of an unbroken win from the
-bottom is printed as SUFFIX_NVFP4_MOE_FP4MMA_MAX_M.
+MOE: not here. The routed experts are a body VARIANT of lane B's seam (docs/dsv41-moe.md section 11), so
+the K4 for them is lane B's gate bench (helion_kernels/nvfp4_moe_tune.py): FlashInfer and EVERY body variant
+per bucket, balanced and skewed, cold L2, the VARIANT TABLE and the `dsv41_moe_variant` rows it writes. This
+file benches the dense GEMM arms only.
 """
 from __future__ import annotations
 
@@ -176,18 +173,6 @@ def write_configs(out_dir: str, platform: str, shipped: dict) -> list:
     return paths
 
 
-def max_m_line(rows: list, ms) -> str:
-    """The MoE rule: SUFFIX_NVFP4_MOE_FP4MMA_MAX_M = the largest M of an unbroken win from the bottom
-    (rows: [{m, win: bool}] over every distribution)."""
-    best_m = 0
-    for m in sorted(ms):
-        if all(r["win"] for r in rows if r["m"] == m) and any(r["m"] == m for r in rows):
-            best_m = m
-        else:
-            break
-    return f"SUFFIX_NVFP4_MOE_FP4MMA_MAX_M={best_m}"
-
-
 # ---------------------------------------------------------------------------
 # device side
 # ---------------------------------------------------------------------------
@@ -244,7 +229,6 @@ def tune_body(body, args, effort: str, settings: dict):
 
 def dense_arm(arm: str, n: int, k: int, m: int, dev, tune: str, iters: int, flush, seed: int = 0) -> dict:
     """Build, check and time one arm. Returns the record (never raises)."""
-    import torch
     from suffix_hybrid import helion_kernels as hk
     from suffix_hybrid.helion_kernels import nvfp4_gemm_fp4mma as fm
     rec = {"arm": arm, "n": n, "k": k, "m": m, "platform": hk.platform(), "toolchain": toolchain()}
@@ -314,7 +298,6 @@ def _helion_runner(kind, p, cfg):
 
 def _alu_runner(case, seed, dev, tune):
     import helion
-    import torch
     from suffix_hybrid import helion_kernels as hk
     from suffix_hybrid.helion_kernels import nvfp4_gemm as old
     p = old.problem(case, seed, dev, True)
@@ -550,107 +533,6 @@ def finish_dense(recs, out_dir, plat, margin) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# MoE whole-layer bench
-# ---------------------------------------------------------------------------
-def _moe_kernels(plan, case, tune, seed, out_dir):
-    """The family's plan kernels for one case: shipped config, else (tune != none) tuned HERE on the
-    lab's own make() args, else Helion's default (flagged untuned). -> (kernels, notes)."""
-    import helion
-    from suffix_hybrid import helion_kernels as hk
-    from suffix_hybrid.helion_kernels import dsv41_moe_fp4mma as fe
-    kerns, notes = [], {}
-    entries = {k["name"]: k for k in fe.KERNELS}
-    for name in fe.PLANS[plan]:
-        cfg = hk.config(name, case)
-        src = "shipped"
-        if cfg is None and tune != "none":
-            e = entries[name]
-            cfg = tune_body(e["body"], e["make"](case, seed), tune, e["settings"])
-            src = "tuned"
-            d = os.path.join(out_dir, "configs", name)
-            os.makedirs(d, exist_ok=True)
-            path = os.path.join(d, hk.platform() + ".json")
-            rows = json.load(open(path)) if os.path.exists(path) else []
-            rows = [r for r in rows if r["key"] != case] + [{"key": case, "config": cfg}]
-            json.dump(rows, open(path, "w"), indent=1)
-        notes[name] = src if cfg is not None else "UNTUNED(default)"
-        settings = {"ignore_warnings": [helion.exc.TensorOperationInWrapper]}
-        kerns.append(helion.kernel(fe.BODIES[name], static_shapes=False, **settings,
-                                   **({"config": helion.Config(**cfg)} if cfg is not None
-                                      else {"autotune_effort": "none"})))
-    return kerns, notes
-
-
-def run_moe(args) -> int:
-    import torch
-    from suffix_hybrid import helion_kernels as hk
-    if not torch.cuda.is_available():
-        _log("MOE NOT RUN: no CUDA device")
-        return 2
-    from suffix_hybrid.helion_kernels import dsv41_moe_fp4mma as fe
-    from suffix_hybrid.helion_kernels import nvfp4_moe as lb
-    from suffix_hybrid.kernels import fp4mma_probe
-    from suffix_hybrid.kernels import nvfp4_moe as nm
-    fp4mma_probe.require_native_stack()
-    fp4mma_probe.install_recorder()
-    dev = torch.device("cuda", torch.cuda.current_device())
-    _log(f"toolchain {toolchain()}")
-    flush, buf = _flusher(dev)
-    e, eg, h, i, topk, limit = 48, 384, 5120, 2304, 6, 10.0
-    base = (eg // e) // 2 * e
-    p = nm.make_problem(e, h, i, "silu", device=dev, seed=3, limit=limit)
-    fi = dict(p, a1g_t=torch.full((e,), p["a1g"], dtype=torch.float32, device=dev),
-              a2g_t=torch.full((e,), p["a2g"], dtype=torch.float32, device=dev),
-              ep_size=eg // e, ep_rank=base // e)
-    ms = [int(x) for x in args.m.split(",")]
-    os.makedirs(args.out, exist_ok=True)
-    rows, recs = [], []
-    for m in ms:
-        case = fe.bucket_case(e, h, i, topk, p["act"], m, limit, eg)
-        plan = fe.plan_name(m)
-        kerns, notes = _moe_kernels(plan, case, args.tune, 0, args.out)
-        lcase = lb.lane_case(e, h, i, topk, p["act"], m, limit, eg)
-        mode = nm.tune_for(m, nm.parse_tune(nm.DEFAULT_TUNE))[0]
-        lplan = lb.plan_name(mode)
-        lkerns = lb._kernels(hk.case_key(lcase), lplan, True)
-        for dist in args.dists.split(","):
-            ids, tw = nm.rand_routing(m, eg, topk, dev, seed=7, base=base, local=e, dist=dist)
-            x = (torch.randn(m, h, device=dev) * (2688.0 / p["a1g"] / 4.5)).bfloat16()
-            out = torch.empty(m, h, dtype=torch.bfloat16, device=dev)
-            arms = {
-                "flashinfer": lambda _s=None: nm._fi_call(fi, x, ids, tw, out),
-                "laneB_helion": lambda _s=None: lb.run_plan(lkerns, lplan, x, ids, tw, p["w13"], p["w13_sf"],
-                                                            p["g1"], p["w2"], p["w2_sf"], p["g2"], out,
-                                                            p["a1g"], p["a2g"], p["act"], base, limit),
-                "fp4mma": lambda _s=None: fe.run_plan(kerns, plan, x, ids, tw, p["w13"], p["w13_sf"],
-                                                      p["g1"], p["w2"], p["w2_sf"], p["g2"], out,
-                                                      p["a1g"], p["a2g"], p["act"], base, limit),
-            }
-            rec = {"m": m, "dist": dist, "plan": plan, "lane_b_plan": lplan, "case": case, "notes": notes,
-                   "platform": hk.platform(), "toolchain": toolchain(), "scale_read": fe.SCALE_READ}
-            try:
-                ref = nm.moe_ref(p, x, nm.to_local(ids, base, e).int(), tw)
-                arms["fp4mma"](None)
-                rec["rel_vs_f64_fp4mma"] = float((out.double() - ref).norm() / ref.norm().clamp_min(1e-30))
-                rec["correct"] = rec["rel_vs_f64_fp4mma"] <= nm.REF_TOL
-                rec["us"] = {name: round(_graph_us(fn, dev, args.iters, flush), 2) for name, fn in arms.items()}
-            except Exception as exc:  # noqa: BLE001
-                rec["error"] = f"{type(exc).__name__}: {exc}"[:600]
-            recs.append(rec)
-            rows.append({"m": m, "dist": dist, "win": bool(
-                rec.get("correct") and rec["us"]["fp4mma"] * (1 + args.margin)
-                <= min(rec["us"]["flashinfer"], rec["us"]["laneB_helion"]))})
-            print(f"{MARKER} moe M={m} {dist} {plan}: {rec.get('us') or rec.get('error')} "
-                  f"{'WIN' if rows[-1]['win'] else 'no win'} {notes}", flush=True)
-            torch.cuda.empty_cache()
-    with open(os.path.join(args.out, "moe.jsonl"), "a") as f:
-        for r in recs:
-            f.write(json.dumps(r) + "\n")
-    print(max_m_line(rows, ms))
-    return 0
-
-
 def selftest() -> int:
     """CPU: case lists, winner logic, shipping rows (bucket rule), the PR config pruning, max-M line."""
     assert len(screen_cases("21")) == 21 and screen_cases("21")[0][1:] == (34816, 5120, 1)
@@ -673,7 +555,6 @@ def selftest() -> int:
     assert [r["key"]["numtokens"] for r in ship["nvfp4_gemm_q_fp4mma"]] == [1], ship
     assert "WINNER TABLE" in table(w, "x")
     assert pr_configs_for(1, 4096, 5120)[0][0] == 16 and all(c[0] <= 64 for c in pr_configs_for(40, 4096, 5120))
-    assert max_m_line([{"m": 1, "win": True}, {"m": 6, "win": True}, {"m": 8, "win": False}], [1, 6, 8]).endswith("=6")
     print("fp4mma_bench selftest OK")
     return 0
 
@@ -690,13 +571,6 @@ def parser() -> argparse.ArgumentParser:
     d.add_argument("--margin", type=float, default=DEFAULT_MARGIN)
     d.add_argument("--budget-s", type=float, default=3000.0)
     d.add_argument("--out", default="/tmp/fp4mma")
-    mo = sub.add_parser("moe")
-    mo.add_argument("--m", default="1,6,8,16,32,64,128,192")
-    mo.add_argument("--dists", default="balanced,skewed")
-    mo.add_argument("--iters", type=int, default=15)
-    mo.add_argument("--margin", type=float, default=DEFAULT_MARGIN)
-    mo.add_argument("--tune", default="none", choices=("none", "quick", "full"))
-    mo.add_argument("--out", default="/tmp/fp4mma")
     rp = sub.add_parser("report")
     rp.add_argument("dir")
     rp.add_argument("--margin", type=float, default=DEFAULT_MARGIN)
@@ -710,8 +584,6 @@ def main(argv=None) -> int:
         return selftest()
     if a.cmd == "dense":
         return run_dense(a)
-    if a.cmd == "moe":
-        return run_moe(a)
     if a.cmd == "report":
         recs = [json.loads(ln) for ln in open(os.path.join(a.dir, "dense.jsonl"))]
         plat = (recs[0].get("platform") if recs else "") or ""

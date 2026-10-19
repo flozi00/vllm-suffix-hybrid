@@ -404,8 +404,9 @@ class FakeDriver:
 
 
 def moe_calls(fe, e: int, h: int, i: int, topk: int = 6, m: int = 16) -> dict:
-    """Host-function arguments of the five MoE bodies at the given H / I and a small expert count E
-    (E only changes the grid and constants, not the instruction mix or the register use)."""
+    """Host-function arguments of the three MoE bodies (route_quant, fc1, fc2) at the given H / I and a
+    small expert count E (E only changes the grid and constants, not the instruction mix or the register
+    use); lane B's combine is not ours to probe."""
     import torch
     from suffix_hybrid.kernels import nvfp4_moe as nm
     p = nm.make_problem(e, h, i, "silu", "cpu", 0, limit=10.0)
@@ -416,18 +417,16 @@ def moe_calls(fe, e: int, h: int, i: int, topk: int = 6, m: int = 16) -> dict:
     sf = lambda rows, cols: fe.sf_arg(torch.zeros(rows, cols, dtype=torch.uint8))  # in fe.SCALE_READ's form
     return {
         fe.ROUTE_QUANT: (torch.randn(m, h).bfloat16(), ids, 1.0, 1.0, e, 2),
-        fe.QUANT: (torch.randn(m, h).bfloat16(), 1.0, 1.0),
         fe.FC1: (torch.zeros(m, h // 2, dtype=torch.uint8), sf(m, h // 16), ps,
                  counts, counts, p["w13"], fe.sf_arg(p["w13_sf"]), p["g1"], 1.0, 1.0, 0, topk, 10.0),
         fe.FC2: (torch.zeros(pairs + 1, i // 2, dtype=torch.uint8), sf(pairs + 1, i // 16), ps, counts, counts,
                  tw, p["w2"], fe.sf_arg(p["w2_sf"]), p["g2"]),
-        fe.COMBINE: (torch.zeros(pairs + 1, h), ids, 2, e, torch.zeros(m, h, dtype=torch.bfloat16)),
     }
 
 
 def helion_bodies(args) -> list:
     """(label, host function name, source text, cpu args, want_native) for the real bodies: the dense GEMM
-    bodies at (N, K) = (--n, --k), M 16, and the five MoE bodies at --moe-h / --moe-i / --moe-e (the V4.1
+    bodies at (N, K) = (--n, --k), M 16, and the three MoE bodies at --moe-h / --moe-i / --moe-e (the V4.1
     EP8 rank's H and I, a handful of experts), each at an explicit realistic config. Needs Helion and
     torch only (the Helion front end lowers on CPU); the compile happens in run_helion."""
     import helion
