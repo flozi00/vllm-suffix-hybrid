@@ -198,6 +198,12 @@ def test_combine_order_vs_vllm_shared_plus_routed(helion):
 # ---------------------------------------------------------------------------
 # generated Triton code (Helion front end, no GPU): stateless, one launch, bounded
 # ---------------------------------------------------------------------------
+def _every_config(kernel, case, plat=None):
+    """A shipped-config table with every kernel tuned (an empty config = Helion's defaults) and no
+    body-variant rows (every bucket stays on the dequant bodies)."""
+    return None if kernel == hm.VARIANT_KERNEL else {}
+
+
 def _bind(helion, name, static, case=None, m=8):
     from helion.runtime.ref_mode import RefMode  # interpret mode has no config space
     case = case or {**EP8, "experts": 2, "experts_global": 16, "numtokens": m}
@@ -286,7 +292,7 @@ def test_served_ms_names_every_gap(monkeypatch):
 
 
 def test_fused_plan_serving_call_and_warm_guard(helion, monkeypatch):
-    monkeypatch.setattr(hk, "config", lambda kernel, case, plat=None: {})
+    monkeypatch.setattr(hk, "config", _every_config)
     monkeypatch.setattr(hk, "platform", lambda device=0: "test_gpu")
     hs._kernels_sh.cache_clear()
     p, sp, ids, tw, x, base, limit = _plan_inputs(7, "balanced", False)
@@ -340,9 +346,10 @@ def test_knobs_fail_closed(monkeypatch):
         monkeypatch.setenv(glue.MAX_M_ENV, bad)
         with pytest.raises(RuntimeError, match=why):
             glue.fuse_max_m(32)
-    glue.check_env(True, "auto")
-    for gate, backend, why in ((False, "auto", "SUFFIX_NVFP4_MOE=1"),
-                               (True, "oxide", "SUFFIX_HELION_NVFP4_MOE")):
+    glue.check_env(True, "helion")
+    for gate, backend, why in ((False, "helion", "SUFFIX_NVFP4_MOE=1"),
+                               (True, "oxide", "SUFFIX_HELION_NVFP4_MOE=helion"),
+                               (True, "auto", "oxide-free")):
         with pytest.raises(RuntimeError, match=why):
             glue.check_env(gate, backend)
     monkeypatch.setenv(glue.KNOB, "0")
@@ -560,7 +567,7 @@ def _prepared(helion, monkeypatch, aux, kernel="FlashInferCutlassMxfp8LinearKern
 
     monkeypatch.setattr(nm, "_graph_us", graph_us)
     monkeypatch.setitem(nm._state, "shared_fused", 0)
-    monkeypatch.setattr(hk, "config", lambda kernel_, case, plat=None: {})
+    monkeypatch.setattr(hk, "config", _every_config)
     monkeypatch.setattr(hk, "platform", lambda device=0: "test_gpu")
     hs._kernels_sh.cache_clear()
     monkeypatch.setenv(glue.MAX_M_ENV, "4")

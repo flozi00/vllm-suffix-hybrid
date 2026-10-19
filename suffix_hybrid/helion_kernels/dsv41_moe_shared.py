@@ -483,6 +483,13 @@ def served_ms_sh(e_count, hdim, idim, topk, max_m, mode_for, limit, e_global, is
     for m in range(1, max_m + 1):
         case = lane_case_sh(e_count, hdim, idim, topk, m, limit, e_global, isz)
         mode = mode_for(m)
+        body = hm.variant_for(base_case(case))
+        if body != hm.DEQUANT:  # the shared expert rides inside the dequant bodies only
+            raise RuntimeError(
+                f"{MARKER} {KNOB}=1: M={m} (bucket {case['numtokens']}) is served by the "
+                f"{body!r} body variant ({hm.VARIANT_KERNEL} row), but the fused shared expert "
+                f"lives in the dequant bodies: lower SUFFIX_DSV41_MOE_FUSE_SHARED_MAX_M below "
+                f"M={m} or select dequant for that bucket")
         lack = missing_sh(case, mode)
         if lack:
             gaps.setdefault((case["numtokens"], hm.plan_name(mode)), lack)

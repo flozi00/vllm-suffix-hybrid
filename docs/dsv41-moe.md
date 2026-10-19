@@ -52,22 +52,25 @@ zeros). Hash routing is not used by V4.1 (`num_hash_layers=0`).
 | file | change |
 |---|---|
 | `suffix_hybrid/kernels/dsv41_moe.py` (new) | the V4.1 shape/arch gate: `refuse(info)`; supported set = hidden 5120, silu, topk 6, limit 10.0, 384 experts, layouts EP8 / TP8 |
-| `suffix_hybrid/kernels/nvfp4_moe.py` | clamp in the references (`clamp_ref`, `gate_up_ref`), eligibility accepts silu+clamp, I % 16, E > 256 (`oxide_gap` -> Helion-only), startup error for any NVFP4+clamp layer the lane refuses, `rand_routing(dist=balanced/skewed/hot)`, `adversarial_blocks`, DS oracle/bench cases, FlashInfer baseline with `swiglu_limit`, cold-L2 bench under two load distributions, `winner_table` |
-| `suffix_hybrid/helion_kernels/nvfp4_moe.py` | clamp in the fc1 epilogue, EP (`experts_global`, `id_base`) in case keys + lab, CLAMP_BUCKETS, plan split fused3 <= 16 / front4 >= 6, bounded search spaces, FlashInfer whole-layer baseline where oxide cannot run, routing distribution by seed |
-| `suffix_hybrid/helion_kernels/nvfp4_moe_tune.py` (new) | in-lab tuner for 30 min lab gates: detached process, records + configs, tunes on skewed routing, gates and scores on balanced/skewed/hot |
+| `suffix_hybrid/kernels/nvfp4_moe.py` | clamp in the references (`clamp_ref`, `gate_up_ref`), eligibility accepts silu+clamp, I % 16, E > 256 (`oxide_gap` -> Helion-only), startup error for any NVFP4+clamp layer the lane refuses (and for any backend but `helion`), the oxide-free route (`oxide_free_route`, `NO_WS`: arm/layer/oracle/bench import no `_native`), `rand_routing(dist=balanced/skewed/hot)`, the EP load model (`expected_load`, `load_stats`, `load_markdown`), `adversarial_blocks`, DS oracle/bench cases, FlashInfer baseline with `swiglu_limit`, cold-L2 bench under two load distributions, `winner_table`, `pick_variants` / `variant_table` |
+| `suffix_hybrid/helion_kernels/nvfp4_moe.py` | clamp in the fc1 epilogue, EP (`experts_global`, `id_base`) in case keys + lab, CLAMP_BUCKETS, plan split fused3 <= 16 / front4 >= 6, bounded search spaces, FlashInfer whole-layer baseline where oxide cannot run, routing distribution by seed, the body-variant seam (`variant_for`, `variant_module`, `check_variant`: section 11) |
+| `suffix_hybrid/helion_kernels/nvfp4_moe_tune.py` (new) | in-lab tuner for 30 min lab gates: detached process, records + configs, searches on balanced routing, gates and scores on balanced/skewed/hot, tunes the variants' kernels too and writes the per-bucket body rows |
 | `suffix_hybrid/helion_kernels/dsv41_moe_shared.py`, `suffix_hybrid/kernels/dsv41_moe_shared.py`, `tests/test_dsv41_moe_shared.py` (new) | the shared-expert fusion (section 7) |
-| tests | `tests/test_nvfp4_moe.py`, `tests/test_helion_nvfp4_moe.py` |
+| tests | `tests/test_nvfp4_moe.py`, `tests/test_helion_nvfp4_moe.py`, `tests/test_dsv41_moe_shared.py`, `tests/test_dsv41_moe_variants.py` (load model + the variant seam), `tests/test_dsv41_moe_oxide_free.py` (the route under an import guard) |
 
 ### Gate behaviour (fail closed, K5)
 
 `SUFFIX_NVFP4_MOE=1` plus a V4.1 NVFP4 layer: `eligibility()` (parallel contract, scale layout,
-gscale_shared, no EPLB/all2all/shared-overlap) then `dsv41_moe.refuse()`. Any failure raises
+gscale_shared, no EPLB/all2all/shared-overlap) then `dsv41_moe.refuse()` then
+`dsv41_moe.backend_refusal()`. Any failure raises
 `[suffix nvfp4-moe] DeepSeek-V4 NVFP4 MoE layer <name> cannot run on the SUFFIX_NVFP4_MOE lane: <why>`
-(naming the supported layouts) instead of quietly staying on vLLM's path. Non-NVFP4 layers (shared
-experts, `mtp.*` MXFP4) are not touched. `SUFFIX_HELION_NVFP4_MOE=oxide` (default) on a clamp layer
-logs why and, with no layer engaged, ends in the existing `NVFP4-MOE NOT ENGAGED` startup error:
-oxide has no clamp, E <= 256 and I % 64 limits, so V4.1 needs `auto` or `helion`; both serve EVERY M
-<= MAX_M on Helion and a missing config is a load error (no oxide fallback exists for this layer).
+(naming the supported layouts, or, for the backend, `SUFFIX_HELION_NVFP4_MOE='oxide': the DeepSeek-V4
+route is oxide-free and runs on Helion only (the oxide kernel cannot serve swiglu clamp 10.0, E=384 >
+256, ...); set SUFFIX_HELION_NVFP4_MOE=helion`) instead of quietly staying on vLLM's path.
+Non-NVFP4 layers (shared experts, `mtp.*` MXFP4) are not touched. V4.1 therefore REQUIRES
+`SUFFIX_HELION_NVFP4_MOE=helion` (the oxide backend cannot serve it, `auto` would import the oxide
+family for a fallback that does not exist): every M <= MAX_M runs on Helion and a missing config is
+a load error. Section 12 is the oxide-free guarantee and its test.
 The layer oracle runs on the real weights at load (ours vs FlashInfer vs f64 spec, zero contract,
 clamp engaged via a x4 activation batch, skewed and hot loads) and refuses on mismatch.
 `arm()` requires cc 12.x. Family 100 is never checked.
@@ -86,9 +89,17 @@ from the bound ConfigSpec at the real shapes; before this the fc1/fc2 row tile c
 the H tile 5120, the ds_mla/fp8_moe timeout pattern in the commit log):
 fc1 rows 16..64, N blocks 1..8 (x16 cols), K bkb 2..8; fc2 rows 16..64, H 16..256, bkb 2..8;
 fc2_combine H 16..128, K 1..16; combine tokens 1..16 x H 16..512; route_quant 16..64 x 16..128 pair
-tiles + 1..8 x 1..64 quant tiles. No grid barriers (deadlock lesson). Rows per expert segment at
-M <= 192 balanced: <= 24 average (table below), so a 16..64 row dot tile covers decode; larger
-segments loop.
+tiles + 1..8 x 1..64 quant tiles. No grid barriers (deadlock lesson). Rows per expert segment
+(re-derived, section 8): an expert gets M / 64 rows on average, ~1-3 per HIT expert and <= ~10 for
+the heaviest of a batch at M = 192 on balanced loads, so a 16-row dot tile is the MMA's M floor and
+mostly padding there (the layer is bandwidth-bound); 16..64 is kept because the skewed tail (~80
+rows on the top expert at M = 192) and the hot case (M rows) loop over 64-row tiles.
+
+Why `fused3` (token-major fc2 + combine, one launch less) is cheap up to M ~ 16: it re-reads an
+expert's w2 once per PAIR instead of once per expert, extra bytes = (local pairs - hit experts) x
+6.6 MB = +0.3 experts at M = 8 (1.8 % of the layer's bytes), +1.3 at M = 16 (4.0 %), +5 at M = 32
+(8.8 %), +17.5 at M = 64 (19 %), from the load table; the tune table's split at M = 8 and the lab's
+fused3 <= 16 overlap come from this, not from rows per expert.
 
 ## 4. Oracle (K3, CPU)
 
@@ -114,14 +125,20 @@ Two entry points, same bodies:
    (`python -m suffix_hybrid.kernels.nvfp4_moe bench`, 30 min cap). The DEV bundle routes that gate
    to `suffix_hybrid.helion_kernels.nvfp4_moe_tune.gate()` (handoff to main: the routing lives in
    the lab bundle, not in this repo). Call it repeatedly: the first call starts ONE detached tuner
-   (quick, then full effort) over all 34 jobs (EP8; `NVFP4_MOE_TP8_NOEP=1` adds the other 34); later calls print progress and the new
+   (quick, then full effort) over the 34 routed jobs (EP8; `NVFP4_MOE_TP8_NOEP=1` adds the other
+   34) + 19 fused-shared jobs (+ 8 per kernel of a dot_scaled variant when lane I's module is in
+   the build); it searches on BALANCED routing (the load is ~1-3 rows per hit expert, section 8)
+   and gates / scores on balanced, skewed and hot; later calls print progress and the new
    configs (paged); when a pass is done the same call runs the cold-L2 e2e bench: FlashInfer
-   CUTLASS vs the Helion plans on the tuned configs, balanced AND skewed, for M in
-   1/6/8/16/32/64/128/192, and prints per layout the **WINNER TABLE** (per M and distribution:
-   helion/flashinfer ratio, WIN/LOSS) and the line `SUFFIX_NVFP4_MOE_MAX_M=<n>`: the largest M
-   with an unbroken win from the bottom (M above it delegates to FlashInfer, "ships only where it
-   wins"). Configs: `<ROOT>/configs/<kernel>/<platform>.json`, copy into
-   `suffix_hybrid/configs/helion/` only for a winning layout.
+   CUTLASS vs the Helion plans under EVERY body variant on the tuned configs, balanced AND skewed,
+   for M in 1/6/8/16/32/64/128/192, and prints per layout the **VARIANT TABLE** (per bucket every
+   variant's worst-dist time, the pick, WIN/LOSS vs FlashInfer; dequant keeps ties within 1 %) and
+   the **WINNER TABLE** (per M and distribution: helion/flashinfer ratio, WIN/LOSS) with the line
+   `SUFFIX_NVFP4_MOE_MAX_M=<n>`: the largest M with an unbroken win from the bottom (M above it
+   delegates to FlashInfer, "ships only where it wins"). The picked non-default bodies are written
+   as `<ROOT>/configs/dsv41_moe_variant/<platform>.json` (section 11). Configs:
+   `<ROOT>/configs/<kernel>/<platform>.json`, copy into `suffix_hybrid/configs/helion/` only for a
+   winning layout.
 2. **Autotune job** with the two-line shim (`from suffix_hybrid.helion_kernels.nvfp4_moe import
    KERNELS`): `cases(model)` derives the EP8 rank (and with `NVFP4_MOE_TP8_NOEP=1` the no-EP rank) from a `DeepseekV41ForCausalLM` model dict with
    `experts` 384, `topk` 6, `moe_intermediate` per rank (I x tp = global), `quant_format` nvfp4.
@@ -235,7 +252,7 @@ as the cause, so the design removes both classes of hazard instead of trusting H
    carried state, not baked host values (the AST audit covers those).
 
 **Fail closed.** `SUFFIX_DSV41_MOE_FUSE_SHARED=1` needs `SUFFIX_NVFP4_MOE=1` and
-`SUFFIX_HELION_NVFP4_MOE=auto|helion`; every V4 NVFP4 routed layer must fuse (gated / latent /
+`SUFFIX_HELION_NVFP4_MOE=helion`; every V4 NVFP4 routed layer must fuse (gated / latent /
 sequence-parallel / dp / reduced-output / rsf != 1 / other linear kernel / limit mismatch /
 unswizzled scales are named); a missing tuned config for any served M names every (bucket, plan,
 kernel); a failed layer oracle (vs the f64 spec 8e-3, shared partial alone 4e-3, vs vLLM's module
@@ -258,29 +275,87 @@ output, ours has unwritten rows (off-rank pairs, the trash row/slot) that differ
 
 ## 8. Expected effect (ESTIMATES, derivation shown)
 
-Weight bytes per expert = 3 x 2304 x 5120 x (1/2 + 1/16) = 19.9 MB. Balanced routing, distinct local
-experts hit d(M) = 48 x (1 - (63/64)^M); time at the PRO 6000 DRAM peak 1.79 TB/s:
+**Expert load of an EP8 rank (corrected 2026-10-19: the first version of the rows column was 8x too
+high, M x 6 / 48 instead of M x 6 / 384).** EP8 with allgather dispatch gives every rank all M
+tokens; each token picks 6 of the 384 experts, so a given expert receives M x 6 / 384 = M / 64 rows
+on average, a rank holds 48 x M / 64 = 0.75 M pairs (1/8 of the 6 M, not all of them) and hits
+d(M) = 48 x (1 - (63/64)^M) distinct experts (the d column and the floors were right all along:
+they never used the rows). Bytes per expert = 3 x 2304 x 5120 x (1/2 + 1/16) = 19.9 MB; floor at the
+PRO 6000 DRAM peak of 1.79 TB/s. `python -m suffix_hybrid.kernels.nvfp4_moe load` prints both tables
+(`nvfp4_moe.expected_load`, `load_stats`, `simulated_load`; `tests/test_dsv41_moe_variants.py`
+pins the first table to the code and a Monte Carlo of the lane's router to the formula):
 
-| M | d | MB read | floor us/layer | avg rows/expert |
-|---|---|---|---|---|
-| 1 | 0.8 | 15 | 8 | 0.1 |
-| 6 | 4.3 | 86 | 48 | 0.75 |
-| 8 | 5.7 | 113 | 63 | 1.0 |
-| 16 | 10.7 | 213 | 119 | 2.0 |
-| 32 | 19.0 | 378 | 211 | 4.0 |
-| 64 | 30.5 | 607 | 339 | 8.0 |
-| 128 | 41.6 | 828 | 463 | 16 |
-| 192 | 45.7 | 909 | 508 | 24 |
+| M | rows/expert (all 48) | hit experts d | rows per hit expert | local pairs | MB read | floor us/layer |
+|---|---|---|---|---|---|---|
+| 1 | 0.016 | 0.8 | 1.00 | 0.8 | 15 | 8 |
+| 6 | 0.094 | 4.3 | 1.04 | 4.5 | 86 | 48 |
+| 8 | 0.125 | 5.7 | 1.06 | 6.0 | 113 | 63 |
+| 16 | 0.250 | 10.7 | 1.12 | 12.0 | 213 | 119 |
+| 32 | 0.500 | 19.0 | 1.26 | 24.0 | 378 | 211 |
+| 64 | 1.000 | 30.5 | 1.57 | 48.0 | 607 | 339 |
+| 128 | 2.000 | 41.6 | 2.31 | 96.0 | 828 | 463 |
+| 192 | 3.000 | 45.7 | 3.15 | 144.0 | 909 | 508 |
 
-x 40 layers: 8.4 ms/step at M = 32, 20 ms at M = 192 as a hard floor for routed-expert weight
-streaming alone. The nvfp4_moe module doc measured FlashInfer at about 58 % of the DRAM peak and
-the oxide lane at 47 % at mid M on qwen/gemma/GLM (not V4.1); at 58 % the M = 32 layer is about
-360 us. A kernel that is 10 % faster than that saves about 0.8 ms of the 8.4 ms step. Where the
-Helion lane can win is small M (fewer launches: 3-4 vs FlashInfer's chain) and a clamp epilogue
-without a separate pass; where it can lose is mid/high M: the Helion bodies dequantize every weight
-tile in ALU (about 6 ops/element, ~10 Gops per layer at M = 192, ~0.2 ms at 45 Tops/s, same order as the
-DRAM floor) and re-dequantize per row tile. The winner table decides; no gain is claimed.
-Skewed loads hit fewer experts (less DRAM traffic) but longer row loops.
+| M | dist | hit experts / rank | rows per hit expert | heaviest expert of a batch (max over ranks) | heaviest ever seen |
+|---|---|---|---|---|---|
+| 1 | balanced | 0.8 | 1.00 | 1.0 | 1 |
+| 1 | skewed | 0.8 | 1.00 | 1.0 | 1 |
+| 1 | hot | 0.8 | 1.00 | 1.0 | 1 |
+| 6 | balanced | 4.3 | 1.04 | 1.8 | 3 |
+| 6 | skewed | 3.8 | 1.18 | 3.1 | 5 |
+| 6 | hot | 3.8 | 1.20 | 6.0 | 6 |
+| 8 | balanced | 5.7 | 1.05 | 2.0 | 4 |
+| 8 | skewed | 5.0 | 1.20 | 3.6 | 6 |
+| 8 | hot | 4.9 | 1.22 | 8.0 | 8 |
+| 16 | balanced | 10.7 | 1.12 | 2.7 | 4 |
+| 16 | skewed | 8.5 | 1.41 | 6.8 | 11 |
+| 16 | hot | 9.3 | 1.30 | 16.0 | 16 |
+| 32 | balanced | 19.1 | 1.26 | 3.6 | 5 |
+| 32 | skewed | 14.5 | 1.66 | 13.2 | 20 |
+| 32 | hot | 16.6 | 1.44 | 32.0 | 32 |
+| 64 | balanced | 30.5 | 1.58 | 4.9 | 6 |
+| 64 | skewed | 22.5 | 2.13 | 26.9 | 34 |
+| 64 | hot | 27.4 | 1.75 | 64.0 | 64 |
+| 128 | balanced | 41.7 | 2.30 | 6.9 | 8 |
+| 128 | skewed | 32.3 | 2.98 | 53.0 | 60 |
+| 128 | hot | 39.2 | 2.45 | 128.0 | 128 |
+| 192 | balanced | 45.8 | 3.15 | 9.0 | 10 |
+| 192 | skewed | 37.9 | 3.80 | 79.1 | 94 |
+| 192 | hot | 44.2 | 3.26 | 192.0 | 192 |
+
+(Second table: `rand_routing` over 32 batches x the 8 EP ranks, the same ids on every rank. The
+heaviest expert of a batch is the max over ranks; "heaviest ever seen" is the single worst expert
+in any batch. Skewed = rank^-0.8 popularity, hot = one expert takes every token.)
+
+What follows from the corrected numbers:
+- **Tiles.** Balanced decode puts 1.0-3.2 rows on a hit expert and at most ~9-10 on the heaviest
+  (M = 192): every segment fits one 16-row MMA tile, 80 % or more of which is padding. The row-tile
+  bound stays 16..64 (16 is the dot's M floor); only skewed (~80 rows) and hot (M rows) loop.
+  Nothing in the kernels' constants depended on the wrong column (grep: no code used it); the
+  lab's SEARCH distribution did rest on "skewed covers both singleton and heavy segments" and is
+  now BALANCED (skewed still gates and scores), so the rare 80-row tail does not steer the row
+  tile of the typical 1-3 row workload.
+- **Floors.** Unchanged (they use d(M), not rows): x 40 layers, 8.4 ms/step at M = 32 and 20 ms
+  at M = 192 as a hard floor for routed-expert weight streaming alone.
+- **Arithmetic intensity.** At 3 rows per expert the layer does 2 x 3 x 35.4 M = 212 Mflop per
+  19.9 MB = ~11 flop/B, one to two orders of magnitude below the ridge of a bf16 MMA (~280 flop/B
+  at an ASSUMED ~500 TFLOP/s over 1.79 TB/s; FP4 MMA higher still): decode is bandwidth-bound at
+  EVERY bucket on balanced loads. A compute-bound expert
+  needs hundreds of rows: the skewed/hot tail, or prefill-sized M (>= 128 rows per expert avg at
+  M ~ 8k), which this lane does not serve (M > SUFFIX_NVFP4_MOE_MAX_M, cap 256, goes to vLLM).
+- **What can still make the dequant bodies lose.** ALU: dequantizing costs ~6 ops per element, 12
+  per weight byte, against ~25 ops/B the SMs can issue at the DRAM peak (188 SMs x 128 lanes x
+  1.9 GHz = 45.7 Tops/s over 1.79 TB/s): ~47 % of the issue budget, a co-bottleneck once enough
+  experts are hit to saturate DRAM (tens of them, M >= ~32; a hypothesis, not a measurement). A hardware block-scaled MMA (`dot_scaled`, lane I) removes exactly that work,
+  so it can win in the bandwidth-bound buckets too; the lab decides per bucket (section 11).
+
+x 40 layers, as above. The nvfp4_moe module doc measured FlashInfer at about 58 % of the DRAM
+peak and the oxide lane at 47 % at mid M on qwen/gemma/GLM (not V4.1); at 58 % the M = 32 layer is
+about 360 us. A kernel that is 10 % faster than that saves about 0.8 ms of the 8.4 ms step. Where
+the Helion lane can win is small M (fewer launches: 3-4 vs FlashInfer's chain) and a clamp
+epilogue without a separate pass; where it can lose is mid/high M (ALU, above). Dequant happens once
+per hit expert on balanced loads (one row tile); only skewed / hot segments re-dequantize per
+row tile. The winner table decides; no gain is claimed.
 
 **Shared-expert fusion (ESTIMATE, not measured).** Stock runs ~6 small launches per layer on the
 aux stream (act quant, mm_mxfp8, clamp-silu-mul, act quant, mm_mxfp8, plus the runner's add and
@@ -301,7 +376,11 @@ shared expert hides behind the routed experts on the aux stream anyway. K4 decid
 4. CUDA-graph capture of the Helion plan at every served M (warm-up compiles all buckets first).
 5. Triton e4m3/e2m1 cast rounding vs torch (CPU proof used torch for both sides).
 6. DSpark/MTP experts are MXFP4 and stay on vLLM's path; hidden-state dtype must be bf16 at the call.
-7. Fused shared expert: the layer oracle against vLLM's module (the first call of the real MXFP8
+7. Body variants: lane I's module must honour the seam (`check_variant` refuses otherwise), its
+   kernels tuned on the same cases, and a bucket's selection row needs every kernel of its plan.
+8. Oxide-free: a V4.1 pod boots with `SUFFIX_HELION_NVFP4_MOE=helion`; any other value is a named
+   startup error. The route imports no oxide module (tested on CPU under an import guard).
+9. Fused shared expert: the layer oracle against vLLM's module (the first call of the real MXFP8
    kernels at load), the K4 ceiling (default 8 until measured), a Triton compile of the 3 fused
    bodies at the real shapes, `tensor_descriptor` indexing in a tuned config under capture, and
    lane D (`SuffixMxfp8LinearKernel` on the shared linears is accepted; its first-forward check
@@ -312,12 +391,127 @@ shared expert hides behind the routed experts on the aux stream anyway. K4 decid
 | name | default | meaning |
 |---|---|---|
 | `SUFFIX_NVFP4_MOE` | off | the lane (required) |
-| `SUFFIX_HELION_NVFP4_MOE` | oxide | V4.1 needs `auto` or `helion` (oxide cannot run clamp / E 384) |
+| `SUFFIX_HELION_NVFP4_MOE` | oxide | V4.1 requires `helion` (oxide / auto refused: the route is oxide-free); `helion` also skips arm()'s oxide import and cubin checks |
 | `SUFFIX_NVFP4_MOE_MAX_M` | 32 | set to the winner table's value (<= 192 for the verify batch, <= 256 cap) |
 | `SUFFIX_NVFP4_MOE_TUNE` | table | plan per M (fused3 <= 8, front4 above); lab-only effect on Helion layers: plan choice |
-| `NVFP4_MOE_TUNE_DIR`, `NVFP4_MOE_TUNE_DIST` | /tmp/nvfp4_moe_tune, skewed | in-lab tuner state dir; distribution the search runs on |
+| `NVFP4_MOE_TUNE_DIR`, `NVFP4_MOE_TUNE_DIST` | /tmp/nvfp4_moe_tune, balanced | in-lab tuner state dir; distribution the search runs on (gating / scoring always cover balanced, skewed, hot) |
 | `NVFP4_MOE_TP8_NOEP` | off | `1` adds the no-EP TP8 rank (I 288) to the lab cases |
 | `SUFFIX_DSV41_MOE_FUSE_SHARED` | off | `1` fuses the shared expert into the Helion plan (section 7); needs `SUFFIX_NVFP4_MOE=1` + a Helion backend; fail closed |
 | `SUFFIX_DSV41_MOE_FUSE_SHARED_MAX_M` | 8 | largest fused M (1..192, <= the lane's MAX_M); K4 `bench` recommends it |
 | `SUFFIX_DSV41_MOE_FUSE_SHARED_POLE_TOL` | 1.05 | boot long-pole guard: fused slower than this x (routed-only + vLLM shared MLP) at M=1 or the ceiling = startup error |
 | `DSV41_MOE_GATE_MS` | 1,2,6,7,13,48,96,192 | M set of the `moe_capture_replay` gate (comma list) |
+
+## 11. Body variants per M bucket: the seam to lane I's dot_scaled bodies
+
+**Premise corrected (2026-10-19):** the brief's "Triton 3.8 has no native FP4 MMA on sm_120" is
+false. Triton >= 3.6.0 lowers `tl.dot_scaled` (e2m1 x e2m1, e4m3 block-16 scales) to `mma.sync ...
+kind::mxf4nvf4.block_scale` on SM120 and Helion's `hl.dot_scaled` emits it (Triton PR #8494,
+MMAv2.cpp at v3.6.0 / 3.7.1 / 3.8.0). Lane I (worktree `vllm-suffix-hybrid-dsv41-fp4`, new files only:
+`helion_kernels/dsv41_moe_fp4mma.py`) builds those bodies. The dequant-to-bf16 bodies of this lane
+stay (they are the bandwidth-bound choice and the baseline); which body serves a bucket is DATA.
+
+**Selection = a row in the config table.** The pseudo-kernel `dsv41_moe_variant` (constant
+`nvfp4_moe.VARIANT_KERNEL`) has rows keyed exactly like every other kernel of the lane (the
+`lane_case` dict, `numtokens` = the bucket, `limit`, `experts_global`, ...):
+
+```json
+configs/helion/dsv41_moe_variant/<platform>.json
+[{"key": {"act": "silu", "experts": 48, "experts_global": 384, "hidden": 5120, "limit": 10.0,
+          "moe_intermediate": 2304, "numtokens": 64, "topk": 6},
+  "config": {"body": "dot_scaled"}}]
+```
+
+No row = `dequant`. `body` is `dequant` or `dot_scaled`; anything else, or a row without `body`, is a
+startup error. Serving only reads the table: `served_ms` resolves the variant of every M <=
+`SUFFIX_NVFP4_MOE_MAX_M`, then demands a shipped config for EVERY kernel of that variant's plan at
+that bucket (a gap is a startup error naming `M<=64 front4/dot_scaled: <kernels>`), and
+`serving_op` runs `variant_module(body).run_plan` for the call's bucket. A variant is selected per
+BUCKET and as a WHOLE PLAN, never per stage: a dot_scaled plan hands packed e2m1 + e4m3 block scales
+between stages, this lane's plans hand bf16-dequantized NVFP4, so the stages are not interchangeable.
+The fused shared expert (section 7) lives in the dequant bodies: a bucket <= its ceiling that selects
+another body is a startup error naming both knobs.
+
+**What the lab does.** `nvfp4_moe_tune.todo()` tunes the dot_scaled kernels on the same buckets
+(`variant_kernels()`); the gate's e2e bench times FlashInfer and EVERY variant at the table plan,
+balanced and skewed, cold L2 (`_bench_helion`), picks per bucket the variant with the lowest
+worst-dist time (dequant keeps ties within 1 %: `pick_variants`), prints the VARIANT TABLE and the
+WINNER TABLE (vs FlashInfer) over the picked bodies, and writes the non-default picks as the rows
+above (`write_variant_rows`: a bucket where dequant wins again loses its row). Shipping = copy the
+variant kernels' configs and this file into `suffix_hybrid/configs/helion/`.
+
+**What lane I must export** (`suffix_hybrid/helion_kernels/dsv41_moe_fp4mma.py`; `check_variant`
+refuses the module at the first use with the exact violation):
+
+| name | contract |
+|---|---|
+| `VARIANT = "dot_scaled"` | the key of `nvfp4_moe.VARIANT_MODULES` |
+| `PLANS` | `{"front4": (names...), "fused3": (names...)}` (a subset is fine, but the tune table assigns the plan by M: fused3 for M <= 8, front4 above, so a bucket whose plan the variant lacks fails closed); kernel names are the config-table / lab names, prefix `dsv41_moe_`; a name that is also a dequant body (e.g. `nvfp4_moe_combine`, whose interface is unchanged: y f32 + ids -> out) is served by that body and ITS tuned config |
+| `BODIES` | `{name: undecorated module-level Helion body}` for every new name |
+| `run_plan(kerns, plan, x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, out, a1_gscale, a2_gscale, act, id_base, limit=None) -> out` | same arguments as `nvfp4_moe.run_plan`; `kerns` are the compiled kernels of `PLANS[plan]` in order; `limit` is the swiglu clamp as a float (None = no clamp); `act` is 0 (silu) |
+| `KERNELS` | lab ABI list (`api/autotune_kernels.py`): `name body cases make reference check baseline`; `cases(model)` must return the SAME case dicts as `nvfp4_moe.cases(model, "nvfp4_moe_fc1")` for the buckets the kernel serves (so rows and selection share keys); names must not collide with a dequant kernel; baselines may be the dequant stage or FlashInfer |
+
+*Layout assumptions (identical to the dequant bodies; vLLM FlashInfer CUTLASS after weight
+processing):* `w13` uint8 `[E_local, 2I, H/2]` rows `[up; gate]`, low nibble = even element;
+`w13_sf` float8_e4m3fn, block 16 along K, 128x4-swizzled PER EXPERT, flat index
+`e * estride + (r // 128) * (cp // 4) * 512 + (r % 32) * 16 + ((r // 32) % 4) * 4 + (kb // 4) * 512
++ kb % 4` with `cp = round_up(K/16, 4)`, `estride = round_up(rows, 128) * cp` (scale of row `r`,
+K block `kb`); `w2` uint8 `[E_local, H, I/2]` and `w2_sf` the same way; `g1`, `g2` float32
+`[E_local]` per-expert alphas (they fold 1/(g_w * g_a)); `a1_gscale`, `a2_gscale` scalar activation
+global scales (x and h are requantized with them: `sf = e4m3(amax16 * g / 6)`, `q = e2m1_rne(x * g /
+sf)`, f64-spec in `nvfp4_moe.quant_codes`); `topk_ids` GLOBAL expert ids int32 (-1 = padding), local
+experts are `[id_base, id_base + E_local)` and everything else is off-rank (exact zeros);
+`topk_w` float32 with the 1.5 routed scaling already folded in; `out` bf16 `[M, H]`.
+
+*Clamp:* after the per-expert alpha, `gate = min(alpha * acc_gate, L)`, `up = clamp(alpha * acc_up,
+-L, L)`, `h = silu(gate) * up`, then the a2 requantization, exactly `nvfp4_moe.clamp_ref` /
+`fc1_ref` (gate clamped from above only; tests pin the edge table).
+
+*Output contract:* bf16 `[M, H]` = sum over the token's local experts of `tw * E_k(x)`, k ascending,
+exact zeros for a token with no local expert; deterministic; STATELESS (no tickets, atomics, grid
+barriers; scratch only from torch's allocator inside the bodies) so it is capture-safe like the dequant
+plan (section 7 rules). Numerics may differ from the dequant plan in accumulation order, not in
+quantization: the bound is the lane's (`REF_TOL` 8e-3 end to end vs the f64 spec, stage checks as
+for the dequant bodies), not bitwise equality with it.
+
+*Search spaces:* literal `register_block_size(min, max)` bounds (powers of two), tested like the
+dequant bodies (`BOUNDS`); the autotune accuracy check must compare only the rows a consumer reads
+(`nvfp4_moe.autotune_check` is the model: unwritten rows of off-rank pairs differ between configs).
+
+*Where it can win, from section 8:* not at "compute-bound decode" (decode is ~1-3 rows per hit
+expert) but where the dequant ALU work binds (many hit experts, M >= ~32) and on the heavy tail;
+the per-bucket selection exists because that is a measurement, not a rule. M above
+`SUFFIX_NVFP4_MOE_MAX_M` (cap 256) never reaches either body (vLLM's FlashInfer path); a prefill-sized
+compute-bound regime would need, beyond a body: a routing kernel that is not O(P^2), a larger cap,
+and warming by Triton specialization class instead of every M. That is a decision for main, not
+something the selection table can express.
+
+## 12. Oxide-free (owner direction): nothing on the V4.1 route imports `_native` or oxide
+
+`SUFFIX_HELION_NVFP4_MOE=helion` (without `SUFFIX_FP8_MOE`) is the oxide-free route
+(`nvfp4_moe.oxide_free_route()`): `arm()` imports neither `suffix_hybrid.oxide_kernels` nor
+`suffix_hybrid._native`, checks no manifest or cubin, `_make_layer_cls(None)` closes over no native
+module, the layer prepare loads no cubin and allocates no oxide workspace (`NO_WS`), the Helion op is
+the only op (`run_ours(None, ...)` raises a named error if a layer was never prepared), the
+standalone oracle/bench take `native` lazily and never for the Helion-only cases (the CLI modes
+`python -m suffix_hybrid.kernels.nvfp4_moe oracle_v41|bench_v41` run only the V4.1 cases; plain
+`oracle|bench` go on to the gemma/GLM/qwen cases, which do need the oxide family; the lab gate
+names `nvfp4_moe_oracle|bench` in sitecustomize.py map to the plain modes), and the K4 bench of the
+fused shared expert times the routed-only arm on the same Helion op. `oxide` and `auto` are
+refused for V4 geometry at the first layer with the message of section 2.
+
+Tested on CPU (`tests/test_dsv41_moe_oxide_free.py`): an import guard that raises on
+`suffix_hybrid.oxide_kernels` and `suffix_hybrid._native` (and fails the test if a swallowed
+`ImportError` hides an attempt) wraps the WHOLE route end to end: `arm()`, the layer class, the
+weight-processing hook (eligibility, V4 gate, served-M table, the layer oracle and its Helion
+warm-up), the fused shared expert (`prepare_layer`: layer oracle, capture-replay, long-pole gate,
+runner detach) and `forward_modular` at fused / split / vLLM-path M; vLLM is faked, the kernels are
+the real Helion bodies. A source-level test pins the only functions that may import the oxide
+family (`arm` behind `not oxide_free`, `_sfx_prepare` behind `hb != "helion" and not gap`,
+`_native_ready`, and the two oxide lab baselines): a new import elsewhere fails it.
+
+Outside this lane's files (handoffs): a V4.1 preset must set `SUFFIX_NVFP4_MOE=1` and
+`SUFFIX_HELION_NVFP4_MOE=helion` (today's `dsv41-sm120` preset sets neither) and must leave
+`SUFFIX_OXIDE_PROBE` unset (sitecustomize.py runs `python -m suffix_hybrid.oxide_kernels` for it);
+the plugin core's suffix-decoding proposer (`wrap.py`, `wrap_v2.py`, `hybrid_proposer.py`) imports
+`suffix_hybrid._native` when ITS knobs are on, which is not this route's business but is where a pod
+that must not load `_native` at all needs a check.

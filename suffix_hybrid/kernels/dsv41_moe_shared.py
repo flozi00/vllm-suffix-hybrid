@@ -5,8 +5,8 @@ oracle, the boot capture-replay gate and the K4 bench. Kernels:
 suffix_hybrid/helion_kernels/dsv41_moe_shared.py (design, math, long-pole argument).
 
 Knobs (default OFF = the previous plugin, byte for byte):
-  SUFFIX_DSV41_MOE_FUSE_SHARED=1          needs SUFFIX_NVFP4_MOE=1 and a Helion backend
-      (SUFFIX_HELION_NVFP4_MOE=auto|helion). Fail closed: every V4 NVFP4 routed layer whose
+  SUFFIX_DSV41_MOE_FUSE_SHARED=1          needs SUFFIX_NVFP4_MOE=1 and
+      SUFFIX_HELION_NVFP4_MOE=helion (the oxide-free route). Fail closed: every V4 NVFP4 routed layer whose
       shared expert cannot be fused, a missing tuned config for a served M, a failed layer
       oracle or capture-replay gate is a STARTUP ERROR naming the reason.
   SUFFIX_DSV41_MOE_FUSE_SHARED_POLE_TOL=<x>  boot guard against the long pole (default 1.05): the
@@ -120,9 +120,10 @@ def check_env(gate_on: bool, helion_backend: str) -> None:
         return
     if not gate_on:
         raise RuntimeError(f"{MARKER} {KNOB}=1 needs SUFFIX_NVFP4_MOE=1")
-    if helion_backend == "oxide":
-        raise RuntimeError(f"{MARKER} {KNOB}=1 needs SUFFIX_HELION_NVFP4_MOE=auto|helion "
-                           "(the fused plan is Helion only)")
+    if helion_backend != "helion":
+        raise RuntimeError(f"{MARKER} {KNOB}=1 needs SUFFIX_HELION_NVFP4_MOE=helion (the fused "
+                           f"plan is Helion only and the DeepSeek-V4 route is oxide-free; got "
+                           f"{helion_backend!r})")
 
 
 # ---------------------------------------------------------------------------
@@ -558,21 +559,24 @@ def long_pole_gate(state, cfg, routed, make, dev, *, timer=None, iters: int = 30
 
 def install_runner_hook(layer_cls) -> None:
     """MoERunner.__init__ post-hook: our routed layer keeps a weak reference to its runner
-    (the shared MLP and the final add live there). Refuses on drift of the pinned anchors."""
+    (the shared MLP and the final add live there). Refuses on drift of the pinned anchors.
+    Idempotent (a second call finds the wrapper and returns)."""
+    import functools
     import weakref
     try:
         from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
     except ImportError as exc:
         raise RuntimeError(f"{MARKER} {KNOB}=1: this vLLM has no MoERunner ({exc})") from exc
-    params = set(inspect.signature(MoERunner.__init__).parameters)
+    orig = MoERunner.__init__
+    if getattr(orig, "_sfx_hooked", False):
+        return
+    params = set(inspect.signature(orig).parameters)
     need = {"routed_experts", "shared_experts", "routed_scaling_factor", "shared_expert_gate"}
     if not need <= params or not callable(getattr(MoERunner, "_select_forward", None)):
         raise RuntimeError(f"{MARKER} {KNOB}=1: MoERunner drifted from vLLM 39983a5e7 "
                            f"(__init__ lacks {sorted(need - params)} or _select_forward is gone)")
-    orig = MoERunner.__init__
-    if getattr(orig, "_sfx_hooked", False):
-        return
 
+    @functools.wraps(orig)
     def init(self, *a, **kw):
         orig(self, *a, **kw)
         layer = getattr(self, "routed_experts", None)
@@ -735,17 +739,15 @@ def _arms(dev, ms):
     capture (like vLLM's SharedExperts)."""
     import torch
     from suffix_hybrid.kernels import nvfp4_moe as nm
-    native = nm._native_ready()
-    case, p, sp, sh = _synthetic(dev)
+    case, p, sp, sh = _synthetic(dev)  # V4.1 is oxide-free: no `_native`, no cubin, no workspace
     e_global, hdim, idim, topk = case[:4]
     base, local = p["id_base"], e_global // case[5]
     plan = _plan(case, ms)
-    ws = nm.workspace(dev, max(ms), topk, hdim, idim, local)
     stock = stock_shared(sp)
     aux, ev_in, ev_out = torch.cuda.Stream(dev), torch.cuda.Event(), torch.cuda.Event()
 
     def routed(x, ids, tw, s):
-        return nm.run_ours(native, p, x, ids, tw, ws, s.cuda_stream)
+        return nm.run_ours(None, p, x, ids, tw, nm.NO_WS, s.cuda_stream)
 
     def fused(x, ids, tw, s):
         return plan(x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"], p["g2"],

@@ -114,9 +114,9 @@ def test_served_ms_knob(monkeypatch):
     args = (256, 6144, 256, 8, 0, 12, mode_for)
     assert hm.served_ms("oxide", *args) == {}
     auto = hm.served_ms("auto", *args)
-    assert auto[1] == (1, "fused3") and auto[12] == (12, "front4")
+    assert auto[1] == (1, "fused3", "dequant") and auto[12] == (12, "front4", "dequant")
     assert not set(auto) & {7, 8}  # front4 bucket 8 lacks fc2 -> oxide there
-    with pytest.raises(RuntimeError, match="M<=8 front4: nvfp4_moe_fc2"):
+    with pytest.raises(RuntimeError, match="M<=8 front4/dequant: nvfp4_moe_fc2"):
         hm.served_ms("helion", *args)
     _fake_tables(monkeypatch, every)
     assert sorted(hm.served_ms("helion", *args)) == list(range(1, 13))
