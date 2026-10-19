@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from typing import Callable
+from typing import NamedTuple
+from typing_extensions import TypeVar
+
+import torch
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
+
+from .. import exc
+from .._compiler.ast_extension import expr_from_string
+from . import _decorators
+
+if TYPE_CHECKING:
+    import ast
+
+    from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.type_info import TypeInfo
+    from .._compiler.variable_origin import Origin
+
+    _T = TypeVar("_T")
+
+
+class ConstExpr(NamedTuple):
+    """
+    Typically used as a type annotation for kernels:
+
+    .. code-block:: python
+
+        @helion.kernel()
+        def fn(v: hl.constexpr, ...):
+            ...
+
+    Can also be used when calling a kernel:
+
+    .. code-block:: python
+
+        some_kernel(..., hl.constexpr(5.0))
+
+    Causes the generated code to specialize on the value of `v`, where a different
+    kernel, hardcoding the value of v, will be generated every time `v` changes.
+
+    See Also:
+        - :func:`specialize`: Convert dynamic shapes to compile-time constants
+    """
+
+    value: object
+
+    def __index__(self) -> int:
+        if isinstance(self.value, int):
+            return self.value
+        raise TypeError(f"ConstExpr cannot be indexed: {self.value}")
+
+    def __bool__(self) -> bool:
+        return bool(self.value)
+
+
+@_decorators.device_func_replacement(ConstExpr)
+def _constexpr_on_device(value: _T) -> _T:
+    """``hl.constexpr(value)`` called inside a device loop is ``value`` itself,
+    as type propagation sees it (``TypeInfo.from_example``).  The NamedTuple
+    wrapper would compare as a tuple (``hl.constexpr(k) == 0`` always False)
+    and coerce its value with bool() (``not hl.constexpr(k)`` guarded on the
+    first call's ``k``)."""
+    return value
+
+
+class ProcessGroupName(ConstExpr):
+    """
+    Used in type annotation to specify the argument as process group name.
+    Autotuning for distributed kernels will use this process group name
+    to run collectives to sync across ranks.
+    """
+
+
+@_decorators.api(is_device_only=False)
+def specialize(value: _T) -> _T:
+    """
+    Turn dynamic tensor sizes or strides into compile-time constants. Examples::
+
+           channels = hl.specialize(tensor.size(1))
+           height, width = hl.specialize(tensor.shape[-2:])
+           row_stride = hl.specialize(tensor.stride(0))
+
+    Args:
+        value: The symbolic value or sequence of symbolic values to specialize on.
+
+    Returns:
+        A Python int or a sequence containing only Python ints.
+
+    See Also:
+        - :class:`ConstExpr`: Create compile-time constants for kernel parameters
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(specialize)
+def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.compile_environment import _symint_free_symbols
+
+    if origin.is_device():
+        raise exc.SpecializeOnDevice
+
+    proxy = value.proxy()
+    env = CompileEnvironment.current()
+
+    def handle_symint(symint: torch.SymInt) -> int:
+        syms = _symint_free_symbols(symint)
+        env.specialized_vars.update(syms)
+        # Track stride specializations
+        for sym in syms:
+            for source in env.shape_env.var_to_sources.get(sym, []):
+                if (
+                    isinstance(source, TensorPropertySource)
+                    and source.prop == TensorProperty.STRIDE
+                    and source.idx is not None
+                ):
+                    env.specialized_strides.add(source)
+        return symint.__int__()
+
+    _convert_specializable(proxy, on_symint=handle_symint)
+    return value
+
+
+@_decorators.register_fake(specialize)
+def _(value: _T) -> _T:
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.compile_environment import _symint_free_symbols
+
+    env = CompileEnvironment.current()
+
+    def handle_symint(symint: torch.SymInt) -> torch.SymInt:
+        syms = _symint_free_symbols(symint)
+        env.specialized_vars.update(syms)
+        for sym in syms:
+            for source in env.shape_env.var_to_sources.get(sym, []):
+                if (
+                    isinstance(source, TensorPropertySource)
+                    and source.prop == TensorProperty.STRIDE
+                    and source.idx is not None
+                ):
+                    env.specialized_strides.add(source)
+        return symint
+
+    return _convert_specializable(value, on_symint=handle_symint)
+
+
+@_decorators.codegen(specialize, "common")
+def _(state: CodegenState) -> ast.AST:
+    specialized = _convert_specializable(state.proxy_arg(0))
+    return expr_from_string(repr(specialized))
+
+
+@_decorators.ref(specialize)
+def _(value: _T) -> _T:
+    return _convert_specializable(value)
+
+
+def _convert_specializable(
+    value: _T,
+    *,
+    on_symint: Callable[[torch.SymInt], int | torch.SymInt] = lambda symint: (
+        symint.__int__()
+    ),
+) -> _T:
+    if isinstance(value, torch.SymInt):
+        # pyrefly: ignore [bad-return]
+        return on_symint(value)
+    if isinstance(value, int):
+        # pyrefly: ignore [bad-return]
+        return value
+    if isinstance(value, (torch.Size, tuple, list)):
+        try:
+            return type(value)(
+                [_convert_specializable(x, on_symint=on_symint) for x in value]
+            )
+        except exc.SpecializeArgType:
+            raise exc.SpecializeArgType(value) from None
+    raise exc.SpecializeArgType(value)
