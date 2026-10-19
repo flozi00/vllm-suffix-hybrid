@@ -64,6 +64,9 @@ def _http(code, detail):
 # ---------------------------------------------------------------------------
 # data
 # ---------------------------------------------------------------------------
+OPEN_THINK = "<think>"
+
+
 def encode(tok, ex, template_kwargs=None, chat_template=None):
     """Example -> (ids, mask): mask 1 on the tokens the loss trains."""
     if not isinstance(ex, dict):
@@ -80,11 +83,20 @@ def encode(tok, ex, template_kwargs=None, chat_template=None):
             kw["tools"] = ex["tools"]
         prompt = tok.apply_chat_template(msgs[:-1], add_generation_prompt=True, **kw)
         full = tok.apply_chat_template(msgs, add_generation_prompt=False, **kw)
-        if not full.startswith(prompt):
+        tail = None
+        if full.startswith(prompt):
+            tail = full[len(prompt):]
+        elif prompt.endswith(OPEN_THINK) and full.startswith(prompt[:-len(OPEN_THINK)]):
+            # LFM2-style: the generation prompt opens <think> for the model, a
+            # final assistant message without reasoning renders without it.
+            # Served, the model continues from <think>: the example answers
+            # with an empty reasoning block.
+            tail = "</think>" + full[len(prompt) - len(OPEN_THINK):]
+        if tail is None:
             raise _http(400, "the chat template renders the history differently once the final "
                              "assistant message is appended; cannot split prompt / completion")
         p = tok.encode(prompt, add_special_tokens=False)
-        c = tok.encode(full[len(prompt):], add_special_tokens=False)
+        c = tok.encode(tail, add_special_tokens=False)
     elif isinstance(ex.get("prompt"), str) and isinstance(ex.get("completion"), str):
         p = tok.encode(ex["prompt"])
         c = tok.encode(ex["completion"], add_special_tokens=False)
@@ -362,6 +374,7 @@ class State:
 
         run_id, stage, commit, t0 = uuid.uuid4().hex, "initialization", None, time.monotonic()
         run_dir = self.hub.directory / "runs" / run_id
+        self.status.pop("rejected", None)
         self.status.update(state="training", run_id=run_id, step=0, steps=steps, loss=None)
         try:
             api, parent = await asyncio.to_thread(self.hub.private_repo)
@@ -494,7 +507,17 @@ async def _exclusive(request, run):
         raise _http(400, "body must be a JSON object")
     if _S.running is not None and not _S.running.done():
         raise _http(409, "an SFT run or load is already in progress")
-    _S.running = asyncio.ensure_future(run(body))
+    async def guarded():
+        try:
+            return await run(body)
+        except BaseException as exc:
+            # a run that failed before it set its own state (validation,
+            # tokenization): with wait=false nobody reads this exception
+            if _S.status.get("state") in ("idle", "starting"):
+                _S.status.update(rejected=dict(code=getattr(exc, "status_code", 500),
+                                               error=str(getattr(exc, "detail", exc))))
+            raise
+    _S.running = asyncio.ensure_future(guarded())
     _S.running.add_done_callback(lambda t: t.cancelled() or t.exception())
     if body.get("wait", True) is False:   # long runs vs the gateway's route timeout
         from fastapi.responses import JSONResponse

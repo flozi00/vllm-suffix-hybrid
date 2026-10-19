@@ -1018,3 +1018,45 @@ def test_parity_aligns_served_prompt_logprobs(tmp_path, monkeypatch):
         W.SFT = None
     assert p["delta"] < 1e-3 and p["tok_max"] < 1e-3 and p["tokens"] == sum(mask[1:])
     assert mask[p["tok_max_pos"]] == 1
+
+
+class OpenThinkTok(Tok):
+    """LFM2 template: the generation prompt opens <think>; a final assistant
+    message without reasoning renders as plain content."""
+
+    def apply_chat_template(self, msgs, add_generation_prompt=False, tokenize=False, **kw):
+        s = "".join(f"<{m['role']}>{m['content']}|" for m in msgs)
+        return s + ("<assistant><think>" if add_generation_prompt else "")
+
+
+def test_encode_open_think_template_trains_an_empty_reasoning_block():
+    tok = OpenThinkTok()
+    ids, mask = A.encode(tok, CHATS[0])
+    want_p = tok.encode("<user>q0|<assistant><think>", add_special_tokens=False)
+    want_c = tok.encode("</think>answer 0!|", add_special_tokens=False)
+    assert ids == want_p + want_c and mask == [0] * len(want_p) + [1] * len(want_c)
+
+    class Weird(Tok):       # a template that diverges for any other reason is still refused
+        def apply_chat_template(self, msgs, add_generation_prompt=False, tokenize=False, **kw):
+            return "A" if add_generation_prompt else "B"
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as e:
+        A.encode(Weird(), CHATS[0])
+    assert e.value.status_code == 400
+
+
+def test_wait_false_rejection_is_visible_in_status(tmp_path):
+    s = _state(tmp_path, sft_for(build()))
+    try:
+        async def go():
+            A._S, s.status["state"] = s, "idle"
+            req = SimpleNamespace(json=lambda: _aval({"examples": [], "wait": False}))
+            r = await A.train_route(req)
+            assert r.status_code == 202
+            await asyncio.gather(s.running, return_exceptions=True)
+        asyncio.run(go())
+        assert s.status["state"] == "idle" and s.status["rejected"]["code"] == 400
+        asyncio.run(s.train(dict(examples=CHATS, steps=1)))    # a run that starts clears it
+        assert "rejected" not in s.status
+    finally:
+        W.SFT, A._S = None, None
