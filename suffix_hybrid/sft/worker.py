@@ -219,6 +219,25 @@ class WorkerSFT:
                         nll=[round(x, 4) for x in loss.tolist()])
         return dict(loss_sum=float(loss), tokens=int(tgt.numel()))
 
+    def diag(self, p):
+        """Dev only (SUFFIX_SFT_DIAG=1): per-token NLL of one example under
+        toggled training-forward variants {name: {toggle: value}}."""
+        if os.environ.get("SUFFIX_SFT_DIAG", "").strip() != "1":
+            raise PermissionError("SUFFIX_SFT_DIAG != 1")
+        self._mem_vote()
+        ids, segs, rows, tgt = self._batch(p)
+        live = {id(layer): (lo.A, lo.B, lo.scale) for layer, lo in self.adapters.values()}
+        out = {}
+        try:
+            for name, flags in p["variants"].items():
+                M.DIAG.clear()
+                M.DIAG.update(flags)
+                with M.TrainMode(self, live, segs, grad=False) as tm:
+                    out[name] = [round(x, 4) for x in tm.nll(ids, rows, tgt, per_token=True).tolist()]
+        finally:
+            M.DIAG.clear()
+        return dict(nll=out, tokens=int(tgt.numel()))
+
     def save(self, p):
         """This rank's shard of the run (or the live adapters) as
         <dir>/adapter-tp<r>-of-<n>.safetensors."""
@@ -313,7 +332,7 @@ def shard_name(rank, world):
     return f"adapter-tp{rank}-of-{world}.safetensors"
 
 
-OPS = ("info", "begin", "micro", "step", "eval", "save", "commit", "abort", "load", "reset")
+OPS = ("info", "begin", "micro", "step", "eval", "save", "commit", "abort", "load", "reset", "diag")
 RUN_OPS = ("micro", "step", "commit")    # need the run on EVERY rank
 
 

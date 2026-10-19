@@ -78,6 +78,7 @@ def _heads_per_group(t, h):
     return GDN_HEAD_GROUP or max(1, min(h, GDN_GROUP_BYTES // max(1, t * 8192)))
 
 _TRAIN = None   # the active TrainMode (only ever set inside an RPC)
+DIAG = {}       # dev-only forward toggles (SUFFIX_SFT_DIAG=1 /v1/sft/diag): moe_qdq, moe_ue8m0, conv32, attn32
 
 
 # ---------------------------------------------------------------------------
@@ -583,9 +584,11 @@ class TrainMode(contextlib.ContextDecorator):
                 i = torch.arange(n, device=q.device)
                 d = i[:, None] - i[None, :]
                 mask = (d >= 0) & (d < sw)
+            if DIAG.get("attn32"):
+                qs, ks, vs = qs.float(), ks.float(), vs.float()
             o = F.scaled_dot_product_attention(qs, ks, vs, attn_mask=mask, is_causal=mask is None,
                                                scale=m.impl.scale)
-            out.append(o[0].transpose(0, 1))
+            out.append(o[0].transpose(0, 1).to(q.dtype))
         return torch.cat(out).reshape(t, nh * hdv)
 
     def gdn(self, m, hidden_states):
@@ -633,9 +636,10 @@ class TrainMode(contextlib.ContextDecorator):
         bias = getattr(m.conv, "bias", None)
         out = []
         for s, e in self.segments:
-            y = F.conv1d(bx[s:e].t()[None], w.to(bx.dtype), None if bias is None else bias.detach().to(bx.dtype),
+            dt = torch.float32 if DIAG.get("conv32") else bx.dtype
+            y = F.conv1d(bx[s:e].t()[None].to(dt), w.to(dt), None if bias is None else bias.detach().to(dt),
                          padding=w.shape[-1] - 1, groups=w.shape[0])[..., :e - s]
-            out.append(y[0].t())
+            out.append(y[0].t().to(bx.dtype))
         o, _ = m.out_proj(c * torch.cat(out))
         output[:o.shape[0]].copy_(o)
 
@@ -708,8 +712,11 @@ class TrainMode(contextlib.ContextDecorator):
             handle[id(re_)] = experts_handle(re_)
         # x and the routing weights are replicated but only this rank's
         # experts see them: their grads are partial sums over the TP/EP ranks
+        hd = handle[id(re_)]
+        if DIAG:
+            hd = dict(hd, **{k: DIAG[f"moe_{k}"] for k in ("act_qdq", "ue8m0") if f"moe_{k}" in DIAG})
         out = FrozenExperts.apply(copy_to_tp(x, self.g), copy_to_tp(tw.to(x.dtype), self.g),
-                                  local, handle[id(re_)])
+                                  local, hd)
         full = None
         se = getattr(m, "shared_expert", None)
         if se is not None:

@@ -539,6 +539,18 @@ async def status_route():
     return dict(_S.status, sft=_S.info, repo=_S.hub.repo_id or None)
 
 
+async def diag_route(request):
+    """Dev only (SUFFIX_SFT_DIAG=1): served vs training-forward per-token NLL of
+    one text under forward variants."""
+    body = await request.json()
+    tok = await _S.tokenizer()
+    ids = tok.encode(body["text"], add_special_tokens=False)[:int(body.get("max_tokens", 512))]
+    mask = [0] + [1] * (len(ids) - 1)
+    served = await _S.served_nll(ids, mask)
+    r = await _S.rpc("diag", dict(ids=ids, mask=mask, seg_lens=[len(ids)], variants=body["variants"]))
+    return dict(tokens=len(ids) - 1, served=served, **{k: v for k, v in r.items() if k != "ms"})
+
+
 class SftEndpointPlugin:
     name = "suffix_sft"
     required_tasks = None
@@ -562,6 +574,12 @@ class SftEndpointPlugin:
         app.add_api_route("/v1/sft/train", train, methods=["POST"], name="suffix_sft_train")
         app.add_api_route("/v1/sft/load", load, methods=["POST"], name="suffix_sft_load")
         app.add_api_route("/v1/sft/status", status_route, methods=["GET"], name="suffix_sft_status")
+        if os.environ.get("SUFFIX_SFT_DIAG", "").strip() == "1":
+            async def diag(request):
+                return await diag_route(request)
+            diag.__annotations__ = {"request": Request}
+            app.add_api_route("/v1/sft/diag", diag, methods=["POST"], name="suffix_sft_diag")
+            _log("DEV route: POST /v1/sft/diag")
         _log("routes: POST /v1/sft/train, POST /v1/sft/load, GET /v1/sft/status")
 
     async def init_state(self, engine_client, state, args) -> None:
