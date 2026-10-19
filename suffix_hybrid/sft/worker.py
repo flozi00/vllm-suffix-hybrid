@@ -355,7 +355,7 @@ def rpc(op, payload=None):
         out = getattr(SFT, op)(payload or {})
     except Exception as exc:  # noqa: BLE001 - never raise into the engine
         oom = isinstance(exc, (torch.OutOfMemoryError, MemoryError))
-        if op not in ("info", "eval", "save"):
+        if op not in ("info", "eval", "save", "diag"):
             SFT.abort()
         _log(f"{op} failed: {type(exc).__name__}: {exc}\n{traceback.format_exc(limit=6)}")
         return {"error": f"{type(exc).__name__}: {exc}", "oom": oom}

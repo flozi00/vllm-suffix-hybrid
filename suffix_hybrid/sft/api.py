@@ -64,6 +64,7 @@ def _http(code, detail):
 # ---------------------------------------------------------------------------
 # data
 # ---------------------------------------------------------------------------
+PARITY_SE_CAP = 0.35   # nats a noisy short example may add to the parity limit (a broken twin also inflates SE)
 OPEN_THINK = "<think>"
 
 
@@ -246,6 +247,7 @@ class State:
         self.hub = Hub(cfg)
         self.running = None   # the in-flight run / load task
         self.status = {"state": "starting", "last_run": None, "checkpoint": None}
+        self.started = 0     # runs / loads that passed validation (rejection detection)
         self.info = None
         self.chat_template = None
         # serving renders with --default-chat-template-kwargs; so must training
@@ -378,6 +380,7 @@ class State:
         run_id, stage, commit, t0 = uuid.uuid4().hex, "initialization", None, time.monotonic()
         run_dir = self.hub.directory / "runs" / run_id
         self.status.pop("rejected", None)
+        self.started += 1
         self.status.update(state="training", run_id=run_id, step=0, steps=steps, loss=None)
         try:
             api, parent = await asyncio.to_thread(self.hub.private_repo)
@@ -385,9 +388,10 @@ class State:
             # noise-aware: a numerically sensitive model (LFM2 FP8: per-token NLL moves by
             # ~1 nat between two correct bf16 paths) has a large standard error on a short
             # example; a real forward bug moves the mean by far more than 3 SE
-            if pre["delta"] is not None and pre["delta"] > c.parity_nats + 3 * pre.get("se", 0.0):
+            if pre["delta"] is not None and pre["delta"] > c.parity_nats + min(
+                    3 * pre.get("se", 0.0), PARITY_SE_CAP):
                 raise _http(409, {"message": "training forward diverges from serving; refusing "
-                                             "(SUFFIX_SFT_PARITY_NATS + 3 standard errors)", "parity": pre})
+                                             "(SUFFIX_SFT_PARITY_NATS + up to 3 standard errors)", "parity": pre})
             stage = "training"
             await self.rpc("begin", dict(lr=lr, weight_decay=wd))
             losses, first, checked = [], None, False
@@ -467,7 +471,9 @@ class State:
     async def load(self, run_id):
         if not isinstance(run_id, str) or not run_id or "/" in run_id or ".." in run_id:
             raise _http(400, "run_id: a published run id or 'base'")
-        keep = {k: self.status.get(k) for k in ("state", "run_id", "error")}
+        keep = {k: self.status[k] for k in ("state", "run_id", "error") if k in self.status}
+        self.status.pop("rejected", None)
+        self.started += 1
         self.status.update(state="loading", run_id=run_id)
         stage = "prepare"     # nothing served has been touched yet
         try:
@@ -493,10 +499,13 @@ class State:
             return dict(serving=run_id, commit_sha=getattr(commit, "oid", None))
         except BaseException as exc:
             if stage == "prepare":   # unknown / foreign / unfetchable run: keep serving what we serve
-                self.status.update(keep, state=keep["state"] if keep["state"] in ("idle", "restore_failed")
-                                   else "idle",
-                                   rejected=dict(code=getattr(exc, "status_code", 500),
-                                                 error=str(getattr(exc, "detail", exc))))
+                for k in ("state", "run_id", "error"):    # exactly the status from before the attempt
+                    if k in keep:
+                        self.status[k] = keep[k]
+                    else:
+                        self.status.pop(k, None)
+                self.status["rejected"] = dict(code=getattr(exc, "status_code", 500),
+                                               error=str(getattr(exc, "detail", exc)))
                 raise
             await self.rpc("reset", check=False)   # never leave TP ranks on different adapters
             self.status.update(state="load_failed", checkpoint={"checkpoint": None},
@@ -525,14 +534,15 @@ async def _exclusive(request, run):
     if _S.running is not None and not _S.running.done():
         raise _http(409, "an SFT run or load is already in progress")
     async def guarded():
+        n0 = _S.started
         try:
             return await run(body)
         except BaseException as exc:
-            # a run that failed before it set its own state (validation,
+            # a request rejected before it started a run / load (validation,
             # tokenization): with wait=false nobody reads this exception
-            if _S.status.get("state") in ("idle", "starting"):
-                _S.status.update(rejected=dict(code=getattr(exc, "status_code", 500),
-                                               error=str(getattr(exc, "detail", exc))))
+            if _S.started == n0:
+                _S.status["rejected"] = dict(code=getattr(exc, "status_code", 500),
+                                             error=str(getattr(exc, "detail", exc)))
             raise
     _S.running = asyncio.ensure_future(guarded())
     _S.running.add_done_callback(lambda t: t.cancelled() or t.exception())
@@ -559,9 +569,13 @@ async def status_route():
 async def diag_route(request):
     """Dev only (SUFFIX_SFT_DIAG=1): served vs training-forward per-token NLL of
     one text under forward variants."""
+    if _S is None:
+        raise _http(503, "SFT is not available on this server")
+    if _S.running is not None and not _S.running.done():
+        raise _http(409, "an SFT run or load is in progress")
     body = await request.json()
     tok = await _S.tokenizer()
-    ids = tok.encode(body["text"], add_special_tokens=False)[:int(body.get("max_tokens", 512))]
+    ids = tok.encode(body["text"], add_special_tokens=False)[:min(int(body.get("max_tokens", 512)), _S.cfg.max_tokens)]
     mask = [0] + [1] * (len(ids) - 1)
     served = await _S.served_nll(ids, mask)
     r = await _S.rpc("diag", dict(ids=ids, mask=mask, seg_lens=[len(ids)], variants=body["variants"]))

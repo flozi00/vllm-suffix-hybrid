@@ -701,26 +701,29 @@ class TrainMode(contextlib.ContextDecorator):
         bias = getattr(m.gate, "e_score_correction_bias", None)
         if bias is None:
             bias = getattr(re_, "e_score_correction_bias", None)
+        scale = float(getattr(getattr(re_, "router", None), "routed_scaling_factor", None)
+                      or getattr(re_, "routed_scaling_factor", 1.0) or 1.0)
+        scale *= float(getattr(m.experts, "routed_scaling_factor", 1.0) or 1.0)
+        renorm = getattr(re_, "renormalize", True)
         logits = m.gate(x)
         logits = (logits[0] if isinstance(logits, tuple) else logits).float()
         if not sigmoid and bias is None:       # plain softmax top-k
             tw, ids = torch.softmax(logits, -1).topk(k, -1)
-            if getattr(re_, "renormalize", True):
+            if renorm:
                 tw = tw / tw.sum(-1, keepdim=True)
-            return tw, ids
+            return tw * scale, ids
         with torch.no_grad():
             score = logits.sigmoid() if sigmoid else logits.softmax(-1)
             ids = (score if bias is None else score + bias.float()).topk(k, -1).indices
         gate_w = getattr(m.gate, "weight", None)
         if gate_w is not None and gate_w.dim() == 2 and gate_w.shape[0] == logits.shape[-1]:
-            logits = F.linear(x.float(), gate_w.detach().float())
+            # serving's (bf16-rounded) logit VALUES, an fp32 re-evaluation as the gradient carrier
+            carrier = F.linear(x.float(), gate_w.detach().float())
+            logits = carrier + (logits - carrier).detach()
         score = logits.sigmoid() if sigmoid else logits.softmax(-1)
         tw = score.gather(-1, ids)
-        if getattr(re_, "renormalize", True):
+        if renorm:
             tw = tw / tw.sum(-1, keepdim=True)
-        scale = float(getattr(getattr(re_, "router", None), "routed_scaling_factor", None)
-                      or getattr(re_, "routed_scaling_factor", 1.0) or 1.0)
-        scale *= float(getattr(m.experts, "routed_scaling_factor", 1.0) or 1.0)
         return tw * scale, ids
 
     def moe(self, m, hidden_states):

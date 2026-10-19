@@ -1068,10 +1068,14 @@ def test_parity_guard_allows_noise_but_not_a_real_divergence(tmp_path):
 
     def fixed(se):
         async def parity(ids, mask, window=0):
-            return dict(delta=0.4, se=se, served_nll=1.0, trained_nll=1.4, tokens=5)
+            return dict(delta=0.4 if se < 0.9 else 2.0, se=se, served_nll=1.0, trained_nll=1.4, tokens=5)
         return parity
     try:
         s.parity = fixed(0.01)       # 0.4 nats with a tiny standard error: a real forward bug
+        with pytest.raises(HTTPException) as e:
+            asyncio.run(s.train(dict(examples=CHATS, steps=1)))
+        assert e.value.status_code == 409
+        s.parity = fixed(0.95)       # a large SE cannot buy an arbitrary allowance (cap)
         with pytest.raises(HTTPException) as e:
             asyncio.run(s.train(dict(examples=CHATS, steps=1)))
         assert e.value.status_code == 409
@@ -1136,3 +1140,25 @@ def test_load_of_an_unknown_or_foreign_run_keeps_serving_the_current_adapter(tmp
         assert e.value.status_code == 409 and torch.equal(_served(lm), trained)
     finally:
         W.SFT = None
+
+
+def test_rejections_are_recorded_after_an_earlier_failure_and_loads_do_not_hide_them(tmp_path):
+    s = _state(tmp_path, sft_for(build()))
+    try:
+        async def go():
+            A._S, s.status["state"] = s, "failed"          # a previous run failed
+            s.status["error"] = "old failure"
+            r = await A.train_route(SimpleNamespace(json=lambda: _aval({"examples": [], "wait": False})))
+            assert r.status_code == 202
+            await asyncio.gather(s.running, return_exceptions=True)
+        asyncio.run(go())
+        assert s.status["rejected"]["code"] == 400 and s.status["state"] == "failed"
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            asyncio.run(s.load("nope"))                     # prepare-stage failure keeps the old failure visible
+        assert s.status["state"] == "failed" and s.status["error"] == "old failure"
+        assert s.status["rejected"]["code"] == 404
+        asyncio.run(s.load("base"))                         # a successful load clears the stale rejection
+        assert "rejected" not in s.status and s.status["state"] == "idle"
+    finally:
+        W.SFT, A._S = None, None

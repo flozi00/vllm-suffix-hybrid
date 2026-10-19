@@ -135,7 +135,7 @@ Facts found on the way (all fixed in the code):
   with the default chat kwargs: `enable_thinking: false` switches the reasoning parser off and the
   `</think>` leaks into `content`.
 - LFM2 FP8 is numerically very sensitive: swapping bf16 for fp32 SDPA alone moves the per-token NLL by
-  sd 0.87 nats (mean ~0). The parity guard therefore refuses at `SUFFIX_SFT_PARITY_NATS` + 3 standard
+  sd 0.87 nats (mean ~0). The parity guard therefore refuses at `SUFFIX_SFT_PARITY_NATS` + up to 3 standard (capped at 0.35 nats)
   errors of the per-token difference, not at a fixed mean.
 - Serving kernels register per-stream workspace resources lazily (Marlin FP8 lock tensor); the training
   stream may create them under the locked workspace. Scratch growth stays locked.

@@ -291,6 +291,9 @@ def test_runner_side_scaling_is_applied_once():
     blk.experts.routed_experts.routed_scaling_factor, blk.experts.routed_scaling_factor = 1.0, SCALE
     tw1, _ = M.TrainMode.route(object(), blk, blk.experts.routed_experts, x)
     torch.testing.assert_close(tw0, tw1)
+    score = torch.sigmoid(blk.gate(x)[0].float())
+    want = score.gather(-1, tw_ids := M.TrainMode.route(object(), blk, blk.experts.routed_experts, x)[1])
+    torch.testing.assert_close(tw1, want / want.sum(-1, keepdim=True) * SCALE, rtol=1e-5, atol=1e-6)
 
 
 def test_training_lowers_loss():
