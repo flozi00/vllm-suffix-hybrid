@@ -664,6 +664,16 @@ _BOOT_GATES = {
                                      "capture_replay"], {}),
     "dsv41_engram_capture_replay": (["-m", "suffix_hybrid.helion_kernels.dsv41_engram",
                                      "capture_replay"], {}),
+    # native-FP4-MMA family (lane I, docs/dsv41-fp4.md): K3 exact + K5 PTX (kind::mxf4nvf4) + capture/replay
+    # + two concurrent graphs. The _bytes gate is the MoE scale-read fallback mode (a gate child gets the pod
+    # env minus its SUFFIX_* keys, so the mode the pool runs must be a gate of its own).
+    "fp4mma_capture_replay": (["-m", "suffix_hybrid.kernels.fp4mma_probe", "capture_replay"],
+                              {"SUFFIX_HELION_NVFP4_GEMM_FP4MMA": "1",
+                               "SUFFIX_HELION_NVFP4_MOE_FP4MMA": "1"}),
+    "fp4mma_capture_replay_bytes": (["-m", "suffix_hybrid.kernels.fp4mma_probe", "capture_replay"],
+                                    {"SUFFIX_HELION_NVFP4_GEMM_FP4MMA": "1",
+                                     "SUFFIX_HELION_NVFP4_MOE_FP4MMA": "1",
+                                     "SUFFIX_FP4MMA_MOE_SCALE_READ": "bytes"}),
     # GLM-5.3 routed MoE per rank, one GPU, cold L2: EP8's busiest rank vs TP8 (no EP) at decode
     # M 1..192 for FlashInfer CUTLASS, our NVFP4 kernel and FlashInfer b12x; numerics vs f64; the
     # TP tune table. Lines: [suffix moe-tp].

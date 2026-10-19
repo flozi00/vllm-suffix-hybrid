@@ -116,7 +116,9 @@ Lab cases (`cases()` keys on `deepseek-v4` in the model name): 8 shapes x TP8 th
 `BUCKETS = (8, 32, 64, 192)`; serving M maps to the smallest bucket >= M.
 
 **Not built, with the reason:**
-* **NVFP4 GEMM**: stays oxide (Triton 3.8 has no FP4 MMA on sm_120). Gap report for V4.1: the only
+* **NVFP4 GEMM**: stays oxide until the native-FP4 bake-off (CORRECTED 2026-10-19: Triton >= 3.6 DOES lower
+  `tl.dot_scaled` e2m1 x e2m1 with e4m3 block-16 scales to `mma.sync kind::mxf4nvf4` on sm_120, triton PR #8494;
+  lane I, `docs/dsv41-fp4.md`, builds that arm). Gap report for V4.1: the only
   NVFP4-dense candidate is `lm_head`; `SUFFIX_NVFP4_LMHEAD=1` applies as is (N=16160 % 32, K=5120 % 64,
   `ParallelLMHead` is still a `PluggableLayer` at 39983a5e7, `head` is unquantised) but the kernel is
   capped at M <= 64 while verify produces up to 192 logit rows (32 seqs x 6) -> stock BF16 above 64.

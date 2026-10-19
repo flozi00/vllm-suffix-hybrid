@@ -2,7 +2,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-GATES = ("mxfp8_capture_replay", "mxfp8_capture_replay_sem", "moe_capture_replay", "dsv41_moe_shared_bench",
+GATES = ("mxfp8_capture_replay", "mxfp8_capture_replay_sem", "fp4mma_capture_replay", "fp4mma_capture_replay_bytes", "moe_capture_replay", "dsv41_moe_shared_bench",
          "dsa_indexer_capture_replay", "dsv41_attn_capture_replay", "dsv41_hc_capture_replay",
          "dsv41_router_capture_replay", "dsv41_swiglu_capture_replay", "dsv41_engram_capture_replay",
          "host_ar_bench_dsv41", "allreduce_matrix_bench_dsv41", "har_l2_prefetch_bench_dsv41",
