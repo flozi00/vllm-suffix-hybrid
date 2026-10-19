@@ -118,6 +118,17 @@ _PRESETS = {
         "SUFFIX_DSV41_SM120_BLOCK64": "1",
     },
 }
+# dsv41-sm120 + host-memory all-reduce/all-gather (GLM g4/g6b path, docs/dsv41-comms.md). A separate
+# name, NOT A/B-gated on V4.1 yet: a plain dsv41-sm120 roll never picks it up. 81 bf16 all-reduces per
+# step (2 x 40 layers + embedding), all [tokens, 5120]. One-shot up to 48 KiB (<= 4 tokens; the 5-token
+# DSpark pass and the 6-token verify are two-shot: the host_ar_bench_dsv41 gate prints both modes, move
+# the threshold to 64K if one-shot wins at 60 KiB). No int8 transport (LOSSY, quality-gate first).
+# SUFFIX_HAR_ALLGATHER: vocab-parallel logits gather + the two Engram head gathers (exact bytes).
+_PRESETS["dsv41-sm120-comms"] = {
+    **_PRESETS["dsv41-sm120"],
+    "SUFFIX_NCCL_BANDS": "0-inf:har", "SUFFIX_HAR_ONESHOT_MAX_BYTES": "48K",
+    "SUFFIX_HAR_ALLGATHER": "1",
+}
 # SUFFIX_PRESET is the vendor-neutral spelling (SUFFIX_ROCM_PRESET predates the GLM preset).
 _preset = (os.environ.get("SUFFIX_PRESET", "").strip()
            or os.environ.get("SUFFIX_ROCM_PRESET", "").strip())
@@ -416,6 +427,13 @@ if any(os.environ.get(k, "").strip() for k in ("SUFFIX_NCCL_SMALL_ALGO", "SUFFIX
     from suffix_hybrid.nccl_split import install_post_import_hook as _ncsplit_hook
     _ncsplit_hook()
 
+# L2 weight prefetch while the host all-reduce waits (suffix_hybrid/har_prefetch.py):
+# SUFFIX_HAR_L2_PREFETCH=1 (+ SUFFIX_HAR_L2_PREFETCH_MB, default 32). Needs the "har" spec
+# and the V2 runner; refuses to start if its prefetch all-reduce is not bit-exact.
+if os.environ.get("SUFFIX_HAR_L2_PREFETCH", "").strip() == "1":
+    from suffix_hybrid.har_prefetch import install_post_import_hook as _l2pf_hook
+    _l2pf_hook()
+
 if os.environ.get("SUFFIX_PROFILE_WORKER", "").strip():
     try:
         from suffix_hybrid.step_profiler import install_worker_hook
@@ -605,6 +623,21 @@ _BOOT_GATES = {
     # pinned host buffer, two-shot / one-shot vs NCCL at GLM token sizes, every rank bit-exact
     # vs the fp32 rank-order sum, graphed us, GPU<->host PCIe probes. Lines: [suffix har].
     "host_ar_bench": (["-m", "suffix_hybrid.host_ar", "bench"], {}),
+    # Same at DeepSeek-V4.1-Flash sizes (hidden 5120, vocab 129280, + the Engram head gather);
+    # and the NCCL candidate matrix at tokens x 5120. docs/dsv41-comms.md.
+    "host_ar_bench_dsv41": (["-m", "suffix_hybrid.host_ar", "bench", "--hidden", "5120",
+                             "--vocab", "129280"], {}),
+    "allreduce_matrix_bench_dsv41": (["-m", "suffix_hybrid.tools.ar_bench", "--matrix",
+                                      "--sizes-kib", "48", "--hidden", "5120"], {}),
+    # SUFFIX_HAR_L2_PREFETCH at V4.1 TP8 shapes, M 6/48 (suffix_hybrid/har_prefetch.py): window GEMMs
+    # (MXFP8 weights as equal-byte BF16 proxies) cold vs prefetched vs hot, the all-reduce alone with
+    # 0/16/32 MiB of concurrent prefetch, all-reduce -> norm -> attention / ffn window from cold L2
+    # with 0/16/32/64 MiB, outputs bit-exact, verdict per layer. Lines: [suffix har-l2pf].
+    "har_l2_prefetch_bench_dsv41": (["-m", "suffix_hybrid.har_prefetch", "bench"], {}),
+    # DP-attention layout study (suffix_hybrid/comm_layout.py): NCCL reduce-scatter / all-gather (the four
+    # dispatch tensors in one group) / all-reduce and the host all-reduce at the padded DP8 token counts
+    # 48 / 96 / 192, one TP8 layer (2 host all-reduces) vs one DP8 layer (RS + AG). Lines: [suffix comm-layout].
+    "dp_ag_rs_bench_dsv41": (["-m", "suffix_hybrid.comm_layout", "bench"], {}),
     # GLM-5.3 routed MoE per rank, one GPU, cold L2: EP8's busiest rank vs TP8 (no EP) at decode
     # M 1..192 for FlashInfer CUTLASS, our NVFP4 kernel and FlashInfer b12x; numerics vs f64; the
     # TP tune table. Lines: [suffix moe-tp].

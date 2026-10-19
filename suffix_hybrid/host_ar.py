@@ -35,11 +35,16 @@ A fused all-reduce + residual add + RMSNorm kernel (for vLLM's fused_allreduce_r
 27.9 vs 23.7 us at 6 tokens and 0.73-0.96x at 1-96 tokens -- the local grid barrier before the row norm
 costs more than the separate norm launch.)
 
+L2 prefetch (pf rows, SUFFIX_HAR_L2_PREFETCH via suffix_hybrid/har_prefetch.py): blocks that
+wait at a round's first barrier issue cp.async.bulk.prefetch.L2 for the next window's weights
+(never the publishing block); nothing is written, outputs are unchanged.
+
 Page placement: each rank first-touches the slots it writes from a CPU of its
 GPU's NUMA node (pages stay put once pinned), so the writes stay socket-local
 and both sockets' memory controllers serve the reads.
 
     python -m suffix_hybrid.host_ar bench   # boot gate host_ar_bench: exactness + graphed us
+    python -m suffix_hybrid.host_ar bench --hidden 5120 --vocab 129280   # DeepSeek-V4.1 sizes (host_ar_bench_dsv41)
 """
 from __future__ import annotations
 
@@ -99,12 +104,37 @@ if triton is not None:
                                   dtype=tl.uint32, is_pure=False, pack=1)
 
     @triton.jit
+    def _l2_prefetch(pf_ptr, pf_cap):
+        """Thread t of program p prefetches table row p + grid * t into L2: rows are int64
+        [addr, bytes] (16 B aligned, bytes % 16 == 0, 0 = skip); cp.async.bulk.prefetch is
+        fire-and-forget and never writes (suffix_hybrid/har_prefetch.py builds the rows)."""
+        tl.inline_asm_elementwise(
+            "{\n.reg .u32 pfi, pfg, pfc, pfn;\n.reg .u64 pfp, pfa, pfs;\n.reg .pred pfq;\n"
+            "mov.u32 pfi, %tid.x;\nmov.u32 pfg, %nctaid.x;\nmov.u32 pfc, %ctaid.x;\n"
+            "mad.lo.u32 pfi, pfi, pfg, pfc;\n"
+            "setp.lt.u32 pfq, pfi, $2;\n"
+            "mul.wide.u32 pfp, pfi, 16;\nadd.s64 pfp, pfp, $1;\n"
+            "@pfq ld.global.nc.v2.u64 {pfa, pfs}, [pfp];\n"
+            "@pfq setp.ne.u64 pfq, pfs, 0;\n"
+            "@pfq cvt.u32.u64 pfn, pfs;\n"
+            "@pfq cp.async.bulk.prefetch.L2.global [pfa], pfn;\n"
+            "mov.u32 $0, 0;\n}",
+            "=r,l,r", [pf_ptr, pf_cap], dtype=tl.uint32, is_pure=False, pack=1)
+
+    @triton.jit
+    def _pf_kernel(pf_ptr, pf_cap):
+        """Standalone L2 prefetch of rows (har_prefetch bench): grid = ceil(cap / 128)."""
+        _l2_prefetch(pf_ptr, pf_cap)
+
+    @triton.jit
     def _barrier(flags, arr_ptr, go_ptr, epoch, ctr_ptr, ctr_new, final,
                  RANK: tl.constexpr, WORLD: tl.constexpr, FLAG_STRIDE: tl.constexpr,
-                 TIMEOUT: tl.constexpr, LEAN: tl.constexpr):
+                 TIMEOUT: tl.constexpr, LEAN: tl.constexpr, pf_ptr, pf_cap, pf_on, PF: tl.constexpr):
         """Grid barrier across all ranks: blocks arrive on a device counter, the last one
         publishes this rank's epoch (st.release.sys; cumulative over the arrivals), polls every
-        rank's flag line and releases the others through a device word."""
+        rank's flag line and releases the others through a device word. PF: blocks that wait
+        (never the publishing one: it is on the critical path) first issue their L2 prefetch
+        rows, so the GDDR idles less while PCIe is busy."""
         if not LEAN:
             _fence_sys()
         tl.debug_barrier()
@@ -124,6 +154,9 @@ if triton is not None:
                     _trap()
             _st_release(go_ptr, epoch, False)
         else:
+            if PF:
+                if pf_on:
+                    _l2_prefetch(pf_ptr, pf_cap)
             done = tl.zeros([], dtype=tl.int32)
             spins = tl.zeros([], dtype=tl.int32)
             while done == 0:
@@ -135,10 +168,10 @@ if triton is not None:
             _fence_sys()
 
     @triton.jit
-    def _har_kernel(x_ptr, out_ptr, data_ptr, red_ptr, flag_ptr, ctr_ptr, arr_ptr, n,
+    def _har_kernel(x_ptr, out_ptr, data_ptr, red_ptr, flag_ptr, ctr_ptr, arr_ptr, n, pf_ptr, pf_cap,
                     RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
                     FLAG_STRIDE: tl.constexpr, ONESHOT: tl.constexpr, BLOCK: tl.constexpr,
-                    TIMEOUT: tl.constexpr, LEAN: tl.constexpr):
+                    TIMEOUT: tl.constexpr, LEAN: tl.constexpr, PF: tl.constexpr):
         RCH: tl.constexpr = ROUND // WORLD
         pid = tl.program_id(0)
         step = tl.num_programs(0) * BLOCK
@@ -168,7 +201,7 @@ if triton is not None:
                 tl.store(dat + RANK * ROUND + o, v, mask=m, cache_modifier=".wt")
             if ONESHOT:
                 _barrier(flags, arr_ptr, arr_ptr + 2, epoch, ctr_ptr, ctr_new, final,
-                         RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+                         RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN, pf_ptr, pf_cap, rnd == 0, PF)
                 for s in range(pid * BLOCK, rn, step):
                     o = s + ar
                     m = o < rn
@@ -182,7 +215,7 @@ if triton is not None:
                     tl.store(out_ptr + base + o, acc.to(out_ptr.dtype.element_ty), mask=m)
             else:
                 _barrier(flags, arr_ptr, arr_ptr + 2, epoch, ctr_ptr, ctr_new, False,
-                         RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+                         RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN, pf_ptr, pf_cap, rnd == 0, PF)
                 for s in range(lo + pid * BLOCK, hi, step):  # phase 2: reduce own chunk
                     o = s + ar
                     m = o < hi
@@ -197,7 +230,8 @@ if triton is not None:
                     tl.store(out_ptr + base + o, r, mask=m)
                     tl.store(red + RANK * RCH + (o - lo), r, mask=m, cache_modifier=".wt")
                 _barrier(flags + WORLD * FLAG_STRIDE, arr_ptr + 1, arr_ptr + 3, epoch, ctr_ptr,
-                         ctr_new, final, RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+                         ctr_new, final, RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN, pf_ptr, pf_cap,
+                         False, False)
                 for j in tl.static_range(WORLD):  # phase 3: the others' reduced chunks
                     if j != RANK:
                         jl = tl.multiple_of(j * ch, 8)
@@ -223,10 +257,10 @@ if triton is not None:
         return tl.reshape(tl.reshape(q.to(tl.float32), (BLOCK // G, G)) * scale[:, None], (BLOCK,))
 
     @triton.jit
-    def _har_q8_kernel(x_ptr, out_ptr, qd, sd, qr, sr, flag_ptr, ctr_ptr, arr_ptr, n,
+    def _har_q8_kernel(x_ptr, out_ptr, qd, sd, qr, sr, flag_ptr, ctr_ptr, arr_ptr, n, pf_ptr, pf_cap,
                        RANK: tl.constexpr, WORLD: tl.constexpr, ROUND: tl.constexpr,
                        FLAG_STRIDE: tl.constexpr, BLOCK: tl.constexpr, G: tl.constexpr,
-                       TIMEOUT: tl.constexpr, LEAN: tl.constexpr):
+                       TIMEOUT: tl.constexpr, LEAN: tl.constexpr, PF: tl.constexpr):
         """Two-shot with int8 transport (per-G absmax scales) in the bf16 kernel's slots: a
         partial slot holds ROUND codes then ROUND // G fp32 scales, a reduced slot RCH codes then
         RCH // G scales. Rank r adds its own partial unquantized and keeps for its own chunk
@@ -262,7 +296,7 @@ if triton is not None:
                 tl.store(mq + o, q, mask=m, cache_modifier=".wt")
                 tl.store(ms + og, sc, mask=mg, cache_modifier=".wt")
             _barrier(flags, arr_ptr, arr_ptr + 2, epoch, ctr_ptr, ctr_new, False,
-                     RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+                     RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN, pf_ptr, pf_cap, rnd == 0, PF)
             rq = qr + (par * WORLD + RANK) * (2 * RCH)
             rs = sr + (par * WORLD + RANK) * (RCH // 2) + RCH // 4
             for s in range(lo + pid * BLOCK, hi, step):  # phase 2: reduce own chunk
@@ -286,7 +320,8 @@ if triton is not None:
                 tl.store(rq + (o - lo), q, mask=m, cache_modifier=".wt")
                 tl.store(rs + (og - lo // G), sc, mask=mg, cache_modifier=".wt")
             _barrier(flags + WORLD * FLAG_STRIDE, arr_ptr + 1, arr_ptr + 3, epoch, ctr_ptr,
-                     ctr_new, final, RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+                     ctr_new, final, RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN, pf_ptr, pf_cap,
+                     False, False)
             for j in tl.static_range(WORLD):  # phase 3: the others' reduced chunks
                 if j != RANK:
                     jl = tl.multiple_of(j * ch, G)
@@ -330,7 +365,8 @@ if triton is not None:
                 tl.store(dat + RANK * ROUND + o, v, mask=m, cache_modifier=".wt")
                 tl.store(out_ptr + RANK * n + base + o, v, mask=m)
             _barrier(flag_ptr + par * (2 * WORLD * FLAG_STRIDE), arr_ptr, arr_ptr + 2, epoch,
-                     ctr_ptr, ctr_new, final, RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN)
+                     ctr_ptr, ctr_new, final, RANK, WORLD, FLAG_STRIDE, TIMEOUT, LEAN, ctr_ptr, 0,
+                     False, False)
             for j in tl.static_range(WORLD):
                 if j != RANK:
                     for s in range(pid * BLOCK, rn, step):
@@ -353,6 +389,24 @@ if triton is not None:
                 tl.store(dst + o, v, mask=m, cache_modifier=".wt")
             else:
                 tl.store(dst + o, v, mask=m)
+
+
+def route(n: int, oneshot_max: int, q8_min: int, q8_group: int = Q8_GROUP,
+          oneshot: bool | None = None, q8: bool | None = None) -> str:
+    """Kernel an n-element bf16 message takes: "one" | "two" | "q8" (HostAllReduce.all_reduce's
+    policy; CPU-checkable). q8 needs n % q8_group == 0, else the bf16 kernel runs."""
+    if oneshot is None:
+        oneshot = n * 2 <= oneshot_max
+    if q8 is None:
+        q8 = not oneshot and n * 2 >= q8_min
+    if q8 and n % q8_group == 0:
+        return "q8"
+    return "one" if oneshot else "two"
+
+
+def rounds(n: int, round_elems: int = ROUND_BYTES // 2) -> int:
+    """In-kernel rounds of an n-element message (one round = ROUND_BYTES per rank)."""
+    return -(-n // round_elems)
 
 
 class _Ptr:
@@ -416,6 +470,7 @@ class HostAllReduce:
         import torch.distributed as dist
 
         self.disabled = True
+        self.cpu_group = cpu_group
         self.rank, self.world = dist.get_rank(cpu_group), dist.get_world_size(cpu_group)
         if self.world not in WORLDS:
             raise ValueError(f"host all-reduce supports world {WORLDS}, not {self.world}")
@@ -479,6 +534,7 @@ class HostAllReduce:
         self.red_q, self.red_s = _Ptr(self.red.addr, torch.int8), _Ptr(self.red.addr, torch.float32)
         self.ctr = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.arr = torch.zeros(4, dtype=torch.int32, device=self.device)  # arrive x2, go x2
+        self.l2pf = None  # har_prefetch.attach(): () -> (rows, cap) | None per all_reduce
         self.disabled = False
 
     def _touch(self, regions) -> None:
@@ -502,29 +558,31 @@ class HostAllReduce:
         return max(1, min(self.max_blocks, -(-min(n, self.round) // self.per_program)))
 
     def all_reduce(self, x, oneshot: bool | None = None, grid: int | None = None,
-                   q8: bool | None = None):
+                   q8: bool | None = None, pf=None):
+        """pf: (int64 rows [cap, 2] on this device, cap) L2 prefetch issued while the
+        barrier waits; None asks self.l2pf (once per call: it counts the calls)."""
         import torch
 
         out = torch.empty_like(x)
         n = x.numel()
         if n == 0:
             return out
-        if oneshot is None:
-            oneshot = n * 2 <= self.oneshot_max
-        if q8 is None:
-            q8 = not oneshot and n * 2 >= self.q8_min
-        if q8 and n % self.q8_group == 0:
+        if pf is None and self.l2pf is not None:
+            pf = self.l2pf()
+        rows, cap = pf if pf is not None else (self.ctr, 0)
+        kind = route(n, self.oneshot_max, self.q8_min, self.q8_group, oneshot, q8)
+        if kind == "q8":
             _har_q8_kernel[(grid or self.grid(n),)](
                 x, out, self.data_q, self.data_s, self.red_q, self.red_s, self.flags, self.ctr,
-                self.arr, n, RANK=self.rank, WORLD=self.world, ROUND=self.round,
+                self.arr, n, rows, cap, RANK=self.rank, WORLD=self.world, ROUND=self.round,
                 FLAG_STRIDE=FLAG_STRIDE, BLOCK=BLOCK, G=self.q8_group, TIMEOUT=self.timeout,
-                LEAN=self.lean, num_warps=4)
+                LEAN=self.lean, PF=pf is not None, num_warps=4)
             return out
         _har_kernel[(grid or self.grid(n),)](
-            x, out, self.data, self.red, self.flags, self.ctr, self.arr, n,
+            x, out, self.data, self.red, self.flags, self.ctr, self.arr, n, rows, cap,
             RANK=self.rank, WORLD=self.world, ROUND=self.round, FLAG_STRIDE=FLAG_STRIDE,
-            ONESHOT=bool(oneshot), BLOCK=BLOCK, TIMEOUT=self.timeout, LEAN=self.lean,
-            num_warps=4)
+            ONESHOT=kind == "one", BLOCK=BLOCK, TIMEOUT=self.timeout, LEAN=self.lean,
+            PF=pf is not None, num_warps=4)
         return out
 
     def supports_gather(self, x) -> bool:
@@ -612,7 +670,9 @@ VARIANTS = (
     ("q8g32", {"q8_min_bytes": 0, "q8_group": 32}, (48, 192, 1024), (None,)),
 )
 STRESS_TOKENS = (1, 6, 48, 192)
-GATHER_ROWS = (1, 6, 32, 48, 192)  # GLM logits shards: rows x vocab / world bf16
+GATHER_ROWS = (1, 6, 32, 48, 192)  # logits shards: rows x vocab / world bf16 (+ V4.1 Engram heads)
+# V4.1 Engram all_gather(dim=1): ceil(hash columns / 8) heads per rank (8 heads -> 1, 3 n-gram orders x 8 -> 3), dim 256
+ENGRAM_SHAPES = ((1, 256), (3, 256))
 
 
 def _sysfacts() -> list[str]:
@@ -675,7 +735,7 @@ def _shared(cpu, rank, size, huge):
     return mm, cbuf, addr, pmd
 
 
-def _bench_worker(rank, world, port, q, hidden) -> None:
+def _bench_worker(rank, world, port, q, hidden, vocab) -> None:
     import torch
     import torch.distributed as dist
 
@@ -718,15 +778,17 @@ def _bench_worker(rank, world, port, q, hidden) -> None:
         nccl = PyNcclCommunicator(group=cpu, device=dev)
         har = HostAllReduce(cpu, dev, timeout_spins=1 << 23)
         out["gather"] = []
-        for rows in GATHER_ROWS:  # all-gather: exact bytes vs NCCL, graphed us
-            g = torch.Generator(device=dev).manual_seed(77 + rows * world + rank)
-            x = torch.randn(rows, 154880 // world, device=dev, generator=g).to(torch.bfloat16)
-            ref = torch.empty((world * rows, x.shape[1]), dtype=x.dtype, device=dev)
+        shapes = [(r, (vocab // world,)) for r in GATHER_ROWS]
+        shapes += [(r, sh) for sh in ENGRAM_SHAPES for r in GATHER_ROWS]
+        for rows, tail in shapes:
+            g = torch.Generator(device=dev).manual_seed(77 + rows * world + rank)  # exact bytes vs NCCL, graphed us
+            x = torch.randn(rows, *tail, device=dev, generator=g).to(torch.bfloat16)
+            ref = torch.empty((world * rows, *tail), dtype=x.dtype, device=dev)
             nccl.all_gather(ref, x)
             got = torch.empty_like(ref)
             har.all_gather_into(got, x)
             torch.cuda.synchronize()
-            out["gather"].append({"rows": rows, "exact": bool(torch.equal(got, ref)),
+            out["gather"].append({"rows": rows, "tail": tail, "exact": bool(torch.equal(got, ref)),
                                   "har_us": ns.graph_time_us(lambda: har.all_gather_into(got, x)),
                                   "nccl_us": ns.graph_time_us(lambda: nccl.all_gather(ref, x))})
         har.destroy()
@@ -793,7 +855,7 @@ def _bench_worker(rank, world, port, q, hidden) -> None:
         pass
 
 
-def bench(hidden: int = 6144) -> int:
+def bench(hidden: int = 6144, vocab: int = 154880) -> int:
     import torch
     import torch.multiprocessing as mp
 
@@ -806,7 +868,7 @@ def bench(hidden: int = 6144) -> int:
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = 29600 + os.getpid() % 1000
-    procs = [ctx.Process(target=_bench_worker, args=(r, world, port, q, hidden)) for r in range(world)]
+    procs = [ctx.Process(target=_bench_worker, args=(r, world, port, q, hidden, vocab)) for r in range(world)]
     [p.start() for p in procs]
     res = []
     try:
@@ -833,7 +895,7 @@ def bench(hidden: int = 6144) -> int:
     for i, row in enumerate(res[0]["gather"]):
         rows = [r["gather"][i] for r in res]
         h, n_ = max(rr["har_us"] for rr in rows), max(rr["nccl_us"] for rr in rows)
-        print(f"{MARK} all-gather {row['rows']:4d} x {154880 // world} bf16/rank: host {h:8.1f} us | nccl "
+        print(f"{MARK} all-gather {row['rows']:4d} x {'x'.join(map(str, row['tail']))} bf16/rank: host {h:8.1f} us | nccl "
               f"{n_:8.1f} us ({n_ / h:4.2f}x) | exact {all(rr['exact'] for rr in rows)}", flush=True)
     gather_ok = all(rr["exact"] for r in res for rr in r["gather"])
     stress = [all(r["stress"][i][2] for r in res) for i in range(len(res[0]["stress"]))]
@@ -865,9 +927,10 @@ def main() -> int:
 
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["bench"])
-    ap.add_argument("--hidden", type=int, default=6144)
+    ap.add_argument("--hidden", type=int, default=6144, help="GLM 6144; DeepSeek-V4.1 5120")
+    ap.add_argument("--vocab", type=int, default=154880, help="GLM 154880; DeepSeek-V4.1 129280")
     a = ap.parse_args()
-    return bench(a.hidden)
+    return bench(a.hidden, a.vocab)
 
 
 if __name__ == "__main__":
