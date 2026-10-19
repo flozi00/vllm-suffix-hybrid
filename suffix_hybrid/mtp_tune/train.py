@@ -71,6 +71,19 @@ class FrozenLinear(torch.autograd.Function):
         if not ctx.needs_input_grad[0]:
             return None, None
         k = ctx.k
+        w = dense_weight(ctx.layer, k)
+        if w is not None:   # plain float weight (bf16 head, unquantized): no probe
+            with torch.no_grad():
+                return dy @ w[:dy.shape[-1]].to(dy.dtype), None
+        rows = nvfp4_rows(ctx.layer, k)
+        if rows is not None and nvfp4_verified(ctx.layer, k, rows, dy.dtype):
+            n, step = dy.shape[-1], max(1, (1 << 24) // k)
+            dx = torch.zeros(*dy.shape[:-1], k, dtype=torch.float32, device=dy.device)
+            with torch.no_grad():
+                for r0 in range(0, n, step):
+                    r1 = min(n, r0 + step)
+                    dx += (dy[..., r0:r1] @ rows(r0, r1).to(dy.dtype)).float()
+            return dx.to(dy.dtype), None
         dx = dy.new_empty(*dy.shape[:-1], k)
         with torch.no_grad():
             for k0 in range(0, k, PROBE_CHUNK):
@@ -82,8 +95,79 @@ class FrozenLinear(torch.autograd.Function):
         return dx, None
 
 
+def dense_weight(layer, k):
+    """The layer's weight when it is a plain float [>=N, K] matrix the GEMM
+    reads as is (unquantized linears, the bf16 lm_head our NVFP4 head keeps
+    resident); None for packed / quantized weights (-> probe)."""
+    w = getattr(layer, "weight", None)
+    qm = getattr(layer, "quant_method", None)
+    qm = getattr(type(qm), "_sft_base", type(qm)).__name__ if qm is not None else ""
+    if (w is None or w.dim() != 2 or not w.dtype.is_floating_point or w.element_size() < 2
+            or int(w.shape[1]) != k or not qm.startswith(("Unquantized", "SuffixNvFp4LMHead"))):
+        return None
+    return w
+
+
+def nvfp4_rows(layer, k):
+    """fn(r0, r1) -> effective weight rows [r1 - r0, K] f32 of a vLLM NVFP4
+    linear (packed e2m1 [N, K/2] low nibble = even k, 128x4-swizzled e4m3
+    block scales, y = alpha * deq(quant(x * input_global_scale_inv)) @
+    deq(w)^T -> W_eff = deq(w) * alpha * input_global_scale_inv); None when
+    the layer does not carry that layout. Trusted only after
+    ``nvfp4_verified`` (other backends repack, e.g. Marlin)."""
+    w, sf = getattr(layer, "weight", None), getattr(layer, "weight_scale", None)
+    alpha, gx = getattr(layer, "alpha", None), getattr(layer, "input_global_scale_inv", None)
+    n = getattr(layer, "output_size_per_partition", None)
+    if (w is None or sf is None or alpha is None or gx is None or n is None
+            or w.dtype != torch.uint8 or w.dim() != 2 or 2 * int(w.shape[1]) != k):
+        return None
+    from suffix_hybrid.kernels.nvfp4_gemm import E2M1, unswizzle_sf
+    sfu = unswizzle_sf(sf, int(n), k // 16)
+    nib = torch.tensor([*E2M1.tolist(), *(-E2M1).tolist()], dtype=torch.float32)
+    # byte -> (low, high) e2m1 pair in one gather; e2m1 x e4m3 products are
+    # exact in bf16 (<= 6 significant bits), only the global factor rounds
+    lut = torch.stack([nib.repeat(16), nib.repeat_interleave(16)], -1).to(torch.bfloat16).to(w.device)
+    factor = float(alpha) * float(gx)
+
+    def rows(r0, r1):
+        v = lut[w[r0:r1].int()].view(r1 - r0, k // 16, 16)
+        s = sfu[r0:r1].contiguous().view(torch.float8_e4m3fn).to(torch.bfloat16)
+        return (v * s[..., None]).reshape(r1 - r0, k) * factor
+    return rows
+
+
+_NVFP4_OK: dict = {}
+
+
+def nvfp4_verified(layer, k, rows, dtype, cols=64):
+    """Once per layer: dequantized W_eff[:, :cols] vs the probe through the
+    layer's own kernel. The probe's identity rows quantize with one uniform
+    e4m3 scale error (<= ~6 %); a wrong layout is uncorrelated (~100 %)."""
+    key = id(layer)
+    if key not in _NVFP4_OK:
+        c = min(k, cols)
+        with torch.no_grad():
+            eye = torch.zeros(c, k, dtype=dtype, device=layer.weight.device)
+            eye[:, :c].fill_diagonal_(1.0)
+            probe = base_apply(layer, eye).float()            # [c, N]
+            n = probe.shape[-1]
+            deq = torch.cat([rows(r0, min(n, r0 + 4096))[:, :c] for r0 in range(0, n, 4096)]).T
+            err = float((probe - deq).norm() / probe.norm().clamp_min(1e-30))
+        _NVFP4_OK[key] = err < 0.15
+    return _NVFP4_OK[key]
+
+
 def expert_weights(handle, e):
-    """(w13 [2I, H], w2 [H, I]) f32 of local expert e."""
+    """(w13 [2I, H] as [gate; up], w2 [H, I]) f32 effective weights of local
+    expert e."""
+    if handle["kind"] == "nvfp4":
+        # serving: g1[e] * (qdq(x, a1g) @ deq(w13)^T), qdq(x, a1g) ~ x * a1g;
+        # vLLM's FlashInfer layout stores w13 as [up; gate]
+        from suffix_hybrid.kernels.nvfp4_moe import _expert_w
+        w13 = _expert_w(handle["w13"], handle["w13_sf"], e) * (handle["g1"][e] * handle["a1g"])
+        i = w13.shape[0] // 2
+        w2 = _expert_w(handle["w2"], handle["w2_sf"], e) * (handle["g2"][e] * handle["a2g"])
+        return torch.cat([w13[i:], w13[:i]]), w2
     if handle["kind"] == "fp8":
         from suffix_hybrid.kernels.fp8_moe import expert_w
         return (expert_w(handle["w13"], handle["w13_s"], e),
@@ -92,6 +176,10 @@ def expert_weights(handle, e):
 
 
 def _qdq(x, handle, stage):
+    if handle["kind"] == "nvfp4":   # serving quantizes x and h to NVFP4
+        from suffix_hybrid.kernels.nvfp4_moe import qdq
+        g = handle["a1g"] if stage == "x" else handle["a2g"]
+        return qdq(x, g) / g
     if handle["kind"] != "fp8" or not handle.get("act_qdq", True):
         return x
     from suffix_hybrid.kernels.fp8_moe import qdq
@@ -159,9 +247,16 @@ class FrozenExperts(torch.autograd.Function):
 def experts_handle(experts):
     """Frozen routed-experts handle from a vLLM FusedMoE layer (or a test
     fake with the same attribute surface)."""
+    # vLLM >= 0.30: MoERunner holds the experts module at .routed_experts
+    experts = getattr(experts, "routed_experts", experts)
     if getattr(experts, "enable_eplb", False):
         raise NotImplementedError("EPLB redundant experts not supported")
     w13, w2 = experts.w13_weight, experts.w2_weight
+    qc = getattr(getattr(experts, "quant_method", None), "moe_quant_config", None)
+    if w13.dtype == torch.uint8 and getattr(qc, "quant_dtype", None) == "nvfp4":
+        return dict(kind="nvfp4", w13=w13, w13_sf=qc.w1_scale, w2=w2, w2_sf=qc.w2_scale,
+                    g1=qc.g1_alphas.float(), g2=qc.g2_alphas.float(),
+                    a1g=float(qc.a1_gscale.reshape(-1)[0]), a2g=float(qc.a2_gscale.reshape(-1)[0]))
     if w13.dtype.is_floating_point and w13.element_size() >= 2:
         return dict(kind="float", w13=w13, w2=w2)
     if w13.dtype == torch.float8_e4m3fn:
@@ -185,8 +280,6 @@ def experts_handle(experts):
             pass
         return dict(kind="fp8", w13=w13, w13_s=s13, w2=w2, w2_s=s2, ue8m0=ue8m0,
                     act_qdq=True)
-    # ponytail: NVFP4 routed experts (GLM prod) need nvfp4_moe._expert_w + the
-    # global scale; add with the GLM family.
     raise NotImplementedError(f"routed expert dtype {w13.dtype} not supported")
 
 
@@ -368,7 +461,7 @@ class Qwen4ExpFunctional:
         return self.lin(sa.o_proj, o, params)
 
     def moe(self, mlp, x, params):
-        ex = mlp.experts
+        ex = getattr(mlp.experts, "routed_experts", mlp.experts)   # vLLM >= 0.30 MoERunner
         logits = self.lin(mlp.gate, x, params).float()
         tw, ids = torch.softmax(logits, -1).topk(int(ex.top_k), -1)
         if getattr(ex, "renormalize", True):
