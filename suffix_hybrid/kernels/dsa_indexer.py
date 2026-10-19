@@ -29,9 +29,26 @@ vLLM 0.30 contract (read from v0.30.0 sources):
 * prefill ``fp8_fp4_mqa_logits`` q [M, H, 128], kv [N, 128] e4m3 + k_scale [N]
   f32, window [ks, ke) per row: same kernel, contiguous K, groups of 8 rows.
 
+vLLM nightly (>= #61149, 2026-10-12; DeepSeek-V4.1) drifts from that:
+* prefill's 6th argument is ``max_seqlen_k`` (int) and the output is
+  COMPRESSED [M, max_seqlen_k] (row i holds K positions [ks[i], ke[i]) from
+  column 0). oxide writes absolute columns only, so compressed calls run the
+  Helion body (column n - ks, where a config is shipped and the backend is not
+  oxide) or the Triton fallback; a bool 6th argument keeps the old path.
+* paged: no clean_logits; V4.1's indexer pages are [blocks, P, 132] with
+  P = 128 on ratio-1 layers and a page stride beside the MLA pages. oxide takes
+  contiguous 64-token pages only; other layouts run Helion (any P % 32 == 0,
+  stride % 128 == 0) or the Triton fallback (any page).
+* two-level candidate selection (consumer layers): SUFFIX_SM120_DSA_INDEXER_CAND=1
+  scores only the candidate blocks (kernels/dsa_candidates.py).
+DSpark / DFlash verify 1 + k rows per request (not PARD's 1 + 2k).
+
 CLI (one GPU):
   python -m suffix_hybrid.kernels.dsa_indexer oracle   # vs Triton + f64 + top-k sets
   python -m suffix_hybrid.kernels.dsa_indexer bench    # us/call, GB/s vs HBM roofline
+  python -m suffix_hybrid.kernels.dsa_indexer capture_replay [--quick] [--default-configs]
+      # boot gate dsa_indexer_capture_replay (kernels/dsa_indexer_gate.py); also under
+      # compute-sanitizer --tool memcheck --error-exitcode 99
 """
 from __future__ import annotations
 
@@ -42,6 +59,8 @@ GATE = "SUFFIX_SM120_DSA_INDEXER"
 GROUP_ENV = "SUFFIX_SM120_DSA_INDEXER_GROUP"
 MIN_TILES_ENV = "SUFFIX_SM120_DSA_INDEXER_MIN_TILES"
 HELION_ENV = "SUFFIX_HELION_DSA_INDEXER"
+STRICT_ENV = "SUFFIX_SM120_DSA_INDEXER_STRICT"
+CTX_ENV = "SUFFIX_DSA_INDEXER_CTX"
 MARKER = "[suffix dsa-indexer]"
 FAMILY = "dsa_indexer"
 PARAMS = {"dsa_logits": 24}  # = the #[kernel] parameter count (tests pin it)
@@ -49,7 +68,7 @@ TILE = 64                    # K tokens per tile == vLLM indexer block_size
 MAX_WARPS = 12               # kernel launch_bounds(384)
 PREFILL_GROUP = 8
 HBM_BPS = 1.79e12            # RTX PRO 6000 (nvfp4_moe.HBM_BPS)
-_state = {"loaded": set(), "said": set(), "cfg_group": None, "sms": {}}
+_state = {"loaded": set(), "said": set(), "cfg_group": None, "sms": {}, "layers": {}}
 
 
 def _log(msg: str) -> None:
@@ -60,6 +79,53 @@ def _once(key: str, msg: str) -> None:
     if key not in _state["said"]:
         _state["said"].add(key)
         _log(msg)
+
+
+def strict() -> bool:
+    return os.environ.get(STRICT_ENV, "").strip() == "1"
+
+
+def indexer_locals(depth=10):
+    """f_locals of the enclosing vLLM ``sparse_attn_indexer`` frame, or None when
+    called from anywhere else (oracle, bench, tests). In a decode graph the frame
+    exists at capture only and its host values are the CAPTURE's: used for the
+    layer name (K5) and the candidate buffers, never for a per-step decision."""
+    f = sys._getframe(1)
+    for _ in range(depth):
+        if f is None:
+            return None
+        if f.f_code.co_name == "sparse_attn_indexer":
+            return f.f_locals
+        f = f.f_back
+    return None
+
+
+def serving_ctx():
+    """Context bucket the row-group config is picked by. V4.1 decode runs in a
+    FULL CUDA graph captured once with the worst-case max_seq_len ("valid at any
+    replay", vLLM model_states/default.py), so there is no per-step context to
+    bucket by: the longest tuned bucket serves unless SUFFIX_DSA_INDEXER_CTX
+    (positions per request) pins another one."""
+    v = os.environ.get(CTX_ENV, "").strip()
+    return int(v) if v else None
+
+
+def note_path(loc, kind, path, why=""):
+    """K5: one log line per (indexer layer, kind, path) the first time it runs;
+    STRICT (SUFFIX_SM120_DSA_INDEXER_STRICT=1) refuses the Triton fallback
+    instead of running it. -> {layer: {(kind, path)}} in layer_paths()."""
+    layer = str(loc.get("k_cache_prefix", "?")) if loc else "?"
+    seen = _state["layers"].setdefault(layer, set())
+    if (kind, path) not in seen:
+        seen.add((kind, path))
+        _log(f"layer {layer}: {kind} path {path}" + (f" ({why})" if why else ""))
+    if path == "triton" and strict():
+        raise RuntimeError(f"{MARKER} {STRICT_ENV}=1: layer {layer} {kind} would fall back to the "
+                           f"Triton path ({why or 'no kernel for this shape'}); refusing")
+
+
+def layer_paths() -> dict:
+    return {k: sorted(v) for k, v in _state["layers"].items()}
 
 
 def gate_on() -> bool:
@@ -95,7 +161,10 @@ def mtp_rows(vllm_config) -> int | None:
     k = getattr(spec, "num_speculative_tokens", None) if spec else None
     if not k:
         return None
-    return 1 + (2 if getattr(spec, "parallel_drafting", False) else 1) * int(k)
+    # DSpark / DFlash set parallel_drafting but verify 1 + k target rows
+    pard = getattr(spec, "parallel_drafting", False) and \
+        getattr(spec, "method", None) not in ("dspark", "dflash")
+    return 1 + (2 if pard else 1) * int(k)
 
 
 def decode_group(next_n: int) -> int:
@@ -158,7 +227,23 @@ def _logits_op(dev):
     return hdi.dsa_indexer_logits_cuda
 
 
+def layout_reason(cache) -> str | None:
+    """Why a paged uint8 [blocks, P, (1,) 132] split-page cache is outside every
+    kernel of the lane (None: Helion's views can read it; oxide additionally
+    needs oxide_layout)."""
+    import torch
+    c = cache.squeeze(2) if cache.dim() == 4 else cache
+    if c.dtype != torch.uint8 or c.dim() != 3 or c.shape[2] != 132:
+        return f"kv cache {tuple(cache.shape)} {cache.dtype} (need uint8 [*, P, 132])"
+    if c.shape[1] % 32 or c.stride(0) % 128 or (c.shape[0] > 1 and c.stride(0) < c.shape[1] * 132) \
+            or c.storage_offset() % 4:
+        return f"kv cache page {c.shape[1]} / stride {c.stride(0)} B (need P % 32 == 0, stride % 128 == 0)"
+    return None
+
+
 def paged_ineligible(qv, kv_cache, weights, block_tables, q_scale, indices) -> str | None:
+    """Why neither oxide nor Helion can take this paged call (None: one can,
+    see paged_route)."""
     import torch
     if q_scale is not None or qv.dtype != torch.float8_e4m3fn:
         return "non-FP8 (MXFP4) query"
@@ -166,20 +251,57 @@ def paged_ineligible(qv, kv_cache, weights, block_tables, q_scale, indices) -> s
         return "varlen indices"
     if qv.dim() not in (3, 4) or qv.shape[-1] != 128 or qv.shape[-2] not in (32, 64):
         return f"q shape {tuple(qv.shape)} (need H 32|64, D 128)"
-    kc = kv_cache.squeeze(2) if kv_cache.dim() == 4 else kv_cache
-    if kc.dtype != torch.uint8 or kc.dim() != 3 or tuple(kc.shape[1:]) != (TILE, 132) \
-            or not kc.is_contiguous():
-        return f"kv cache {tuple(kv_cache.shape)} {kv_cache.dtype} (need [*, 64, 132] uint8)"
+    why = layout_reason(kv_cache)
+    if why is not None:
+        return why
     if weights.dtype != torch.float32 or block_tables.dtype != torch.int32:
         return "weights/block_tables dtype"
     return None
 
 
+def oxide_layout(kv_cache) -> bool:
+    """oxide reads contiguous [blocks, 64, 132] split pages only."""
+    kc = kv_cache.squeeze(2) if kv_cache.dim() == 4 else kv_cache
+    return kc.shape[1] == TILE and kc.is_contiguous()
+
+
+def _use_group(heads, rows, next_n, group, ctx) -> bool:
+    """The flattened MTP rows of a request go through ONE Helion K sweep
+    (helion_kernels/dsa_indexer.dsa_group_logits): backend allows Helion, the
+    layout is the flattened one (next_n 1), and a group config is shipped for
+    this rows / context bucket."""
+    if next_n != 1 or group < 2 or _backend() == "oxide":
+        return False
+    from suffix_hybrid.helion_kernels import dsa_indexer as hdi
+    return hdi.has_group(heads, rows, group, ctx)
+
+
+def paged_route(qv, kv_cache, ctx=None) -> str:
+    """oxide | helion-group | helion | triton for an eligible paged call: the
+    Helion row-group body for flattened MTP rows where a config is shipped;
+    Helion per row when the backend allows it and (helion mode, or a config for
+    this rows bucket); else oxide on its own layout; else the Triton fallback.
+    (The Helion module is only imported when the backend is not oxide.)"""
+    nn = qv.shape[1] if qv.dim() == 4 else 1
+    rows = qv.shape[0] * nn
+    if _use_group(qv.shape[-2], rows, nn, decode_group(nn), ctx):
+        return "helion-group"
+    mode = _backend()
+    if mode == "helion":
+        return "helion"
+    if mode == "auto":
+        from suffix_hybrid.helion_kernels import dsa_indexer as hdi
+        if hdi.has_config(hdi.DECODE, qv.shape[-2], rows):
+            return "helion"
+    return "oxide" if oxide_layout(kv_cache) else "triton"
+
+
 def paged_logits(qv, kv_cache, weights, context_lens, block_tables, max_model_len,
-                 clean_logits=False, out=None, group=None, min_tiles=None):
+                 clean_logits=False, out=None, group=None, min_tiles=None, ctx=None):
     """deep_gemm fp8_fp4_paged_mqa_logits (FP8) on our kernel; the caller
     checked paged_ineligible(). `out` (oracle/bench): a preallocated
-    [rows, >= max_model_len] f32 buffer; `group` / `min_tiles`: plan overrides."""
+    [rows, >= max_model_len] f32 buffer; `group` / `min_tiles`: plan overrides;
+    `ctx`: the Helion row-group context bucket (None: the longest, see serving_ctx)."""
     import torch
     dev = qv.device
     if qv.dim() == 3:
@@ -204,8 +326,12 @@ def paged_logits(qv, kv_cache, weights, context_lens, block_tables, max_model_le
         out.fill_(float("-inf"))
     if rows == 0 or max_model_len == 0:
         return out
-    p = plan(rows, group or decode_group(next_n), max_model_len, _sms(dev),
-             min_tiles or _min_tiles())
+    grp = group or decode_group(next_n)
+    if _use_group(h, rows, next_n, grp, ctx):
+        from suffix_hybrid.helion_kernels import dsa_indexer as hdi
+        return hdi.group_logits(qv.reshape(rows, h, d).contiguous(), weights, kv_cache, block_tables,
+                                cl, out, max_model_len, grp, ctx)
+    p = plan(rows, grp, max_model_len, _sms(dev), min_tiles or _min_tiles())
     _logits_op(dev)(
         out, qv.reshape(rows, h, d).contiguous(), weights, kc, None, block_tables,
         None, cl, max_model_len, p["group"], p["slices"], next_n, p["splits"],
@@ -256,28 +382,68 @@ def wrap_paged(fallback):
                                  schedule_metadata, max_model_len, clean_logits=False,
                                  indices=None):
         qv, q_scale = q
+        loc = indexer_locals()
+        ctx = serving_ctx()
         why = paged_ineligible(qv, kv_cache, weights, block_tables, q_scale, indices)
-        if why is not None:
+        if why is None:
+            from suffix_hybrid.kernels import dsa_candidates
+            fused = dsa_candidates.maybe_fuse(qv, kv_cache, weights, context_lens, block_tables)
+            if fused is not None:
+                note_path(loc, "decode", "cand-fused")
+                return fused
+        route = "triton" if why is not None else paged_route(qv, kv_cache, ctx)
+        if route == "triton":
+            why = why or "page layout oxide cannot read and no Helion config for this bucket"
+            note_path(loc, "decode", "triton", why)
             _once("paged:" + why, f"paged logits -> Triton fallback: {why}")
             return fallback(q, kv_cache, weights, context_lens, block_tables,
                             schedule_metadata, max_model_len, clean_logits, indices)
         nn = qv.shape[1] if qv.dim() == 4 else 1
-        _once("paged", f"paged logits ACTIVE ({_backend()} e4m3 mma, H={qv.shape[-2]}, "
-                       f"rows/CTA group={decode_group(nn)})")
+        kc = kv_cache.squeeze(2) if kv_cache.dim() == 4 else kv_cache
+        note_path(loc, "decode", route, f"page {kc.shape[1]}")
+        _once(f"paged:{route}:{kc.shape[1]}",
+              f"paged logits ACTIVE ({route} e4m3 mma, H={qv.shape[-2]}, page {kc.shape[1]}, "
+              f"rows/CTA group={decode_group(nn)})")
         return paged_logits(qv, kv_cache, weights, context_lens, block_tables,
-                            max_model_len, clean_logits)
+                            max_model_len, clean_logits, ctx=ctx)
     return fp8_fp4_paged_mqa_logits
 
 
 def wrap_mqa(fallback):
-    def fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=False):
+    def fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k=None,
+                           clean_logits=False):
         (qv, q_scale), (kv_v, kv_scale) = q, kv
+        args = (q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k, clean_logits)
+        loc = indexer_locals()
         why = mqa_ineligible(qv, kv_v, kv_scale, weights, q_scale)
         if why is not None:
+            note_path(loc, "prefill", "triton", why)
             _once("mqa:" + why, f"prefill logits -> Triton fallback: {why}")
-            return fallback(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits)
+            return fallback(*args)
+        if isinstance(max_seqlen_k, int) and not isinstance(max_seqlen_k, bool):
+            # vLLM nightly: compressed [M, max_seqlen_k] (oxide cannot shift columns)
+            mode, m = _backend(), qv.shape[0]
+            hdi = None
+            if mode != "oxide":
+                from suffix_hybrid.helion_kernels import dsa_indexer as hdi
+            if mode == "helion" or (mode == "auto" and hdi.has_config(hdi.PREFILL, qv.shape[1], m)):
+                note_path(loc, "prefill", "helion-compressed")
+                _once("mqa:c", f"compressed prefill logits ACTIVE (helion, H={qv.shape[1]})")
+                import torch
+                out = torch.empty((m, max_seqlen_k), dtype=torch.float32, device=qv.device)
+                return hdi.prefill_logits(qv, kv_v, kv_scale, weights, cu_seqlen_ks, cu_seqlen_ke,
+                                          out, compressed=True)
+            note_path(loc, "prefill", "triton", "oxide writes absolute columns only; "
+                                                "no Helion config for this bucket")
+            _once("mqa:ct", "compressed prefill logits -> Triton fallback (oxide writes absolute "
+                            "columns only; no Helion config for this bucket)")
+            return fallback(*args)
+        if max_seqlen_k is not None and not isinstance(max_seqlen_k, bool):
+            return fallback(*args)  # neither contract: the fallback refuses (fail closed)
+        note_path(loc, "prefill", _backend())
         _once("mqa", f"prefill logits ACTIVE ({_backend()} e4m3 mma, H={qv.shape[1]})")
-        return mqa_logits(qv, kv_v, kv_scale, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits)
+        return mqa_logits(qv, kv_v, kv_scale, weights, cu_seqlen_ks, cu_seqlen_ke,
+                          bool(max_seqlen_k) or clean_logits)
     return fp8_fp4_mqa_logits
 
 
@@ -383,14 +549,17 @@ def _fallback_mod():
     return mod
 
 
-def make_decode(dev, heads, batch, next_n, ctx, flattened, max_model_len, seed=0):
-    """GLM-5.3-like decode problem: per request ctx_b ~ U[ctx/2, ctx] tokens in
-    shuffled physical pages; rows ordered by request; row j of a request sees
-    L - next_n + 1 + j (vLLM's per-row causal lens). flattened: vLLM's SM120
-    layout (q [rows, 1], cl [rows, 1], block-table row copied per row)."""
+def make_decode(dev, heads, batch, next_n, ctx, flattened, max_model_len, seed=0, exact=False):
+    """GLM-5.3-like decode problem: per request ctx_b ~ U[ctx/2, ctx] tokens
+    (exact: all ctx) in shuffled physical pages; rows ordered by request; row j
+    of a request sees L - next_n + 1 + j (vLLM's per-row causal lens).
+    flattened: vLLM's SM120 layout (q [rows, 1], cl [rows, 1], block-table row
+    copied per row)."""
     import torch
     g = torch.Generator(device="cpu").manual_seed(seed)
     lens = torch.randint(max(next_n, ctx // 2), ctx + 1, (batch,), generator=g)
+    if exact:
+        lens = torch.full((batch,), ctx)
     nblk = [-(-int(n) // TILE) for n in lens]
     total = sum(nblk)
     perm = torch.randperm(total + 3, generator=g)[:total]  # scattered pages, spare ones unused
@@ -608,7 +777,11 @@ def bench(cases=BENCH_CASES, iters=50):
 
 
 def main(argv=None):
-    mode = (argv or sys.argv[1:] or ["oracle"])[0]
+    argv = list(sys.argv[1:] if argv is None else argv)
+    mode = (argv or ["oracle"])[0]
+    if mode == "capture_replay":   # boot gate dsa_indexer_capture_replay (needs no oxide cubin)
+        from suffix_hybrid.kernels import dsa_indexer_gate
+        return dsa_indexer_gate.main(argv[1:])
     try:
         import torch
         _native(torch.device("cuda", torch.cuda.current_device()))
