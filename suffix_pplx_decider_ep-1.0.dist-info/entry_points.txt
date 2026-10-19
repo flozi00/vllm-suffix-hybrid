@@ -1,0 +1,5 @@
+[vllm.general_plugins]
+suffix_pplx_decider = suffix_hybrid.decider_plugin:register
+
+[vllm.endpoint_plugins]
+suffix_pplx_decider_endpoint = suffix_hybrid_decider_ep:register
