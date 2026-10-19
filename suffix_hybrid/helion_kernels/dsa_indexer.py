@@ -413,12 +413,22 @@ def _reqs(rows):
     return rows // MTP_ROWS if rows % MTP_ROWS == 0 else rows
 
 
-def decode_case(heads: int, rows: int) -> dict:
-    return {"heads": heads, "rows": rows, "ctx": DECODE_CTX, "numtokens": _reqs(rows)}
+FMT_V41 = "v41"   # case-key marker of DeepSeek-V4.1 geometry: its own configs, tuned against the STOCK path
 
 
-def prefill_case(heads: int, m: int) -> dict:
-    return {"heads": heads, "m": m, "n": max(4 * m, 8192), "numtokens": m}
+def _tag(case: dict, fmt) -> dict:
+    """GLM-5.3 keys stay exactly as shipped; V4.1 keys carry fmt so a config tuned
+    against oxide (GLM) can never serve V4.1 and V4.1 configs only exist where they
+    beat the stock path."""
+    return {**case, "fmt": fmt} if fmt else case
+
+
+def decode_case(heads: int, rows: int, fmt=None) -> dict:
+    return _tag({"heads": heads, "rows": rows, "ctx": DECODE_CTX, "numtokens": _reqs(rows)}, fmt)
+
+
+def prefill_case(heads: int, m: int, fmt=None) -> dict:
+    return _tag({"heads": heads, "m": m, "n": max(4 * m, 8192), "numtokens": m}, fmt)
 
 
 def cand_case(heads: int, rows: int, ncand: int = 2048, bsz: int = 8) -> dict:
@@ -426,8 +436,8 @@ def cand_case(heads: int, rows: int, ncand: int = 2048, bsz: int = 8) -> dict:
             "numtokens": _reqs(rows)}
 
 
-def group_case(heads: int, reqs: int, ctx: int, g: int = GROUP_G) -> dict:
-    return {"heads": heads, "rows": reqs * g, "group": g, "ctx": ctx, "numtokens": reqs}
+def group_case(heads: int, reqs: int, ctx: int, g: int = GROUP_G, fmt=None) -> dict:
+    return _tag({"heads": heads, "rows": reqs * g, "group": g, "ctx": ctx, "numtokens": reqs}, fmt)
 
 
 def ctx_bucket(ctx) -> int:
@@ -437,14 +447,15 @@ def ctx_bucket(ctx) -> int:
     return hk.bucket(ctx, GROUP_CTX) if ctx else GROUP_CTX[-1]
 
 
-def group_serving_case(heads: int, rows: int, g: int, ctx) -> dict:
+def group_serving_case(heads: int, rows: int, g: int, ctx, fmt=None) -> dict:
     cb = ctx_bucket(ctx)
-    return group_case(heads, hk.bucket(-(-rows // g), GROUP_REQS[cb]), cb, g)
+    return group_case(heads, hk.bucket(-(-rows // g), GROUP_REQS[cb]), cb, g, fmt)
 
 
-def has_group(heads: int, rows: int, g: int, ctx) -> bool:
+def has_group(heads: int, rows: int, g: int, ctx, fmt=None) -> bool:
     """A shipped row-group config for this decode (g must be the tuned G)."""
-    return g == GROUP_G and rows > 0 and hk.config(GROUP, group_serving_case(heads, rows, g, ctx)) is not None
+    return g == GROUP_G and rows > 0 \
+        and hk.config(GROUP, group_serving_case(heads, rows, g, ctx, fmt)) is not None
 
 
 def n_cols_for(case: dict) -> int:
@@ -462,8 +473,8 @@ _BODY = {DECODE: dsa_decode_logits, PREFILL: dsa_prefill_logits, CANDK: dsa_cand
 def all_cases(kernel: str, heads: int, **kw) -> list:
     """[(dummy-warm size, case)] of every tuned bucket of `kernel`."""
     if kernel == GROUP:
-        g = kw.get("g", GROUP_G)
-        return [(r, group_case(heads, r, c, g)) for c in GROUP_CTX for r in GROUP_REQS[c]]
+        g, fmt = kw.get("g", GROUP_G), kw.get("fmt")
+        return [(r, group_case(heads, r, c, g, fmt)) for c in GROUP_CTX for r in GROUP_REQS[c]]
     make_case, buckets = _CASE[kernel]
     return [(b, make_case(heads, b, **kw)) for b in buckets]
 
@@ -572,13 +583,15 @@ def _warm(kernel, heads, dev, kv, n_cols, mode, bt_width=2, force=False, **kw):
     _WARM.add(key)
 
 
-def warm_all(dev, cache, n_cols, bt_width, heads=32, g=GROUP_G, cand=None):
+def warm_all(dev, cache, n_cols, bt_width, heads=32, g=GROUP_G, cand=None, v41=False):
     """Load-time warm-up of everything the lane can launch on a decode graph:
     the per-row and row-group bodies (and the fused-candidate body for
-    cand = (ncand, bsz)) for this cache, logits width and block-table width.
-    Call it before the first capture (boot gate dsa_indexer_capture_replay does)."""
-    _warm(DECODE, heads, dev, cache, n_cols, di._backend(), bt_width, force=True)
-    _warm(GROUP, heads, dev, cache, n_cols, "auto", bt_width, force=True, g=g)
+    cand = (ncand, bsz)) for this cache, logits width and block-table width
+    (v41: the V4.1-keyed configs). Call it before the first capture (boot gate
+    dsa_indexer_capture_replay does)."""
+    fmt = {"fmt": FMT_V41} if v41 else {}
+    _warm(DECODE, heads, dev, cache, n_cols, di._backend(), bt_width, force=True, **fmt)
+    _warm(GROUP, heads, dev, cache, n_cols, "auto", bt_width, force=True, g=g, **fmt)
     if cand is not None:
         _warm(CANDK, heads, dev, cache, cand[0] * cand[1], "auto", bt_width, force=True,
               ncand=cand[0], bsz=cand[1])
@@ -590,13 +603,16 @@ def _check_q(q):
 
 
 def dsa_indexer_logits_cuda(out, q, weights, kv, k_scale, block_tables, lo, hi, n_cols, group,
-                            slices, bt_div, splits, min_tiles, stream_ptr):
+                            slices, bt_div, splits, min_tiles, stream_ptr, *, v41=False):
     """Drop-in for ``_native.dsa_indexer_logits_cuda`` (same signature and
     contract, src/dsa_indexer_oxide.rs): paged when block_tables is given
     (any cache_views layout: the oxide fallback below only takes contiguous
     64-token pages, the lane routes other layouts here only with a config).
     group / slices / splits / min_tiles are the oxide plan — passed through
     on the oxide fallback, ignored by Helion (its config owns the schedule).
+    v41: DeepSeek-V4.1 geometry -- its own (fmt-keyed) configs, and NO oxide
+    fallback: a bucket without a config is an error here (the shim wrapper
+    sends such calls to the stock path before getting here).
     Runs on torch's current stream (= stream_ptr in the lane)."""
     paged = block_tables is not None
     kernel = DECODE if paged else PREFILL
@@ -608,10 +624,15 @@ def dsa_indexer_logits_cuda(out, q, weights, kv, k_scale, block_tables, lo, hi, 
         raise ValueError(f"dsa_indexer: contiguous kv {tuple(kv.shape)} needs k_scale and n_cols == N")
     mode = di._backend()
     dev = q.device
+    fmt = {"fmt": FMT_V41} if v41 else {}
     _warm(kernel, heads, dev, kv if paged else None, n_cols, mode,
-          block_tables.shape[-1] if paged and block_tables.dim() > 1 else 2)
-    case = serving_case(kernel, heads, rows)
+          block_tables.shape[-1] if paged and block_tables.dim() > 1 else 2, **fmt)
+    case = serving_case(kernel, heads, rows, **fmt)
     if hk.config(kernel, case) is None:  # auto: oxide won (or was never beaten) here
+        if v41:
+            raise RuntimeError(f"{hk.MARKER} {kernel}: no tuned config for {hk.case_key(case)} on "
+                               f"{hk.platform(dev.index or 0)}; DeepSeek-V4.1 geometry has no oxide fallback "
+                               "(oxide is retired for V4.1): ship the config or serve the stock path")
         return di._native(dev).dsa_indexer_logits_cuda(
             out, q, weights, kv, k_scale, block_tables, lo, hi, n_cols, group, slices, bt_div,
             splits, min_tiles, stream_ptr)
@@ -632,19 +653,21 @@ def dsa_indexer_logits_cuda(out, q, weights, kv, k_scale, block_tables, lo, hi, 
     return None
 
 
-def prefill_logits(q, kv, k_scale, w, lo, hi, out, compressed):
-    """vLLM's prefill contract on the Helion body (the lane checked has_config):
+def prefill_logits(q, kv, k_scale, w, lo, hi, out, compressed, v41=False):
+    """vLLM's prefill contract on the Helion body (the lane checked has_config;
+    v41: the V4.1-keyed configs):
     q e4m3 [M, H, 128], kv e4m3 [N, 128], k_scale f32 [N], w f32 [M, H], lo / hi
     int32 [M]; out contiguous f32 [M, W] — compressed (column n - lo) or
     absolute (W == N)."""
     _check_q(q)
     rows, heads = q.shape[0], q.shape[1]
     dev = q.device
-    _warm(PREFILL, heads, dev, None, out.shape[1], di._backend())
+    fmt = {"fmt": FMT_V41} if v41 else {}
+    _warm(PREFILL, heads, dev, None, out.shape[1], di._backend(), **fmt)
     if rows == 0 or out.shape[1] == 0 or kv.shape[0] == 0:
         return out
     lo, hi = lo.to(torch.int32).contiguous(), hi.to(torch.int32).contiguous()
-    kern = hk.compiled(dsa_prefill_logits, PREFILL, serving_case(PREFILL, heads, rows))
+    kern = hk.compiled(dsa_prefill_logits, PREFILL, serving_case(PREFILL, heads, rows, **fmt))
     n_sms = di._sms(dev) if dev.type == "cuda" else 4
     _launch(kern, q, kv, k_scale.reshape(-1).to(torch.float32).contiguous(), w[:rows], lo, hi,
             lo if compressed else torch.zeros_like(lo), out,
@@ -668,7 +691,7 @@ def group_pad(q, w, cl, g):
     return q.view(reqs, g, heads, 128), w.view(reqs, g, heads), cl
 
 
-def group_logits(q, w, cache, bt, cl, out, n_cols, g, ctx=None):
+def group_logits(q, w, cache, bt, cl, out, n_cols, g, ctx=None, v41=False):
     """Row-group decode (the lane checked has_group and layout_reason): q e4m3
     [rows, H, 128] contiguous (rows = G x requests, flattened MTP layout), w f32
     [>= rows, H], cache uint8 [blocks, P, (1,) 132], bt int32 [rows, W] (a block
@@ -676,14 +699,15 @@ def group_logits(q, w, cache, bt, cl, out, n_cols, g, ctx=None):
     on [0, min(cl, n_cols))). rows need not be a multiple of g: the last group
     is padded with cl 0 rows. ctx: the tuned context bucket (None: the longest --
     a decode graph is captured once and replayed at every context, so serving
-    never has a per-step context to bucket by)."""
+    never has a per-step context to bucket by). v41: the V4.1-keyed configs."""
     _check_q(q)
     rows, heads = q.shape[0], q.shape[1]
     dev = q.device
-    _warm(GROUP, heads, dev, cache, n_cols, "auto", bt.shape[-1], g=g)
+    fmt = FMT_V41 if v41 else None
+    _warm(GROUP, heads, dev, cache, n_cols, "auto", bt.shape[-1], g=g, **({"fmt": fmt} if fmt else {}))
     if rows == 0 or n_cols == 0:
         return out
-    kern = hk.compiled(dsa_group_logits, GROUP, group_serving_case(heads, rows, g, ctx))
+    kern = hk.compiled(dsa_group_logits, GROUP, group_serving_case(heads, rows, g, ctx, fmt))
     q4, w3, cl = group_pad(q, w, cl, g)   # dead rows read the last real block-table row
     kv, ks, page, prow, sp = cache_views(cache)
     n_sms = di._sms(dev) if dev.type == "cuda" else 4
@@ -806,7 +830,7 @@ SELECT_STALE = 0.1   # fraction of the warm set that is stale (random window pos
 
 
 def select_case(heads: int, reqs: int, ctx: int, g: int = GROUP_G) -> dict:
-    return group_case(heads, reqs, ctx, g)
+    return group_case(heads, reqs, ctx, g, FMT_V41)    # V4.1-only experiment
 
 
 def select_make(case, seed):
@@ -873,25 +897,24 @@ def select_check(out, ref):
 
 
 def select_make_baseline(case, seed):
-    """oxide dense logits + a torch compaction (the lanes it replaces, minus the top-k)."""
+    """The stock dense logits (vendored DeepGEMM) + a torch compaction (what the
+    select replaces, minus the top-k)."""
     pr, n_sms = _decode_problem(case, seed)
-    out = torch.full((pr["rows"], n_cols_for(case)), float("-inf"), device=pr["q"].device)
-    thr = select_make(case, seed)[6]
-    return (out, pr["q"], pr["cache"], pr["w"], pr["cl"], pr["bt"], case["rows"] // case["numtokens"], thr)
+    return (*decode_make_dg_from(pr, n_sms), select_make(case, seed)[6])
 
 
-def select_baseline(out, q, cache, w, cl, bt, group, thr):
-    decode_baseline(out, q, cache, w, cl, bt, group)
-    keep = out >= thr[:, None]
+def select_baseline(q, cache, w, cl, bt, sched, thr):
+    out = decode_baseline_dg(q, cache, w, cl, bt, sched)
+    col = torch.arange(out.shape[1], device=out.device)
+    keep = (out >= thr[:, None]) & (col[None, :] < cl.reshape(-1, 1))
     cnt = keep.sum(1, dtype=torch.int32)
     return torch.nonzero(keep), cnt
 
 
 def _select_tune_baseline(q, w, kv, ks, bt, cl, thr, comp_v, comp_i, cnt, page, prow, sp, splits):
-    """Dense oxide logits + position-order compaction, in the select kernel's output form."""
+    """Dense stock logits + position-order compaction, in the select kernel's output form."""
     rows = comp_v.shape[0]
-    dense = torch.full(comp_v.shape, float("-inf"), device=comp_v.device)
-    _group_tune_baseline(q, w, kv, ks, bt, cl, dense, page, prow, sp, splits)
+    dense = _stock_dense(q, w, kv, bt, cl, comp_v.shape[1], page, sp)
     keep = dense >= thr[:, None]
     n = keep.sum(1, dtype=torch.int32)
     pos = torch.cumsum(keep.to(torch.int32), 1) - 1
@@ -931,12 +954,50 @@ def decode_baseline(out, q, cache, w, cl, bt, group):
                   None, cl.reshape(-1).to(torch.int32), group)
 
 
+def baseline_make(case, seed):
+    """K4 baseline problem of a DECODE / GROUP case: V4.1 (fmt) -> the stock
+    vendored-DeepGEMM call, GLM-5.3 -> oxide's page-dedup row group. The config
+    pull then ships a V4.1 config only where Helion beat the STOCK path."""
+    if case.get("fmt") == FMT_V41:
+        return ("stock", *decode_make_dg(case, seed))
+    return ("oxide", *decode_make_baseline(case, seed))
+
+
+def baseline_run(kind, *a):
+    return decode_baseline_dg(*a) if kind == "stock" else decode_baseline(*a)
+
+
 def decode_make_dg(case, seed):
     """The problem in vLLM's DeepGEMM paged-MQA call (flattened next_n = 1)."""
     return decode_make_dg_from(*_decode_problem(case, seed))
 
 
+def vendor_baseline_guard():
+    """K4 integrity: a V4.1 baseline is the stock VENDORED DeepGEMM call. With the suffix shim's fallback
+    engaged (SUFFIX_SM120=1) vLLM's wrappers still reach the vendor, but only while the shim's trio dispatches
+    there (sm120_fallback.vendor_paged_ok) and the lane's own wrappers are not installed; on a pod where they
+    would hit the Triton stand-in (GLM-era vLLM, SUFFIX_DSA_INDEXER_STOCK=shim) or our lane, the measured
+    'baseline' would not be what boot5 ran and a won config would not beat A1: refuse."""
+    try:
+        import deep_gemm
+    except ImportError:         # no shim on the path: vLLM's wrappers import the vendored module itself
+        return
+    if not (getattr(deep_gemm, "__suffix_shim__", False) and getattr(deep_gemm, "_use_fallback", False)):
+        return
+    why = "the lane's own wrappers are installed (SUFFIX_SM120_DSA_INDEXER=1)" if getattr(
+        deep_gemm, "_dsa_indexer", False) else None
+    for name in ("fp8_fp4_mqa_logits", "fp8_fp4_paged_mqa_logits", "get_paged_mqa_logits_metadata"):
+        applies = getattr(getattr(deep_gemm, name, None), "vendor_applies", None)
+        if why is None and (applies is None or not applies(max_seqlen_k=1, clean_logits=False)):
+            why = f"deep_gemm.{name} resolves to the shim's Triton stand-in"
+    if why:
+        raise RuntimeError(f"[suffix dsa-indexer] a V4.1 K4 baseline must be the vendored DeepGEMM, but {why}: "
+                           "run the lab with the shim inert (no SUFFIX_SM120) or on a nightly pod whose vendor "
+                           "runs the SM120 paged MQA (SUFFIX_DSA_INDEXER_STOCK unset)")
+
+
 def decode_make_dg_from(pr, n_sms):
+    vendor_baseline_guard()
     from vllm.utils import deep_gemm as vdg
     rows = pr["rows"]
     cl = pr["cl"].reshape(rows, 1).to(torch.int32).contiguous()
@@ -949,10 +1010,8 @@ def decode_make_dg_from(pr, n_sms):
 def decode_baseline_dg(q, cache, w, cl, bt, sched):
     """vLLM's production SM120 path: the vendored DeepGEMM (vllm.utils.deep_gemm,
     whatever wrapper name this vLLM has); never our shim's fallback."""
-    import deep_gemm
+    vendor_baseline_guard()
     from vllm.utils import deep_gemm as vdg
-    if getattr(deep_gemm, "__suffix_shim__", False) and getattr(deep_gemm, "_use_fallback", False):
-        raise RuntimeError("deep_gemm resolves to the suffix SM120 fallback, not DeepGEMM")
     import inspect
     fn = getattr(vdg, "fp8_fp4_paged_mqa_logits", None)
     if fn is None:
@@ -1011,6 +1070,25 @@ def prefill_reference(q, kv, ks, w, lo, hi, off, out, splits):
             o = int(off[r])
             val[r, a - o:b - o], mag[r, a - o:b - o] = di.ref_logits(q[r], w[r], kv[a:b], ks[a:b])
     return val, mag
+
+
+def prefill_make_baseline_any(case, seed):
+    """V4.1 (fmt): the stock vendored-DeepGEMM compressed prefill call; GLM: oxide."""
+    if case.get("fmt") == FMT_V41:
+        dev, _ = _dev_sms()
+        q, kv, ksc, w, lo, hi, _, _ = prefill_problem(case["heads"], case["m"], case["n"], dev, seed,
+                                                      compressed=True)
+        return ("stock", q, kv, ksc, w, lo, hi, case["n"])
+    return ("oxide", *prefill_make_baseline(case, seed))
+
+
+def prefill_baseline_any(kind, *a):
+    if kind == "stock":
+        vendor_baseline_guard()
+        from vllm.utils import deep_gemm as vdg
+        q, kv, ksc, w, lo, hi, n = a
+        return vdg.fp8_fp4_mqa_logits((q, None), (kv, ksc), w, lo, hi, n)
+    return prefill_baseline(*a)
 
 
 def prefill_baseline(q, kv, ks, w, lo, hi, out, splits):
@@ -1079,19 +1157,17 @@ def cand_reference(q, w, kv, ks, bt, cl, cand, out, page, prow, sp, splits):
 
 
 def cand_make_baseline(case, seed):
-    """What the fused body replaces, on the same problem: the dense lane over
-    [0, cl) (oxide, the MTP row group) + vLLM's apply_candidate_mask over the
-    full logits width (when this vLLM has it; else the dense pass alone — a
-    baseline that only gets cheaper)."""
+    """What the fused body replaces, on the same problem: the stock dense logits
+    (vendored DeepGEMM) + vLLM's apply_candidate_mask over the full logits width
+    (when this vLLM has it; else the dense pass alone -- a baseline that only
+    gets cheaper)."""
     pr, n_sms = _cand_problem(case, seed)
-    out = torch.full((pr["rows"], di.MAX_MODEL_LEN), float("-inf"), device=pr["q"].device)
     cand = cand_problem(pr, case["cand"], case["cbs"], seed)
-    return (out, pr["q"], pr["cache"], pr["w"], pr["cl"], pr["bt"],
-            case["rows"] // case["numtokens"], cand, case["cbs"])
+    return (*decode_make_dg_from(pr, n_sms), cand, case["cbs"])
 
 
-def cand_baseline(out, q, cache, w, cl, bt, group, cand, bsz):
-    decode_baseline(out, q, cache, w, cl, bt, group)
+def cand_baseline(q, cache, w, cl, bt, sched, cand, bsz):
+    out = decode_baseline_dg(q, cache, w, cl, bt, sched)
     try:
         from vllm.model_executor.kernels.attention.dsa.candidate_blocks import apply_candidate_mask
     except ImportError:
@@ -1102,35 +1178,52 @@ def cand_baseline(out, q, cache, w, cl, bt, group, cand, bsz):
 
 # Helion's autotuner checks every candidate against a baseline run over the
 # WHOLE output; the windows are the only defined part (the kernel never writes
-# elsewhere). Lab-only settings (serving never autotunes): the baseline is the
-# oxide kernel (or the Triton fallback where oxide has no such layout) on the
-# body's own args, and the comparison is restricted to the columns the
-# baseline wrote (finite), like the consumer. The lab's check() still proves
-# the winner wrote nothing outside the windows.
-def _oxide_cache(kv, page, sp):
-    return kv.view(torch.uint8).view(-1, page, 132) if sp * 4 == page * 132 else None
+# elsewhere). Lab-only settings (serving never autotunes): the accuracy baseline
+# is the shim's Triton stand-in of the DeepGEMM contract (sm120_fallback.triton_*:
+# exact on every page layout, no oxide, never the vendor) on the body's own args, and the
+# comparison is restricted to the columns the baseline wrote (finite), like the
+# consumer. The lab's check() still proves the winner wrote nothing outside the
+# windows.
+def _cache_of(kv, page, sp):
+    """The uint8 [blocks, page, 132] split-page cache behind cache_views' kv view
+    (contiguous or with a packed page stride)."""
+    s = sp * 4
+    flat = kv.view(torch.uint8).reshape(-1)
+    return flat.as_strided(((flat.numel() - page * 132) // s + 1, page, 132), (s, 132, 1))
+
+
+def _stock_dense(q, w, kv, bt, cl, n_cols, page, sp):
+    """Dense logits [rows, n_cols] (-inf outside every row's window) from the shim's
+    Triton stand-in of the DeepGEMM contract (sm120_fallback.triton_paged_mqa_logits,
+    never the vendored kernel): the accuracy baseline of every decode tune case, GLM
+    and V4.1 alike -- exact on any page layout, and no oxide."""
+    rows = bt.shape[0]
+    heads = q.shape[-2]
+    cl = cl.reshape(-1)[:rows]            # (group bodies carry padding rows past `rows`)
+    res = di._fallback_mod().triton_paged_mqa_logits(
+        (q.reshape(-1, heads, 128)[:rows].reshape(rows, 1, heads, 128), None),
+        _cache_of(kv, page, sp).unsqueeze(2), w.reshape(-1, heads)[:rows], cl.reshape(rows, 1), bt, None, n_cols)
+    col = torch.arange(n_cols, device=res.device)
+    return torch.where(col[None, :] < torch.clamp(cl, 0, n_cols)[:, None], res, float("-inf"))
 
 
 def _decode_tune_baseline(q, w, kv, ks, bt, cl, out, page, prow, sp, splits):
-    return _oxide(out, q, w, _oxide_cache(kv, page, sp), None, bt, None, cl, 1)
+    return _stock_dense(q, w, kv, bt, cl, out.shape[1], page, sp)
 
 
 def _group_tune_baseline(q, w, kv, ks, bt, cl, out, page, prow, sp, splits):
-    rows, heads = out.shape[0], q.shape[2]
-    return _oxide(out, q.reshape(rows, heads, 128), w.reshape(rows, heads), _oxide_cache(kv, page, sp),
-                  None, bt, None, cl, q.shape[1])
+    return _stock_dense(q, w, kv, bt, cl, out.shape[1], page, sp)
 
 
 def _prefill_tune_baseline(q, kv, ks, w, lo, hi, off, out, splits):
     """The Triton fallback's compressed logits, cleaned past each window."""
-    res = di._fallback_mod().fp8_fp4_mqa_logits((q, None), (kv, ks), w, lo, hi, out.shape[1])
+    res = di._fallback_mod().triton_mqa_logits((q, None), (kv, ks), w, lo, hi, out.shape[1])
     col = torch.arange(out.shape[1], device=out.device)
     return torch.where(col[None, :] < (hi - lo)[:, None], res, float("-inf"))
 
 
 def _cand_tune_baseline(q, w, kv, ks, bt, cl, cand, out, page, prow, sp, splits):
-    dense = torch.full((q.shape[0], di.MAX_MODEL_LEN), float("-inf"), device=q.device)
-    _decode_tune_baseline(q, w, kv, ks, bt, cl, dense, page, prow, sp, splits)
+    dense = _stock_dense(q, w, kv, bt, cl, di.MAX_MODEL_LEN, page, sp)
     bsz = out.shape[1] // cand.shape[1]
     j = torch.arange(out.shape[1], device=q.device)
     blk = cand[:, j // bsz].long()
@@ -1182,6 +1275,8 @@ def _cases(kernel, archs=None, rows=None):
         kw = {}
         if kernel == CANDK:
             kw = dict(zip(("ncand", "bsz"), CAND[arch]))
+        elif arch in CAND:   # DeepSeek-V4.1: its own keys, baselines are the stock path
+            kw = {"fmt": FMT_V41}
         return [make_case(heads, b, **kw) for b in buckets if rows is None or b in rows]
     return cases
 
@@ -1192,7 +1287,8 @@ def _group_cases(only=None, archs=None):
         heads = INDEX_HEADS.get(arch)
         if heads is None or (archs is not None and arch not in archs):
             return []
-        return [c for _, c in all_cases(GROUP, heads) if only is None or (c["ctx"], c["numtokens"]) in only]
+        fmt = FMT_V41 if arch in CAND else None
+        return [c for _, c in all_cases(GROUP, heads, fmt=fmt) if only is None or (c["ctx"], c["numtokens"]) in only]
     return cases
 
 
@@ -1200,57 +1296,42 @@ _SETTINGS = {"autotune_baseline_accuracy_check_fn": _tune_check, **cap.SEARCH_SE
 KERNELS = [
     {"name": DECODE, "body": dsa_decode_logits, "cases": _cases(DECODE),
      "make": decode_make, "reference": decode_reference, "check": check,
-     "make_baseline": decode_make_baseline, "baseline": decode_baseline,
-     "baseline_name": "oxide dsa_indexer", "replaces": [r"dsa_logits"],
+     "make_baseline": baseline_make, "baseline": baseline_run,
+     "baseline_name": "oxide dsa_indexer (GLM-5.3) | vLLM DeepGEMM paged MQA (V4.1)",
+     "replaces": [r"dsa_logits"],
      "settings": {"autotune_baseline_fn": _decode_tune_baseline, **_SETTINGS}},
     # MTP rows of a request scored in one K sweep (V4.1 DSpark: G = 6), per
-    # request count and context bucket up to 524288; baseline = oxide's own
-    # page-dedup row group (the kernel it replaces where oxide can read the layout)
+    # request count and context bucket up to 524288; baseline = the stock
+    # DeepGEMM call on V4.1 (oxide's page-dedup group on GLM-5.3)
     {"name": GROUP, "body": dsa_group_logits, "cases": _group_cases(),
      "make": group_make, "reference": group_reference, "check": check,
-     "make_baseline": decode_make_baseline, "baseline": decode_baseline,
-     "baseline_name": "oxide dsa_indexer (MTP row group)", "replaces": [],
+     "make_baseline": baseline_make, "baseline": baseline_run,
+     "baseline_name": "oxide dsa_indexer MTP row group (GLM-5.3) | vLLM DeepGEMM paged MQA (V4.1)", "replaces": [],
      "settings": {"autotune_baseline_fn": _group_tune_baseline, **_SETTINGS}},
     # fused top-k without dense logits: the group scan writes only the survivors of a
-    # warm-start bound (kernels/dsa_select.py); baseline = oxide dense logits + a
+    # warm-start bound (kernels/dsa_select.py); baseline = the stock dense logits + a
     # torch compaction. Lab only: not wired into serving yet (no config is read).
     {"name": SELECT, "body": dsa_group_select, "cases": _group_cases(set(SELECT_CASES), CAND),
      "make": select_make, "reference": select_reference, "check": select_check,
      "make_baseline": select_make_baseline, "baseline": select_baseline,
-     "baseline_name": "oxide dsa_indexer dense logits + torch compaction", "replaces": [],
+     "baseline_name": "vLLM DeepGEMM dense logits + torch compaction", "replaces": [],
      "settings": {"autotune_baseline_fn": _select_tune_baseline,
                   "autotune_baseline_accuracy_check_fn": _select_tune_check, **cap.SEARCH_SETTINGS}},
     # the oxide entry is ONE kernel for decode and prefill: the decode-dominated
     # profile op is credited to the decode port only (no double count)
     {"name": PREFILL, "body": dsa_prefill_logits, "cases": _cases(PREFILL),
      "make": prefill_make, "reference": prefill_reference, "check": check,
-     "make_baseline": prefill_make_baseline, "baseline": prefill_baseline,
-     "baseline_name": "oxide dsa_indexer (absolute columns)", "replaces": [],
+     "make_baseline": prefill_make_baseline_any, "baseline": prefill_baseline_any,
+     "baseline_name": "oxide dsa_indexer absolute columns (GLM-5.3) | vLLM DeepGEMM compressed (V4.1)",
+     "replaces": [],
      "settings": {"autotune_baseline_fn": _prefill_tune_baseline, **_SETTINGS}},
     # DeepSeek-V4.1 consumer indexers: fused candidate scoring vs dense + mask
     {"name": CANDK, "body": dsa_cand_logits, "cases": _cases(CANDK, CAND),
      "make": cand_make, "reference": cand_reference, "check": check,
      "make_baseline": cand_make_baseline, "baseline": cand_baseline,
-     "baseline_name": "oxide dsa_indexer dense + vLLM apply_candidate_mask",
+     "baseline_name": "vLLM DeepGEMM dense logits + apply_candidate_mask",
      "replaces": [r"_mask_candidates_kernel", r"_candidate_flags_kernel"],
      "settings": {"autotune_baseline_fn": _cand_tune_baseline, **_SETTINGS}},
-    # the same dense decode body timed against vLLM's own SM120 path (vendored
-    # DeepGEMM paged MQA logits): a measurement, never shipped (serving reads
-    # dsa_indexer_decode configs only)
-    {"name": DECODE + "_dg", "body": dsa_decode_logits,
-     "cases": _cases(DECODE, CAND, rows=(1, 6, 48, 192)),
-     "make": decode_make, "reference": decode_reference, "check": check,
-     "make_baseline": decode_make_dg, "baseline": decode_baseline_dg,
-     "baseline_name": "vLLM DeepGEMM fp8_fp4_paged_mqa_logits (vendored, SM120)", "replaces": [],
-     "settings": {"autotune_baseline_fn": _decode_tune_baseline, **_SETTINGS}},
-    # ... and the row-group body vs DeepGEMM, short and 512k contexts: the K4 verdict
-    # vs what V4.1 serves today (a measurement, never shipped)
-    {"name": GROUP + "_dg", "body": dsa_group_logits,
-     "cases": _group_cases({(32768, 1), (32768, 8), (524288, 1), (524288, 4)}, CAND),
-     "make": group_make, "reference": group_reference, "check": check,
-     "make_baseline": decode_make_dg, "baseline": decode_baseline_dg,
-     "baseline_name": "vLLM DeepGEMM fp8_fp4_paged_mqa_logits (vendored, SM120)", "replaces": [],
-     "settings": {"autotune_baseline_fn": _group_tune_baseline, **_SETTINGS}},
 ]
 
 

@@ -182,7 +182,7 @@ def test_fused_equals_vllm_path(monkeypatch, tmp_path, prob):
     mod = _module(tmp_path, calls)
     monkeypatch.setattr(di, "paged_logits", lambda q, kv, w, cl, bt, mml, clean=False, **kw: mod._dense(
         q, kv, w, cl, bt, None, mml))
-    monkeypatch.setattr(di, "paged_route", lambda q, kv, ctx=None: "oxide")  # dense = the spec above
+    monkeypatch.setattr(di, "paged_route", lambda q, kv, ctx=None, v41=None: "oxide")  # dense = the spec above
     monkeypatch.setattr(dc, "_state", {"code": None, "pending": None, "sorted": None})
     monkeypatch.setattr(dc, "cands_sorted", lambda: True)
     monkeypatch.setattr(hk, "config", lambda kernel, case, plat=None:
@@ -243,7 +243,7 @@ def test_fusion_does_not_depend_on_the_steps_context(monkeypatch, tmp_path):
     mod = _module(tmp_path, calls)
     monkeypatch.setattr(di, "paged_logits", lambda q, kv, w, cl, bt, mml, clean=False, **kw: mod._dense(
         q, kv, w, cl, bt, None, mml))
-    monkeypatch.setattr(di, "paged_route", lambda q, kv, ctx=None: "oxide")
+    monkeypatch.setattr(di, "paged_route", lambda q, kv, ctx=None, v41=None: "oxide")
     monkeypatch.setattr(dc, "_state", {"code": None, "pending": None, "sorted": None})
     monkeypatch.setattr(dc, "cands_sorted", lambda: True)
     monkeypatch.setattr(hk, "config", lambda kernel, case, plat=None:

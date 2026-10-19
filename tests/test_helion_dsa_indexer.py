@@ -567,8 +567,7 @@ def test_kernels_abi():
     glm = {"architecture": "GlmMoeDsaForCausalLM", "name": "glm-5.3-nvfp4", "tp": 8}
     dsv41 = {"architecture": "DeepseekV41ForCausalLM", "name": "deepseek-v4.1-flash-1017-nvfp4"}
     names = [k["name"] for k in hdi.KERNELS]
-    assert names == [hdi.DECODE, hdi.GROUP, hdi.SELECT, hdi.PREFILL, hdi.CANDK, hdi.DECODE + "_dg",
-                     hdi.GROUP + "_dg"]
+    assert names == [hdi.DECODE, hdi.GROUP, hdi.SELECT, hdi.PREFILL, hdi.CANDK]
     K = {k["name"]: k for k in hdi.KERNELS}
     for k in hdi.KERNELS:
         assert re.fullmatch(r"[a-z0-9_]{1,40}", k["name"])
@@ -587,20 +586,73 @@ def test_kernels_abi():
         assert k["cases"]({"architecture": "Qwen3ForCausalLM"}) == [] and k["cases"]({}) == []
     cand = K[hdi.CANDK]["cases"](dsv41)
     assert {(c["cand"], c["cbs"], c["ctx"]) for c in cand} == {(2048, 8, hdi.CAND_CTX)}
-    assert [c["rows"] for c in K[hdi.DECODE + "_dg"]["cases"](dsv41)] == [1, 6, 48, 192]
-    # DSpark block 5 verifies 1 + 5 rows per request: the MTP bucket is 6
-    assert K[hdi.DECODE]["cases"](dsv41) == K[hdi.DECODE]["cases"](glm)
+    # DSpark block 5 verifies 1 + 5 rows per request: the MTP bucket is 6. V4.1 keys carry fmt=v41
+    # (own configs, tuned against the stock path); GLM-5.3 keys are exactly the shipped ones.
+    for name in (hdi.DECODE, hdi.GROUP, hdi.PREFILL):
+        v, g = K[name]["cases"](dsv41), K[name]["cases"](glm)
+        assert all(c.get("fmt") == "v41" for c in v) and all("fmt" not in c for c in g)
+        if name == hdi.DECODE:
+            assert [{k_: x for k_, x in c.items() if k_ != "fmt"} for c in v] == g
+    assert hdi.decode_case(32, 6) == {"heads": 32, "rows": 6, "ctx": 32768, "numtokens": 1}   # a shipped GLM key
     assert K[hdi.PREFILL]["cases"]({"architecture": "DeepseekV32ForCausalLM"})[0]["heads"] == 64
     # row-group decode: G = 6, requests x context buckets up to the 524288 target
     grp = K[hdi.GROUP]["cases"](dsv41)
     assert {(c["ctx"], c["numtokens"]) for c in grp} == {
         (c, r) for c, rs in hdi.GROUP_REQS.items() for r in rs}
     assert max(c["ctx"] for c in grp) == 524288 and all(c["rows"] == c["numtokens"] * 6 for c in grp)
-    assert {(c["ctx"], c["numtokens"]) for c in K[hdi.GROUP + "_dg"]["cases"](dsv41)} == {
-        (32768, 1), (32768, 8), (524288, 1), (524288, 4)}
-    assert K[hdi.GROUP + "_dg"]["cases"](glm) == [] and K[hdi.SELECT]["cases"](glm) == []
+    assert K[hdi.SELECT]["cases"](glm) == []
     assert {(c["ctx"], c["numtokens"]) for c in K[hdi.SELECT]["cases"](dsv41)} == set(hdi.SELECT_CASES)
+    assert all(c["fmt"] == "v41" for c in K[hdi.SELECT]["cases"](dsv41))
 
+
+def test_v41_baselines_are_the_stock_path_and_glm_keeps_oxide(monkeypatch):
+    """The K4 baseline of a V4.1 case is the vendored DeepGEMM call (a V4.1 config ships only where
+    Helion beat the stock path); GLM-5.3 keeps oxide's. Dispatch is by the case's fmt."""
+    monkeypatch.setattr(hdi, "decode_make_dg", lambda case, seed: ("dg-args",))
+    monkeypatch.setattr(hdi, "decode_make_baseline", lambda case, seed: ("oxide-args",))
+    monkeypatch.setattr(hdi, "decode_baseline_dg", lambda *a: ("dg", a))
+    monkeypatch.setattr(hdi, "decode_baseline", lambda *a: ("oxide", a))
+    v41 = hdi.decode_case(32, 6, fmt="v41")
+    assert hdi.baseline_make(v41, 0) == ("stock", "dg-args") and hdi.baseline_make(hdi.decode_case(32, 6), 0) == (
+        "oxide", "oxide-args")
+    assert hdi.baseline_run(*hdi.baseline_make(v41, 0)) == ("dg", ("dg-args",))
+    assert hdi.baseline_run(*hdi.baseline_make(hdi.decode_case(32, 6), 0)) == ("oxide", ("oxide-args",))
+    # the V4.1-only entries never name oxide anywhere in their baseline
+    K = {k["name"]: k for k in hdi.KERNELS}
+    assert "oxide" not in K[hdi.SELECT]["baseline_name"] and "oxide" not in K[hdi.CANDK]["baseline_name"]
+
+
+def test_accuracy_baselines_of_every_decode_case_are_oxide_free(monkeypatch):
+    """The autotuner's accuracy baseline is the shim's Triton stand-in (never the vendored kernel, never the
+    vendor-first public name) on any page layout (contiguous or packed stride): exact, and never the native
+    extension."""
+    sys_mod = __import__("sys")
+    import suffix_hybrid
+    monkeypatch.setitem(sys_mod.modules, "suffix_hybrid.oxide_kernels", None)
+    monkeypatch.setitem(sys_mod.modules, "suffix_hybrid._native", None)
+    monkeypatch.delattr(suffix_hybrid, "oxide_kernels", raising=False)
+    got = []
+
+    class FakeFallback:
+        def triton_paged_mqa_logits(self, q, cache, w, cl, bt, sched, n_cols):
+            got.append((tuple(q[0].shape), tuple(cache.shape), tuple(cache.stride()), tuple(cl.shape)))
+            return torch.ones((bt.shape[0], n_cols))
+
+        def fp8_fp4_paged_mqa_logits(self, *a, **kw):    # the vendor-first public name: not the oracle's reference
+            raise AssertionError("an accuracy baseline must not reach the vendor-first dispatcher")
+    monkeypatch.setattr(di, "_fallback_mod", lambda: FakeFallback())
+    for page, pad in ((64, 0), (128, 128), (32, 128)):
+        args = decode_problem(32, [100, 40], 6, 200, seed=5, page=page, pad=pad)
+        q, w, kv, ks, bt, cl, out, pg, prow, sp, sps = args
+        res = hdi._decode_tune_baseline(*args)
+        assert res.shape == out.shape and bool(torch.isneginf(res[0, int(cl[0]):]).all()) \
+            and bool((res[0, :int(cl[0])] == 1).all())
+        _, cshape, cstride, _ = got[-1]
+        assert cshape[1:] == (page, 1, 132)                           # [blocks, page, 1, 132] for the fallback
+        assert cstride[0] == page * 132 + pad and cstride[-1] == 1    # the packed page stride is kept
+        q4, w3, clp = hdi.group_pad(q, w, cl, 6)
+        res2 = hdi._group_tune_baseline(q4, w3, kv, ks, bt, clp, out, pg, prow, sp, sps)   # padded groups
+        assert res2.shape == out.shape
 
 def test_serving_buckets():
     assert hdi.serving_case(hdi.DECODE, 32, 5) == hdi.decode_case(32, 6)

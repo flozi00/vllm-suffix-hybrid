@@ -4,8 +4,9 @@ Branch `dsv41-indexer`, base d0fec38 / 8a75f0d. No GPU, no cluster, nothing comm
 proven on CPU (torch 2.14 CPU, Helion 1.5.1 eager mode + Triton **source** generation, vLLM source at
 `39983a5e7a5a575a7829f5d5ada50a33d9337ec1`, pinned in `tests/fixtures/vllm_39983a5e7/`). Anything about speed is an
 **estimate** with its derivation; silicon decides (section 9). Owner direction applied (coordinator message):
-Helion first and auto-tuned, oxide only where Helion has not won; no barriers / semaphores / last-arriver merges in
-graph-captured paths; scratch only from torch's allocator; no host sync; everything warmed before capture.
+Helion first and auto-tuned; **oxide retired for V4.1** (section 4g: `auto` falls back to the baseline's own vendored DeepGEMM, never oxide; 4h); no
+barriers / semaphores / last-arriver merges in graph-captured paths; scratch only from torch's allocator; no host sync;
+everything warmed before capture.
 
 ## 1. What stock vLLM runs on SM120 for this model (source-anchored)
 
@@ -58,15 +59,15 @@ sequence-step (some L2 credit); against the model's 1.73 ms roofline that bracke
 
 | file | what |
 |---|---|
-| `suffix_hybrid/helion_kernels/dsa_indexer.py` | `DeepseekV41ForCausalLM` registered (INDEX_HEADS 32; CAND (2048, 8)); bodies: per-row decode, **row-group decode** `dsa_group_logits`, prefill (compressed + absolute), fused candidates `dsa_cand_logits`, lab-only survivor select `dsa_group_select`; free page layout (P % 32, packed stride), serving entries (`group_logits`, `cand_logits`, `prefill_logits`, `warm_all`), lab ABI `KERNELS` (7 entries incl. the DeepGEMM baselines) |
-| `suffix_hybrid/kernels/dsa_indexer.py` | routing `oxide | helion-group | helion | triton`, K5 `note_path`/`strict`, DSpark = 1+k rows, `capture_replay` CLI mode |
+| `suffix_hybrid/helion_kernels/dsa_indexer.py` | `DeepseekV41ForCausalLM` registered (INDEX_HEADS 32; CAND (2048, 8)); bodies: per-row decode, **row-group decode** `dsa_group_logits`, prefill (compressed + absolute), fused candidates `dsa_cand_logits`, lab-only survivor select `dsa_group_select`; free page layout (P % 32, packed stride), serving entries (`group_logits`, `cand_logits`, `prefill_logits`, `warm_all`), lab ABI `KERNELS` (5 entries; V4.1 cases keyed `fmt=v41`, timed against the stock DeepGEMM call) |
+| `suffix_hybrid/kernels/dsa_indexer.py` | V4.1 geometry detection, routing `oxide (GLM only) | helion-group | helion | fallback`, K5 `note_path`/`strict`/`stock_label`/`vendor_fallbacks`/`stock_fallbacks`, DSpark = 1+k rows, `capture_replay` CLI mode |
 | `suffix_hybrid/kernels/dsa_candidates.py` | consumer-layer candidate fusion (patched `_apply_candidate_mask`/`get_indexer_topk`, anchored), candidate-source block selection (`CANDSEL`), one-launch Triton slot remap |
 | `suffix_hybrid/kernels/dsa_capture.py` | capture discipline: `launch` guard, `serving_violation`, `search_filter` |
 | `suffix_hybrid/kernels/dsa_select.py` | warm-start threshold select: exactness proof + CPU reference (design, not wired) |
 | `suffix_hybrid/kernels/dsa_indexer_gate.py` | boot gate `dsa_indexer_capture_replay` |
 | `suffix_hybrid/kernels/dsa_indexer_lab.py` | one-run silicon driver (oracle, gate, tune, per-layer benchmark, report) |
 | `suffix_hybrid/kernels/dsa_indexer_cost.py` | byte/launch model above |
-| `sm120/deep_gemm_shim/sm120_fallback.py` | Triton fallback honours the compressed prefill contract (6th arg int = `max_seqlen_k`) |
+| `sm120/deep_gemm_shim/sm120_fallback.py` | the shim's exported trio is **vendor-first** (section 4h): the vendored DeepGEMM verbatim where it runs the SM120 paged MQA, the Triton stand-in (now `triton_*`, honours the compressed prefill contract: int 6th arg = `max_seqlen_k`) only where it cannot |
 | `tests/test_dsa_*.py`, `test_helion_dsa_indexer.py`, `test_dsv41_indexer_anchors.py`, `tests/fixtures/vllm_39983a5e7/` | proofs below |
 
 ## 4. Design
@@ -90,7 +91,7 @@ reset between replays). Tunables: `block_n` 16-256, `min_tiles`, `split_div`, nu
 resolve to the same cache lines, so the 2nd-6th load of a K tile is an L1 hit and HBM sees K once (K / G). The row loop is a
 rolled device loop: the config space stays that of the per-row body (8 eviction / 9 indexing entries, not 42 / 48 when
 unrolled) and the compile is 2x shorter. Dead lanes issue no block-table read (`hl.load(extra_mask)`), read K from page 0 and
-store nothing. K4 on silicon must show the L1 reuse; oxide's page-dedup group is the baseline where it can read the layout.
+store nothing. K4 on silicon must show the L1 reuse against the stock DeepGEMM call (oxide's page-dedup group is the GLM-5.3 baseline only).
 
 **(c) Fused top-k, three levers, decreasing certainty.**
 1. *Candidate fusion* (consumers, built, graph-safe, env `..._CAND`): scores only the 16384 candidate positions straight into
@@ -122,18 +123,64 @@ lanes (the stand-in raises on any unmasked dereference; a mutant without `extra_
 `oracle` task + the capture gate (f64 on the first replay, ctx up to 524288).
 
 **(e) Lab.** `python -m suffix_hybrid.kernels.dsa_indexer_lab [budget_s]` on one PRO 6000 (plugin mounted, vLLM
-39983a5e7): `oracle` -> `gate` -> `tune` (full-effort Helion per case: group, cand, select, decode, prefill; baseline oxide, accuracy
-check vs the f64 spec) -> `bench_layer` for every (dense@ctx/2 | source | consumer) x ctx 8k..524288 x 1/4/32 requests (stock =
-vendored DeepGEMM -> mask/selection -> persistent_topk as one graph; ours = oxide (reference), per-row, row group at the
+39983a5e7): `oracle` -> `gate` -> `tune` (full-effort Helion per case: group, cand, select, decode, prefill; V4.1 baseline = the stock
+vendored-DeepGEMM call, accuracy baseline = the stock shim implementation, check vs the f64 spec) -> `bench_layer` for every
+(dense@ctx/2 | source | consumer) x ctx 8k..524288 x 1/4/32 requests (stock =
+vendored DeepGEMM -> mask/selection -> persistent_topk as one graph; ours = per-row, row group at the
 **serving config** (longest bucket) and at the config tuned for that context, candsel, cand_fused, warm select at 0/10/50 %
 stale) -> `bench_prefill` -> `report`: winner table, **decode-step totals (3 dense + source + 4 consumers) stock vs ours**,
 crossovers per request count (first context where each lever / ours-vs-stock wins), the cost of serving one config at every
 context (`serving_policy_penalty`), next to the byte model. Resumable (`/tmp/dsa_indexer_lab.json`).
 
-**(f) K5.** Every indexer call logs `layer <name>: decode|prefill path <helion-group|helion|oxide|cand-fused|triton|...>` once
-per layer at startup (vLLM's capture warm-up runs every layer eagerly first); `SUFFIX_SM120_DSA_INDEXER_STRICT=1` turns any
-Triton fallback into a startup error. Family check: only SM120 gets the shim wrappers; MXFP4 / varlen / non-FP8 shapes route to
-the fallback and are refused in strict mode.
+**(f) K5.** Every indexer call logs `layer <name>: decode|prefill path <helion-group|helion|cand-fused|vendor|stock|...>` once
+per layer at startup (vLLM's capture warm-up runs every layer eagerly first). A fallback gets its own loud line:
+`VENDOR FALLBACK layer <name>: ... the vendored DeepGEMM serves it verbatim, as without the plugin, not a Helion kernel` (listed by
+`vendor_fallbacks()`) or `STOCK FALLBACK layer <name>: ... the shim's Triton stand-in serves it, not a Helion kernel and not the
+vendored DeepGEMM` (listed by `stock_fallbacks()`; only on a pod whose vendor cannot run the call). The label is read from the shim
+fallback itself (`fn.vendor_applies(**call)`, the same predicate the dispatcher uses), never guessed.
+`SUFFIX_SM120_DSA_INDEXER_STRICT=1` turns either fallback into a startup error. Family check: only SM120 gets the shim wrappers;
+MXFP4 / varlen / non-FP8 shapes route to the fallback and are refused in strict mode.
+
+**(g) Oxide-free V4.1 route (owner direction 2026-10-19; audit `oxide-retirement-2026-10-19.md` section 6).** V4.1 geometry =
+32 index heads x 128 with top-512 (the `sparse_attn_indexer` frame's `topk_tokens`, else the vLLM config, else the pin
+`SUFFIX_DSA_INDEXER_GEOMETRY=v41|glm`; unknown = GLM-5.3). On it: `SUFFIX_HELION_DSA_INDEXER=oxide` (also the default when the
+knob is unset) is **refused** at the first wrapped call with a message naming why (oxide's dsa_indexer is the GLM-5.3 format and
+cannot read V4.1's packed pages or compressed prefill); `helion` needs every bucket's config (missing = startup error from
+`_warm`); `auto` serves a V4.1-keyed config where shipped and otherwise the **fallback** the deep_gemm shim hands in, which on a
+nightly pod is the **vendored DeepGEMM itself, verbatim** (section 4h; the Triton stand-in only where the vendor cannot run it),
+logged per layer by K5 and refused by STRICT. V4.1 configs are keyed `fmt=v41` (GLM-5.3 keys are untouched), so a config tuned
+against oxide can never serve V4.1, and a V4.1 config only ships where Helion beat the stock DeepGEMM call (K4 baselines of V4.1
+cases are the vendored call, guarded by `hdi.vendor_baseline_guard`; the autotuner's accuracy baseline is the Triton stand-in,
+named explicitly as `triton_*`, exact on every layout). `hdi.dsa_indexer_logits_cuda(v41=True)`
+has no oxide fallback. The whole route runs with `suffix_hybrid.oxide_kernels` / `_native` unimportable
+(`tests/test_dsa_v41_oxide_free.py`); the capture gate pins the V4.1 geometry.
+
+**(h) Fallback = baseline (coordinator follow-up 2026-10-19, A/B-critical).** A bucket the lane does not serve must behave
+exactly like A1, so turning the lane on (`SUFFIX_SM120=1`) may never make it slower than the baseline. boot5 ran with the shim
+inert, i.e. on the vendored DeepGEMM; with the gate on, the shim exports `sm120_fallback`'s trio, which used to be the Triton
+stand-in (slower than the vendor kernel). Now the three exported functions are vendor-first dispatchers:
+
+* **vendor applies** when the vendored module exports the trio and `vllm.utils.deep_gemm.get_paged_mqa_page_sizes()` declares 64
+  (the nightly's own statement that its vendor runs the SM120 paged MQA at block 64; GLM-era vLLM has no such function, so the
+  probe is False there), the call is in the vendor's contract (paged: no `clean_logits`; prefill: an int `max_seqlen_k`, not the
+  old bool / None sixth argument) -> `vendor_module().<fn>(<exactly the arguments vLLM's wrapper passed>)`: seven positional + `indices`
+  only when given (paged), six positional (prefill), `(context_lens, block_size, num_slots[, indices=])` (schedule). The schedule is
+  the vendor's real one (the Triton `zeros` would starve the vendor kernel), decided by the same cached flag as the logits call.
+  MXFP4 inputs reach the vendor untouched (the stand-in refuses them).
+* **vendor cannot** -> the Triton stand-in, exactly as before (`triton_mqa_logits` / `triton_paged_mqa_logits` /
+  `triton_paged_mqa_metadata`; the oracles, benches, lab Triton arm and the autotuner's accuracy baseline call these names, never
+  the public ones).
+* `SUFFIX_DSA_INDEXER_STOCK=vendor|shim`: `vendor` fails closed (every call raises) where the vendor cannot; `shim` forces the
+  stand-in (the behaviour before this change); unset = probe. Read once per process; a typo is a `ValueError`. The probe is pure
+  Python (no device call, no allocation); its first call is eager (the schedule metadata is built before any logits call and before a
+  capture) and a test pins that it runs once.
+* **The trio is the only replaced surface.** Everything else vLLM resolves from `deep_gemm` (`fp8_gemm_nt`, the grouped / masked /
+  MXFP4 gemms of the draft head's `DeepGemmFP4Experts`, layout helpers, `set_pdl`, `get_num_sms` ...) is the vendor's own object
+  (`__init__`'s re-export loop); `tests/test_dsa_vendor_fallback.py` loads the real shim into a fake vendor and asserts identity for
+  every name the pinned nightly source resolves plus an unknown one, and that the lane's wrappers add nothing beyond the paged
+  and prefill entries (the schedule is never wrapped).
+* Chain for V4.1 `auto` with no config: `wrap_paged` -> `paged_route` = STOCK -> K5 `VENDOR FALLBACK` -> dispatcher -> vendor.
+  A Helion-served bucket never reaches the vendor; its (unused) schedule costs what the baseline's costs.
 
 ## 5. Graph-capture discipline (coordinator rules, enforced in code)
 
@@ -172,7 +219,7 @@ cand 8, select 4, decode 8, prefill 4); the lab runs them in that order so the K
 
 | kernel | K1 contract | K2 compile | K3 oracle | K4 bench vs replaced | K5 assert |
 |---|---|---|---|---|---|
-| row-group decode (`dsa_group_logits`) | written (section 4b) | Triton **source** generated for the rolled body, defaults; no-spill / 99 KB / cubin load need silicon | CPU: stand-in + Helion eager + codegen, edge/ties/524288 | needs silicon: lab `tune` + `bench_layer` (baseline oxide group, DeepGEMM) | `note_path` + strict |
+| row-group decode (`dsa_group_logits`) | written (section 4b) | Triton **source** generated for the rolled body, defaults; no-spill / 99 KB / cubin load need silicon | CPU: stand-in + Helion eager + codegen, edge/ties/524288 | needs silicon: lab `tune` + `bench_layer` (baseline: the stock DeepGEMM call) | `note_path` + strict |
 | fused candidates + remap | written | codegen only; Triton remap compiles on first (warmed) launch | CPU vs the dense mask path, 3 problems | silicon: `bench_layer` consumer | yes |
 | valid-block selection | written | uses vLLM's own kernel | CPU twin vs stock set, anchored signature | silicon | yes |
 | survivor select (lab-only) | written (`dsa_select.py`) | codegen incl. atomic cursor + cumsum | CPU reference 20 cases + Helion eager + survivor-set oracle | silicon: `bench_layer` dense (`select_us`) | not wired |
@@ -183,15 +230,17 @@ cand 8, select 4, decode 8, prefill 4); the lab runs them in that order so the K
 
 | name | default | meaning |
 |---|---|---|
-| `SUFFIX_SM120=1`, `SUFFIX_SM120_DSA_INDEXER=1` | off | **required**: boot5 had the shim inert; without them stock DeepGEMM runs |
-| `SUFFIX_HELION_DSA_INDEXER` | `oxide` | set `helion` (V4.1's 32/64/128-token packed pages are Helion-only; every shipped bucket must exist, else startup error) or `auto` while configs are partial |
+| `SUFFIX_SM120=1`, `SUFFIX_SM120_DSA_INDEXER=1` | off | **required**: boot5 had the shim inert; without them stock DeepGEMM runs (with them, unserved buckets still run the vendored DeepGEMM, section 4h) |
+| `SUFFIX_HELION_DSA_INDEXER` | `oxide` | **V4.1 refuses `oxide` (and the unset default)**: set `helion` (every shipped bucket must exist, else startup error) or `auto` (V4.1 configs where shipped, else the vendored DeepGEMM as in A1, logged per layer) |
+| `SUFFIX_DSA_INDEXER_STOCK` | unset = probe | `vendor`: fail closed where the vendored DeepGEMM cannot run the SM120 paged MQA; `shim`: force the Triton stand-in (pre-2026-10-19 behaviour; breaks V4.1 K4 baselines, the lab refuses it) |
+| `SUFFIX_DSA_INDEXER_GEOMETRY` | unset = detect | `v41` / `glm`: pin the geometry where there is no vLLM frame / config (lab, gate, tests) |
 | `SUFFIX_SM120_DSA_INDEXER_GROUP` | vLLM config: DSpark = 1+k | 6 explicit is safe |
 | `SUFFIX_SM120_DSA_INDEXER_CAND=1` | off | fused candidate logits on layers 24-36 (needs `CANDK` configs) |
 | `SUFFIX_SM120_DSA_INDEXER_CANDSEL=1` | off | valid-block selection on layer 20 |
-| `SUFFIX_SM120_DSA_INDEXER_STRICT=1` | off | K5: any Triton fallback is a startup error (recommended with the above) |
+| `SUFFIX_SM120_DSA_INDEXER_STRICT=1` | off | K5: any fallback (vendor or Triton) is a startup error; set it only once every bucket ships a config (unset, the fallback is the baseline itself and is only logged) |
 | `SUFFIX_DSA_INDEXER_CTX` | unset = longest bucket | pin the row-group context bucket (positions per request) |
 
-Handoffs: (1) preset `dsv41-sm120` (main session): the 5 keys above + the config pull of `configs/helion/dsa_indexer_{group,cand,decode,prefill}/<platform>.json`
+Handoffs: (1) preset `dsv41-sm120` (main session): the keys above (set `SUFFIX_DSA_INDEXER_GEOMETRY=v41` too, belt and braces for the detection) + the config pull of `configs/helion/dsa_indexer_{group,cand,decode,prefill}/<platform>.json`
 after the lab; (2) run the lab then the gate on a dev pool before any A/B; (3) `--attention-config.indexer_tp_shard_min_rows`
 (dossier item 3) is orthogonal and arg-only; (4) the per-row decode body and the select body are not graph-reviewed beyond
 this lane; (5) with the gates off nothing changes for GLM or for the oxide backend (a subprocess test pins that the oxide backend
@@ -202,7 +251,7 @@ never imports the Helion port; shipped GLM config keys are untouched).
 1. **Triton specialisation guard false alarm**: the key is deliberately finer than Triton's (shape classes of every tensor).
    In vLLM's flow capture is preceded by an identical eager warm-up so it cannot fire; if the first boot shows it, the gate
    prints the argument that differs (set it right in `spec_key`, do not disable).
-2. **L1 reuse of the row group** (the whole 6x claim): compare `groupS_us` with `oxide_us` and DeepGEMM; if L1 does not
+2. **L1 reuse of the row group** (the whole 6x claim): compare `groupS_us` with `row_us` and the stock DeepGEMM `stock_us`; if L1 does not
    deliver, the fallback design is an explicit shared tile (3-D batched dot) - not built.
 3. **Helion int32/int64 index class** at the real cache size (> 2^31 bytes): `_warm` keys on the storage span; the gate runs
    with the pool's real cache only in the pod (the lab cache is small). Run the gate on the pool.
@@ -210,6 +259,19 @@ never imports the Helion port; shipped GLM config keys are untouched).
    smem are silicon facts. 5. The top-k tie order of persistent_topk differs between runs only at the k-th value (tests accept
    ties, serving A/B decides quality). 6. Dense layers' L2 sharing in stock may already give part of the K/G win: the lab's
    `stock_us` is the truth, the byte model an upper bound.
+7. **Fallback = baseline (section 4h) needs silicon to confirm**: (a) the vendor's `fp8_fp4_paged_mqa_logits` accepts the dispatcher's
+   call (7 positional, `indices` kw only when given) at 64-token pages on the nightly, including the ratio-2 layers' pages and the
+   flattened `next_n = 1` rows -- boot5.log proves the vendor ran this via vLLM's wrapper; the dispatcher passes the same arguments, but
+   only a boot with `SUFFIX_SM120=1` and no config shows `VENDOR FALLBACK` lines AND a clean first step; (b) `get_paged_mqa_page_sizes()` is
+   `(64,)` on the pod (the probe's marker) and the vendor's `get_paged_mqa_logits_metadata(context_lens, 64, num_slots)` gets the same
+   `num_slots` as in A1 (vLLM computes it before our dispatcher, so it is the baseline's value); (c) the vendor's prefill
+   `fp8_fp4_mqa_logits` takes an int `max_seqlen_k` and the compressed contract at the chunk sizes the Helion prefill config does not
+   cover; (d) the vendor JITs lazily on its first call: the first eager step (warm-up / profile run) pays it, and a capture must not be
+   the first call -- true in vLLM's flow (the metadata builder and the dummy run precede the capture), unverified for the pod; (e)
+   PDL (`set_pdl`) is the vendor's own flag (vLLM's `_apply_pdl` sets it through the shim's re-export), unchanged by the lane;
+   (f) MXFP4 inputs (draft head) reach the vendor unchanged: the lane never saw them in boot5, so the first MXFP4 indexer call is
+   the proof; (g) per-step host cost of the dispatcher (one dict read + one function call per trio call, eager steps only: decode
+   graphs replay without Python) is below noise, but the A1/B host profile is the proof.
 
 ## 10. Expected effect (estimate, derivation in section 2)
 
@@ -222,12 +284,15 @@ before the top-k - the valid-block selection removes it at every context. Nothin
 ## 11. Tests (exact lines, torch 2.14 CPU, Helion 1.5.1; `PYTHONPATH=<worktree> /tmp/lane-c/venv/bin/python -m pytest ... -p no:cacheprovider -q`)
 
 ```
-tests/test_dsa_indexer.py: 25 passed        tests/test_helion_dsa_indexer.py: 176 passed
+tests/test_dsa_indexer.py: 25 passed        tests/test_helion_dsa_indexer.py: 178 passed
 tests/test_dsa_candidates.py: 15 passed     tests/test_dsv41_indexer_anchors.py: 8 passed
 tests/test_dsa_select.py: 20 passed         tests/test_dsa_indexer_cost.py: 6 passed
-tests/test_dsa_capture.py: 11 passed        tests/test_dsa_indexer_gate.py: 7 passed
-tests/test_dsa_indexer_lab.py: 4 passed     all nine files together: 272 passed
-without Helion installed (import blocked):  244 passed, 28 skipped
+tests/test_dsa_capture.py: 11 passed        tests/test_dsa_indexer_gate.py: 9 passed
+tests/test_dsa_indexer_lab.py: 4 passed     tests/test_dsa_v41_oxide_free.py: 11 passed
+tests/test_dsa_vendor_fallback.py: 33 passed
+all eleven files together: 320 passed
+without Helion installed (import blocked):  278 passed, 42 skipped
+sm120/tests/test_deep_gemm_shim.py (not this lane's, run to check the renames; fake triton on PYTHONPATH): 7 passed, 5 skipped (need CUDA)
 ```
 
 ## 12. Root causes proven in this lane (for `MINED-LESSONS.md`, main session appends)

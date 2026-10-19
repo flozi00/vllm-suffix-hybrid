@@ -446,7 +446,7 @@ def test_compressed_prefill_routes_to_helion(monkeypatch):
     q, kvc, w = torch.zeros((2, 32, D), dtype=f8), torch.zeros((9, D), dtype=f8), torch.zeros((2, 32))
     one = torch.ones(2, dtype=torch.int32)
     assert mqa((q, None), (kvc, torch.zeros(9)), w, one - 1, one, 7) == "helion"
-    assert got == [((2, 7), {"compressed": True})]
+    assert got == [((2, 7), {"compressed": True, "v41": False})]
 
 
 def _cfg_for(monkeypatch, ctxs):
@@ -492,7 +492,7 @@ def test_paged_logits_dispatches_the_group_body(monkeypatch):
     monkeypatch.setenv(di.HELION_ENV, "auto")
     monkeypatch.setenv(di.GROUP_ENV, "6")
     got = []
-    monkeypatch.setattr(hdi, "group_logits", lambda *a: got.append(a) or a[5])
+    monkeypatch.setattr(hdi, "group_logits", lambda *a, **k: got.append(a) or a[5])
     q = torch.zeros((11, 1, 32, D), dtype=f8)           # 11 rows: the last group is partial
     kv = torch.zeros((4, T, 1, 132), dtype=torch.uint8)
     bt = torch.zeros((11, 3), dtype=torch.int32)
@@ -520,26 +520,44 @@ def test_indexer_locals_finds_the_vllm_frame():
     assert sparse_attn_indexer("model.layers.2.attn.indexer.k_cache")["k_cache_prefix"].startswith("model")
 
 
-def test_k5_logs_each_layers_path_once_and_strict_refuses_triton(monkeypatch, capsys):
+def test_k5_logs_each_layers_path_once_and_strict_refuses_the_stock_fallback(monkeypatch, capsys):
     monkeypatch.setitem(di._state, "layers", {})
+    monkeypatch.setitem(di._state, "stock", [])
+    monkeypatch.setitem(di._state, "vendor", [])
     l20 = {"k_cache_prefix": "model.layers.20.attn.indexer.k_cache"}
     l24 = {"k_cache_prefix": "model.layers.24.attn.indexer.k_cache"}
     monkeypatch.delenv(di.STRICT_ENV, raising=False)
     di.note_path(l20, "decode", "helion-group", "ctx 524288")
     di.note_path(l20, "decode", "helion-group")
     di.note_path(l24, "decode", "cand-fused")
-    di.note_path(l24, "decode", "triton", "no config")      # loud, allowed (strict off)
+    di.note_path(l24, "decode", di.STOCK, "no config")      # loud, allowed (strict off)
+    di.note_path(l24, "decode", di.STOCK, "no config")      # ... and logged once
     err = capsys.readouterr().err
     assert err.count("layer model.layers.20.attn.indexer.k_cache: decode path helion-group") == 1
-    assert "layer model.layers.24.attn.indexer.k_cache: decode path triton (no config)" in err
+    assert err.count("STOCK FALLBACK layer model.layers.24.attn.indexer.k_cache: decode path stock (no config)") == 1
+    assert "not a Helion kernel" in err
     assert di.layer_paths() == {l20["k_cache_prefix"]: [("decode", "helion-group")],
-                                l24["k_cache_prefix"]: [("decode", "cand-fused"), ("decode", "triton")]}
+                                l24["k_cache_prefix"]: [("decode", "cand-fused"), ("decode", "stock")]}
+    assert di.stock_fallbacks() == [(l24["k_cache_prefix"], "decode", "no config")]
+    assert di.vendor_fallbacks() == []
+    # the vendored DeepGEMM serving the call is a fallback too: its own loud line and list
+    di.note_path(l24, "prefill", di.VENDOR, "no config")
+    di.note_path(l24, "prefill", di.VENDOR, "no config")
+    err = capsys.readouterr().err
+    assert err.count("VENDOR FALLBACK layer model.layers.24.attn.indexer.k_cache: prefill path vendor (no config)") == 1
+    assert "STOCK FALLBACK" not in err and "vendored DeepGEMM serves it verbatim" in err
+    assert di.vendor_fallbacks() == [(l24["k_cache_prefix"], "prefill", "no config")]
+    assert di.stock_fallbacks() == [(l24["k_cache_prefix"], "decode", "no config")]
     monkeypatch.setenv(di.STRICT_ENV, "1")
     di.note_path(l24, "decode", "cand-fused")                # a kernel path is fine
-    with pytest.raises(RuntimeError, match="Triton"):
-        di.note_path(l20, "prefill", "triton", "MXFP4")
-    with pytest.raises(RuntimeError, match="Triton"):
-        di.note_path(None, "decode", "triton")               # outside vLLM: still refused
+    with pytest.raises(RuntimeError, match="stock"):
+        di.note_path(l20, "prefill", di.STOCK, "MXFP4")
+    with pytest.raises(RuntimeError, match="stock"):
+        di.note_path(None, "decode", di.STOCK)               # outside vLLM: still refused
+    with pytest.raises(RuntimeError, match="vendored DeepGEMM"):
+        di.note_path(l20, "decode", di.VENDOR, "no config") # STRICT refuses the vendor fallback as well
+    with pytest.raises(RuntimeError, match="vendored DeepGEMM"):
+        di.note_path(l24, "prefill", di.VENDOR, "no config")  # ... even where it was logged before
 
 
 def test_wrap_paged_passes_layer_and_the_bucket_pin_to_the_lane(monkeypatch):
@@ -549,7 +567,7 @@ def test_wrap_paged_passes_layer_and_the_bucket_pin_to_the_lane(monkeypatch):
     seen = []
     monkeypatch.setitem(di._state, "layers", {})
     monkeypatch.setattr(di, "paged_logits", lambda *a, **k: seen.append(k.get("ctx")) or "ours")
-    monkeypatch.setattr(di, "paged_route", lambda q, kv, ctx=None: "helion-group")
+    monkeypatch.setattr(di, "paged_route", lambda q, kv, ctx=None, v41=None: "helion-group")
     paged = di.wrap_paged(lambda *a: "triton")
     q = torch.zeros((2, 1, 32, D), dtype=f8)
     kv = torch.zeros((4, T, 1, 132), dtype=torch.uint8)
