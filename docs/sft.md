@@ -129,6 +129,24 @@ Dev pool `lfm25-sft-dev` = prod LFM env (DeepGEMM off, `SUFFIX_FP8_MOE`, `SHORTC
 | micro-step @ ~3.9k tokens | 2.8 s, +1.8 GiB peak VRAM over serving (18.8 GiB free at util 0.80) |
 | client disconnect mid-run | the run finishes, publishes and is served; a second run meanwhile gets 409 |
 
+### A/B gate (benchmarks suite): SFT on, untrained adapters vs SFT off
+
+Dev pool `lfm25-sft-dev`, 1x RTX PRO 6000, vLLM v0.32.0, bundle 881f1bd3 (CI-green exact head), A1 -> B -> A2,
+5 rounds x 60 s, chat-en / chat-de / rag-8k at c=1/8/32, quality quick tier on every leg.
+
+| metric | result |
+|---|---|
+| quality (3228 pairs, 16 cells, Holm) | **PASS**, pooled +0.33 pp (p = 0.42), no cell worse |
+| drift (de / en / code, ~40k positions) | **KL 0.00000, top-1 100 %, ppl ratio 1.0000**: untrained adapters are a bit-exact no-op on the prefill path |
+| decode agg tok/s, chat-en | c1 -10.1 %, c8 -6.5 %, c32 -3.3 % (A 293-323 / 1004-1049 / 2484-2525 -> B 263-280 / 960-965 / 2426-2442) |
+| decode agg tok/s, chat-de | c1 -9.6 %, c8 -6.4 %, c32 -3.4 % |
+| decode agg tok/s, rag-8k | c1 -6.4 %, c8 -5.0 %, c32 -6.6 % |
+| TTFT / ITL p99 | tied (rag-8k: p50 TTFT +4 %) |
+
+The speed verdict is a LOSS by design: 84 adapters x two skinny GEMMs per decode step (risk R1, same ~10 % at c1 as
+on qwen-fable). It is the price of an SFT-enabled pool; with `SUFFIX_SFT` unset nothing is imported, patched or
+attached, so every other pool is unchanged. Enable SFT only on pools that train.
+
 Facts found on the way (all fixed in the code):
 - The LFM2 chat template opens `<think>` in the generation prompt and renders a final assistant message
   without reasoning as plain content. `encode` trains `</think>` + answer (an empty reasoning block). Serve
