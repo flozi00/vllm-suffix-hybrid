@@ -25,7 +25,7 @@ suffix_hybrid/configs/helion/<kernel>/<platform>.json   tuned WINS from the auto
 | kgdn1 | kernels-oxide/kgdn1 | kernels/qwen_gdn.py | `SUFFIX_HELION_KGDN1` |
 | dsv41_attn_{partial,row} | none (FlashInfer SM120 sparse MLA is the baseline) | kernels/dsv41_attn.py | `SUFFIX_HELION_DSV41_ATTN` |
 | nvfp4_gemm_fp4mma | none (arm of nvfp4_gemm; lab baseline FlashInfer CUTLASS) | kernels/nvfp4_linear.py, kernels/nvfp4_lm_head.py via `hx` | `SUFFIX_HELION_NVFP4_GEMM_FP4MMA` (+ `_STRICT`) |
-| dsv41_moe_fp4mma | none (alternative body set to nvfp4_moe's dequant bodies, chosen per M bucket) | kernels/nvfp4_moe.py (variant seam) | `SUFFIX_HELION_NVFP4_MOE_FP4MMA` (+ `_STRICT`) |
+| dsv41_moe_fp4mma | none (alternative body set to nvfp4_moe's dequant bodies, chosen per M bucket by the `dsv41_moe_variant` config row) | kernels/nvfp4_moe.py (variant seam) | config row (no env knob) |
 
 Every knob is `helion_kernels.backend(env)`:
 

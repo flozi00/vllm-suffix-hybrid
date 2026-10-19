@@ -300,6 +300,7 @@ def test_in_lab_tuner_plan_and_config_files(tmp_path, monkeypatch):
     helion_kernels' own table reader under the exact serving case keys."""
     from suffix_hybrid.helion_kernels import nvfp4_moe_tune as nt
     monkeypatch.delenv("NVFP4_MOE_TP8_NOEP", raising=False)
+    monkeypatch.setattr(nt, "variant_kernels", lambda: [])  # this test counts the dequant plan only
     plan = nt.todo()
     assert len(plan) == len({(k, hk.case_key(c)) for k, c in plan}) == 53  # 34 routed + 19 fused
     assert all("experts_global" in c for _, c in plan)          # EP8 only (prod)
