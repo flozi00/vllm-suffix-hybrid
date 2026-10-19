@@ -18,8 +18,11 @@
    as `_default_launcher`) returns `triton_kernel.run(...)` = the CompiledKernel, with `.asm["ptx"]`,
    `.n_regs`, `.n_spills` (after the first launch loaded it) and `.metadata.shared`. There is no
    official hook, so `install_recorder()` swaps `helion.runtime.default_launcher` for a recording
-   wrapper BEFORE the family's first kernel is compiled (prepare() does it); kernels compiled earlier
-   (other lanes) keep the original launcher and are never recorded. If the swap cannot be made
+   wrapper BEFORE the family's first kernel is compiled (the dense `prepare()` does it; the MoE
+   `run_plan` does it on its first GPU call and then judges every newly compiled fc1 / fc2 right after
+   the launch, so lane B's seam needs no K5 line of its own); kernels compiled earlier (other lanes)
+   keep the original launcher and are never recorded, and `install_recorder(watch=...)` keeps only
+   the family's own kernels (exact Triton names, `name_matches`). If the swap cannot be made
    (a Helion without that attribute) the assertion cannot run and the lane refuses to start; the
    fallback for such a build is Triton's own cache (TRITON_CACHE_DIR=<fresh dir> + `ptx_from_cache`).
 
@@ -29,9 +32,10 @@
    capture_replay`; sitecustomize `_BOOT_GATES` entry in BOOT_GATES below): the capture-safety proof,
    in the style of the mxfp8 / moe_shared gates. Per probe (body x real shape x M x explicit config; plus
    every SHIPPED config of this platform): eager on three inputs with the output and every partial
-   NaN-poisoned first (K3 vs the exact f64 product, K5 PTX on the first compile), capture the same call on
+   NaN-poisoned first (K3 vs the exact f64 product), capture the same call on
    a side stream, replay with NEW data bit-exact against eager, a guarded output (sentinel bands),
-   and two graphs replayed concurrently on two streams. Exit 0 PASS / 1 FAIL / 2 NOT RUN.
+   and two graphs replayed concurrently on two streams; at the end `gate_k5` judges the compiled PTX of
+   every body the probes ran (lab strictness: spills fail). Exit 0 PASS / 1 FAIL / 2 NOT RUN.
    compute-sanitizer works (the gate times and tunes nothing).
 """
 from __future__ import annotations
@@ -58,6 +62,9 @@ class Fp4mmaError(RuntimeError):
 
 def _log(msg: str) -> None:
     print(f"{MARKER} {msg}", file=sys.stderr, flush=True)
+
+
+logline = _log  # for the family modules (K5 arm lines)
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +115,8 @@ def require_native_stack() -> None:
     helion_ok = importlib.util.find_spec("helion") is not None
     why = stack_problems(cc, triton_v, helion_ok)
     if why:
-        raise Fp4mmaError(f"{MARKER} the native FP4 MMA arm (SUFFIX_HELION_NVFP4_GEMM_FP4MMA / "
-                          f"SUFFIX_HELION_NVFP4_MOE_FP4MMA = 1) cannot run: " + "; ".join(why))
+        raise Fp4mmaError(f"{MARKER} the native FP4 MMA arm (SUFFIX_HELION_NVFP4_GEMM_FP4MMA=1, or a "
+                          f"dsv41_moe_variant row selecting dot_scaled) cannot run: " + "; ".join(why))
 
 
 # ---------------------------------------------------------------------------
@@ -192,13 +199,28 @@ class Record(NamedTuple):
 
 
 _RECORDS: dict = {}
+_CHECKED: set = set()  # record keys assert_native(only_new=True) already judged
+_WATCH: tuple | None = None  # Triton function names record_kernel keeps; None = every kernel
+_WATCHED: dict = {}  # memo: Triton function name -> kept? (the recorder sits on EVERY Helion launch: one dict get)
 
 
-def install_recorder() -> bool:
+def name_matches(name: str, want: str) -> bool:
+    """A Triton function name is `want` or Helion's numbered variant of it (`want_1`): NOT a longer name
+    that merely starts with it (`_helion_dsv41_moe_fc1_sh` is lane B's shared-expert kernel, not fc1)."""
+    return name == want or (name.startswith(want + "_") and name[len(want) + 1:].isdigit())
+
+
+def install_recorder(watch=None) -> bool:
     """Swap helion.runtime.default_launcher for a wrapper that records the CompiledKernel the
     real launcher returns. Idempotent. MUST run before the family's first kernel compiles: a
-    generated module binds `default_launcher` at its first import. Returns True when installed
-    (or already), False when this Helion has no such attribute (K5 then cannot run)."""
+    generated module binds `default_launcher` at its first import. `watch`: Triton function names to
+    keep (accumulates over calls; default = record every kernel, which a serving process does not
+    want: PTX of unrelated Helion kernels would pile up). Returns True when installed (or already),
+    False when this Helion has no such attribute (K5 then cannot run)."""
+    global _WATCH
+    if watch is not None:
+        _WATCH = tuple(dict.fromkeys((*(_WATCH or ()), *watch)))
+        _WATCHED.clear()
     try:
         import helion.runtime as hrt
     except Exception:  # noqa: BLE001
@@ -224,6 +246,9 @@ def install_recorder() -> bool:
 
 
 def uninstall_recorder() -> None:
+    global _WATCH
+    _WATCH = None
+    _WATCHED.clear()
     try:
         import helion.runtime as hrt
     except Exception:  # noqa: BLE001
@@ -245,11 +270,16 @@ def record_kernel(triton_kernel, ck) -> None:
     """Keep the PTX / resource facts of a CompiledKernel (None = a warm-up/hook run: nothing)."""
     if ck is None or not hasattr(ck, "asm"):
         return
+    name = getattr(getattr(triton_kernel, "fn", None), "__name__", None) or getattr(ck, "name", "?")
+    kept = _WATCHED.get(name)
+    if kept is None:
+        kept = _WATCHED[name] = _WATCH is None or any(name_matches(name, w) for w in _WATCH)
+    if not kept:
+        return
     key = str(getattr(ck, "hash", id(ck)))
     if key in _RECORDS:
         return
     md = getattr(ck, "metadata", None)
-    name = getattr(getattr(triton_kernel, "fn", None), "__name__", None) or getattr(ck, "name", "?")
     _RECORDS[key] = Record(
         name=name, key=key, ptx=str(ck.asm["ptx"]), n_regs=getattr(ck, "n_regs", None),
         n_spills=getattr(ck, "n_spills", None), shared=getattr(md, "shared", None),
@@ -260,8 +290,13 @@ def records(prefix: str = "") -> list:
     return [r for r in _RECORDS.values() if r.name.startswith(prefix)]
 
 
+def record_count() -> int:
+    return len(_RECORDS)
+
+
 def clear_records() -> None:
     _RECORDS.clear()
+    _CHECKED.clear()
 
 
 def record_line(r: Record, info: dict | None = None) -> str:
@@ -271,11 +306,14 @@ def record_line(r: Record, info: dict | None = None) -> str:
             f"native_mma={info['native_mma']} cp.async={info['cp_async']} local={info['local']}")
 
 
-def assert_native(names, *, allow_local: bool = True, log=_log) -> list:
-    """K5. `names` = Triton function names (or prefixes) the family served at warm-up. Each must
-    have >= 1 recorded compile and EVERY recorded compile must pass `ptx_problems`; else
-    Fp4mmaError naming the kernel and the reason. Logs one line per compiled specialization.
-    Returns the checked records."""
+def assert_native(names, *, allow_local: bool = True, log=_log, only_new: bool = False,
+                  require: bool = True) -> list:
+    """K5. `names` = Triton function names (a trailing `_<n>` of Helion's numbering is the same
+    kernel; a longer name is not) the family served at warm-up. Each must have >= 1 recorded
+    compile (`require`) and EVERY recorded compile must pass `ptx_problems`; else Fp4mmaError naming
+    the kernel and the reason. Logs one line per compiled specialization. `only_new`: skip (and do
+    not log again) the compiles an earlier call already judged OK: the serving check after every
+    launch. Returns the checked records."""
     if not recorder_installed():
         raise Fp4mmaError(f"{MARKER} K5: the launcher recorder is not installed (call "
                           "install_recorder() before the first compile; this Helion may lack "
@@ -283,13 +321,15 @@ def assert_native(names, *, allow_local: bool = True, log=_log) -> list:
                           "assertion")
     checked = []
     for name in names:
-        recs = records(name)
-        if not recs:
+        recs = [r for r in _RECORDS.values() if name_matches(r.name, name)]
+        if not recs and require:
             raise Fp4mmaError(f"{MARKER} K5: no compiled kernel recorded for {name!r} — the lane "
                               "did not warm it up under the recorder, the planned kernel never ran, "
                               "or the PTX was not available (TRITON_STORE_BINARY_ONLY=1 drops it "
                               "from Triton's cache; unset it for these pools)")
         for r in recs:
+            if only_new and r.key in _CHECKED:
+                continue
             info = analyze_ptx(r.ptx)
             why = ptx_problems(info, allow_local=allow_local)
             log(("K5 ok  " if not why else "K5 FAIL ") + record_line(r, info))
@@ -299,6 +339,7 @@ def assert_native(names, *, allow_local: bool = True, log=_log) -> list:
             if info["local"] or (r.n_spills or 0) > 0:
                 log(f"K5 WARN {r.name}: local memory / spills "
                     f"({r.n_spills} B spilled): slow, not wrong; retune the config")
+            _CHECKED.add(r.key)
             checked.append(r)
     return checked
 
@@ -310,7 +351,7 @@ def assert_contains(names, tokens, what: str, log=_log) -> list:
         raise Fp4mmaError(f"{MARKER} K5: the launcher recorder is not installed")
     checked = []
     for name in names:
-        recs = records(name)
+        recs = [r for r in _RECORDS.values() if name_matches(r.name, name)]
         if not recs:
             raise Fp4mmaError(f"{MARKER} K5: no compiled kernel recorded for {name!r}")
         for r in recs:
@@ -464,14 +505,11 @@ class Case:
 
 # sitecustomize runs a gate in a child that gets the pod env WITHOUT its SUFFIX_* keys plus the dict below, so
 # the MoE scale-read mode the pool runs has to be a gate of its own (the dense bodies have no such mode).
+# No enable knob is needed: the gate builds the kernels itself, and the MoE variant is selected by data.
 BOOT_GATES = {
-    "fp4mma_capture_replay": (["-m", "suffix_hybrid.kernels.fp4mma_probe", "capture_replay"],
-                              {"SUFFIX_HELION_NVFP4_GEMM_FP4MMA": "1",
-                               "SUFFIX_HELION_NVFP4_MOE_FP4MMA": "1"}),
+    "fp4mma_capture_replay": (["-m", "suffix_hybrid.kernels.fp4mma_probe", "capture_replay"], {}),
     "fp4mma_capture_replay_bytes": (["-m", "suffix_hybrid.kernels.fp4mma_probe", "capture_replay"],
-                                    {"SUFFIX_HELION_NVFP4_GEMM_FP4MMA": "1",
-                                     "SUFFIX_HELION_NVFP4_MOE_FP4MMA": "1",
-                                     "SUFFIX_FP4MMA_MOE_SCALE_READ": "bytes"}),
+                                    {"SUFFIX_FP4MMA_MOE_SCALE_READ": "bytes"}),
 }
 
 
@@ -501,7 +539,9 @@ def run_probe(pr: Probe, build, rt, dev, replays: int, streams: int, capture: bo
         eager0 = case.run(static).clone()
         rt.sync()
     except Exception as exc:  # noqa: BLE001
-        rec.update(status="NOT RUN", detail=f"{type(exc).__name__}: {exc}"[:600])
+        # a K5 refusal (PTX without the native MMA) raised by the family's own run_plan is the finding
+        rec.update(status="FAIL" if isinstance(exc, Fp4mmaError) else "NOT RUN",
+                   detail=f"{type(exc).__name__}: {exc}"[:600])
         return rec
     try:
         ok, msg = case.exact(case.inputs[0], eager0)
@@ -570,6 +610,29 @@ def _concurrent(case, dev, rounds: int) -> None:
                                   "from eager — shared state between two graphs")
 
 
+def gate_k5(plist, recs, log=_log) -> dict:
+    """K5 over what a GPU gate just compiled, with the lab's strictness (spills fail: K2): every dense dot_scaled
+    body and every MoE fc1 / fc2 that ran must carry kind::mxf4nvf4 for sm_120a, the hardware-cvt control its
+    cvt. (The MoE run_plan also judges its own kernels at every GPU call, serving's strictness.) Returns
+    the gate record."""
+    from suffix_hybrid.helion_kernels import nvfp4_gemm_fp4mma as fm
+    ran = {r["label"] for r in recs if r["status"] in ("PASS", "FAIL")}
+    bodies = {p.spec["body"] for p in plist if p.family == "gemm" and p.label in ran}
+    names = [fm.TRITON_NAMES[b] for b in sorted(bodies) if b != fm.CVT]
+    if any(p.family == "moe" and p.label in ran for p in plist):
+        from suffix_hybrid.helion_kernels import dsv41_moe_fp4mma as fe
+        names += [fe.TRITON_NAMES[k] for k in fe.NATIVE_KERNELS]
+    try:
+        if names:
+            assert_native(names, allow_local=False, log=log)
+        if fm.CVT in bodies:
+            assert_contains([fm.TRITON_NAMES[fm.CVT]], ["cvt.rn.f16x2.e2m1x2"], "hardware FP4 decode", log=log)
+    except Fp4mmaError as exc:
+        return {"label": "K5", "family": "all", "status": "FAIL", "detail": str(exc)[:900]}
+    return {"label": "K5", "family": "all", "status": "PASS",
+            "detail": f"{len(names)} native kernels + {int(fm.CVT in bodies)} cvt control judged on the compiled PTX"}
+
+
 def run_gate(tier="quick", rt=None, dev=None, replays=6, streams=2, capture=True, guards=True,
              only="", plist=None, builders=None, emit=lambda s: print(s, flush=True)) -> dict:
     """The gate as a function (the lab driver and the CPU tests call it). Returns
@@ -598,6 +661,10 @@ def run_gate(tier="quick", rt=None, dev=None, replays=6, streams=2, capture=True
         if rec["status"] == "FAIL" and ("CUDA" in rec["detail"] or "illegal" in rec["detail"]):
             emit(f"{MARKER} sticky CUDA error: stopping at the first faulting probe")
             break
+    if rt is CudaRuntime and any(r["status"] in ("PASS", "FAIL") for r in recs):
+        k5 = gate_k5(plist, recs, log=lambda s: emit(f"{MARKER} {s}"))
+        recs.append(k5)
+        emit(f"{MARKER} PROBE K5: {k5['status']} — {k5['detail']}")
     fail = [r for r in recs if r["status"] == "FAIL"]
     ran = [r for r in recs if r["status"] == "PASS"]
     verdict = "FAIL" if fail else ("PASS" if ran else "NOT RUN")

@@ -280,7 +280,7 @@ def table(monkeypatch):
         return kern
     monkeypatch.setattr(hk, "compiled", compiled)
     monkeypatch.setattr(probe, "require_native_stack", lambda: None)
-    monkeypatch.setattr(probe, "install_recorder", lambda: True)
+    monkeypatch.setattr(probe, "install_recorder", lambda watch=None: True)
     monkeypatch.setattr(fm, "_PLANS", {})
     return cfgs, calls
 
@@ -403,7 +403,7 @@ def test_twin_end_to_end_prequant_and_bf16_route(split, monkeypatch, nvfp4_ref, 
     small_tiles(16, 32, 64)
     monkeypatch.setenv(fm.ENV, "1")
     monkeypatch.setattr(probe, "require_native_stack", lambda: None)
-    monkeypatch.setattr(probe, "install_recorder", lambda: True)
+    monkeypatch.setattr(probe, "install_recorder", lambda watch=None: True)
     monkeypatch.setattr(hk, "platform", lambda device=0: "cpu")
     old = fm._old()
     real = {fm.WORDS: kernel(fm.WORDS, split_k=split),

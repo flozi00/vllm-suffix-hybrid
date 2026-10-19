@@ -613,7 +613,7 @@ def prepare(n: int, k: int, prequant: bool, max_m: int, mode: str) -> list:
                            "use the prequant route (vLLM's quant) above that")
     from suffix_hybrid.kernels import fp4mma_probe
     fp4mma_probe.require_native_stack()
-    fp4mma_probe.install_recorder()
+    fp4mma_probe.install_recorder(watch=tuple(TRITON_NAMES.values()))
     old = _old()
     fail_closed = mode == "helion" or strict()
     per = {}

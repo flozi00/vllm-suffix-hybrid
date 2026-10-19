@@ -1,26 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K1-K3 on CPU for the V4.1 routed-experts family on native FP4 MMA (dsv41_moe_fp4mma.py): the five bodies
-in Helion's eager mode against lane B's f64 spec (kernels/nvfp4_moe.moe_ref: quantize x and h to NVFP4,
-swiglu clamp `gate = min(gate, L)` / `up = clamp(up, -L, L)` before silu, f32 accumulate), the two route
-implementations against a plain python sort, balanced / skewed / hot / off-rank expert loads, adversarial
-scale blocks, forced small tiles, the seam (per-M routing, chunking), the lab ABI and the capture gate.
+"""The V4.1 routed-experts dot_scaled VARIANT (dsv41_moe_fp4mma.py) on CPU: (1) the bodies in Helion's
+eager mode against lane B's f64 spec (kernels/nvfp4_moe.moe_ref: quantize x and h to NVFP4, swiglu clamp
+`gate = min(gate, L)` / `up = clamp(up, -L, L)` before silu, f32 accumulate), balanced / skewed / hot /
+off-rank expert loads, adversarial scale blocks, forced small tiles, BOTH scale-read modes; (2) the
+contract of lane B's per-bucket seam (`nvfp4_moe.check_variant`) and the seam's own end-to-end path
+(config-table row -> served_ms -> serving_op -> this module's run_plan) against lane B's dequant bodies at the
+oracle tolerance, with the refusals; (3) the K5 hook inside run_plan, the lab ABI and the capture gate.
 
 CPU eager mode proves indexing and numerics. Speed, registers and the native instruction are K4/K5 (silicon).
 """
 import ast
+import importlib.abc
 import inspect
-import json
+import sys
+import types
 
 import pytest
 import torch
 
+import suffix_hybrid
 from suffix_hybrid import helion_kernels as hk
 from suffix_hybrid.helion_kernels import dsv41_moe_fp4mma as fe
-from suffix_hybrid.helion_kernels import nvfp4_gemm_fp4mma as fm
+from suffix_hybrid.helion_kernels import dsv41_moe_shared as hs
 from suffix_hybrid.helion_kernels import nvfp4_moe as lb
 from suffix_hybrid.kernels import fp4mma_probe as probe
 from suffix_hybrid.kernels import nvfp4_moe as nm
 
+from test_fp4mma_probe import DECOMPOSED_PTX, NATIVE_PTX, FakeCK, FakeJit, fake_launcher  # noqa: E402,F401
 from test_fp4mma_ref import cpu_mm, nvfp4_ref  # noqa: E402,F401
 
 try:
@@ -28,12 +34,17 @@ try:
 except ImportError:
     helion = None
 needs_helion = pytest.mark.skipif(helion is None, reason="Helion not installed")
+WARN = [helion.exc.TensorOperationInWrapper] if helion else []
+
+DS = {"name": "deepseek-v4.1-flash-1017-nvfp4", "architecture": "DeepseekV41ForCausalLM",
+      "tp": 8, "hidden": 5120, "moe_intermediate": 288, "experts": 384, "topk": 6, "quant_format": "nvfp4"}
 
 
-def kernels(plan, cfgs=None):
+def kernels(plan="front4", cfgs=None):
+    """The plan's kernels as the seam builds them (ours from BODIES, lane B's combine from lane B's)."""
     cfgs = cfgs or {}
-    return [helion.kernel(fe.BODIES[k], config=helion.Config(**cfgs.get(k, {})), static_shapes=False,
-                          ignore_warnings=[helion.exc.TensorOperationInWrapper]) for k in fe.PLANS[plan]]
+    return [helion.kernel(fe.BODIES.get(k) or lb.BODIES[k], config=helion.Config(**cfgs.get(k, {})),
+                          static_shapes=False, ignore_warnings=WARN) for k in fe.PLANS[plan]]
 
 
 def layer(e_local=6, e_global=12, base=3, h=128, i=128, topk=3, m=7, dist="balanced", seed=0, limit=10.0,
@@ -45,7 +56,7 @@ def layer(e_local=6, e_global=12, base=3, h=128, i=128, topk=3, m=7, dist="balan
     return p, x, ids, tw, base
 
 
-def run(plan, p, x, ids, tw, base, cfgs=None):
+def run(p, x, ids, tw, base, cfgs=None, plan="front4"):
     out = torch.full((x.shape[0], x.shape[1]), float("nan")).bfloat16()
     fe.run_plan(kernels(plan, cfgs), plan, x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"],
                 p["g2"], out, p["a1g"], p["a2g"], p["act"], base, p["limit"])
@@ -56,6 +67,15 @@ def rel_vs_spec(out, p, x, ids, tw, base):
     lid = nm.to_local(ids, base, p["w13"].shape[0]).int()
     ref = nm.moe_ref(p, x, lid, tw)
     return float((out.double() - ref).norm() / ref.norm().clamp_min(1e-30)), lid
+
+
+@pytest.fixture(autouse=True)
+def _leave_the_variant_cache_as_found():
+    """lane B caches the imported variant module in `_VARIANTS`: no test of ours may leak that into another file's."""
+    before = dict(lb._VARIANTS)
+    yield
+    lb._VARIANTS.clear()
+    lb._VARIANTS.update(before)
 
 
 @pytest.fixture(params=["words", "bytes"])
@@ -75,28 +95,17 @@ def small_tiles(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# the route: three implementations of one sort
+# the route: the python spec == lane B's sort; the kernel route == the spec
 # ---------------------------------------------------------------------------
-def ids_with_offrank(m, topk, e_global, base, e_local, seed):
-    ids, _ = nm.rand_routing(m, e_global, topk, "cpu", seed, base, e_local, dist="skewed")
-    return ids
-
-
 @pytest.mark.parametrize("m", [1, 5, 16, 33])
-def test_route_torch_equals_the_python_spec_and_lane_b(m):
-    ids = ids_with_offrank(m, 3, 12, 3, 6, m)
+def test_route_ref_is_lane_bs_sort_in_expert_major_form(m):
+    ids, _ = nm.rand_routing(m, 12, 3, "cpu", m, 3, 6, dist="skewed")
     spec = fe.route_ref(ids, 6, 3)
-    got = fe.route_torch(ids, 6, 3)
-    for a, b in zip(got, spec):
-        assert torch.equal(a, b) and a.dtype == torch.int32
     lps, lseg, lseg_e = lb.route_ref(ids, 6, 3)  # lane B's per-position arrays, rebuilt from (counts, starts)
     seg, seg_e = fe.seg_from(*spec)
     assert torch.equal(spec[0], lps) and torch.equal(seg, lseg) and torch.equal(seg_e, lseg_e)
-    # structure: local pairs first, ascending expert, ascending pair; counts sum = number of local pairs
-    n_local = int(spec[1].sum())
-    keys = spec[0][:n_local].long()
-    flat = ids.reshape(-1).long() - 3
-    ek = flat[keys]
+    n_local = int(spec[1].sum())  # local pairs first, ascending expert, ascending pair
+    ek = (ids.reshape(-1).long() - 3)[spec[0][:n_local].long()]
     assert bool((ek[1:] >= ek[:-1]).all()) and bool((0 <= ek).all()) and bool((ek < 6).all())
     assert int(spec[2][0]) == 0 and torch.equal(spec[2], torch.cumsum(spec[1], 0) - spec[1])
 
@@ -112,36 +121,31 @@ def test_route_quant_kernel_vs_spec_and_quant_codes(m, nvfp4_ref, small_tiles):
     ok, msg = fe.check_route_quant(out, ref)
     assert ok, msg
     assert torch.equal(out[0], ref[0]) and torch.equal(out[1].view(torch.uint8), ref[1].view(torch.uint8))
-    # the quant kernel alone (the prefill-range plan) is the same quantization
-    q = helion.kernel(fe.BODIES[fe.QUANT], config=helion.Config(), static_shapes=False)
-    qo = q(x, fe._f32(p["a1g"]), fe._div6(p["a1g"]))
-    assert torch.equal(qo[0], out[0]) and torch.equal(qo[1].view(torch.uint8), out[1].view(torch.uint8))
 
 
 @needs_helion
 def test_quant_of_hostile_activations_is_the_spec(nvfp4_ref):
     p, x, ids, tw, base = layer(m=9, adversarial=True)
     x = nm.adversarial_blocks(x.float(), torch.Generator().manual_seed(4)).bfloat16()
-    q = helion.kernel(fe.BODIES[fe.QUANT], config=helion.Config(), static_shapes=False)
-    got = q(x, fe._f32(p["a1g"]), fe._div6(p["a1g"]))
-    want = fe.quant_ref(x, fe._f32(p["a1g"]), fe._div6(p["a1g"]))
-    assert fe.check_quant(got, want)[0]
+    k = helion.kernel(fe.BODIES[fe.ROUTE_QUANT], config=helion.Config(), static_shapes=False)
+    got = k(x, ids, fe._f32(p["a1g"]), fe._div6(p["a1g"]), 6, base)
+    want = fe.route_quant_ref(x, ids, fe._f32(p["a1g"]), fe._div6(p["a1g"]), 6, base)
+    assert fe.check_route_quant(got, want)[0]
     assert (want[1].view(torch.uint8) == 0).any()  # zero blocks really occur
 
 
 # ---------------------------------------------------------------------------
-# the layer, end to end, both plans
+# the layer, end to end (the plan's four kernels), both scale-read modes
 # ---------------------------------------------------------------------------
 LOADS = [dict(m=1), dict(m=7), dict(m=16, dist="skewed"), dict(m=12, dist="hot"),
          dict(m=9, limit=0.8), dict(m=16, limit=0.8, dist="skewed", adversarial=True)]
 
 
 @needs_helion
-@pytest.mark.parametrize("plan", ["fp4mma4", "fp4mma4t"])
 @pytest.mark.parametrize("kw", LOADS, ids=lambda d: ",".join(f"{k}={v}" for k, v in d.items()))
-def test_layer_vs_f64_spec(plan, kw, nvfp4_ref, cpu_mm, scale_read):
+def test_layer_vs_f64_spec(kw, nvfp4_ref, cpu_mm, scale_read):
     p, x, ids, tw, base = layer(**kw)
-    out = run(plan, p, x, ids, tw, base)
+    out = run(p, x, ids, tw, base)
     rel, lid = rel_vs_spec(out, p, x, ids, tw, base)
     assert rel <= nm.REF_TOL and torch.isfinite(out.float()).all(), rel
     assert rel < 5e-3  # measured ~1-2e-3 (bf16 output rounding + requant flips)
@@ -150,31 +154,27 @@ def test_layer_vs_f64_spec(plan, kw, nvfp4_ref, cpu_mm, scale_read):
 
 
 @needs_helion
-@pytest.mark.parametrize("plan", ["fp4mma4", "fp4mma4t"])
-def test_layer_with_many_small_tiles_and_long_row_loops(plan, nvfp4_ref, cpu_mm, small_tiles, scale_read):
+def test_layer_with_many_small_tiles_and_long_row_loops(nvfp4_ref, cpu_mm, small_tiles, scale_read):
     """brow 16, 32 I-columns per program, 32-byte K steps, tiny route tiles; the hot load puts every row of
     the batch on one expert (a 40-row segment = 3 row tiles)."""
     small_tiles()
     p, x, ids, tw, base = layer(m=40, dist="hot", limit=0.8, seed=2)
-    out = run(plan, p, x, ids, tw, base)
+    out = run(p, x, ids, tw, base)
     rel, lid = rel_vs_spec(out, p, x, ids, tw, base)
     assert rel <= nm.REF_TOL
-    counts = fe.route_ref(ids, 6, base)[1]
-    assert int(counts.max()) > 16  # a segment longer than one row tile
+    assert int(fe.route_ref(ids, 6, base)[1].max()) > 16  # a segment longer than one row tile
     assert nm.clamp_frac(p, x, lid) > 0.05
 
 
 @needs_helion
 def test_off_rank_tokens_are_exact_zeros_and_all_off_rank_batches_work(nvfp4_ref, cpu_mm, scale_read):
-    for plan in ("fp4mma4", "fp4mma4t"):
-        p, x, ids, tw, base = layer(m=8, dead=True)  # every token routes outside this rank
-        out = run(plan, p, x, ids, tw, base)
-        assert torch.equal(out, torch.zeros_like(out))
-        p, x, ids, tw, base = layer(m=10, seed=3)  # rows t % 3 == 1 are off-rank
-        out = run(plan, p, x, ids, tw, base)
-        lid = nm.to_local(ids, base, 6)
-        dead = (lid < 0).all(1)
-        assert bool(dead.any()) and bool((out[dead] == 0).all())
+    p, x, ids, tw, base = layer(m=8, dead=True)  # every token routes outside this rank
+    out = run(p, x, ids, tw, base)
+    assert torch.equal(out, torch.zeros_like(out))
+    p, x, ids, tw, base = layer(m=10, seed=3)  # rows t % 3 == 1 are off-rank
+    out = run(p, x, ids, tw, base)
+    dead = (nm.to_local(ids, base, 6) < 0).all(1)
+    assert bool(dead.any()) and bool((out[dead] == 0).all())
 
 
 @needs_helion
@@ -182,7 +182,7 @@ def test_gate_clamp_is_one_sided_and_the_test_can_tell(nvfp4_ref, cpu_mm, monkey
     """vLLM clamps the gate from ABOVE only. Drive the gate strongly negative on some rows (a symmetric
     clamp would flatten them) and require the one-sided result; then show a symmetric spec would NOT match."""
     p, x, ids, tw, base = layer(m=16, limit=0.8, seed=6, gain=3.0)
-    out = run("fp4mma4", p, x, ids, tw, base)
+    out = run(p, x, ids, tw, base)
     rel, lid = rel_vs_spec(out, p, x, ids, tw, base)
     assert rel <= nm.REF_TOL
     gu = nm.gate_up_ref(p, x, lid)
@@ -201,23 +201,26 @@ def test_gate_clamp_is_one_sided_and_the_test_can_tell(nvfp4_ref, cpu_mm, monkey
 def test_stage_references_judge_fc1_fc2_and_combine(nvfp4_ref, cpu_mm, small_tiles, scale_read):
     small_tiles()
     p, x, ids, tw, base = layer(m=12, limit=0.8, dist="skewed", seed=4)
-    ks = kernels("fp4mma4")
+    ks = kernels("front4")
     e = p["w13"].shape[0]
     xq, xs, ps, counts, starts = ks[0](x, ids, fe._f32(p["a1g"]), fe._div6(p["a1g"]), e, base)
     w13s, w2s = fe.sf_arg(p["w13_sf"]), fe.sf_arg(p["w2_sf"])
     args1 = (xq, fe.sf_arg(xs), ps, counts, starts, p["w13"], w13s, p["g1"], fe._f32(p["a2g"]),
              fe._div6(p["a2g"]), p["act"], ids.shape[1], 0.8)
-    hq, hs = ks[1](*args1)
-    ok, msg = fe.check_fc1((hq, hs), fe.fc1_ref(*args1))
+    hq, hs_ = ks[1](*args1)
+    ok, msg = fe.check_fc1((hq, hs_), fe.fc1_ref(*args1))
     assert ok, msg
-    args2 = (hq, fe.sf_arg(hs), ps, counts, starts, tw, p["w2"], w2s, p["g2"])
+    args2 = (hq, fe.sf_arg(hs_), ps, counts, starts, tw, p["w2"], w2s, p["g2"])
     y = ks[2](*args2)
     ok, msg = fe.check_fc2(y, fe.fc2_ref(*args2))
     assert ok, msg
     out = torch.empty(12, 128, dtype=torch.bfloat16)
-    ks[3](y, ids, base, e, out)
-    want = lb._ref_combine(y, ids, base, e, out)
-    assert lb._check_combine(out, want)[0]
+    ks[3](y, ids, base, e, out)  # lane B's combine, unchanged interface
+    assert lb._check_combine(out, lb._ref_combine(y, ids, base, e, out))[0]
+
+
+def kernels_for(name):
+    return helion.kernel(fe.BODIES[name], config=helion.Config(), static_shapes=False, ignore_warnings=WARN)
 
 
 @needs_helion
@@ -230,20 +233,10 @@ def test_lab_make_inputs_feed_the_bodies(nvfp4_ref, cpu_mm, scale_read):
     assert cs and all(c["experts"] == 12 and c["experts_global"] == 96 and c["limit"] == 10.0 for c in cs)
     case = {**cs[0], "numtokens": 6}
     for e in fe.KERNELS:
-        if e["name"] == fe.QUANT:
-            continue
         args = e["make"](case, 0)
         out = kernels_for(e["name"])(*args)
         ok, msg = e["check"](out, e["reference"](*args))
         assert ok, (e["name"], msg)
-    q = next(x for x in fe.KERNELS if x["name"] == fe.QUANT)
-    qa = q["make"](case, 0)
-    assert q["check"](kernels_for(fe.QUANT)(*qa), q["reference"](*qa))[0]
-
-
-def kernels_for(name):
-    return helion.kernel(fe.BODIES[name], config=helion.Config(), static_shapes=False,
-                         ignore_warnings=[helion.exc.TensorOperationInWrapper])
 
 
 def test_autotune_check_compares_only_what_a_consumer_reads():
@@ -254,14 +247,16 @@ def test_autotune_check_compares_only_what_a_consumer_reads():
     starts = torch.tensor([0, 2], dtype=torch.int32)
     fe.LAST_ARGS[fe.FC1] = (None, None, ps, counts, starts)
     hq = torch.randint(0, 255, (6, 8), dtype=torch.uint8)
-    hs = torch.randint(0, 120, (6, 2), dtype=torch.uint8).view(torch.float8_e4m3fn)
-    other = (hq.clone(), hs.clone())
+    hs_ = torch.randint(0, 120, (6, 2), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    other = (hq.clone(), hs_.clone())
     other[0][3:] = 7  # garbage rows 3, 4, 5 differ: not read
     chk = fe.autotune_check(fe.FC1)
-    chk((hq, hs), other)
+    chk((hq, hs_), other)
     other[0][1] ^= 0xFF  # a local row differs
     with pytest.raises(AssertionError, match="hq"):
-        chk((hq, hs), other)
+        chk((hq, hs_), other)
+    with pytest.raises(AssertionError, match="no check for kernel"):
+        fe.autotune_check(lb.COMBINE)((hq,), (hq,))  # lane B's body is judged by lane B's check
 
 
 # ---------------------------------------------------------------------------
@@ -281,18 +276,15 @@ def lowered(name, e=4, h=256, i=128, topk=3, m=8):
     ps = torch.zeros(pairs + 1, dtype=torch.int32)
     counts = torch.zeros(e, dtype=torch.int32)
     hq = torch.zeros(pairs + 1, i // 2, dtype=torch.uint8)
-    hs = fe.sf_arg(torch.zeros(pairs + 1, i // 16, dtype=torch.uint8))
+    hs_ = fe.sf_arg(torch.zeros(pairs + 1, i // 16, dtype=torch.uint8))
     args = {
-        fe.ROUTE_QUANT: (x, ids, 1.0, 1.0, e, 2), fe.QUANT: (x, 1.0, 1.0),
+        fe.ROUTE_QUANT: (x, ids, 1.0, 1.0, e, 2),
         fe.FC1: (xq, xs, ps, counts, counts, p["w13"], fe.sf_arg(p["w13_sf"]), p["g1"], 1.0, 1.0, 0, topk, 10.0),
-        fe.FC2: (hq, hs, ps, counts, counts, tw, p["w2"], fe.sf_arg(p["w2_sf"]), p["g2"]),
-        fe.COMBINE: (torch.zeros(pairs + 1, h), ids, 2, e, torch.zeros(m, h, dtype=torch.bfloat16)),
+        fe.FC2: (hq, hs_, ps, counts, counts, tw, p["w2"], fe.sf_arg(p["w2_sf"]), p["g2"]),
     }[name]
-    cfg = {fe.ROUTE_QUANT: dict(block_sizes=[16, 32, 2, 8]), fe.QUANT: dict(block_sizes=[2, 8]),
-           fe.FC1: dict(block_sizes=[16, 2, 32]), fe.FC2: dict(block_sizes=[16, 32, 32]),
-           fe.COMBINE: dict(block_sizes=[2, 64])}[name]
-    k = helion.kernel(fe.BODIES[name], ref_mode=RefMode.OFF, static_shapes=False,
-                      ignore_warnings=[helion.exc.TensorOperationInWrapper])
+    cfg = {fe.ROUTE_QUANT: dict(block_sizes=[16, 32, 2, 8]), fe.FC1: dict(block_sizes=[16, 2, 32]),
+           fe.FC2: dict(block_sizes=[16, 32, 32])}[name]
+    k = helion.kernel(fe.BODIES[name], ref_mode=RefMode.OFF, static_shapes=False, ignore_warnings=WARN)
     return k.bind(args).to_triton_code(helion.Config(**cfg, num_warps=4, num_stages=3))
 
 
@@ -302,173 +294,22 @@ def test_triton_source_of_every_body(name, scale_read):
     code = lowered(name)
     assert not any(t in code for t in BANNED), [t for t in BANNED if t in code]
     assert code.count("_launcher(") == 1
+    assert f"def _helion_{name}(" in code and fe.TRITON_NAMES.get(name, "_helion_" + name) == "_helion_" + name
     calls = [ln for ln in code.splitlines() if "tl.dot_scaled(" in ln and not ln.strip().startswith("#")]
     expect = {fe.FC1: 2, fe.FC2: 1}.get(name, 0)
     assert len(calls) == expect and all(c.count("'e2m1'") == 2 for c in calls), calls
-    if name in (fe.FC1, fe.FC2) and scale_read == "words":  # K5 targets: int32 words unpacked in registers, bit-cast to e4m3
+    if name in (fe.FC1, fe.FC2) and scale_read == "words":  # K5 targets: int32 words unpacked in registers, bit-cast
         assert code.count("tl.float8e4nv, bitcast=True") == expect + 1 and "tl.join" in code
     if name in (fe.FC1, fe.FC2) and scale_read == "bytes":  # the scale tile is a plain e4m3 load: no join, no bitcast
         assert "tl.join" not in code and "bitcast=True" not in code
     if name == fe.ROUTE_QUANT:  # three roots in ONE launch: pair sort, expert scan, quant
         grid = [ln for ln in code.splitlines() if "_launcher(" in ln][0]
         assert grid.count("+") >= 2 and "e_count" in grid
-    if name == fe.COMBINE:
-        assert "tl.range(0, tl.cast(topk" in code
 
 
 # ---------------------------------------------------------------------------
-# the seam
+# the scale-read knob
 # ---------------------------------------------------------------------------
-@pytest.fixture
-def shipped(monkeypatch):
-    cfgs = {}
-    monkeypatch.setattr(hk, "config", lambda name, case, plat=None: cfgs.get((name, case["numtokens"])))
-    monkeypatch.setattr(hk, "platform", lambda device=0: "gpu")
-    return cfgs
-
-
-def ship(cfgs, bucket, plan):
-    for k in fe.PLANS[plan]:
-        cfgs[(k, bucket)] = {}
-
-
-def test_bucket_case_uses_lane_bs_schema_with_this_familys_buckets():
-    c = fe.bucket_case(48, 5120, 2304, 6, 0, 150, 10.0, 384)
-    assert c == {"experts": 48, "hidden": 5120, "moe_intermediate": 2304, "topk": 6, "act": "silu",
-                 "numtokens": 192, "limit": 10.0, "experts_global": 384}
-    assert fe.bucket_case(48, 5120, 2304, 6, 0, 1, 10.0, 384)["numtokens"] == 1
-    assert fe.bucket_case(48, 5120, 2304, 6, 0, 300, 10.0, 384)["numtokens"] == 512
-    assert fe.bucket_case(48, 5120, 2304, 6, 0, 1024, 10.0, 384)["numtokens"] == 1024
-    assert fe.bucket_case(48, 5120, 2304, 6, 0, 3000, 10.0, 384)["numtokens"] == 4096
-    assert [fe.plan_name(m) for m in (1, 512, 513, 1024)] == ["fp4mma4", "fp4mma4", "fp4mma4t", "fp4mma4t"]
-
-
-def test_served_ms_serves_a_bucket_only_when_every_kernel_of_its_plan_is_shipped(shipped):
-    ship(shipped, 8, "fp4mma4")
-    ship(shipped, 32, "fp4mma4")
-    shipped[(fe.FC2, 64)] = {}  # a partially shipped bucket serves nothing
-    shipped[(fe.FC1, 64)] = {}
-    got = fe.served_ms(48, 5120, 2304, 6, 0, 70, 10.0, 384)
-    assert sorted(set(got.values())) == [(8, "fp4mma4"), (32, "fp4mma4")]
-    assert sorted(got) == list(range(7, 9)) + list(range(17, 33))  # M 7..8 -> bucket 8, 17..32 -> bucket 32
-    assert all(not (9 <= m <= 16 or m > 32) for m in got)
-    with pytest.raises(RuntimeError, match="STRICT.*M<=1 fp4mma4"):
-        fe.served_ms(48, 5120, 2304, 6, 0, 70, 10.0, 384, fail_closed=True)
-
-
-def test_served_ms_chunks_prefill_and_needs_every_chunk_bucket(shipped, monkeypatch):
-    ship(shipped, 1024, "fp4mma4t")
-    monkeypatch.setattr(fe, "CHUNK_M", 1024)
-    got = fe.served_ms(48, 5120, 2304, 6, 0, 2048 + 7, 10.0, 384)
-    assert 1024 in got and 2048 in got
-    assert (2048 + 7) not in got  # the 7-token remainder chunk (bucket 8) is unserved
-    assert 1025 not in got  # remainder chunk of 1 token: bucket 1 unshipped
-    ship(shipped, 1, "fp4mma4")
-    assert 1025 in fe.served_ms(48, 5120, 2304, 6, 0, 1100, 10.0, 384)
-    assert fe.chunks(1100, 1024) == [(0, 1024), (1024, 1100)] and fe.chunks(50, 1024) == [(0, 50)]
-
-
-def test_chunk_size_from_the_y_budget(monkeypatch):
-    monkeypatch.delenv(fe.Y_MB_ENV, raising=False)
-    monkeypatch.setattr(fe, "CHUNK_M", None)
-    # V4.1: y = tokens * 6 * 5120 * 4 B; 512 MB -> 4096 tokens (2 passes at an 8192-token prefill chunk)
-    assert fe.chunk_size(6, 5120) == 4096
-    monkeypatch.setenv(fe.Y_MB_ENV, "128")
-    assert fe.chunk_size(6, 5120) == 1024
-    monkeypatch.setenv(fe.Y_MB_ENV, "16")
-    assert fe.chunk_size(6, 5120) == 256 and fe.chunk_size(8, 6144) == 256  # floor
-    monkeypatch.setenv(fe.Y_MB_ENV, "lots")
-    with pytest.raises(RuntimeError, match="MB >= 16"):
-        fe.chunk_size(6, 5120)
-    monkeypatch.setattr(fe, "CHUNK_M", 7)
-    assert fe.chunk_size(6, 5120) == 7
-
-
-def test_warm_ms_per_specialization_class():
-    served = {m: (8, "fp4mma4") for m in range(1, 40)}
-    assert fe.warm_ms(served) == [1, 2, 8, 16, 24, 32, 39]
-    assert fe.warm_ms({}) == []
-
-
-def test_eligibility():
-    assert fe.eligible(5120, 2304, 48) is None
-    assert "I % 64" in fe.eligible(5120, 288, 384)  # the kernel-only TP8-no-EP rank: lane B's, not ours
-    assert fe.eligible(5120, 2304, 0) and fe.eligible(100, 2304, 8) and fe.eligible(5120, 64 - 16, 8)
-    assert fe.eligible(2816, 704, 128) is None  # gemma-4 26B: I = 704 = 11 * 64
-
-
-def fake_args(m, h=128, topk=3, e=6, i=128):
-    x = torch.zeros(m, h, dtype=torch.bfloat16)
-    ids = torch.zeros(m, topk, dtype=torch.int32)
-    tw = torch.zeros(m, topk)
-    w13 = torch.zeros(e, 2 * i, h // 2, dtype=torch.uint8)
-    return (x, ids, tw, w13, None, None, None, None, None, None, None, None, None, None, None, None,
-            torch.zeros(m, h, dtype=torch.bfloat16), 1.0, 1.0, 0, 0, 1, 0, 0)
-
-
-def test_serving_op_routes_per_m_and_chunks(monkeypatch):
-    calls = []
-    base = lambda *a: calls.append(("base", a[0].shape[0])) or "base"
-    monkeypatch.setattr(fe, "plan_name", lambda n: "fp4mma4")
-    monkeypatch.setattr(fe, "_kernels", lambda key, plan, untuned: (json.loads(key)["numtokens"], plan))
-    monkeypatch.setattr(fe, "run_plan", lambda kerns, plan, x, *a: calls.append((kerns[0], x.shape[0])))
-    monkeypatch.setattr(fe, "CHUNK_M", 8)
-    served = {m: (hk.bucket(m, fe.BUCKETS), "fp4mma4") for m in range(1, 9)}
-    op = fe.serving_op(base, 10.0, 12, served)
-    assert op.backend == "fp4mma" and op.served is served
-    # served M: the family's plan, at the bucket the lab tuned (M = 5 -> bucket 6)
-    out = op(*fake_args(5))
-    assert calls == [(6, 5)] and out.shape == (5, 128)
-    # an M the table does not hold (and not chunkable into held lengths): the wrapped op, all args through
-    calls.clear()
-    del served[7]
-    assert op(*fake_args(7)) == "base" and calls == [("base", 7)]
-    # chunked: M = 19 = 8 + 8 + 3, every chunk length served -> three plan runs on token slices, no base call
-    calls.clear()
-    out = op(*fake_args(19))
-    assert calls == [(8, 8), (8, 8), (6, 3)] and out.shape == (19, 128)
-    # one unserved chunk length sends the WHOLE call to the wrapped op
-    del served[3]
-    calls.clear()
-    assert op(*fake_args(19)) == "base" and calls == [("base", 19)]
-    # untuned_ok (standalone oracle / bench): no table needed, every M runs the family
-    calls.clear()
-    free = fe.serving_op(base, 10.0, 12, {}, untuned_ok=True)
-    free(*fake_args(3))
-    assert calls == [(6, 3)]
-
-
-def test_prepare_layer_gates(monkeypatch, shipped):
-    base = object()
-    monkeypatch.delenv(fe.ENV, raising=False)
-    with pytest.raises(RuntimeError, match="unset/0"):
-        fe.prepare_layer(base, 5120, 2304, 48, 6, 0, 192, 10.0, 384)
-    monkeypatch.setenv(fe.ENV, "1")
-    with pytest.raises(RuntimeError, match="not eligible.*I % 64"):
-        fe.prepare_layer(base, 5120, 288, 384, 6, 0, 192, 10.0, 384)
-    with pytest.raises(probe.Fp4mmaError, match="cannot run"):
-        fe.prepare_layer(base, 5120, 2304, 48, 6, 0, 192, 10.0, 384)  # this box: no SM12x / Triton
-    monkeypatch.setattr(probe, "require_native_stack", lambda: None)
-    monkeypatch.setattr(probe, "install_recorder", lambda: True)
-    op, served = fe.prepare_layer(base, 5120, 2304, 48, 6, 0, 192, 10.0, 384)
-    assert op is base and served == {}  # nothing shipped: lane B's behaviour exactly
-    monkeypatch.setenv(fe.STRICT_ENV, "1")
-    with pytest.raises(RuntimeError, match="STRICT"):
-        fe.prepare_layer(base, 5120, 2304, 48, 6, 0, 192, 10.0, 384)
-    monkeypatch.delenv(fe.STRICT_ENV)
-    ship(shipped, 8, "fp4mma4")
-    op, served = fe.prepare_layer(base, 5120, 2304, 48, 6, 0, 192, 10.0, 384)
-    assert op is not base and op.backend == "fp4mma" and sorted(served) == [7, 8]
-
-
-def test_verify_served_asserts_the_two_dot_kernels(monkeypatch):
-    seen = []
-    monkeypatch.setattr(probe, "assert_native", lambda names, allow_local=True: seen.append(list(names)) or [])
-    assert fe.verify_served({}) == [] and seen == []
-    fe.verify_served({1: (1, "fp4mma4")})
-    assert seen == [["_helion_dsv41_fp4mma_fc1", "_helion_dsv41_fp4mma_fc2"]]
-
-
 def test_scale_read_knob_defaults_to_words_and_is_loud(monkeypatch):
     monkeypatch.delenv(fe.SCALE_ENV, raising=False)
     assert fe._scale_read() == "words" and fe.SCALE_READ == "words"
@@ -493,17 +334,335 @@ def test_sf_arg_is_the_same_bytes_in_either_mode(monkeypatch):
         fe.sf_arg(sf.transpose(1, 2))
 
 
-def test_knob_loud_and_default_off(monkeypatch):
-    monkeypatch.delenv(fe.ENV, raising=False)
-    assert fe.enabled() is False and fe.strict() is False
-    monkeypatch.setenv(fe.ENV, "2")
-    with pytest.raises(RuntimeError, match="expected 0 or 1"):
-        fe.enabled()
+# ---------------------------------------------------------------------------
+# THE CONTRACT of lane B's per-bucket seam (nvfp4_moe.check_variant)
+# ---------------------------------------------------------------------------
+def test_module_honours_the_variant_contract():
+    lb.check_variant("dot_scaled", fe)  # raises with the exact violation otherwise
+    assert fe.VARIANT == lb.DOT_SCALED == "dot_scaled"
+    assert set(fe.PLANS) == {"front4"} and set(fe.PLANS) <= set(lb.PLANS)
+    assert fe.COMBINE == lb.COMBINE and fe.PLANS["front4"] == (fe.ROUTE_QUANT, fe.FC1, fe.FC2, lb.COMBINE)
+    # every plan name has a body (ours, or lane B's for the shared combine) and the Triton names K5 reads
+    assert all(k in fe.BODIES or k in lb.BODIES for names in fe.PLANS.values() for k in names)
+    assert set(fe.BODIES) == {fe.ROUTE_QUANT, fe.FC1, fe.FC2} and not set(fe.BODIES) & set(lb.BODIES)
+    assert {k: b.__name__ for k, b in fe.BODIES.items()} == {k: k for k in fe.BODIES}
+    assert set(fe.TRITON_NAMES.values()) == {"_helion_" + k for k in fe.BODIES}
+    # lab names: lane B's documented prefix, no collision with the dequant kernels or the fused shared ones
+    names = [e["name"] for e in fe.KERNELS]
+    assert names == [fe.ROUTE_QUANT, fe.FC1, fe.FC2] and all(n.startswith("dsv41_moe_") for n in names)
+    assert not set(names) & (set(lb.BODIES) | set(hs.NEW_KERNELS))
+    assert all(set(lb._KERNEL_KEYS) <= set(e) for e in fe.KERNELS)
+    # run_plan: lane B's signature, name for name
+    want = inspect.signature(lb.run_plan)
+    assert list(inspect.signature(fe.run_plan).parameters) == list(want.parameters)
+    assert inspect.signature(fe.run_plan).parameters["limit"].default is None
+    # the module is what VARIANT_MODULES points at, and the seam imports it through check_variant
+    assert lb.VARIANT_MODULES[lb.DOT_SCALED] == fe.__name__
+    assert lb.variant_module(lb.DOT_SCALED) is fe and lb.DOT_SCALED in lb.available_variants()
+
+
+def _bad(**over):
+    mod = types.ModuleType("bad_dsv41_moe_fp4mma")
+    mod.__dict__.update({k: v for k, v in vars(fe).items() if not k.startswith("__")})
+    for k, v in over.items():
+        setattr(mod, k, v)
+    return mod
+
+
+@pytest.mark.parametrize("over,needle", [
+    ({"VARIANT": None}, "VARIANT None != 'dot_scaled'"),
+    ({"PLANS": {}}, "non-empty dict"),
+    ({"PLANS": {"fp4mma4": ("a",)}}, "non-empty dict"),                       # the old plan names are refused
+    ({"BODIES": []}, "BODIES must be"),
+    ({"BODIES": {}}, "no body in BODIES"),                                    # a plan kernel nobody implements
+    ({"run_plan": None}, "run_plan("),
+    ({"KERNELS": []}, "KERNELS (lab ABI list) is missing"),
+    ({"KERNELS": [{"name": "dsv41_moe_fc1"}]}, "lacks ['body'"),
+    ({"KERNELS": [{**dict.fromkeys(lb._KERNEL_KEYS, 1), "name": lb.FC1}]}, "collides with a dequant kernel name"),
+])
+def test_contract_violations_are_refused(over, needle):
+    if "no body in BODIES" in needle:
+        over = {"BODIES": {}, "PLANS": {"front4": ("dsv41_moe_nobody",)}}
+    with pytest.raises(RuntimeError, match="breaks the seam") as exc:
+        lb.check_variant("dot_scaled", _bad(**over))
+    assert needle in str(exc.value), str(exc.value)
 
 
 # ---------------------------------------------------------------------------
-# capture-safety audits + the CPU gate
+# the seam end to end on CPU: table row -> served_ms -> serving_op -> run_plan, vs lane B's dequant bodies
 # ---------------------------------------------------------------------------
+class _Forbid(importlib.abc.MetaPathFinder):
+    """The V4.1 route is oxide-free (docs/dsv41-moe.md section 12): a variant must not import the oxide family."""
+
+    def __init__(self):
+        self.hits = []
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname in ("suffix_hybrid.oxide_kernels", "suffix_hybrid._native") \
+                or fullname.startswith("suffix_hybrid._native."):
+            self.hits.append(fullname)
+            raise ImportError(f"{fullname}: the DeepSeek-V4 route is oxide-free")
+        return None
+
+
+@pytest.fixture
+def seam(monkeypatch):
+    """Lane B's real seam over a tiny clamped EP layer: hk.config answers from `rows`, no oxide importable."""
+    rows = {}
+    monkeypatch.setattr(hk, "platform", lambda device=0: "test_gpu")
+    monkeypatch.setattr(hk, "config", lambda kernel, case, plat=None: rows.get((kernel, case["numtokens"])))
+    finder = _Forbid()
+    monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
+    for name in ("suffix_hybrid.oxide_kernels", "suffix_hybrid._native"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.delattr(suffix_hybrid, "oxide_kernels", raising=False)
+    monkeypatch.delattr(suffix_hybrid, "_native", raising=False)
+    hk._COMPILED.clear()
+    lb._kernels.cache_clear()
+    yield rows
+    hk._COMPILED.clear()
+    lb._kernels.cache_clear()
+    lb._VARIANTS.pop("dot_scaled", None)
+    assert finder.hits == [], f"the oxide-free route imported {finder.hits}"
+
+
+def ship(rows, names, buckets, cfg=None):
+    rows.update({(k, b): dict(cfg or {}) for k in names for b in buckets})
+
+
+def ws():
+    return (None,) * 7
+
+
+def op_args(p, x, ids, tw, out):
+    return (x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"], p["g2"], *ws(), out,
+            p["a1g"], p["a2g"], p["act"])
+
+
+MODE_FOR = lambda m: 2 if m <= 8 else 1  # the lane's tune table: fused3 up to M 8, front4 above
+E_LOC, E_GLO, BASE, LIM = 6, 12, 3, 0.8
+
+
+def seam_rows(rows, variant_buckets, buckets=lb.CLAMP_BUCKETS):
+    """Shipped configs for the dequant plans on every bucket, the dot_scaled plan on `variant_buckets`
+    (our three kernels; the combine is lane B's own config), and the table rows selecting dot_scaled."""
+    ship(rows, {k for names in lb.PLANS.values() for k in names}, buckets)
+    ship(rows, fe.BODIES, variant_buckets)
+    for b in variant_buckets:
+        rows[(lb.VARIANT_KERNEL, b)] = {"body": "dot_scaled"}
+
+
+@needs_helion
+def test_seam_serves_a_dot_scaled_bucket_and_matches_the_dequant_bodies(seam, nvfp4_ref, cpu_mm, small_tiles,
+                                                                       scale_read, monkeypatch):
+    small_tiles()
+    seam_rows(seam, variant_buckets=(32,))
+    got = lb.served_ms("helion", E_LOC, 128, 128, 3, 0, 40, MODE_FOR, LIM, E_GLO)
+    assert got[20] == (32, "front4", "dot_scaled") and got[32] == (32, "front4", "dot_scaled")
+    assert got[17] == (32, "front4", "dot_scaled") and got[16] == (16, "front4", "dequant")
+    assert got[7] == (8, "fused3", "dequant") and got[40] == (64, "front4", "dequant")  # 33..40 -> bucket 64
+
+    seen = []
+    real = fe.run_plan
+    monkeypatch.setattr(fe, "run_plan", lambda kerns, plan, *a, **kw: (seen.append((plan, len(kerns))),
+                                                                     real(kerns, plan, *a, **kw))[1])
+    table_op = lb.serving_op(None, "helion", LIM, E_GLO)                         # the table decides
+    dequant_op = lb.serving_op(None, "helion", LIM, E_GLO, variant="dequant")    # forced: lane B's bodies
+    p, x, ids, tw, base = layer(e_local=E_LOC, e_global=E_GLO, base=BASE, m=20, limit=LIM, dist="skewed", seed=7)
+    ds = torch.full((20, 128), float("nan")).bfloat16()
+    dq = torch.full((20, 128), float("nan")).bfloat16()
+    r = table_op(*op_args(p, x, ids, tw, ds), base, 1, 0, 0)
+    assert r is ds and seen == [("front4", 4)]                                    # OUR run_plan served it
+    dequant_op(*op_args(p, x, ids, tw, dq), base, 1, 0, 0)
+    assert seen == [("front4", 4)]                                                # lane B's bodies served this one
+    rel_ds, lid = rel_vs_spec(ds, p, x, ids, tw, base)
+    rel_dq, _ = rel_vs_spec(dq, p, x, ids, tw, base)
+    rel_between = float((ds.double() - dq.double()).norm() / dq.double().norm().clamp_min(1e-30))
+    assert rel_ds <= nm.REF_TOL and rel_dq <= nm.REF_TOL and rel_between <= nm.REF_TOL, (rel_ds, rel_dq, rel_between)
+    assert nm.clamp_frac(p, x, lid) > 0.05                                        # the clamp engaged in both
+    # a bucket with no row stays on the dequant bodies through the same op
+    p7, x7, ids7, tw7, _ = layer(e_local=E_LOC, e_global=E_GLO, base=BASE, m=7, limit=LIM, seed=8)
+    out7 = torch.full((7, 128), float("nan")).bfloat16()
+    table_op(*op_args(p7, x7, ids7, tw7, out7), base, 2, 0, 0)
+    assert seen == [("front4", 4)] and rel_vs_spec(out7, p7, x7, ids7, tw7, base)[0] <= nm.REF_TOL
+
+
+@needs_helion
+def test_seam_refuses_the_buckets_this_module_cannot_serve(seam):
+    # M <= 8 is fused3 in the tune table; the variant has no fused3 plan: refused by name, never guessed
+    seam_rows(seam, variant_buckets=(8,))
+    with pytest.raises(RuntimeError, match=r"body variant 'dot_scaled' has no 'fused3' plan \(it serves \['front4'\]\)"):
+        lb.served_ms("helion", E_LOC, 128, 128, 3, 0, 12, MODE_FOR, LIM, E_GLO)
+    # a row whose bucket lacks one of the plan's configs is a startup error naming variant and kernel
+    seam.clear()
+    seam_rows(seam, variant_buckets=(32,))
+    del seam[(fe.FC2, 32)]
+    with pytest.raises(RuntimeError, match=r"M<=32 front4/dot_scaled: dsv41_moe_fc2"):
+        lb.served_ms("helion", E_LOC, 128, 128, 3, 0, 40, MODE_FOR, LIM, E_GLO)
+    # lane B's combine is part of the dot_scaled plan: its missing config is named too
+    seam.clear()
+    seam_rows(seam, variant_buckets=(32,))
+    del seam[(lb.COMBINE, 32)]
+    with pytest.raises(RuntimeError, match=r"M<=32 front4/dot_scaled: nvfp4_moe_combine"):
+        lb.served_ms("helion", E_LOC, 128, 128, 3, 0, 40, MODE_FOR, LIM, E_GLO)
+
+
+@needs_helion
+def test_a_module_that_violates_the_contract_is_refused_through_the_seam(seam, monkeypatch):
+    seam_rows(seam, variant_buckets=(32,))
+    for over, needle in (({"VARIANT": "other"}, "VARIANT 'other'"),
+                         ({"PLANS": {"fp4mma4": (fe.FC1,)}}, "non-empty dict"),
+                         ({"run_plan": None}, "run_plan(")):
+        monkeypatch.setitem(sys.modules, lb.VARIANT_MODULES["dot_scaled"], _bad(**over))
+        monkeypatch.delitem(lb._VARIANTS, "dot_scaled", raising=False)
+        with pytest.raises(RuntimeError, match="breaks the seam") as exc:
+            lb.served_ms("helion", E_LOC, 128, 128, 3, 0, 40, MODE_FOR, LIM, E_GLO)    # the first use at load
+        assert needle in str(exc.value)
+        with pytest.raises(RuntimeError, match="breaks the seam"):
+            lb.available_variants()                                                      # and in the lab
+    monkeypatch.delitem(lb._VARIANTS, "dot_scaled", raising=False)
+
+
+def _tensors(m, h=128, i=128, e=6, topk=3):
+    p = nm.make_problem(e, h, i, "silu", "cpu", 0, limit=LIM)
+    ids, tw = nm.rand_routing(m, 12, topk, "cpu", 1, 3, e)
+    return p, torch.zeros(m, h, dtype=torch.bfloat16), ids, tw, torch.zeros(m, h, dtype=torch.bfloat16)
+
+
+def test_run_plan_refuses_what_it_cannot_serve_before_launching_anything():
+    boom = [lambda *a: pytest.fail("a kernel was launched")] * 4
+    p, x, ids, tw, out = _tensors(4)
+    args = (p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"], p["g2"], out, p["a1g"], p["a2g"])
+    with pytest.raises(RuntimeError, match="no 'fused3' plan"):
+        fe.run_plan(boom, "fused3", x, ids, tw, *args, 0, 3, LIM)
+    with pytest.raises(RuntimeError, match="silu .0. only"):
+        fe.run_plan(boom, "front4", x, ids, tw, *args, 1, 3, LIM)
+    p2, x2, ids2, tw2, out2 = _tensors(4, h=128, i=96)  # I % 64 != 0: lane B's dequant bodies take it, ours do not
+    with pytest.raises(RuntimeError, match="I % 64"):
+        fe.run_plan(boom, "front4", x2, ids2, tw2, p2["w13"], p2["w13_sf"], p2["g1"], p2["w2"], p2["w2_sf"],
+                    p2["g2"], out2, p2["a1g"], p2["a2g"], 0, 3, LIM)
+
+
+# ---------------------------------------------------------------------------
+# K5 inside run_plan: armed before the first GPU launch, judged right after it, nothing on CPU tensors
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def k5_state(monkeypatch):
+    monkeypatch.setattr(fe, "_K5", {"stack": False, "seen": False, "n": 0})
+    yield fe._K5
+
+
+def _spy_kernels(calls):
+    """Stand-ins that only record their order and return what run_plan feeds on (scale buffers uint8)."""
+    sf = torch.zeros(4, dtype=torch.uint8)
+    outs = {"k0": lambda a: (a[0], sf, a[1], a[1], a[1]), "k1": lambda a: (a[0], sf), "k2": lambda a: a[0],
+            "k3": lambda a: a[-1]}
+    return [lambda *a, _n=n: (calls.append(_n), outs[_n](a))[1] for n in ("k0", "k1", "k2", "k3")]
+
+
+def test_run_plan_arms_k5_before_the_first_launch_and_judges_after_the_last_only_on_gpu(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fe, "_k5_arm", lambda: calls.append("arm"))
+    monkeypatch.setattr(fe, "_k5_check", lambda: calls.append("check"))
+    p, x, ids, tw, out = _tensors(4)
+    args = (x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"], p["g2"], out, p["a1g"], p["a2g"], 0, 3, LIM)
+    fe.run_plan(_spy_kernels(calls), "front4", *args)
+    assert calls == ["k0", "k1", "k2", "k3"], "CPU tensors: nothing armed, nothing judged"
+    calls.clear()
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))     # a GPU call, as far as run_plan can tell
+    fe.run_plan(_spy_kernels(calls), "front4", *args)
+    assert calls == ["arm", "k0", "k1", "k2", "k3", "check"]
+    # the real arm on a box that is not SM12x: refused by name BEFORE any kernel is launched
+    calls.clear()
+    monkeypatch.undo()
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(fe, "_K5", {"stack": False, "seen": False, "n": 0})
+    with pytest.raises(probe.Fp4mmaError, match="no CUDA device"):
+        fe.run_plan(_spy_kernels(calls), "front4", *args)
+    assert calls == []
+
+
+def test_k5_arm_is_the_stack_gate_then_a_watching_recorder(k5_state, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)               # whatever box this runs on
+    with pytest.raises(probe.Fp4mmaError, match="cannot run"):
+        fe._k5_arm()
+    assert not k5_state["stack"]
+    seen = []
+    monkeypatch.setattr(probe, "require_native_stack", lambda: seen.append("stack"))
+    monkeypatch.setattr(probe, "install_recorder", lambda watch=None: seen.append(("recorder", watch)))
+    monkeypatch.setattr(probe, "logline", lambda s: seen.append(s))
+    fe._k5_arm()
+    fe._k5_arm()                                                                  # once
+    assert seen[0] == "stack" and seen[1] == ("recorder", tuple(fe.TRITON_NAMES.values())) and len(seen) == 3
+    assert k5_state["stack"]
+
+
+def test_k5_check_judges_every_new_fc1_fc2_compile_and_refuses_a_decomposition(k5_state, fake_launcher):
+    import helion.runtime as hrt
+    probe.install_recorder(watch=tuple(fe.TRITON_NAMES.values()))
+    # first call: both native kernels must have been recorded at all (no PTX = no assertion = refuse)
+    with pytest.raises(probe.Fp4mmaError, match="no compiled kernel recorded for '_helion_dsv41_moe_fc1'"):
+        fe._k5_check()
+    for name, h in (("_helion_dsv41_moe_fc1", "a"), ("_helion_dsv41_moe_fc2", "b"),
+                    ("_helion_dsv41_moe_route_quant", "r")):
+        fake_launcher["ck"] = FakeCK(NATIVE_PTX if name.endswith(("fc1", "fc2")) else DECOMPOSED_PTX, h)
+        hrt.default_launcher(FakeJit(name), (1,))
+    fe._k5_check()                                                                # route_quant has no MMA: not judged
+    assert k5_state["seen"] and k5_state["n"] == probe.record_count() == 3
+    fe._k5_check()                                                                # nothing new: one len(), no work
+    # lane B's shared-expert kernel shares our name's prefix: neither recorded nor judged
+    fake_launcher["ck"] = FakeCK(DECOMPOSED_PTX, "sh")
+    hrt.default_launcher(FakeJit("_helion_dsv41_moe_fc1_sh"), (1,))
+    assert probe.record_count() == 3
+    # a new fc2 specialization that Triton decomposed is refused at the launch that compiled it
+    fake_launcher["ck"] = FakeCK(DECOMPOSED_PTX, "c")
+    hrt.default_launcher(FakeJit("_helion_dsv41_moe_fc2"), (1,))
+    with pytest.raises(probe.Fp4mmaError, match="decomposed tl.dot_scaled"):
+        fe._k5_check()
+
+
+def test_recorder_watch_and_exact_names(fake_launcher):
+    import helion.runtime as hrt
+    probe.install_recorder(watch=("_helion_a",))
+    probe.install_recorder(watch=("_helion_b",))                                   # accumulates
+    for name, h in (("_helion_a", "1"), ("_helion_a_2", "2"), ("_helion_a_sh", "3"), ("_helion_b", "4"),
+                    ("_helion_c", "5")):
+        fake_launcher["ck"] = FakeCK(NATIVE_PTX, h)
+        hrt.default_launcher(FakeJit(name), (1,))
+    assert sorted(r.name for r in probe.records()) == ["_helion_a", "_helion_a_2", "_helion_b"]
+    assert probe.name_matches("_helion_a_12", "_helion_a") and not probe.name_matches("_helion_a_sh", "_helion_a")
+    got = probe.assert_native(["_helion_a"], log=lambda s: None, only_new=True)
+    assert [r.name for r in got] == ["_helion_a", "_helion_a_2"]                   # exact: not _helion_a_sh, not _b
+    assert probe.assert_native(["_helion_a"], log=lambda s: None, only_new=True) == []
+    assert probe.assert_native(["_helion_zzz"], log=lambda s: None, only_new=True, require=False) == []
+
+
+# ---------------------------------------------------------------------------
+# lab ABI, capture-safety audits, the CPU gate
+# ---------------------------------------------------------------------------
+def test_cases_are_lane_bs_front4_cases_of_the_layouts_these_bodies_take(monkeypatch):
+    monkeypatch.delenv("NVFP4_MOE_TP8_NOEP", raising=False)
+    want = [c for c in lb.cases(DS, lb.FC2)]
+    assert want and {c["numtokens"] for c in want} == {6, 8, 16, 32, 64, 128, 192}
+    for e in fe.KERNELS:
+        got = e["cases"](DS)
+        assert got == want and all(c in lb.cases(DS, lb.FC1) for c in got)         # rows and selection share keys
+    monkeypatch.setenv("NVFP4_MOE_TP8_NOEP", "1")                                  # the I = 288 no-EP rank: not ours
+    assert all(c["moe_intermediate"] == 2304 for e in fe.KERNELS for c in e["cases"](DS))
+    assert fe.cases({**DS, "quant_format": "bf16"}) == []
+
+
+def test_tuner_plan_gains_exactly_our_three_kernels_on_the_front4_buckets(monkeypatch):
+    from suffix_hybrid.helion_kernels import nvfp4_moe_tune as nt
+    monkeypatch.delenv("NVFP4_MOE_TP8_NOEP", raising=False)
+    assert [k["name"] for k in nt.variant_kernels()] == [e["name"] for e in fe.KERNELS]
+    names = [k for k, _ in nt.todo()]
+    assert {k: names.count(k) for k in fe.BODIES} == {k: 7 for k in fe.BODIES}
+    assert len(names) == 53 + 3 * 7          # lane B's 53 (dequant 34 + fused shared 19) + 21 of ours
+    assert nt.todo()[0][0] == lb.ROUTE_QUANT  # the key M of lane B's own plan still goes first
+
+
 def _calls(fn):
     out = set()
     for node in ast.walk(ast.parse(inspect.getsource(fn))):
@@ -515,23 +674,24 @@ def _calls(fn):
 
 def test_served_paths_are_sync_free_and_shape_static():
     banned = {"item", "cpu", "tolist", "synchronize", "nonzero", "bincount", "unique", "masked_select",
-              "Stream", "Event", "record", "atomic_add"}
-    for fn in (fe.route_torch, fe.run_plan, fe.serving_op, fe.verify_served, fe.served_ms, fe.chunks):
+              "Stream", "Event", "record", "atomic_add", "empty_cache"}
+    for fn in (fe.run_plan, fe._k5_arm, fe._k5_check, fe.sf_arg):
         assert not (_calls(fn) & banned), (fn.__name__, _calls(fn) & banned)
-    # the op closure inside serving_op: audited through its source text
-    assert not any(t in inspect.getsource(fe.serving_op) for t in (".item()", "synchronize", "nonzero"))
 
 
-def test_bodies_hold_no_state_across_launches():
+def test_module_never_imports_the_oxide_stack_and_holds_no_state_across_launches():
+    tree = ast.parse(inspect.getsource(fe))
+    for node in ast.walk(tree):
+        mods = [node.module] if isinstance(node, ast.ImportFrom) and node.module else \
+            [a.name for a in node.names] if isinstance(node, ast.Import) else []
+        assert not any("oxide" in m or m.endswith("_native") for m in mods), mods
     for name, body in fe.BODIES.items():
         text = inspect.getsource(body)
         assert not any(t in text for t in ("atomic", "barrier", "counters", "semaphore")), name
-        tree = ast.parse(text)
-        # every buffer a body writes is allocated in the body (torch.empty) or is its `out`
-        allocs = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+        allocs = {t.id for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Assign)
                   if isinstance(n.value, ast.Call) and getattr(n.value.func, "attr", "") == "empty"
                   for t in n.targets if isinstance(t, ast.Name)}
-        assert allocs or name == fe.COMBINE, name
+        assert allocs, name  # every buffer a body writes is allocated in the body
 
 
 @needs_helion
@@ -539,12 +699,12 @@ def test_capture_replay_gate_tiny_moe_probes_pass_on_the_eager_runtime(nvfp4_ref
     res = probe.run_gate(rt=probe.EagerRuntime, dev="cpu", plist=fe.probes("tiny"),
                          builders={"moe": fe.build_probe}, replays=3, streams=1, emit=lambda s: None)
     assert res["verdict"] == "PASS", res["probes"]
-    assert {r["label"] for r in res["probes"]} == {"tiny.fp4mma4.m7", "tiny.fp4mma4t.m16"}
+    assert {r["label"] for r in res["probes"]} == {"tiny.front4.m7", "tiny.front4.m16"}
 
 
 def test_probe_lists():
     quick = fe.probes("quick")
-    assert [p.spec["m"] for p in quick] == [1, 6, 48, 192, 600] and all(p.spec["e"] == 48 for p in quick)
-    assert all(p.spec["plan"] == ("fp4mma4" if p.spec["m"] <= fe.ROUTE_KERNEL_MAX_M else "fp4mma4t") for p in quick)
+    assert [p.spec["m"] for p in quick] == [6, 16, 48, 192] and all(p.spec["e"] == 48 for p in quick)
+    assert all(p.spec["plan"] == "front4" for p in quick + fe.probes("full") + fe.probes("tiny"))
     assert {p.spec["dists"][2] for p in quick} == {"hot"} and "dead" in quick[0].spec["dists"]
-    assert len(fe.probes("full")) == 15
+    assert [p.spec["m"] for p in fe.probes("full")] == [6, 8, 16, 32, 48, 64, 96, 128, 192, 256]

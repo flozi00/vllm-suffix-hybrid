@@ -1,16 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek-V4.1 routed experts on NATIVE FP4 MMA: Helion `hl.dot_scaled` fc1 / fc2 bodies (lane I
-of the blind program) as a drop-in ALTERNATIVE to lane B's dequant-to-bf16 bodies
-(helion_kernels/nvfp4_moe.py, docs/dsv41-moe.md). docs/dsv41-fp4.md is the long form.
+"""DeepSeek-V4.1 routed experts on NATIVE FP4 MMA: Helion `hl.dot_scaled` bodies (lane I of the blind
+program) = the "dot_scaled" BODY VARIANT of lane B's per-bucket seam (helion_kernels/nvfp4_moe.py "body
+variants per M bucket", docs/dsv41-moe.md section 11). docs/dsv41-fp4.md is the long form.
+
+THE CONTRACT (`nvfp4_moe.check_variant("dot_scaled", <this module>)` pins it and refuses a violation at the
+first use): VARIANT = "dot_scaled"; PLANS = {"front4": ...}; BODIES = the new bodies; run_plan(...) with lane
+B's signature; KERNELS = the lab list of the new kernels. Selection is DATA, not an env knob: a row
+{"body": "dot_scaled"} of the config table `dsv41_moe_variant` for a bucket, plus a shipped config of every
+kernel of the plan for that bucket. No row = dequant = the plugin exactly as before (this module is not even
+imported then). Lane B's `served_ms` / `serving_op` / oracle do the rest; nothing here wraps or replaces them.
+
+Plans: ONLY `front4` = dsv41_moe_route_quant, dsv41_moe_fc1, dsv41_moe_fc2, nvfp4_moe_combine (lane B's
+body: y f32 [P+1, H] + ids -> out is unchanged, served with ITS tuned config). `fused3` (token-major GEMV,
+the tune table's plan for M <= 8) is not served: the tile is m16 and a decode GEMV has one row, so a bucket
+whose plan is fused3 that selects dot_scaled is refused by the seam ("has no 'fused3' plan"), never guessed.
+Buckets: lane B's (CLAMP_BUCKETS on a clamped layer); the lab tunes these kernels from FRONT4_MIN up.
+Calls above SUFFIX_NVFP4_MOE_MAX_M (cap 256) never reach any body, so there is no prefill plan here.
 
 Same layer contract as lane B (vLLM FLASHINFER_CUTLASS after weight processing): w13 uint8
 [E, 2I, H/2] = [up; gate], w2 [E, H, I/2], low nibble = even element, e4m3 block-16 scales 128x4-
 swizzled PER EXPERT, per-expert alphas g1 / g2, ONE activation gscale per GEMM (a1 for x, a2 for h),
 swiglu clamp `gate = min(gate, L)`, `up = clamp(up, -L, L)` BEFORE silu (the placement lane B proved
 against vLLM at 39983a5e7), W4A4: x and h are quantized to NVFP4 (e4m3 block-16 scales, the spec
-rounding of kernels/nvfp4_moe.quant_codes), f32 accumulate. Eligibility: H % 64 == 0 and
-I % 64 == 0 (a k64 step = 4 scale blocks = one 32-bit scale word; lane B only needs I % 16): V4.1 EP8
-(48 of 384 experts, H 5120, I 2304) qualifies, the kernel-only TP8-no-EP rank (I = 288) does not.
+rounding of kernels/nvfp4_moe.quant_codes), f32 accumulate. act = 0 (silu) only. Eligibility: H % 64 == 0
+and I % 64 == 0 (a k64 step = 4 scale blocks = one 32-bit scale word; lane B only needs I % 16): V4.1 EP8
+(48 of 384 experts, H 5120, I 2304) qualifies, the kernel-only TP8-no-EP rank (I = 288) does not
+(`run_plan` refuses it by name).
 
 What differs from lane B (the part that decides speed, none of it measured):
   * the MMA is the block-scaled FP4 instruction (no ALU decode of weights, no re-decode per row tile);
@@ -19,37 +34,30 @@ What differs from lane B (the part that decides speed, none of it measured):
     that scans the keys: O(E * P), E = 48) next to lane B's per-pair counting sort, so fc1 / fc2 launch
     ceil(E * ncols / tile) programs instead of one program per sorted PAIR (M = 192: ~20k programs of
     which ~1k work in lane B -> ~0.9k)
-  * above `ROUTE_KERNEL_MAX_M` the route is torch ops (argsort of key * pairs + pair, scatter_add of
-    the counts, cumsum: sync-free, capturable) because lane B's O(P^2) pair loop is a prefill non-starter
-    (P = 49152 at 8192 tokens) — the prefill-range arm; the decode / verify arm keeps the one-launch
-    kernel route
   * activation scales are LINEAR (we write them), weight scales are read in place from the swizzled
-    layout as int32 words (nvfp4_gemm_fp4mma.py explains the word gather)
+    layout (SCALE_READ below; nvfp4_gemm_fp4mma.py explains the word gather)
 
-Plans (the seam: `serving_op` wraps lane B's op and routes per M, `served_ms` is its table):
-  fp4mma4   route_quant (one launch) , fc1 , fc2 , combine          M <= ROUTE_KERNEL_MAX_M
-  fp4mma4t  torch route + quant      , fc1 , fc2 , combine          prefill range
-A plan serves bucket(M) only when EVERY kernel of it has a shipped config for that bucket; any other
-M calls the wrapped op (lane B's Helion plan / oxide / FlashInfer), exactly as before.
-
-Capture safety (docs/dsv41-fp4.md section 7): no atomics / barriers / semaphores / counters; every
+Capture safety (docs/dsv41-fp4.md section 6): no atomics / barriers / semaphores / counters; every
 scratch is a torch.empty inside the bodies' host code (graph pool under capture); the route's
 counts / starts are rewritten completely by every launch; nothing is created on first use but the
-Triton compile, which `served_ms` + the lane's warm-up do before capture.
+Triton compile, which lane B's oracle warm-up does (every served M) before capture.
 
-Env knob SUFFIX_HELION_NVFP4_MOE_FP4MMA = 0 (default) | 1; STRICT=1 makes a layer whose plan has a
-gap an error (default: the gap stays on lane B's op). SUFFIX_FP4MMA_MOE_SCALE_READ = words (default) | bytes
-picks how fc1 / fc2 read the scale buffers (see SCALE_READ below): `bytes` is the fallback for the case that
-the P0 probe shows Triton decomposing the `words` unpack; configs are tuned per mode.
+K5 (the served PTX must carry `kind::mxf4nvf4` for sm_120a) is self-contained: `run_plan` arms the
+launcher recorder before the family's first GPU launch (and runs the stack gate: SM12x, Triton >= 3.6,
+Helion) and judges every newly compiled fc1 / fc2 right after the launch that compiled it, so lane B's
+oracle warm-up (it runs every served M before capture) raises `Fp4mmaError` at load: fail closed, no
+extra line in lane B's code. On CPU tensors (tests, dry runs) nothing is armed.
+
+Env knob SUFFIX_FP4MMA_MOE_SCALE_READ = words (default) | bytes picks how fc1 / fc2 read the scale
+buffers (see SCALE_READ below): `bytes` is the fallback for the case that the P0 probe shows Triton
+decomposing the `words` unpack; configs are tuned per mode.
 """
 from __future__ import annotations
 
-import functools
 import os
 
 import torch
 
-from suffix_hybrid import helion_kernels as hk
 from suffix_hybrid.helion_kernels import ensure_vendor
 
 ensure_vendor()
@@ -59,25 +67,16 @@ try:
 except ImportError:  # CPU / no Helion: plans, cases, references still import
     helion = hl = None
 
-ENV = "SUFFIX_HELION_NVFP4_MOE_FP4MMA"
-STRICT_ENV = "SUFFIX_HELION_NVFP4_MOE_FP4MMA_STRICT"
+VARIANT = "dot_scaled"  # the key of nvfp4_moe.VARIANT_MODULES
 MARKER = "[suffix dsv41-moe fp4mma]"
 
-ROUTE_QUANT, QUANT, FC1, FC2, COMBINE = (
-    "dsv41_fp4mma_route_quant", "dsv41_fp4mma_quant", "dsv41_fp4mma_fc1", "dsv41_fp4mma_fc2",
-    "dsv41_fp4mma_combine")
-PLANS = {"fp4mma4": (ROUTE_QUANT, FC1, FC2, COMBINE), "fp4mma4t": (QUANT, FC1, FC2, COMBINE)}
-TRITON_NAMES = {k: "_helion_" + k for k in (ROUTE_QUANT, QUANT, FC1, FC2, COMBINE)}
-# decode / verify buckets (lane B's CLAMP_BUCKETS) + the prefill-range ones (a call is chunked to <= chunk_size)
-BUCKETS = (1, 6, 8, 16, 32, 64, 128, 192, 256, 512, 1024, 2048, 4096)
-ROUTE_KERNEL_MAX_M = 512  # above: torch route (lane B's pair loop is O(P^2))
-# y is [P+1, H] f32 per call (1 GB at M = 8192, topk 6, H 5120). A call whose y would exceed Y_MB runs in
-# token chunks (rows are independent), each chunk its own bucket / plan. The price is weight traffic: every
-# chunk re-reads the touched experts (~955 MB per layer at V4.1 EP8 once every expert has rows), so the
-# default 512 MB budget = 4096-token chunks (2 passes at 8192; an ESTIMATE of 2x the one-pass 0.66 ms weight
-# floor), not 1024 (8 passes). CHUNK_M pins the size (tests); SUFFIX_FP4MMA_MOE_Y_MB sets the budget.
-Y_MB_ENV = "SUFFIX_FP4MMA_MOE_Y_MB"
-CHUNK_M = None
+ROUTE_QUANT, FC1, FC2 = "dsv41_moe_route_quant", "dsv41_moe_fc1", "dsv41_moe_fc2"
+# lane B's body, served by it and ITS shipped config (docs/dsv41-moe.md section 11: a name that is also a
+# dequant body keeps its interface; ours is the same y f32 [P+1, H] + ids -> out)
+COMBINE = "nvfp4_moe_combine"
+PLANS = {"front4": (ROUTE_QUANT, FC1, FC2, COMBINE)}
+TRITON_NAMES = {k: "_helion_" + k for k in (ROUTE_QUANT, FC1, FC2)}
+NATIVE_KERNELS = (FC1, FC2)  # the kernels K5 asserts carry the native FP4 MMA
 NO_CLAMP = 3.0e38
 
 # How fc1 / fc2 read the scale buffers (the one open Triton question, docs/dsv41-fp4.md section 5), a process-wide
@@ -110,20 +109,6 @@ def _scale_read() -> str:
 SCALE_READ = _scale_read()
 
 
-def enabled() -> bool:
-    raw = os.environ.get(ENV, "0").strip() or "0"
-    if raw not in ("0", "1"):
-        raise RuntimeError(f"{MARKER} {ENV}={raw!r}: expected 0 or 1")
-    return raw == "1"
-
-
-def strict() -> bool:
-    raw = os.environ.get(STRICT_ENV, "0").strip() or "0"
-    if raw not in ("0", "1"):
-        raise RuntimeError(f"{MARKER} {STRICT_ENV}={raw!r}: expected 0 or 1")
-    return raw == "1"
-
-
 def _f32(v: float) -> float:
     import numpy as np
     return float(np.float32(v))
@@ -146,7 +131,7 @@ def eligible(hdim: int, idim: int, e_count: int) -> str | None:
 # Helion bodies (module level, undecorated, literals only). Expert-major tile map:
 # counts[e] rows start at pair_sorted[starts[e]], local experts ascending, pairs ascending.
 # ---------------------------------------------------------------------------
-def dsv41_fp4mma_route_quant(x: torch.Tensor, topk_ids: torch.Tensor, g: float, g6: float,
+def dsv41_moe_route_quant(x: torch.Tensor, topk_ids: torch.Tensor, g: float, g6: float,
                              e_count: int, id_base: int):
     """(xq u8 [M, H/2], xs e4m3 [M, H/16] LINEAR, pair_sorted i32 [P+1], counts i32 [E], starts
     i32 [E]). Three roots in one launch: (1) lane B's counting sort of the pairs (key = local expert,
@@ -212,36 +197,7 @@ def dsv41_fp4mma_route_quant(x: torch.Tensor, topk_ids: torch.Tensor, g: float, 
     return xq, xs, pair_sorted, counts, starts
 
 
-def dsv41_fp4mma_quant(x: torch.Tensor, g: float, g6: float):
-    """(xq u8 [M, H/2], xs e4m3 [M, H/16] linear): the quant root of the route kernel alone (the
-    prefill-range plan routes with torch ops)."""
-    m, hdim = x.size()
-    x3 = x.view(m, hdim // 16, 16)
-    xq = torch.empty([m, hdim // 2], dtype=torch.uint8, device=x.device)
-    xq3 = xq.view(m, hdim // 16, 8)
-    xs = torch.empty([m, hdim // 16], dtype=torch.float8_e4m3fn, device=x.device)
-    bm = hl.register_block_size(1, BX_ROWS_MAX)
-    bb = hl.register_block_size(1, BX_BLKS_MAX)
-    for tile_m, tile_b in hl.tile([m, hdim // 16], block_size=[bm, bb]):
-        v = x3[tile_m, tile_b, :].to(torch.float32)
-        amax = torch.amax(torch.abs(v), dim=-1)
-        s8 = torch.clamp(amax * g6, max=448.0).to(torch.float8_e4m3fn)
-        sf = s8.to(torch.float32)
-        inv = torch.where(sf == 0.0, 0.0,
-                          (g / torch.where(sf == 0.0, 1.0, sf).to(torch.float64)).to(torch.float32))
-        sv = v * inv[:, :, None]
-        a = torch.abs(sv)
-        code = ((a > 0.25).to(torch.int32) + (a >= 0.75).to(torch.int32)
-                + (a > 1.25).to(torch.int32) + (a >= 1.75).to(torch.int32)
-                + (a > 2.5).to(torch.int32) + (a >= 3.5).to(torch.int32)
-                + (a > 5.0).to(torch.int32)) | ((sv < 0.0).to(torch.int32) << 3)
-        lo, hi = hl.split(code.reshape(code.size(0), code.size(1), 8, 2))
-        xq3[tile_m, tile_b, :] = (lo | (hi << 4)).to(torch.uint8)
-        xs[tile_m, tile_b] = s8
-    return xq, xs
-
-
-def dsv41_fp4mma_fc1(xq: torch.Tensor, xs: torch.Tensor, pair_sorted: torch.Tensor,
+def dsv41_moe_fc1(xq: torch.Tensor, xs: torch.Tensor, pair_sorted: torch.Tensor,
                      counts: torch.Tensor, starts: torch.Tensor, w13: torch.Tensor,
                      w13s: torch.Tensor, g1: torch.Tensor, a2g: float, a2g6: float, act: int,
                      topk: int, limit: float):
@@ -334,7 +290,7 @@ def dsv41_fp4mma_fc1(xq: torch.Tensor, xs: torch.Tensor, pair_sorted: torch.Tens
     return hq, hs
 
 
-def dsv41_fp4mma_fc2(hq: torch.Tensor, hs: torch.Tensor, pair_sorted: torch.Tensor,
+def dsv41_moe_fc2(hq: torch.Tensor, hs: torch.Tensor, pair_sorted: torch.Tensor,
                      counts: torch.Tensor, starts: torch.Tensor, topk_w: torch.Tensor,
                      w2: torch.Tensor, w2s: torch.Tensor, g2: torch.Tensor):
     """y f32 [P+1, H] = g2[e] * topk_w[p] * (h[p] . w2[e]) per routed pair, h packed (hq u8
@@ -387,53 +343,14 @@ def dsv41_fp4mma_fc2(hq: torch.Tensor, hs: torch.Tensor, pair_sorted: torch.Tens
     return y
 
 
-def dsv41_fp4mma_combine(y: torch.Tensor, topk_ids: torch.Tensor, id_base: int, e_count: int,
-                         out: torch.Tensor):
-    """out bf16 [M, H] = bf16(sum_k y[t*topk + k]) over local ids, k ascending (lane B's body,
-    under this family's own config key so the prefill buckets can be tuned)."""
-    m, topk = topk_ids.size()
-    hdim = out.size(1)
-    ids = topk_ids.view(-1)
-    bt = hl.register_block_size(1, 16)
-    bh = hl.register_block_size(16, 512)
-    for tile_t, tile_h in hl.tile([m, hdim], block_size=[bt, bh]):
-        acc = hl.zeros([tile_t, tile_h], dtype=torch.float32)
-        tok = torch.clamp(tile_t.index, max=m - 1)
-        for k in hl.grid(topk):
-            p = tok * topk + k
-            loc = ids[p].to(torch.int32) - id_base
-            ok = (loc >= 0) & (loc < e_count)
-            acc = acc + torch.where(ok[:, None], y[p, tile_h], 0.0)
-        out[tile_t, tile_h] = acc.to(torch.bfloat16)
-    return out
-
-
-BODIES = {ROUTE_QUANT: dsv41_fp4mma_route_quant, QUANT: dsv41_fp4mma_quant, FC1: dsv41_fp4mma_fc1,
-          FC2: dsv41_fp4mma_fc2, COMBINE: dsv41_fp4mma_combine}
+BODIES = {ROUTE_QUANT: dsv41_moe_route_quant, FC1: dsv41_moe_fc1, FC2: dsv41_moe_fc2}
 
 
 # ---------------------------------------------------------------------------
-# torch route for the prefill range (sync-free, capturable) and its test twin
+# the route's spec (the independent oracle of the tests and of the lab operands)
 # ---------------------------------------------------------------------------
-def route_torch(topk_ids: torch.Tensor, e_count: int, id_base: int):
-    """(pair_sorted i32 [P+1], counts i32 [E], starts i32 [E]) with torch ops only: the stable
-    sort of (local expert, pair) (off-rank pairs last), per-expert counts by scatter_add (int32,
-    exact, deterministic) and the exclusive cumsum. No data-dependent shape, no host sync."""
-    pairs = topk_ids.numel()
-    dev = topk_ids.device
-    loc = topk_ids.reshape(-1).to(torch.int64) - id_base
-    key = torch.where((loc >= 0) & (loc < e_count), loc, torch.full_like(loc, e_count))
-    order = torch.argsort(key * pairs + torch.arange(pairs, device=dev, dtype=torch.int64))
-    hist = torch.zeros(e_count + 1, dtype=torch.int64, device=dev)
-    hist.scatter_add_(0, key, torch.ones_like(key))
-    first = torch.cumsum(hist, 0) - hist
-    pair_sorted = torch.cat([order.to(torch.int32), torch.zeros(1, dtype=torch.int32, device=dev)])
-    return pair_sorted, hist[:e_count].to(torch.int32), first[:e_count].to(torch.int32)
-
-
 def route_ref(topk_ids: torch.Tensor, e_count: int, id_base: int):
-    """The spec of the route: same outputs as route_torch / the kernel route, by a plain python
-    sort (the independent oracle of the tests)."""
+    """The spec of the route: same outputs as the kernel route, by a plain python sort."""
     flat = [int(v) - id_base for v in topk_ids.reshape(-1).tolist()]
     key = [v if 0 <= v < e_count else e_count for v in flat]
     order = sorted(range(len(key)), key=lambda p: (key[p], p))
@@ -445,92 +362,8 @@ def route_ref(topk_ids: torch.Tensor, e_count: int, id_base: int):
 
 
 # ---------------------------------------------------------------------------
-# plans: which M runs which plan, the wrapper op (the seam), the plan runner
+# scale buffers as the bodies read them; the plan runner (lane B's run_plan signature); K5
 # ---------------------------------------------------------------------------
-def bucket_case(e_count: int, hdim: int, idim: int, topk: int, act: int, m: int,
-                limit: float | None = None, e_global: int | None = None) -> dict:
-    """The tuned case a serving call of M tokens runs as: lane B's `lane_case` schema (so lab
-    and bench rows line up) with this family's bucket list."""
-    from suffix_hybrid.helion_kernels import nvfp4_moe as lb
-    case = lb.lane_case(e_count, hdim, idim, topk, act, m, limit, e_global)
-    case["numtokens"] = hk.bucket(m, BUCKETS)
-    return case
-
-
-def plan_name(m: int) -> str:
-    return "fp4mma4" if m <= ROUTE_KERNEL_MAX_M else "fp4mma4t"
-
-
-def missing(case: dict, plan: str) -> list:
-    return [k for k in PLANS[plan] if hk.config(k, case) is None]
-
-
-def chunk_size(topk: int, hdim: int) -> int:
-    """Tokens per chunk: CHUNK_M when pinned, else the largest POWER OF TWO whose y buffer
-    (tokens * topk * H * 4 bytes) fits SUFFIX_FP4MMA_MOE_Y_MB (default 512), at least 256 (so an
-    8192-token prefill chunk is exactly 2 x 4096 at V4.1's topk 6 / H 5120)."""
-    if CHUNK_M:
-        return int(CHUNK_M)
-    raw = os.environ.get(Y_MB_ENV, "512").strip() or "512"
-    if not raw.isdigit() or int(raw) < 16:
-        raise RuntimeError(f"{MARKER} {Y_MB_ENV}={raw!r}: want an integer MB >= 16")
-    fit = int(raw) * (1 << 20) // (topk * hdim * 4)
-    return max(256, 1 << (fit.bit_length() - 1))
-
-
-def chunks(m: int, size: int) -> list:
-    """Token spans one call of m tokens runs as: [(0, m)] up to `size`, else `size`-sized spans."""
-    return [(0, m)] if m <= size else [(a, min(a + size, m)) for a in range(0, m, size)]
-
-
-def served_ms(e_count: int, hdim: int, idim: int, topk: int, act: int, max_m: int,
-              limit: float | None = None, e_global: int | None = None,
-              fail_closed: bool = False) -> dict:
-    """{M: (bucket, plan)} for every M in 1..max_m this family serves: every kernel of the plan of
-    EACH chunk of M has a shipped config for that chunk's bucket (the value is the first chunk's).
-    fail_closed (STRICT=1): a gap is an error naming each (bucket, plan, kernel). The lane warms
-    exactly the `warm_ms` of this table before graph capture and K5 asserts their PTX."""
-    size = chunk_size(topk, hdim)
-    direct, gaps = {}, {}
-    for m in range(1, min(max_m, size) + 1):
-        case = bucket_case(e_count, hdim, idim, topk, act, m, limit, e_global)
-        plan = plan_name(m)
-        lack = missing(case, plan)
-        if lack:
-            gaps.setdefault((case["numtokens"], plan), lack)
-        else:
-            direct[m] = (case["numtokens"], plan)
-    out = {m: direct[m] for m in direct}
-    for m in range(size + 1, max_m + 1):
-        if all(b - a in direct for a, b in chunks(m, size)):
-            first = chunks(m, size)[0]
-            out[m] = direct[first[1] - first[0]]
-    if gaps and fail_closed:
-        raise RuntimeError(
-            f"{MARKER} {STRICT_ENV}=1 but no tuned config on {hk.platform()} for E={e_count}/"
-            f"{e_global or e_count} H={hdim} I={idim} topk={topk} limit={limit}: "
-            + "; ".join(f"M<={b} {p}: {', '.join(k)}" for (b, p), k in sorted(gaps.items()))
-            + " (tune them with fp4mma_bench / the autotune lab, ship "
-            "configs/helion/<kernel>/<platform>.json)")
-    return out
-
-
-@functools.lru_cache(maxsize=None)
-def _kernels(case_key: str, plan: str, untuned_ok: bool = False):
-    """The plan's serving kernels for one bucketed case. untuned_ok (the lane's standalone
-    oracle / bench only, never serving): a kernel with no shipped config runs Helion's default."""
-    import json
-    case = json.loads(case_key)
-    out = []
-    for k in PLANS[plan]:
-        if untuned_ok and hk.config(k, case) is None:
-            hk.log(f"dsv41-moe-fp4mma UNTUNED {k} {case_key}: Helion default config (bench only)")
-            out.append(helion.kernel(BODIES[k], autotune_effort="none", static_shapes=False))
-        else:
-            out.append(hk.compiled(BODIES[k], k, case))
-    return out
-
-
 def words(t: torch.Tensor) -> torch.Tensor:
     """Flat int32 words of a scale buffer (e4m3 / uint8 / int32): metadata only."""
     from suffix_hybrid.helion_kernels.nvfp4_gemm_fp4mma import as_words
@@ -547,110 +380,63 @@ def sf_arg(t: torch.Tensor) -> torch.Tensor:
     return t.reshape(-1).view(torch.uint8).view(torch.float8_e4m3fn)
 
 
+_K5 = {"stack": False, "seen": False, "n": 0}  # stack gate passed / fc1 + fc2 judged once / records at that time
+
+
+def _k5_arm() -> None:
+    """Before the family's first GPU launch: the stack gate (a startup error naming the reason) and the PTX
+    recorder, which must be in place before the first kernel is built (a generated module binds the launcher
+    at its first import). Idempotent; watches only this family's kernels."""
+    if _K5["stack"]:
+        return
+    from suffix_hybrid.kernels import fp4mma_probe
+    fp4mma_probe.require_native_stack()
+    fp4mma_probe.install_recorder(watch=tuple(TRITON_NAMES.values()))
+    fp4mma_probe.logline(f"K5 armed: dsv41 MoE dot_scaled bodies, scale read {SCALE_READ}")
+    _K5["stack"] = True
+
+
+def _k5_check() -> None:
+    """Right after a launch: every fc1 / fc2 compiled so far must carry kind::mxf4nvf4 for sm_120a, else
+    Fp4mmaError. The first call also demands that both were recorded at all (no PTX = no assertion =
+    refuse). Later calls cost one len() unless something new compiled."""
+    from suffix_hybrid.kernels import fp4mma_probe
+    n = fp4mma_probe.record_count()
+    if _K5["seen"] and n == _K5["n"]:
+        return
+    fp4mma_probe.assert_native([TRITON_NAMES[k] for k in NATIVE_KERNELS], allow_local=True,
+                               only_new=True, require=not _K5["seen"])
+    _K5.update(seen=True, n=n)
+
+
 def run_plan(kerns, plan, x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, out, a1_gscale,
              a2_gscale, act, id_base, limit=None):
-    """One MoE forward on the family's kernels `kerns` (PLANS[plan] order) -> out. The scale
-    buffers may be the lane's [E, rows, cols] e4m3 tensors (viewed as words here)."""
+    """One MoE forward on `kerns` (the compiled kernels of PLANS[plan], in order) -> out. Lane B's
+    `nvfp4_moe.run_plan` signature (check_variant pins it). The scale buffers are the lane's
+    [E, rows, cols] e4m3 tensors (read as words or bytes, SCALE_READ)."""
+    if plan not in PLANS:
+        raise RuntimeError(f"{MARKER} no {plan!r} plan (the dot_scaled bodies serve {sorted(PLANS)}; "
+                           "fused3 is lane B's token-major GEMV, not an m16 tile)")
+    if int(act) != 0:
+        raise RuntimeError(f"{MARKER} act={act}: the dot_scaled bodies serve silu (0) only "
+                           "(docs/dsv41-moe.md section 11)")
+    why = eligible(x.shape[1], w13.shape[1] // 2, w13.shape[0])
+    if why:
+        raise RuntimeError(f"{MARKER} {why}")
+    gpu = x.is_cuda
+    if gpu:
+        _k5_arm()
     e_count = w13.shape[0]
-    if plan == "fp4mma4":
-        xq, xs, ps, counts, starts = kerns[0](x, topk_ids, _f32(a1_gscale), _div6(a1_gscale),
-                                              e_count, id_base)
-    else:
-        ps, counts, starts = route_torch(topk_ids, e_count, id_base)
-        xq, xs = kerns[0](x, _f32(a1_gscale), _div6(a1_gscale))
+    xq, xs, ps, counts, starts = kerns[0](x, topk_ids, _f32(a1_gscale), _div6(a1_gscale),
+                                          e_count, id_base)
     hq, hs = kerns[1](xq, sf_arg(xs), ps, counts, starts, w13, sf_arg(w13_sf), g1, _f32(a2_gscale),
                       _div6(a2_gscale), act, topk_ids.shape[1],
                       NO_CLAMP if limit is None else float(limit))
     y = kerns[2](hq, sf_arg(hs), ps, counts, starts, topk_w, w2, sf_arg(w2_sf), g2)
-    return kerns[3](y, topk_ids, id_base, e_count, out)
-
-
-def serving_op(base_op, limit: float | None = None, e_global: int | None = None,
-               served: dict | None = None, untuned_ok: bool = False):
-    """THE SEAM. Wraps the lane's host op (lane B's `serving_op(...)`, or the oxide op: any
-    callable with `_native.nvfp4_moe_cuda`'s signature) into one with the same signature that runs
-    this family's plan for every M in `served` ({M: (bucket, plan)}, from `served_ms`) and calls
-    `base_op` for every other M. Calls above CHUNK_M tokens run in CHUNK_M-token chunks (y is
-    [P+1, H] f32). ws_* / mode / tune / stream_ptr are the oxide op's: unused here (Helion runs on
-    torch's current stream = the lane's). untuned_ok: standalone oracle / bench only."""
-    served = served if served is not None else {}
-
-    def op(x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter, ws_hq,
-           ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, id_base, mode, tune, stream_ptr):
-        m = x.shape[0]
-        spans = chunks(m, chunk_size(topk_ids.shape[1], x.shape[1]))
-        if not untuned_ok and not all((b - a) in served for a, b in spans):
-            return base_op(x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf,
-                           ws_inter, ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale,
-                           act, id_base, mode, tune, stream_ptr)
-        for a, b in spans:
-            n = b - a
-            plan = plan_name(n)
-            case = bucket_case(w13.shape[0], x.shape[1], w13.shape[1] // 2, topk_ids.shape[1], act,
-                               n, limit, e_global)
-            kerns = _kernels(hk.case_key(case), plan, untuned_ok)
-            run_plan(kerns, plan, x[a:b], topk_ids[a:b], topk_w[a:b], w13, w13_sf, g1, w2, w2_sf,
-                     g2, out[a:b], a1_gscale, a2_gscale, act, id_base, limit)
-        return out
-
-    op.backend = "fp4mma"
-    op.served = served
-    return op
-
-
-def warm_ms(served: dict, size: int | None = None) -> list:
-    """Ms the lane must run once before graph capture. Triton specializes int arguments on == 1
-    and on divisibility by 16 (M, and P = M * topk, 6M % 16 == 0 <=> M % 8 == 0 at topk 6): per
-    (bucket, plan) the first and last served M of each class (M == 1, M % 16 == 0, M % 8 == 0,
-    other); only the direct Ms (<= the layer's chunk size `size`; default: the longest unbroken
-    1..m run of the table), chunked calls reuse them."""
-    size = size or next((m for m in range(len(served) + 1, 0, -1) if all(k in served for k in range(1, m + 1))), 0)
-    by = {}
-    for m, key in served.items():
-        if m <= size:
-            by.setdefault((key, m == 1, m % 16 == 0, m % 8 == 0), []).append(m)
-    out = set()
-    for ms in by.values():
-        out |= {min(ms), max(ms)}
-    return sorted(out)
-
-
-NATIVE_KERNELS = (FC1, FC2)  # the kernels K5 asserts carry the native FP4 MMA
-
-
-def verify_served(served: dict, allow_local: bool = True) -> list:
-    """K5 for a layer's served table: after the lane warmed `warm_ms(served)`, every fc1 / fc2
-    specialization compiled under the recorder must carry kind::mxf4nvf4 for sm_120a (else
-    Fp4mmaError, fail closed). No-op for an empty table."""
-    if not served:
-        return []
-    from suffix_hybrid.kernels import fp4mma_probe
-    return fp4mma_probe.assert_native([TRITON_NAMES[k] for k in NATIVE_KERNELS],
-                                      allow_local=allow_local)
-
-
-def prepare_layer(base_op, hdim: int, idim: int, e_count: int, topk: int, act: int, max_m: int,
-                  limit: float | None = None, e_global: int | None = None):
-    """What the lane calls once per layer when SUFFIX_HELION_NVFP4_MOE_FP4MMA=1: (op, served).
-    Fails closed on the stack (SM12x, Triton >= 3.6, Helion), on an ineligible shape and (STRICT=1)
-    on a gap; installs the K5 recorder BEFORE any kernel of the family compiles. An empty `served`
-    (no shipped config anywhere) returns `base_op` unchanged: lane B's behaviour exactly."""
-    if not enabled():
-        raise RuntimeError(f"{MARKER} prepare_layer called with {ENV} unset/0")
-    why = eligible(hdim, idim, e_count)
-    if why:
-        raise RuntimeError(f"{MARKER} {ENV}=1 but the layer is not eligible: {why}")
-    from suffix_hybrid.kernels import fp4mma_probe
-    fp4mma_probe.require_native_stack()
-    fp4mma_probe.install_recorder()
-    served = served_ms(e_count, hdim, idim, topk, act, max_m, limit, e_global, strict())
-    if not served:
-        hk.log(f"dsv41-moe-fp4mma: no shipped config on {hk.platform()} — the layer stays on its "
-               "incumbent op")
-        return base_op, served
-    hk.log(f"dsv41-moe-fp4mma: serves {len(served)}/{max_m} Ms {sorted(set(served.values()))} on the native FP4 MMA "
-           f"(scale read {SCALE_READ}, E={e_count} H={hdim} I={idim}), {max_m - len(served)} Ms stay on the wrapped op")
-    return serving_op(base_op, limit, e_global, served), served
+    out = kerns[3](y, topk_ids, id_base, e_count, out)
+    if gpu:
+        _k5_check()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -678,17 +464,11 @@ def seg_from(ps: torch.Tensor, counts: torch.Tensor, starts: torch.Tensor):
 
 
 def route_quant_ref(x, topk_ids, g, g6, e_count, id_base):
-    """Spec of dsv41_fp4mma_route_quant: (xq, xs e4m3, pair_sorted, counts, starts)."""
+    """Spec of dsv41_moe_route_quant: (xq, xs e4m3, pair_sorted, counts, starts)."""
     from suffix_hybrid.kernels import nvfp4_moe as nm
     q, sfb = nm.quant_codes(x.float(), g)
     ps, counts, starts = route_ref(topk_ids, e_count, id_base)
     return q, sfb.view(torch.float8_e4m3fn), ps, counts, starts
-
-
-def quant_ref(x, g, g6):
-    from suffix_hybrid.kernels import nvfp4_moe as nm
-    q, sfb = nm.quant_codes(x.float(), g)
-    return q, sfb.view(torch.float8_e4m3fn)
 
 
 def _frac(a, b) -> float:
@@ -706,14 +486,6 @@ def check_route_quant(out, ref):
     fs = _frac(out[1].view(torch.uint8), ref[1].view(torch.uint8))
     return (exact and fq <= nm.STAGE_TOL["xq"] and fs <= nm.STAGE_TOL["xq"],
             f"route exact={exact} xq bytes differing={fq:.1e} scale bytes differing={fs:.1e}")
-
-
-def check_quant(out, ref):
-    from suffix_hybrid.kernels import nvfp4_moe as nm
-    fq = _frac(out[0], ref[0])
-    fs = _frac(out[1].view(torch.uint8), ref[1].view(torch.uint8))
-    return (fq <= nm.STAGE_TOL["xq"] and fs <= nm.STAGE_TOL["xq"],
-            f"xq bytes differing={fq:.1e} scale bytes differing={fs:.1e}")
 
 
 def _layer_p(w13, w13s, g1, a2g, act, limit, w2=None, w2s=None, g2=None):
@@ -791,12 +563,6 @@ def make_route_quant(case, seed):
     return lb._make_route_quant(case, seed)
 
 
-def make_quant(case, seed):
-    from suffix_hybrid.helion_kernels import nvfp4_moe as lb
-    x, _ids, g, g6, _e, _base = lb._make_route_quant(case, seed)
-    return x, g, g6
-
-
 def make_fc1(case, seed):
     d = pk_inputs(case, seed)
     p, lim = d["p"], case.get("limit")
@@ -814,11 +580,6 @@ def make_fc2(case, seed):
     pad = lambda t: torch.cat([t, torch.zeros(1, *t.shape[1:], dtype=t.dtype, device=t.device)])
     return (pad(hq), sf_arg(pad(hsb)), d["ps"], d["counts"], d["starts"], d["tw"], p["w2"],
             d["w2s"], p["g2"])
-
-
-def make_combine(case, seed):
-    from suffix_hybrid.helion_kernels import nvfp4_moe as lb
-    return lb._make_combine(case, seed)
 
 
 # Helion's autotuner compares every candidate with the default config's output over the WHOLE output
@@ -858,13 +619,12 @@ def autotune_check(name):
             ps, counts = args[ps_i], args[c_i]
             return ps[:int(counts.sum())].long()  # sorted position < sum(counts) = local pairs
 
-        if name in (ROUTE_QUANT, QUANT):
-            if name == ROUTE_QUANT:
-                pairs = want[2].numel() - 1
-                for i, w in ((2, "pair_sorted"), (3, "counts"), (4, "starts")):
-                    a, b = (got[i][:pairs], want[i][:pairs]) if i == 2 else (got[i], want[i])
-                    if not torch.equal(a, b):
-                        raise AssertionError(f"{name}.{w}: routing differs between configs")
+        if name == ROUTE_QUANT:
+            pairs = want[2].numel() - 1
+            for i, w in ((2, "pair_sorted"), (3, "counts"), (4, "starts")):
+                a, b = (got[i][:pairs], want[i][:pairs]) if i == 2 else (got[i], want[i])
+                if not torch.equal(a, b):
+                    raise AssertionError(f"{name}.{w}: routing differs between configs")
             flips(got[0], want[0], "xq")
             flips(got[1], want[1], "xs")
         elif name == FC1:
@@ -877,8 +637,8 @@ def autotune_check(name):
             rel = float((a - b).norm() / b.norm().clamp_min(1e-30))
             if not bool(torch.isfinite(a).all()) or rel > AUTOTUNE_REL:
                 raise AssertionError(f"{name}.y: rel {rel:.2e} (> {AUTOTUNE_REL})")
-        else:  # combine: every row of out is written
-            flips(got[0], want[0], "out")
+        else:
+            raise AssertionError(f"autotune_check: no check for kernel {name!r}")
     return check
 
 
@@ -892,20 +652,17 @@ def _kernel_entry(name, make, reference, check_fn, stage):
             "make_baseline": lambda case, seed: lb._oxide_args(case, seed, 1, stage),
             "baseline_name": "vLLM FlashInfer CUTLASS (V4.1: oxide cannot run it), WHOLE layer, "
                              "this EP rank, cold L2; sum a plan's stages to compare; the verdict is "
-                             "fp4mma_bench's end-to-end table vs lane B's plans",
+                             "lane B's gate bench (nvfp4_moe_tune: every body variant per bucket)",
             "replaces": []}
 
 
 def cases(model: dict, kernel: str | None = None) -> list:
-    """Lane B's EP-rank layouts x this family's decode buckets (FP4MMA_PREFILL_CASES=1 adds the
-    chunked prefill range), only layouts the bodies take (H % 64, I % 64)."""
+    """The SAME case dicts as lane B's `nvfp4_moe.cases(model, "nvfp4_moe_fc2")` (so a variant row and a
+    kernel config share keys): the front4 buckets (from FRONT4_MIN up on a clamped layer) of the layouts
+    these bodies take (silu, H % 64, I % 64)."""
     from suffix_hybrid.helion_kernels import nvfp4_moe as lb
-    want = {ROUTE_QUANT: lambda m: m <= ROUTE_KERNEL_MAX_M,
-            QUANT: lambda m: m > ROUTE_KERNEL_MAX_M}.get(kernel, lambda m: True)
-    top = BUCKETS[-1] if os.environ.get("FP4MMA_PREFILL_CASES") == "1" else 192
-    return [{**d, "numtokens": m} for d in lb._layouts(model)
-            if eligible(d["hidden"], d["moe_intermediate"], d["experts"]) is None
-            for m in BUCKETS if m <= top and want(m)]
+    return [c for c in lb.cases(model, lb.FC2)
+            if c["act"] == "silu" and eligible(c["hidden"], c["moe_intermediate"], c["experts"]) is None]
 
 
 def _lab_kernels():
@@ -913,23 +670,9 @@ def _lab_kernels():
         return []
     return [
         _kernel_entry(ROUTE_QUANT, make_route_quant, route_quant_ref, check_route_quant, 0),
-        _kernel_entry(QUANT, make_quant, quant_ref, check_quant, 0),
         _kernel_entry(FC1, make_fc1, fc1_ref, check_fc1, 1),
         _kernel_entry(FC2, make_fc2, fc2_ref, check_fc2, 2),
-        _kernel_entry(COMBINE, make_combine,
-                      lambda y, ids, base, e, out: _ref_combine(y, ids, base, e, out),
-                      lambda out, ref: _check_combine(out, ref), 3),
     ]
-
-
-def _ref_combine(y, ids, base, e, out):
-    from suffix_hybrid.helion_kernels import nvfp4_moe as lb
-    return lb._ref_combine(y, ids, base, e, out)
-
-
-def _check_combine(out, ref):
-    from suffix_hybrid.helion_kernels import nvfp4_moe as lb
-    return lb._check_combine(out, ref)
 
 
 KERNELS = _lab_kernels()
@@ -940,10 +683,9 @@ KERNELS = _lab_kernels()
 # ---------------------------------------------------------------------------
 PROBE_CFG = {
     ROUTE_QUANT: dict(block_sizes=[32, 64, 4, 32], num_warps=4, num_stages=1),
-    QUANT: dict(block_sizes=[4, 32], num_warps=4, num_stages=1),
     FC1: dict(block_sizes=[16, 4, 128], num_warps=4, num_stages=3),
     FC2: dict(block_sizes=[16, 64, 128], num_warps=4, num_stages=3),
-    COMBINE: dict(block_sizes=[4, 256], num_warps=4, num_stages=1),
+    COMBINE: dict(block_sizes=[4, 256], num_warps=4, num_stages=1),  # lane B's body, an explicit config
 }
 DIST_ROTATION = ("balanced", "skewed", "hot", "dead")
 
@@ -951,20 +693,15 @@ DIST_ROTATION = ("balanced", "skewed", "hot", "dead")
 def probes(tier: str) -> list:
     from suffix_hybrid.kernels.fp4mma_probe import Probe
 
-    def p(label, plan, m, e=48, eg=384, h=5120, i=2304, topk=6, limit=10.0, dists=DIST_ROTATION):
-        return Probe(label, "moe", dict(plan=plan, m=m, e=e, eg=eg, h=h, i=i, topk=topk, limit=limit,
+    def p(label, m, e=48, eg=384, h=5120, i=2304, topk=6, limit=10.0, dists=DIST_ROTATION):
+        return Probe(label, "moe", dict(plan="front4", m=m, e=e, eg=eg, h=h, i=i, topk=topk, limit=limit,
                                         dists=list(dists)))
 
     if tier == "tiny":  # CPU tests
-        return [p("tiny.fp4mma4.m7", "fp4mma4", 7, 6, 12, 128, 128, 3, 0.8),
-                p("tiny.fp4mma4t.m16", "fp4mma4t", 16, 6, 12, 128, 128, 3, 0.8)]
+        return [p("tiny.front4.m7", 7, 6, 12, 128, 128, 3, 0.8), p("tiny.front4.m16", 16, 6, 12, 128, 128, 3, 0.8)]
     if tier == "quick":  # the V4.1 EP8 rank: 48 of 384 experts, H 5120, I 2304
-        return [p("ep8.fp4mma4.m1", "fp4mma4", 1), p("ep8.fp4mma4.m6", "fp4mma4", 6),
-                p("ep8.fp4mma4.m48", "fp4mma4", 48), p("ep8.fp4mma4.m192", "fp4mma4", 192),
-                p("ep8.fp4mma4t.m600", "fp4mma4t", 600)]
-    return [p(f"ep8.{pl}.m{m}", pl, m) for pl in ("fp4mma4", "fp4mma4t")
-            for m in (1, 2, 6, 8, 16, 32, 48, 64, 96, 128, 192, 300, 512, 600, 1024)
-            if (pl == "fp4mma4") == (m <= ROUTE_KERNEL_MAX_M)]
+        return [p("ep8.front4.m6", 6), p("ep8.front4.m16", 16), p("ep8.front4.m48", 48), p("ep8.front4.m192", 192)]
+    return [p(f"ep8.front4.m{m}", m) for m in (6, 8, 16, 32, 48, 64, 96, 128, 192, 256)]
 
 
 def build_probe(pr, dev):
@@ -989,8 +726,10 @@ def build_probe(pr, dev):
         x = (torch.randn(m, h, generator=gen) * amp / 4.5 * (4.0 if dist == "hot" else 1.0)).to(
             dev, torch.bfloat16)
         inputs.append({"x": x, "ids": ids, "tw": tw})
-    kerns = [helion.kernel(BODIES[k], config=helion.Config(**PROBE_CFG[k]), static_shapes=False,
-                           ignore_warnings=[helion.exc.TensorOperationInWrapper]) for k in PLANS[plan]]
+    from suffix_hybrid.helion_kernels import nvfp4_moe as lb
+    kerns = [helion.kernel(BODIES.get(k) or lb.BODIES[k], config=helion.Config(**PROBE_CFG[k]),
+                           static_shapes=False, ignore_warnings=[helion.exc.TensorOperationInWrapper])
+             for k in PLANS[plan]]
 
     def run(static, out=None):
         o = out if out is not None else torch.empty(m, h, dtype=torch.bfloat16, device=dev)

@@ -12,12 +12,12 @@ ran on a GPU. Every claim is labelled PROVEN (CPU test named), DESIGN (written, 
 | dense `nvfp4_gemm_q_fp4mma` (words) | written, section 3 | DESIGN: P0 probe + Linux CI test, unrun | CPU PASS (eager vs exact f64) | harness ready, unrun | code + plumbing CPU-proven; never saw a real PTX |
 | dense `..._fp4mma_b` (bytes), `..._fp4mma_lin` (linear scales) | same | same | CPU PASS | same | same |
 | dense `nvfp4_gemm_q_fp4cvt` (hardware-cvt control arm) | same | DESIGN (asm assembles for sm_120a?) | CPU PASS | same | asserts `cvt.rn.f16x2.e2m1x2` instead |
-| MoE `dsv41_fp4mma_fc1` / `_fc2` (scale read `words` and `bytes`) | section 3.5 | DESIGN | CPU PASS in both modes (layer vs f64 spec, stages vs lane B refs) | harness ready, unrun | as the dense dot bodies |
-| MoE `route_quant`, `quant`, `combine`, `route_torch` | section 3.5 | no MMA, nothing to assert | CPU PASS | part of the whole-layer bench | n/a |
+| MoE `dsv41_moe_fc1` / `_fc2` (scale read `words` and `bytes`) | section 3.5 | DESIGN | CPU PASS in both modes (layer vs f64 spec, stages vs lane B refs, lane B's seam end to end vs its dequant bodies) | lane B's gate bench (unrun) | K5 inside `run_plan`: CPU-proven plumbing, never saw a real PTX |
+| MoE `dsv41_moe_route_quant` (+ lane B's `nvfp4_moe_combine`, reused) | section 3.5 | no MMA, nothing to assert | CPU PASS | same bench | n/a |
 
 Gate K6 (serving A/B) is not claimed. K2, K4 and the silicon half of K3/K5 need a GPU.
 
-PROVEN on CPU (257 tests, section 13): index maths of the scale layouts byte for byte; every body against an
+PROVEN on CPU (252 tests, section 13): index maths of the scale layouts byte for byte; every body against an
 independent exact f64 reference in Helion's eager mode incl. zero blocks, subnormal e4m3, saturated 448,
 single-element outliers, K/N tails, M in {1,2,15,16,17,64} and above one scale atom (M>128), low nibble first,
 forced small tiles, split-K 1/2/4+, bit-exact run to run; Helion's real front end lowers every body (at the
@@ -57,11 +57,11 @@ quotes the AGENTS.md sentence.
 | path | lines | role |
 |---|---|---|
 | `suffix_hybrid/helion_kernels/nvfp4_gemm_fp4mma.py` | 956 | dense family: bodies, scale-layout maths, plans, oxide-signature twins, lab ABI, probes |
-| `suffix_hybrid/helion_kernels/dsv41_moe_fp4mma.py` | 1012 | V4.1 routed experts: route/quant/fc1/fc2/combine bodies, plans, the seam wrapper, references, lab ABI |
-| `suffix_hybrid/kernels/fp4mma_probe.py` | 659 | stack gate, PTX analysis, K5 recorder/assertions, capture/replay boot gate |
-| `suffix_hybrid/kernels/fp4mma_bench.py` | 724 | bake-off harness (dense arms, whole-layer MoE, winner table, config shipping) |
-| `scripts/fp4mma_p0_probe.py` | 602 | P0: raw-Triton mirror kernels compiled for `GPUTarget("cuda", 120, 32)`, no GPU needed |
-| `tests/test_fp4mma_{ref,layout,gemm,moe,probe,ptx}.py` | 178 / 187 / 606 / 550 / 411 / 87 | CPU tests; `_ptx` is the Linux-only P0 as a test |
+| `suffix_hybrid/helion_kernels/dsv41_moe_fp4mma.py` | 751 | V4.1 routed experts as lane B's `dot_scaled` body variant: route_quant / fc1 / fc2 bodies, the variant contract, K5 hook, references, lab ABI |
+| `suffix_hybrid/kernels/fp4mma_probe.py` | 726 | stack gate, PTX analysis, K5 recorder/assertions, capture/replay boot gate |
+| `suffix_hybrid/kernels/fp4mma_bench.py` | 596 | bake-off harness (dense arms, winner table, config shipping; the MoE K4 is lane B's gate bench) |
+| `scripts/fp4mma_p0_probe.py` | 601 | P0: raw-Triton mirror kernels compiled for `GPUTarget("cuda", 120, 32)`, no GPU needed |
+| `tests/test_fp4mma_{ref,layout,gemm,moe,probe,ptx}.py` | 178 / 187 / 606 / 710 / 463 / 87 | CPU tests; `_ptx` is the Linux-only P0 as a test |
 | `docs/dsv41-fp4.md` | this file | |
 
 ## 3. K1: contracts
@@ -156,36 +156,49 @@ g/sf as an exact f64 divide), then the dots run on the FP4 MMA with f32 accumula
 experts, H 5120, I 2304 (eligible: H % 64 == 0 and I % 64 == 0; lane B needs only I % 16). The kernel-only
 TP8-no-EP rank (I = 288) is NOT eligible and stays on lane B.
 
-Plans (`PLANS`): `fp4mma4` = route_quant (one launch: lane B's counting sort + per-expert counts/starts + x quant),
-fc1, fc2, combine for M <= `ROUTE_KERNEL_MAX_M` = 512; `fp4mma4t` = torch route (argsort of key*pairs+pair,
-scatter_add of the counts, cumsum; sync-free, capturable; lane B's O(P^2) pair loop is a non-starter at
-P = 49152) + quant, fc1, fc2, combine for the prefill range. Buckets
-(1, 6, 8, 16, 32, 64, 128, 192, 256, 512, 1024, 2048, 4096). A plan serves a bucket only when EVERY kernel of it
-has a shipped config for that bucket; any other M calls the wrapped op (lane B's Helion plan / oxide /
-FlashInfer) unchanged. Differences from lane B that decide speed (none measured): the MMA is the block-scaled
-FP4 instruction (no ALU decode of weights, no re-decode per row tile); x and h travel packed (u8 + e4m3
-scales) instead of bf16 dequantized rows; the tile map is expert-major (program count ceil(E*ncols/tile)
-instead of one program per sorted pair: at M = 192 roughly 20k programs of which ~1k work in lane B, ~0.9k
-here; ESTIMATE from lane B's grid).
+The seam is lane B's (`docs/dsv41-moe.md` section 11, `nvfp4_moe.py` "body variants per M bucket"); this module is its
+`dot_scaled` BODY VARIANT and exports exactly what `check_variant` pins: `VARIANT = "dot_scaled"`, `PLANS`, `BODIES`,
+`run_plan` (lane B's signature, name for name) and `KERNELS` (the lab list). Selection is DATA: a row
+`{"body": "dot_scaled"}` of the config table `dsv41_moe_variant` for a bucket (lane B's gate bench times every variant
+per bucket and writes the rows); `served_ms` then demands a shipped config of every kernel of the plan at that bucket,
+`serving_op` runs this module's `run_plan` for the call's bucket, and lane B's load oracle runs every served M once
+before capture. No row = dequant, and this module is not even imported. `test_module_honours_the_variant_contract`
+runs `check_variant`; `test_contract_violations_are_refused` breaks each clause and shows the refusal.
+
+Plan: `front4` only = `dsv41_moe_route_quant` (one launch: lane B's counting sort + per-expert counts/starts + x quant),
+`dsv41_moe_fc1`, `dsv41_moe_fc2` and `nvfp4_moe_combine` (lane B's body, served with ITS shipped config: y f32 + ids -> out
+is unchanged; my first version carried a byte-identical copy, deleted). `fused3` (token-major GEMV, the tune table's plan
+for M <= 8) is NOT served: a decode GEMV has one row and the tile is m16. A bucket whose table plan is fused3 that
+selects dot_scaled is refused by the seam ("body variant 'dot_scaled' has no 'fused3' plan (it serves ['front4'])",
+`test_seam_refuses_the_buckets_this_module_cannot_serve`), and lane B's bench skips the variant there. The lab tunes the
+three kernels on the front4 buckets (6, 8, 16, 32, 64, 128, 192 on a clamped layer; `cases` = lane B's
+`cases(model, "nvfp4_moe_fc2")` filtered to silu, H % 64, I % 64: rows and selection share keys). `run_plan` refuses by
+name what the bodies cannot serve (act != 0, an ineligible shape, another plan) before launching anything. Calls above
+`SUFFIX_NVFP4_MOE_MAX_M` (cap 256) never reach a body, so the prefill machinery of the first version (torch route,
+quant kernel, y chunking, buckets to 4096) was unreachable behind the seam and is deleted (git history, commit aefeb6f).
+
+Differences from lane B that decide speed (none measured): the MMA is the block-scaled FP4 instruction (no ALU decode of
+weights, no re-decode per row tile); x and h travel packed (u8 + e4m3 scales) instead of bf16 dequantized rows; the
+tile map is expert-major (program count ceil(E*ncols/tile) instead of one program per sorted pair: at M = 192 roughly
+20k programs of which ~1k work in lane B, ~0.9k here; ESTIMATE from lane B's grid).
 
 fc1 programs are (expert, 16-column blocks of I): up and gate dots share the activation tile, the epilogue clamps,
 activates, requantizes h (a2 gscale) and writes `hq` (packed) + `hs` (linear scales); fc2 programs are (expert,
-H tile): `y[pair] = g2[e] * topk_w[pair] * (h . w2[e])` in f32 into `y[P+1, H]` (row P = trash); combine sums
-the top-6 rows per token in a fixed order into bf16 and masks off-rank ids (a select, so uninitialised y rows
-cannot leak NaN). Off-rank tokens give exact zeros. `y` is `[P+1, H]` f32 per call (1 GB at M = 8192): calls
-whose y would exceed `SUFFIX_FP4MMA_MOE_Y_MB` (default 512 MB) run in power-of-two token chunks (>= 256; 4096 at
-V4.1 topk 6 / H 5120 = 2 passes at 8192, each pass re-reads the touched experts, ~955 MB per layer once every
-expert has rows, a ~0.66 ms floor per pass).
+H tile): `y[pair] = g2[e] * topk_w[pair] * (h . w2[e])` in f32 into `y[P+1, H]` (row P = trash, 31 MB at the cap of
+256 tokens); lane B's combine sums the top-6 rows per token in a fixed order into bf16 and masks off-rank ids (a select,
+so uninitialised y rows cannot leak NaN). Off-rank tokens give exact zeros.
 
 ## 4. Kernel list (lab names = `configs/helion/<name>/<platform>.json`)
 
 Dense (`KERNELS` order = lab budget order): `nvfp4_gemm_q_fp4mma`, `nvfp4_gemm_q_fp4mma_b`,
-`nvfp4_gemm_q_fp4cvt`, `nvfp4_gemm_q_fp4mma_lin`. MoE: `dsv41_fp4mma_route_quant`, `dsv41_fp4mma_quant`,
-`dsv41_fp4mma_fc1`, `dsv41_fp4mma_fc2`, `dsv41_fp4mma_combine`. Dense buckets (1, 8, 16, 32, 64, 128, 192); lab
-baseline = vLLM FlashInfer CUTLASS FP4 GEMM on the same prequantized operands (V4.1 has no oxide to compare to;
-the oxide arm is the bench's job). The console auto-discovers every `suffix_hybrid/helion_kernels/<family>.py`
-as a port family (`api/autotune.py` `port_families`, name <= 33 chars): once this branch is merged, `tune_model`
-will queue both families on its own.
+`nvfp4_gemm_q_fp4cvt`, `nvfp4_gemm_q_fp4mma_lin`. MoE: `dsv41_moe_route_quant`, `dsv41_moe_fc1`, `dsv41_moe_fc2`
+(lane B's prefix; no collision with its dequant or fused-shared names). Dense buckets (1, 8, 16, 32, 64, 128, 192);
+lab baseline = vLLM FlashInfer CUTLASS FP4 GEMM on the same prequantized operands (V4.1 has no oxide to compare to;
+the oxide arm is the bench's job). The MoE K4 is lane B's gate bench (`nvfp4_moe_tune`), which times FlashInfer and
+every body variant per bucket. The console auto-discovers every `suffix_hybrid/helion_kernels/<family>.py` as a port
+family (`api/autotune.py` `port_families`, name <= 33 chars): once merged, `tune_model` queues both families on its
+own, and lane B's `nvfp4_moe_tune.todo()` grows from 53 to 74 entries (21 = our 3 kernels x the 7 front4 buckets;
+127 with `NVFP4_MOE_TP8_NOEP=1`), see section 9.1.
 
 The hardware-cvt arm (`..._fp4cvt`) is the "ALU vs MMA" control: `cvt.rn.f16x2.e2m1x2` (PTX ISA 8.6+, sm_100a /
 sm_120a) via Helion's `hl.load_float4_e2m1fn_x16_to_float16`, both operands decoded to f16, scale applied in
@@ -205,11 +218,20 @@ Plumbing (read from Helion 1.5.x and Triton 3.7.1 / 3.8.0 sources, then run unde
 code calls `_launcher(triton_kernel, grid, *args, num_warps=, num_stages=)` and drops the return value;
 `helion.runtime.default_launcher` (bound into every generated module at its first import) returns
 `triton_kernel.run(...)` = the `CompiledKernel` (`.asm["ptx"]`, `.n_regs`, `.n_spills`, `.metadata.shared`).
-There is no official hook, so `install_recorder()` swaps `default_launcher` for a recording wrapper BEFORE
-the family's first kernel compiles (`prepare` / `prepare_layer` do it). A Helion without that attribute makes
-the lane refuse to start; the documented fallback for such a build is a fresh `TRITON_CACHE_DIR` +
+There is no official hook, so `install_recorder(watch=...)` swaps `default_launcher` for a recording wrapper BEFORE
+the family's first kernel compiles (the dense `prepare`; the MoE `run_plan` on its first GPU call) and keeps only the
+family's own kernels (exact Triton names: lane B's `_helion_dsv41_moe_fc1_sh` shares our prefix and is neither
+recorded nor judged; the wrapper costs one dict lookup on every other Helion launch). A Helion without that attribute
+makes the lane refuse to start; the documented fallback for such a build is a fresh `TRITON_CACHE_DIR` +
 `ptx_from_cache`. Kernels compiled earlier by other lanes keep the original launcher and are never recorded.
-Dense lanes call `verify_served(plans)` after their warm-up; the MoE lane calls `verify_served(served)`.
+
+Where K5 runs. Dense lanes call `verify_served(plans)` after their warm-up. The MoE needs NO line in lane B's code:
+`run_plan` is the one entry lane B's seam calls at load (its oracle warm-up runs every served M, then serving), so
+on its first GPU call it runs the stack gate (a startup error naming the reason) and arms the recorder before its
+first launch, and after every launch it judges each newly compiled fc1 / fc2 (`only_new`; the first call also demands
+that both were recorded at all: no PTX, no assertion, refuse). A decomposed lowering therefore raises
+`Fp4mmaError` inside lane B's oracle, i.e. at load; in lane B's lab bench the same error excludes the variant loudly, so
+a lowering Triton decomposes can never earn a `dsv41_moe_variant` row. CPU tensors (tests, dry runs) arm nothing.
 
 P0 (`scripts/fp4mma_p0_probe.py`, Linux, no GPU): `triton.compile(ASTSource(...), target=GPUTarget("cuda", 120,
 32))` needs no driver (the wheel's bundled `ptxas-blackwell` assembles; `CompiledKernel.__init__` is lazy in both
@@ -218,10 +240,10 @@ patterns of our bodies (`pr` = vLLM#38338's kernel, `pr_perm`, `bytes`, `words`,
 `--cvt`) over the dossier's tile sweep (`--quick` = 12 configs), asserts native instruction / `.target sm_120a` /
 no `.local` / smem <= 101376 B, prints regs, spills and smem from `ptxas -v`, and summarizes the legal tiles
 with suggested register_block_size bounds. `--helion` pushes the REAL generated bodies (the 4 dense GEMM bodies
-and the 5 MoE bodies at the V4.1 H 5120 / I 2304 with 4 experts: E only changes the grid; `--helion-families`,
+and the 3 MoE bodies at the V4.1 H 5120 / I 2304 with 4 experts: E only changes the grid; `--helion-families`,
 `--moe-e/-h/-i` adjust it) through `JITFunction.run` with a duck-typed driver and `knobs.runtime.jit_cache_hook`
 (the 2026-10-11 fake-driver technique), so fc1/fc2 (two accumulators, data-dependent row loop) are probed too, in BOTH MoE scale-read
-modes (`moe.dsv41_fp4mma_fc1` / `_fc2` = words, `...[bytes]`). Their Helion front-end half (all eleven rows lower to
+modes (`moe.dsv41_moe_fc1` / `_fc2` = words, `...[bytes]`). Their Helion front-end half (all nine rows lower to
 parseable Triton with the expected `tl.dot_scaled` count, `tl.join` only in the words programs) is a CPU test, and
 `tests/test_fp4mma_ptx.py::test_real_helion_bodies_compile_for_sm120a_with_the_native_mma` runs the compile half on
 the Linux CI (no GPU needed). `--compare a.json b.json` diffs a 3.7.1 run against a 3.8.0 run. `tests/test_fp4mma_ptx.py` is the
@@ -251,16 +273,19 @@ Contract (tests `test_served_paths_have_no_host_sync_no_streams_no_atomics`, `te
 `test_bodies_are_module_level_literal_only_and_never_import_the_oxide_stack`): no atomics, barriers, semaphores or
 counters; every scratch is a `torch.empty` inside the call (graph pool under capture); the route's
 counts/starts are rewritten completely by every launch; nothing is created on first use except the Triton
-compile, which the lane's warm-up does before capture (`warm_ms`: M == 1, and per bucket the top rows and the one
-below, because Triton specializes int arguments on == 1 and on divisibility by 16; the MoE variant covers
-M % 16 and M % 8 since P = 6M).
+compile, which the lane's warm-up does before capture (dense `warm_ms`: M == 1, and per bucket the top rows and the
+one below, because Triton specializes int arguments on == 1 and on divisibility by 16; the MoE: lane B's oracle
+runs EVERY served M, which also covers M % 16 and M % 8 since P = 6M).
 
 Boot gate `fp4mma_capture_replay` (`python -m suffix_hybrid.kernels.fp4mma_probe capture_replay [--full]`;
 exit 0 PASS / 1 FAIL / 2 NOT RUN; output line `FP4MMA-CAPTURE-REPLAY <verdict>`): per probe (body x real shape x M x
 explicit config, plus every SHIPPED config of the platform): eager on three inputs with the output and every
-partial NaN-poisoned first (K3 vs the exact f64 product; K5 PTX on the first compile), capture the same call on a
+partial NaN-poisoned first (K3 vs the exact f64 product), capture the same call on a
 side stream, replay with NEW data bit-exact against eager, a guarded output (4096 sentinel elements each side),
-and two graphs replayed concurrently on two streams. A poisoned partial makes a split a kernel forgot to write
+and two graphs replayed concurrently on two streams; after the probes `gate_k5` judges the compiled PTX of every
+body that ran with the lab's strictness (a spill fails; the earlier text claimed K5 here while the gate never
+asserted it: fixed, `test_gate_k5_judges_the_ptx_of_every_body_the_gate_ran`), and a K5 refusal raised inside a probe's
+eager step (the MoE `run_plan`) is a FAIL, not a NOT RUN. A poisoned partial makes a split a kernel forgot to write
 fail the exact check (`test_poisoned_partial_exposes_an_unwritten_split`, and the gate fails a deliberately
 broken kernel: `test_capture_replay_gate_fails_a_kernel_with_an_unwritten_split`). `compute-sanitizer` works (the
 gate times and tunes nothing). Quick tier uses the V4.1 lm_head (16160x5120, M 1/16/64/192, bytes/lin/cvt
@@ -273,7 +298,6 @@ One command per question, same script on the RTX PRO 6000 and the RTX 5090 (plat
 ```
 python -m suffix_hybrid.kernels.fp4mma_bench dense --screen 21 --tune quick --out /tmp/fp4     # 7 shapes x M{1,16,64}
 python -m suffix_hybrid.kernels.fp4mma_bench dense --screen dsv41 --tune full --out /tmp/fp4   # V4.1 lm_head, M 1..192
-python -m suffix_hybrid.kernels.fp4mma_bench moe --m 1,6,16,48,192 --tune quick --out /tmp/fp4 # EP8 layer
 python -m suffix_hybrid.kernels.fp4mma_bench report /tmp/fp4 ; ... selftest                     # selftest runs on CPU
 ```
 
@@ -286,18 +310,18 @@ SM120, the record holds "runs" or the exception). Timing is the lane's autoroute
 (`kernels/nvfp4_gemm._graph_us`): one CUDA graph per arm, the L2 flushed by a 2x-L2 scratch read before EVERY
 replay, the median of `--iters`; the Helion arms include their stage-2 reduce and per-call allocations (what
 serves). Every record carries the toolchain that compiled it (torch, Triton, the ptxas Triton uses and its
-path, Helion): the lab-vs-serving skew decides whether a timing transfers (dossier 3.7, T3). MoE: whole-layer cold-L2 time per M and per routing distribution (balanced, skewed) for FlashInfer
-CUTLASS, lane B's plan and this family's plan; a bucket ships only if the family wins on EVERY distribution
-(lane B's rule); the bench prints the largest M of an unbroken win from the bottom as
-`SUFFIX_NVFP4_MOE_FP4MMA_MAX_M=<n>` (a recommendation printed for the person copying configs, not a knob the code reads).
+path, Helion): the lab-vs-serving skew decides whether a timing transfers (dossier 3.7, T3). The MoE has no bench
+here: it is a body variant of lane B's seam, so its K4 is lane B's gate bench (`nvfp4_moe_tune`: FlashInfer and EVERY
+variant per bucket, balanced and skewed, cold L2, the VARIANT TABLE and the `dsv41_moe_variant` rows it writes; the
+first version's duplicate whole-layer bench is deleted).
 
 Shipping convention (docs/helion-kernels.md): a case where the best fp4mma arm beats the stock arms
 (flashinfer, oxide) by >= `--margin` (3 %, the autoroute's) is a shipping row in
 `<out>/configs/<kernel>/<platform>.json = [{"key": case, "config": {...}}]`; copy those files into
 `suffix_hybrid/configs/helion/` for the winners only. Several M of one bucket must all win for the bucket to ship
 (a bucket is served for every M of it; the config shipped is the one tuned at the bucket's top M). CPU-tested:
-case lists, winner logic, bucket rule, PR config pruning, max-M line (`selftest`). The GPU-only paths
-(`run_moe`, `_moe_kernels`, `_triton_pr_runner`, `_scaled_mm_runner`) were statically reviewed (every module
+case lists, winner logic, bucket rule, PR config pruning (`selftest`). The GPU-only paths
+(`_triton_pr_runner`, `_scaled_mm_runner`, `toolchain`) were statically reviewed (every module
 attribute and call signature resolved against the repo, the PR kernel's strides/masks against the PR text,
 the `F.scaled_mm` call against torch 2.14's signature) and never executed.
 
@@ -307,44 +331,35 @@ the `F.scaled_mm` call against torch 2.14's signature) and never executed.
 |---|---|---|
 | `SUFFIX_HELION_NVFP4_GEMM_FP4MMA` | `0` | `1`: dense GEMM native-FP4-MMA arm. `0`: no lane imports the module. Not 0/1: RuntimeError. With 1, `prepare()` raises naming the reason on non-SM12x, Triton < 3.6.0, Helion missing |
 | `SUFFIX_HELION_NVFP4_GEMM_FP4MMA_STRICT` | `0` | `1`: a bucket <= max_m with no shipped config is a startup error instead of the incumbent serving it (mode `helion` of the lane implies it) |
-| `SUFFIX_HELION_NVFP4_MOE_FP4MMA` | `0` | `1`: routed-expert arm (`prepare_layer`); fails closed on stack, ineligible shape (H or I % 64) |
-| `SUFFIX_HELION_NVFP4_MOE_FP4MMA_STRICT` | `0` | `1`: a plan gap is an error naming each (bucket, plan, kernel); default: the gap stays on lane B's op |
 | `SUFFIX_FP4MMA_MOE_SCALE_READ` | `words` | `words` or `bytes`: how fc1 / fc2 read scales (section 3.2); the fallback if P0 shows Triton decomposing the words unpack. Anything else: RuntimeError at import. Configs are tuned per mode |
-| `SUFFIX_FP4MMA_MOE_Y_MB` | `512` | y-buffer budget per call -> prefill chunk size (power of two tokens, >= 256) |
 | `SUFFIX_BOOT_GATES=fp4mma_capture_replay` (or `..._bytes` when the pool runs the bytes mode) | unset | after the sitecustomize entries of section 9.4 exist: run the gate in a child before vLLM sizes memory |
-| `FP4MMA_PREFILL_CASES=1` | unset | lab only: append the prefill buckets (512, 2048, 8192) to the dense lab cases |
+| `FP4MMA_PREFILL_CASES=1` | unset | lab only: append the prefill buckets (512, 2048, 8192) to the DENSE lab cases |
 
-With every flag off the behaviour equals the previous plugin (nothing imports these modules; checked by the
-knob tests). The existing family knobs (`SUFFIX_HELION_<FAMILY>=oxide|helion|auto`) pick a backend inside a
-lane; this one is an additional arm, so it is a plain on/off. The lane owner may fold it into the tri-state.
+With every flag off the behaviour equals the previous plugin (nothing imports the dense module; checked by the
+knob tests). The MoE has NO enable knob any more (the first version's `SUFFIX_HELION_NVFP4_MOE_FP4MMA`, `_STRICT` and
+`SUFFIX_FP4MMA_MOE_Y_MB` are deleted): lane B's seam selects the variant by data, a `dsv41_moe_variant` row per
+bucket, and a row without the plan's shipped configs is already lane B's startup error; no row = dequant = the plugin
+exactly as before, with this module not imported. The existing family knobs (`SUFFIX_HELION_<FAMILY>=oxide|helion|auto`)
+pick a backend inside a lane; the dense knob is an additional arm, so it is a plain on/off.
 
 ## 9. Handoffs
 
-### 9.1 Lane B / MoE lane (`kernels/nvfp4_moe.py`, `_sfx_prepare`, right after `cfg["helion_ms"] = hmoe.served_ms(...)`)
+### 9.1 Lane B / MoE lane: the seam is already there; the lines to add are none (and one test fix)
 
-The seam is `serving_op(base_op, ...)`: it has the oxide host op's 24-argument signature, so `run_ours`
-(`op = p.get("op") or native.nvfp4_moe_cuda`) already routes through it. The lane's `_sfx_oracle` consumes
-`cfg["helion_ms"]` = `{M: (bucket, plan)}` (the same schema `fe.served_ms` returns): it runs EVERY served M once
-before capture ("no compile can happen later"), judges one M per (bucket, plan) against FlashInfer and the f64
-reference, runs the imbalanced-load cases and checks determinism. Merging the family's table into it gives the
-family all of that with no new warm-up code.
+Lane B's seam serves this module as the `dot_scaled` variant: `served_ms` reads the table rows and the plan's
+configs, `serving_op` calls `run_plan`, `_sfx_oracle` warms every served M and judges one M per (bucket, plan, variant)
+against FlashInfer and the f64 reference. K5 needs no hook of its own (section 5): it sits inside `run_plan`, which is the
+one entry the seam calls at load. The first version's `prepare_layer` snippet is therefore gone (it would have
+conflicted: two ops for one layer). To ship the variant for a bucket, copy into `suffix_hybrid/configs/helion/` the
+configs of `dsv41_moe_route_quant`, `dsv41_moe_fc1`, `dsv41_moe_fc2` for that bucket (lane B's gate bench writes
+them with the `dsv41_moe_variant` row), tuned in the scale-read mode the pool runs.
 
-```python
-if os.environ.get("SUFFIX_HELION_NVFP4_MOE_FP4MMA", "0") == "1":      # off: byte-identical to lane B
-    from suffix_hybrid.helion_kernels import dsv41_moe_fp4mma as fe
-    cfg["op"], fp4_ms = fe.prepare_layer(
-        cfg.get("op") or native.nvfp4_moe_cuda, info["H"], info["I"], info["E"], cfg["topk"], cfg["act"],
-        cfg["max_m"], limit=cfg["limit"], e_global=cfg["E_global"])
-    cfg["helion_ms"] = {**(cfg.get("helion_ms") or {}), **fp4_ms}     # the family's Ms override lane B's
-    cfg["fp4mma_ms"] = fp4_ms
-# after `self._sfx_oracle(cfg, info)` in the same function (the oracle's warm-up has compiled everything):
-if cfg.get("fp4mma_ms"):
-    fe.verify_served(cfg["fp4mma_ms"])        # K5: Fp4mmaError = fail closed, names the kernel and the PTX problem
-```
-
-`prepare_layer` returns `(base_op, {})` (lane B exactly) when no config is shipped. Calls above the chunk size
-run chunked inside the wrapper. M's not in the table call `base_op`. On V4.1 the oxide cannot serve the clamp
-(`oxide_gap`), so `base_op` is lane B's Helion op.
+One change in lane B's file (read-only for me): `tests/test_helion_nvfp4_moe.py::test_in_lab_tuner_plan_and_config_files`
+hard-codes the tuner plan WITHOUT a variant module (53 entries, then 106 with the no-EP rank). With this module in the build
+`nvfp4_moe_tune.todo()` is 74 (127), our 3 kernels x 7 front4 buckets more, so the test now fails on `== 53`. Fix: make the
+test independent of the build, one line before `plan = nt.todo()`:
+`monkeypatch.setattr(nt, "variant_kernels", lambda: [])` (its variant coverage lives in `test_dsv41_moe_variants.py` with the
+fake module; ours is `tests/test_fp4mma_moe.py::test_tuner_plan_gains_exactly_our_three_kernels_on_the_front4_buckets`).
 
 ### 9.2 Dense / lm_head lanes (`kernels/nvfp4_lm_head.py` l.268-300 and `select`, `kernels/nvfp4_linear.py` same pattern)
 
@@ -373,7 +388,7 @@ ORACLE against the exact quantized reference, the graph-vs-eager bit-identity ch
 
 ```
 | nvfp4_gemm_fp4mma | none (arm of nvfp4_gemm; lab baseline FlashInfer CUTLASS) | kernels/nvfp4_linear.py, kernels/nvfp4_lm_head.py via `hx` | `SUFFIX_HELION_NVFP4_GEMM_FP4MMA` (+ `_STRICT`) |
-| dsv41_moe_fp4mma  | none (alternative to nvfp4_moe's dequant bodies)           | kernels/nvfp4_moe.py via `serving_op`                      | `SUFFIX_HELION_NVFP4_MOE_FP4MMA` (+ `_STRICT`) |
+| dsv41_moe_fp4mma  | none (the `dot_scaled` body variant of nvfp4_moe)          | kernels/nvfp4_moe.py via lane B's variant seam             | data: `dsv41_moe_variant` rows (+ `SUFFIX_FP4MMA_MOE_SCALE_READ`) |
 ```
 
 plus a sentence that the autotune console auto-queues both families once merged, and the corrected
@@ -382,16 +397,12 @@ plus a sentence that the autotune console auto-queues both families once merged,
 ### 9.4 `sitecustomize.py` `_BOOT_GATES` (add; identical to `fp4mma_probe.BOOT_GATES`)
 
 ```python
-    # native-FP4-MMA family (lane I): K3 exact + K5 PTX + capture/replay + two concurrent graphs
-    "fp4mma_capture_replay": (["-m", "suffix_hybrid.kernels.fp4mma_probe", "capture_replay"],
-                              {"SUFFIX_HELION_NVFP4_GEMM_FP4MMA": "1",
-                               "SUFFIX_HELION_NVFP4_MOE_FP4MMA": "1"}),
-    # the same with the MoE scale-read fallback (a gate child gets the pod env minus its SUFFIX_* keys, so the
-    # mode the pool runs must be a gate of its own)
+    # native-FP4-MMA family (lane I): K3 exact + K5 PTX (gate_k5) + capture/replay + two concurrent graphs.
+    # No enable knob exists: the gate builds the kernels itself. A gate child gets the pod env minus its SUFFIX_* keys,
+    # so the MoE scale-read mode the pool runs must be a gate of its own.
+    "fp4mma_capture_replay": (["-m", "suffix_hybrid.kernels.fp4mma_probe", "capture_replay"], {}),
     "fp4mma_capture_replay_bytes": (["-m", "suffix_hybrid.kernels.fp4mma_probe", "capture_replay"],
-                                    {"SUFFIX_HELION_NVFP4_GEMM_FP4MMA": "1",
-                                     "SUFFIX_HELION_NVFP4_MOE_FP4MMA": "1",
-                                     "SUFFIX_FP4MMA_MOE_SCALE_READ": "bytes"}),
+                                    {"SUFFIX_FP4MMA_MOE_SCALE_READ": "bytes"}),
 ```
 
 ### 9.5 CI / other
@@ -450,7 +461,7 @@ Tensor time / memory time = 2*M*W/(eta*P) / (W*0.5625/BW):
    computes exact products with f32/f64 accumulation; the tensor core's internal accumulation of the
    block-scaled MMA is not modelled), K5 on real PTX, capture/replay bit-exactness, guards, concurrent graphs.
 3. `fp4mma_bench dense --screen dsv41 --tune quick` (lm_head, M 1..192) with all arms, then `--screen 21`; then
-   `moe --m 1,6,16,48,192`. Run in the V4.1 serving image (Triton 3.8.0), not only the lab (3.7.1).
+   lane B's gate bench for the MoE variant. Run in the V4.1 serving image (Triton 3.8.0), not only the lab (3.7.1).
 4. Ship configs for winners only; dev-pool A/B per AGENTS.md section 5 (K6) before any prod change.
 
 Risks: (a) `words` pattern (join/reshape/bitcast of a gathered tile) may give Triton a linear-encoded scale
@@ -461,15 +472,16 @@ to a linear layout, and `remove-layout-conversions` runs before `accelerate-matm
 contiguity; the words are 4-byte loads by construction, but unmeasured); (c) 3.7.1 vs 3.8.0 scheduling
 difference (`add_prefetch`); (d) register pressure of fc1 (two accumulators `[BROW, 16*BCOL]` + requant epilogue)
 may spill at the large tile bounds: P0 `--helion` prints it; (e) per-call `torch.empty` for the split-K partial
-and y inside graphs relies on the graph pool (lane D precedent), gate unrun; (f) the MoE prefill route
-(`route_torch`: argsort over P = 6*8192) and the y chunking are estimates; (g) tile bounds BM 16, BN 32 are
+and y inside graphs relies on the graph pool (lane D precedent), gate unrun; (f) fused3 buckets (M <= 8) stay on the
+dequant bodies: the variant cannot win there by construction, so a decode-heavy c1 gains nothing from this module;
+(g) tile bounds BM 16, BN 32 are
 untested minimums; (h) `hl.dot_scaled` and `hl.join` behave identically in Helion 1.5.0 (the bundle pin) and
 1.5.1 on CPU (both suites pass); the Triton side is untested; (i) boot compile time: every served
 (bucket, kernel, specialization class) is a Triton compile at warm-up and the Triton cache is not persisted
-across pods. `warm_ms` for the full V4.1 decode table (M 1..192) is 30 Ms x 4 kernels = at most 120 launches
-(Triton dedups identical specializations, so ~60-120 compiles; 42 Ms with the prefill buckets), the lm_head
-adds 13 Ms x 1 kernel. At a few seconds each [ESTIMATE] that is minutes per pod. Mitigation: ship only the
-winning buckets (only shipped buckets are served and warmed), seed `TRITON_CACHE_DIR` from CI.
+across pods. Lane B's oracle runs every served M once; our compiles are the distinct (bucket x {M == 1, M % 16 == 0,
+M % 8 == 0, other}) classes x 3 kernels, at most 7 x 4 x 3 = 84 for the V4.1 front4 buckets, plus the dense lm_head's
+13 Ms x 1 kernel. At a few seconds each [ESTIMATE] that is minutes per pod. Mitigation: ship only the winning buckets
+(only buckets with a row are served and warmed), seed `TRITON_CACHE_DIR` from CI.
 
 ## 12. Claims I could NOT verify
 
@@ -492,24 +504,32 @@ winning buckets (only shipped buckets are served and warmed), seed `TRITON_CACHE
 11. The 20k-vs-0.9k program-count comparison with lane B (read from lane B's grid, not executed).
 12. That the lab (Helion 1.5.0, Triton 3.7.1) autotunes these bodies without invalid-config storms; the Helion
     autotuner skips configs that fail to compile, so a bad bound shows as a slow search, not a wrong result.
+13. The K5 hook inside the MoE `run_plan` on a real GPU (the order arm -> launches -> check, the stack gate, the
+    judgement of new compiles and the refusal of a decomposed one are CPU-tested with a fake launcher and fake PTX).
+14. Lane B's gate bench (`_bench_helion`) and the on-silicon layer oracle with this variant: read, not run. On the CPU
+    the seam's own path (table row -> `served_ms` -> `serving_op` -> `run_plan`) matches lane B's dequant bodies to
+    the oracle tolerance (bitwise equal on the tiny test layer), which proves wiring and numerics, not speed.
 
 ## 13. Tests run (macOS, CPU, Helion eager; exact result lines of the final run)
 
 ```
 $ PYTHONPATH=<worktree> /tmp/lane-c/venv/bin/python -m pytest tests/test_fp4mma_ref.py tests/test_fp4mma_layout.py \
     tests/test_fp4mma_gemm.py tests/test_fp4mma_moe.py tests/test_fp4mma_probe.py tests/test_fp4mma_ptx.py -q
-257 passed, 1 skipped in 31.65s                 (Helion 1.5.1; the skip is test_fp4mma_ptx.py: Triton is Linux-only)
+252 passed, 1 skipped in 33.31s                 (Helion 1.5.1; the skip is test_fp4mma_ptx.py: Triton is Linux-only)
 $ PYTHONPATH=/tmp/lane-i/helion150:<worktree> ... (the five CPU files)
-257 passed in 37.79s                            (Helion 1.5.0, the plugin bundle's pin)
-per file: ref 9, layout 25, gemm 131, moe 71, probe 21
-$ neighbours + fp4mma in ONE process (helion_runtime, helion_nvfp4_gemm, helion_nvfp4_moe, helion_mxfp8_gemm,
-  dsv41_dense_capture_replay, dsv41_moe_shared + the six fp4mma files)
-523 passed, 1 skipped in 82.60s
+252 passed in 49.81s                            (Helion 1.5.0, the plugin bundle's pin)
+per file: ref 9, layout 25, gemm 131, moe 64, probe 23
+$ lane B's five (test_dsv41_moe_oxide_free, _shared, _variants, test_helion_nvfp4_moe, test_nvfp4_moe)
+1 failed, 330 passed in 62.64s                  (the 1: lane B's test_in_lab_tuner_plan_and_config_files, 74 == 53, section 9.1)
+331 passed in 56.10s                            (the same five with the one-line fix of section 9.1 simulated by a /tmp plugin)
+$ all of the above + helion_runtime, helion_nvfp4_gemm, helion_mxfp8_gemm, dsv41_dense_capture_replay in ONE process
+1 failed, 681 passed, 1 skipped in 102.26s      (the same single lane-B test)
 $ python scripts/fp4mma_p0_probe.py --selftest          -> fp4mma_p0_probe selftest OK
 $ python -m suffix_hybrid.kernels.fp4mma_bench selftest -> fp4mma_bench selftest OK
 $ python -m compileall -q <every new file>              -> compileall-ok;  pyflakes: no undefined names
 ```
 
-`git status`: twelve new files, no tracked file changed. Not run, by design: `tests/test_fp4mma_ptx.py` (Linux +
-Triton: the mirror kernels and the real generated bodies), `scripts/fp4mma_p0_probe.py` without `--selftest`,
-`fp4mma_bench dense|moe|report`, `fp4mma_probe capture_replay`.
+`git status`: only files of this lane changed (they are committed on the integration branch since aefeb6f; nothing of lane B's or
+anyone else's was touched). Not run, by design: `tests/test_fp4mma_ptx.py` (Linux + Triton: the mirror kernels and the real
+generated bodies), `scripts/fp4mma_p0_probe.py` without `--selftest`, `fp4mma_bench dense|report`,
+`fp4mma_probe capture_replay`, lane B's gate bench with this variant.
