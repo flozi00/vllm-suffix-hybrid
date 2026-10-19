@@ -58,8 +58,10 @@ from suffix_hybrid.mtp_tune.train import (
 
 DEFAULT_TARGETS = (
     "*.qkv_proj", "*.q_proj", "*.o_proj",          # attention (incl. KV-shared)
-    "*.in_proj_qkvz", "*.out_proj",                # GDN
+    "*.in_proj_qkvz", "*.out_proj",                # GDN (out_proj: also attention / short conv)
+    "*.in_proj",                                   # LFM2 short conv (B, C, x gates)
     "*.gate_up_proj", "*.down_proj",               # dense MLP
+    "*.w13", "*.w2",                               # LFM2 dense MLP (routed experts have no linear)
 )
 FUSED_FLAGS = ("use_fused_qk_norm_rope_gate",)    # Qwen3NextAttention Triton fusion
 QSA_DENSE_MAX = 2048        # QSA selects every key up to its 2048-block budget: dense = exact
@@ -103,7 +105,12 @@ def is_qsa(m) -> bool:      # Qwen4Exp query-sparse attention owner (qkv + index
     return hasattr(m, "_run_qsa") and hasattr(m, "qkv_proj") and hasattr(m, "o_proj")
 
 
-def is_moe_block(m) -> bool:  # Qwen3Next / Qwen4Exp sparse MoE block (router + runner)
+def is_shortconv(m) -> bool:  # LFM2 gated short convolution (vLLM ShortConv)
+    return (hasattr(m, "L_cache") and hasattr(m, "in_proj") and hasattr(m, "out_proj")
+            and hasattr(m, "conv"))
+
+
+def is_moe_block(m) -> bool:  # Qwen3Next / Qwen4Exp / LFM2 sparse MoE block (router + runner)
     return hasattr(getattr(m, "experts", None), "routed_experts") and hasattr(m, "gate")
 
 
@@ -129,8 +136,11 @@ def check_supported(lm, vllm_config=None):
         if (getattr(re_, "enable_eplb", False) or getattr(m, "is_sequence_parallel", False)
                 or getattr(m, "is_fused_shared_expert_enabled", False)):
             raise NotImplementedError(f"MoE with EPLB / sequence parallel ({name})")
-        if getattr(re_, "use_grouped_topk", False) or getattr(re_, "scoring_func", "softmax") != "softmax":
-            raise NotImplementedError(f"MoE routing other than softmax top-k ({name})")
+        if (getattr(re_, "use_grouped_topk", False) and int(getattr(re_, "num_expert_group", 1) or 1) > 1
+                or getattr(re_, "scoring_func", "softmax") not in ("softmax", "sigmoid")
+                or getattr(re_, "custom_routing_function", None) is not None
+                or getattr(re_, "hash_indices_table", None) is not None):
+            raise NotImplementedError(f"MoE routing other than (grouped x1) softmax / sigmoid top-k ({name})")
         experts_handle(m.experts)   # raises for unsupported expert dtypes
     for name, m in lm.named_modules():
         cls = type(m).__name__
@@ -144,7 +154,7 @@ def check_supported(lm, vllm_config=None):
                 raise NotImplementedError(f"attention soft-capping ({name})")
             if str(getattr(m, "attn_type", "decoder")).lower().split(".")[-1] != "decoder":
                 raise NotImplementedError(f"non-causal attention ({name})")
-        if hasattr(m, "get_state_shape") and not (is_gdn(m) or is_ple(m) or is_qsa(m)):
+        if hasattr(m, "get_state_shape") and not (is_gdn(m) or is_ple(m) or is_qsa(m) or is_shortconv(m)):
             raise NotImplementedError(f"recurrent layer {name}: {cls}")
 
 
@@ -421,6 +431,7 @@ class TrainMode(contextlib.ContextDecorator):
             if mods is None:   # classify once per model (thousands of modules)
                 mods = self.s.__dict__["_sft_mods"] = [
                     (m, "qsa" if is_qsa(m) else "moe" if is_moe_block(m) else
+                     "sconv" if is_shortconv(m) else
                      "hc" if is_hc(m) else "ple" if is_ple(m) else
                      "attn" if is_attention(m) else "gdn" if is_gdn(m) else
                      "op" if hasattr(m, "_forward_method") and hasattr(m, "forward_native") else None,
@@ -453,6 +464,9 @@ class TrainMode(contextlib.ContextDecorator):
                     self._set(m, "forward", lambda q, k, v, *a, _m=m, **kw: self.attention(_m, q, k, v))
                 elif kind == "gdn":
                     self._set(m, "forward", lambda hidden_states, _m=m: self.gdn(_m, hidden_states))
+                elif kind == "sconv":
+                    self._set(m, "forward", lambda hidden_states, output, _m=m:
+                              self.shortconv(_m, hidden_states, output))
                 elif kind == "op":
                     self._set(m, "_forward_method", m.forward_native)
                 if compiled:
@@ -604,6 +618,23 @@ class TrainMode(contextlib.ContextDecorator):
         o, _ = m.out_proj(core.flatten(-2))
         return o
 
+    def shortconv(self, m, hidden_states, output):
+        """LFM2 ShortConv: y = out_proj(C * causal_depthwise_conv(B * x)); the
+        conv starts from a zero state at every packed segment. vLLM's layer
+        writes into `output` (a fresh tensor of the caller): copy_ keeps autograd."""
+        bcx, _ = m.in_proj(hidden_states)
+        b, c, x = bcx.chunk(3, -1)
+        bx = b * x
+        w = m.conv.weight.detach()                       # [C, 1, K]
+        bias = getattr(m.conv, "bias", None)
+        out = []
+        for s, e in self.segments:
+            y = F.conv1d(bx[s:e].t()[None], w.to(bx.dtype), None if bias is None else bias.detach().to(bx.dtype),
+                         padding=w.shape[-1] - 1, groups=w.shape[0])[..., :e - s]
+            out.append(y[0].t())
+        o, _ = m.out_proj(c * torch.cat(out))
+        output[:o.shape[0]].copy_(o)
+
     def qsa(self, m, positions, hidden_states):
         """Qwen4Exp QSA as dense causal attention: exact while every segment
         fits the indexer budget (every key selected); sigma(gate) in f32."""
@@ -626,17 +657,46 @@ class TrainMode(contextlib.ContextDecorator):
         o = (o.float() * torch.sigmoid(gate.float())).to(hidden_states.dtype)
         return m.o_proj(o)[0]
 
+    def route(self, m, re_, x):
+        """(top-k weights [T, k] with autograd, ids). softmax / sigmoid scoring,
+        optional selection bias (`e_score_correction_bias`, selection only),
+        renormalize, routed scaling factor (router- or runner-side). Ids come
+        from serving's own gate, weights from an fp32 re-evaluation so the
+        gate input gets its gradient (GateLinear's kernels have none)."""
+        k = int(re_.top_k)
+        sigmoid = getattr(re_, "scoring_func", "softmax") == "sigmoid"
+        bias = getattr(m.gate, "e_score_correction_bias", None)
+        if bias is None:
+            bias = getattr(re_, "e_score_correction_bias", None)
+        logits = m.gate(x)
+        logits = (logits[0] if isinstance(logits, tuple) else logits).float()
+        if not sigmoid and bias is None:       # plain softmax top-k
+            tw, ids = torch.softmax(logits, -1).topk(k, -1)
+            if getattr(re_, "renormalize", True):
+                tw = tw / tw.sum(-1, keepdim=True)
+            return tw, ids
+        with torch.no_grad():
+            score = logits.sigmoid() if sigmoid else logits.softmax(-1)
+            ids = (score if bias is None else score + bias.float()).topk(k, -1).indices
+        gate_w = getattr(m.gate, "weight", None)
+        if gate_w is not None and gate_w.dim() == 2 and gate_w.shape[0] == logits.shape[-1]:
+            logits = F.linear(x.float(), gate_w.detach().float())
+        score = logits.sigmoid() if sigmoid else logits.softmax(-1)
+        tw = score.gather(-1, ids)
+        if getattr(re_, "renormalize", True):
+            tw = tw / tw.sum(-1, keepdim=True)
+        scale = float(getattr(getattr(re_, "router", None), "routed_scaling_factor", None)
+                      or getattr(re_, "routed_scaling_factor", 1.0) or 1.0)
+        scale *= float(getattr(m.experts, "routed_scaling_factor", 1.0) or 1.0)
+        return tw * scale, ids
+
     def moe(self, m, hidden_states):
         """Router softmax top-k -> frozen routed experts (local to this EP
         rank) + gated shared expert, partials summed by one TP all-reduce."""
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
         re_ = m.experts.routed_experts
-        logits = m.gate(x)
-        logits = (logits[0] if isinstance(logits, tuple) else logits).float()
-        tw, ids = torch.softmax(logits, -1).topk(int(re_.top_k), -1)
-        if getattr(re_, "renormalize", True):
-            tw = tw / tw.sum(-1, keepdim=True)
+        tw, ids = self.route(m, re_, x)
         emap = getattr(re_, "expert_map", None)
         local = ids if emap is None else emap.to(ids.device)[ids]
         handle = self.s.__dict__.setdefault("_sft_experts", {})
