@@ -323,7 +323,10 @@ class State:
             worst = max(range(len(d)), key=lambda i: abs(served[i] - r["nll"][i]))
             pos = [i for i in range(1, len(ids)) if mask[i]][worst]
             mean = sum(served) / len(served)
-            out.update(served_nll=round(mean, 5), delta=round(abs(mean - trained), 5),
+            diff = [a - b for a, b in zip(served, r["nll"])]
+            mu = sum(diff) / len(diff)
+            se = (sum((x - mu) ** 2 for x in diff) / len(diff)) ** 0.5 / len(diff) ** 0.5
+            out.update(served_nll=round(mean, 5), delta=round(abs(mean - trained), 5), se=round(se, 5),
                        tok_p50=round(d[len(d) // 2], 4), tok_p99=round(d[int(len(d) * 0.99)], 4),
                        tok_max=round(d[-1], 4), tok_max_pos=pos, len=len(ids),
                        tok_max_served=round(served[worst], 4), tok_max_trained=r["nll"][worst])
@@ -379,9 +382,12 @@ class State:
         try:
             api, parent = await asyncio.to_thread(self.hub.private_repo)
             pre = await self.parity(*data[0])
-            if pre["delta"] is not None and pre["delta"] > c.parity_nats:
+            # noise-aware: a numerically sensitive model (LFM2 FP8: per-token NLL moves by
+            # ~1 nat between two correct bf16 paths) has a large standard error on a short
+            # example; a real forward bug moves the mean by far more than 3 SE
+            if pre["delta"] is not None and pre["delta"] > c.parity_nats + 3 * pre.get("se", 0.0):
                 raise _http(409, {"message": "training forward diverges from serving; refusing "
-                                             "(SUFFIX_SFT_PARITY_NATS)", "parity": pre})
+                                             "(SUFFIX_SFT_PARITY_NATS + 3 standard errors)", "parity": pre})
             stage = "training"
             await self.rpc("begin", dict(lr=lr, weight_decay=wd))
             losses, first, checked = [], None, False

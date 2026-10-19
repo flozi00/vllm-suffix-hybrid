@@ -1060,3 +1060,22 @@ def test_wait_false_rejection_is_visible_in_status(tmp_path):
         assert "rejected" not in s.status
     finally:
         W.SFT, A._S = None, None
+
+
+def test_parity_guard_allows_noise_but_not_a_real_divergence(tmp_path):
+    from fastapi import HTTPException
+    s = _state(tmp_path, sft_for(build()))
+
+    def fixed(se):
+        async def parity(ids, mask, window=0):
+            return dict(delta=0.4, se=se, served_nll=1.0, trained_nll=1.4, tokens=5)
+        return parity
+    try:
+        s.parity = fixed(0.01)       # 0.4 nats with a tiny standard error: a real forward bug
+        with pytest.raises(HTTPException) as e:
+            asyncio.run(s.train(dict(examples=CHATS, steps=1)))
+        assert e.value.status_code == 409
+        s.parity = fixed(0.2)        # same mean on a noisy short example: within 3 SE
+        assert asyncio.run(s.train(dict(examples=CHATS, steps=1)))["served"]
+    finally:
+        W.SFT = None
