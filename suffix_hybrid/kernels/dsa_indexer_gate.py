@@ -26,15 +26,18 @@ deadlock). What the gate proves, per entry and shape:
     every column a consumer reads (top-k sets for the ranking steps);
  4. the f64 spec still holds on the first replay (the oracle of the lab).
 
-Entries: ``row`` (Helion per-row decode body), ``group`` (Helion row-group
+V4.1 geometry only (the gate pins SUFFIX_DSA_INDEXER_GEOMETRY=v41): the oxide kernels
+are retired for V4.1, so the gate runs Helion bodies keyed fmt=v41 and never imports
+the native extension. Entries: ``row`` (Helion per-row decode body), ``group`` (Helion row-group
 body), ``cand`` (fused candidate logits + the Triton slot remap, + vLLM's
 persistent top-k when vLLM is importable), ``candsel`` (valid-block selection
 for the candidate source layer; needs vLLM). Shipped configs are used as
 shipped (the pool's real set); ``--default-configs`` forces the bounded Helion
 default config on every kernel (the lab, before anything is shipped).
-An entry whose kernel has no shipped config reports ``not shipped`` (the lane
-falls back to oxide / the per-row body exactly as serving would) -- never a
-silent pass: the line says which route ran.
+An entry whose kernel has no shipped config reports ``skipped (not shipped ...)``
+(the shim wrapper serves the stock path there, exactly as in serving -- the vendored
+DeepGEMM verbatim where it runs, as in A1, else the shim's Triton stand-in -- and K5 logs
+it per layer) -- never a silent pass: the line says which route ran.
 """
 from __future__ import annotations
 
@@ -144,21 +147,27 @@ class Rig:
 # entries: (run(rig) -> {name: tensor}, how to compare each tensor, route label)
 # ---------------------------------------------------------------------------
 def _row_route(rig):
+    """"helion per-row", or why not (V4.1 geometry: no config means the stock path serves)."""
     from suffix_hybrid import helion_kernels as hk
     from suffix_hybrid.helion_kernels import dsa_indexer as hdi
     from suffix_hybrid.kernels import dsa_indexer as di
-    if di._backend() != "oxide" and hk.config(hdi.DECODE, hdi.serving_case(hdi.DECODE, HEADS, rig.rows)) is not None:
+    di.refuse_oxide_for_v41()
+    if hk.config(hdi.DECODE, hdi.serving_case(hdi.DECODE, HEADS, rig.rows, fmt=hdi.FMT_V41)) is not None:
         return "helion per-row"
-    return "oxide (no per-row config shipped for this rows bucket)"
+    return None
 
 
 def entry_row(rig):
     from suffix_hybrid.kernels import dsa_indexer as di
+    route = _row_route(rig)
+    if route is None:
+        return ("not shipped for this rows bucket (the shim wrapper serves the stock path, the baseline's own "
+                "kernel: nothing of ours to capture)")
 
     def run():
         return {"logits": di.paged_logits(rig.q.view(rig.rows, 1, HEADS, 128), rig.cache4, rig.w,
                                           rig.cl.view(rig.rows, 1), rig.bt, rig.n_cols, group=1)}
-    return run, {"logits": "window"}, _row_route(rig), None
+    return run, {"logits": "window"}, route, None
 
 
 def entry_group(rig):
@@ -167,8 +176,13 @@ def entry_group(rig):
     def run():
         return {"logits": di.paged_logits(rig.q.view(rig.rows, 1, HEADS, 128), rig.cache4, rig.w,
                                           rig.cl.view(rig.rows, 1), rig.bt, rig.n_cols, group=6)}
-    route = "helion row-group" if di._use_group(HEADS, rig.rows, 1, 6, None) \
-        else "NOT shipped for this rows bucket: " + _row_route(rig)
+    if di._use_group(HEADS, rig.rows, 1, 6, None, True):
+        route = "helion row-group"
+    else:
+        route = _row_route(rig)
+        if route is None:
+            return "no row-group and no per-row config shipped for this rows bucket (stock path serves)"
+        route = "row-group NOT shipped for this rows bucket: " + route
     return run, {"logits": "window"}, route, None
 
 
@@ -315,9 +329,9 @@ def run_gate(runner, dev, cases=CASES, trials=4, entries=None, log=print, f64=Tr
             rig = Rig(dev, reqs, nn, ctx, page, pad, seed=ctx + reqs + page)
             rig.refill(0)
             built = make(rig)
-            if built is None:
-                lines.append(f"capture_replay {name} reqs={reqs}x{nn} page={page}: skipped (needs vLLM, "
-                             f"or width < {NCAND * CBS})")
+            if built is None or isinstance(built, str):
+                lines.append(f"capture_replay {name} reqs={reqs}x{nn} page={page}: skipped ("
+                             + (built or f"needs vLLM, or width < {NCAND * CBS}") + ")")
                 log(lines[-1])
                 continue
             run, how, route, warm = built
@@ -327,7 +341,7 @@ def run_gate(runner, dev, cases=CASES, trials=4, entries=None, log=print, f64=Tr
                 continue
             # warm-up is the ONLY thing before the capture: the captured call never ran eagerly
             hdi.warm_all(dev, rig.cache4, rig.n_cols, rig.width, HEADS, 6,
-                         cand=(NCAND, CBS) if name == "cand" else None)
+                         cand=(NCAND, CBS) if name == "cand" else None, v41=True)
             if warm is not None:
                 warm()
             graph, out_graph = runner.capture(run)
@@ -392,6 +406,7 @@ def main(argv=None):
     try:
         import torch
         os.environ.setdefault("SUFFIX_HELION_DSA_INDEXER", "helion")
+        os.environ.setdefault("SUFFIX_DSA_INDEXER_GEOMETRY", "v41")   # this gate is the V4.1 one: no oxide anywhere
         if "--default-configs" in argv:
             default_configs()
         dev = torch.device("cuda", torch.cuda.current_device())

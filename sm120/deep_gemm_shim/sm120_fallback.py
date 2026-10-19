@@ -1,8 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Triton MQA-logits fallback for SM120 (cc 12.0) GPUs.
+"""MQA-logits trio of the deep_gemm shim for SM120 (cc 12.0) GPUs.
 
-Implements the three kernels the sparse attention indexer needs from
-DeepGEMM, matching the wrapper contract of ``vllm/utils/deep_gemm.py``
+The public names ``fp8_fp4_mqa_logits`` / ``fp8_fp4_paged_mqa_logits`` /
+``get_paged_mqa_logits_metadata`` are what the shim exports when SUFFIX_SM120=1 on
+an SM120 GPU (the rest of the DeepGEMM surface is the vendor's own objects, see
+``__init__``). They are VENDOR-FIRST: on a pod whose vendored DeepGEMM runs the
+SM120 paged MQA at 64-token pages (vLLM nightly >= 39983a5e7, the path boot5.log
+ran; probe: the vendored module exports the trio and
+``vllm.utils.deep_gemm.get_paged_mqa_page_sizes()`` declares 64) each of the three
+calls the vendored callable VERBATIM -- the arguments vLLM's own wrapper passed,
+nothing added, nothing dropped, including the vendor's own schedule metadata -- so
+a call nobody replaces behaves exactly like the baseline (SUFFIX_SM120=1 must not
+make an unserved bucket slower than A1). The Triton stand-in below runs only where
+the vendor cannot: the GLM-era vLLM 0.30 images and a missing vendor (probe False),
+or a call in the OLD contract the vendor does not take (``clean_logits=True``, a
+bool / None 6th prefill argument). It stays addressable by name
+(``triton_mqa_logits`` / ``triton_paged_mqa_logits`` / ``triton_paged_mqa_metadata``)
+for the oracles, benches and accuracy baselines, which must never reach the vendor.
+``fn.vendor_applies(**call)`` says which of the two a call takes (K5 labels).
+SUFFIX_DSA_INDEXER_STOCK = ``vendor`` (fail closed where the vendor cannot) |
+``shim`` (force the stand-in, the behaviour before 2026-10-19) | unset (probe);
+read once per process, so the metadata and the logits call never disagree.
+
+The Triton stand-in implements the three kernels the sparse attention indexer
+needs from DeepGEMM, matching the wrapper contract of ``vllm/utils/deep_gemm.py``
 (vLLM 0.30) for the FP8 path:
 
 ``fp8_fp4_mqa_logits(q=(qv, None), kv=(kv, k_scale), weights, ks, ke,
@@ -47,11 +68,60 @@ fp32, so the dot products here are exact up to accumulation order — same
 guarantee the CPU reference kernel (``fp8_paged_mqa_logits_cpu``) gives.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 _FP8 = torch.float8_e4m3fn
+
+STOCK_ENV = "SUFFIX_DSA_INDEXER_STOCK"
+TRIO = ("fp8_fp4_mqa_logits", "fp8_fp4_paged_mqa_logits", "get_paged_mqa_logits_metadata")
+_probe = {}
+
+
+def vendor_module():
+    """The vendored DeepGEMM (``vllm.third_party.deep_gemm``) or None -- never the
+    shim package itself (that is the top-level ``deep_gemm``)."""
+    if "module" not in _probe:
+        try:
+            import importlib
+            _probe["module"] = importlib.import_module("vllm.third_party.deep_gemm")
+        except Exception:  # noqa: BLE001 - absent, or its _C.init() failed: no vendor
+            _probe["module"] = None
+    return _probe["module"]
+
+
+def _probe_vendor() -> bool:
+    mod = vendor_module()
+    if mod is None or not all(callable(getattr(mod, n, None)) for n in TRIO):
+        return False
+    try:   # vLLM declares which kernel page sizes the vendored paged MQA takes on this GPU family
+        from vllm.utils import deep_gemm as vdg
+        return 64 in tuple(vdg.get_paged_mqa_page_sizes())
+    except Exception:  # noqa: BLE001 - the GLM-era vLLM has no such declaration: the vendor cannot
+        return False
+
+
+def vendor_paged_ok() -> bool:
+    """The vendored DeepGEMM runs the SM120 paged MQA at 64-token pages (module doc).
+    Probed and cached on the first call -- which is eager (the schedule metadata is
+    built before any logits call, and before a CUDA graph is captured) -- and pure
+    Python: no device call, no allocation."""
+    ok = _probe.get("ok")
+    if ok is None:
+        mode = os.environ.get(STOCK_ENV, "").strip().lower()
+        if mode not in ("", "vendor", "shim"):
+            raise ValueError(f"{STOCK_ENV}={mode!r}: expected vendor | shim | unset")
+        ok = False if mode == "shim" else _probe_vendor()
+        if mode == "vendor" and not ok:   # fail closed, loud, on every call (nothing cached)
+            raise RuntimeError(
+                f"{STOCK_ENV}=vendor but the vendored DeepGEMM cannot run the SM120 paged MQA here (no "
+                "vllm.third_party.deep_gemm with the trio, or vLLM does not declare 64-token pages): "
+                "unset it (probe) or use =shim")
+        _probe["ok"] = ok
+    return ok
 
 
 def _require_fp8(name: str, t: torch.Tensor) -> None:
@@ -145,7 +215,7 @@ def mqa_contract(max_seqlen_k, clean_logits):
     return int(max_seqlen_k), False
 
 
-def fp8_fp4_mqa_logits(
+def triton_mqa_logits(
     q: tuple,
     kv: tuple,
     weights: torch.Tensor,
@@ -278,7 +348,7 @@ def _paged_mqa_logits_kernel(
     tl.store(out_ptr + r * stride_om + offs_n, logits, mask=n_ok)
 
 
-def get_paged_mqa_logits_metadata(
+def triton_paged_mqa_metadata(
     context_lens: torch.Tensor,
     block_size: int,
     num_sms: int,
@@ -296,7 +366,7 @@ def get_paged_mqa_logits_metadata(
                        device=context_lens.device)
 
 
-def fp8_fp4_paged_mqa_logits(
+def triton_paged_mqa_logits(
     q: tuple,
     kv_cache: torch.Tensor,
     weights: torch.Tensor,
@@ -407,3 +477,60 @@ def fp8_fp4_paged_mqa_logits(
         num_warps=4,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# the shim's exported trio: vendor-first, the stand-in only where the vendor cannot
+# ---------------------------------------------------------------------------
+def _vendor_kw(indices):
+    return {} if indices is None else {"indices": indices}
+
+
+def _vendor_mqa_applies(max_seqlen_k=None, clean_logits=False, **_) -> bool:
+    """The vendored prefill kernel takes the nightly contract only: an int
+    max_seqlen_k (compressed logits); a bool / None 6th argument or clean_logits
+    belong to the old contract the vendor does not implement."""
+    return isinstance(max_seqlen_k, int) and not isinstance(max_seqlen_k, bool) \
+        and not clean_logits and vendor_paged_ok()
+
+
+def fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k=None, clean_logits=False):
+    """deep_gemm.fp8_fp4_mqa_logits: the vendored kernel verbatim where it runs
+    (vLLM's call: six positional arguments), else the Triton stand-in."""
+    if _vendor_mqa_applies(max_seqlen_k, clean_logits):
+        return vendor_module().fp8_fp4_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k)
+    return triton_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k, clean_logits)
+
+
+def _vendor_paged_applies(clean_logits=False, **_) -> bool:
+    return not clean_logits and vendor_paged_ok()
+
+
+def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata,
+                             max_model_len, clean_logits=False, indices=None):
+    """deep_gemm.fp8_fp4_paged_mqa_logits: the vendored kernel verbatim where it runs
+    (vLLM's call: seven positional arguments + ``indices`` only when given; the
+    schedule metadata is the vendor's own, see get_paged_mqa_logits_metadata),
+    else the Triton stand-in."""
+    if _vendor_paged_applies(clean_logits):
+        return vendor_module().fp8_fp4_paged_mqa_logits(
+            q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len,
+            **_vendor_kw(indices))
+    return triton_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata,
+                                   max_model_len, clean_logits, indices)
+
+
+def get_paged_mqa_logits_metadata(context_lens, block_size, num_sms, indices=None):
+    """deep_gemm.get_paged_mqa_logits_metadata: the vendor's real schedule where the
+    vendor runs the paged kernel (it must see the schedule built for it, exactly as
+    in the baseline), else the stand-in's trivially-shaped zeros."""
+    if vendor_paged_ok():
+        return vendor_module().get_paged_mqa_logits_metadata(context_lens, block_size, num_sms,
+                                                             **_vendor_kw(indices))
+    return triton_paged_mqa_metadata(context_lens, block_size, num_sms, indices)
+
+
+# which implementation a call resolves to (K5 in kernels/dsa_indexer.stock_label)
+fp8_fp4_mqa_logits.vendor_applies = _vendor_mqa_applies
+fp8_fp4_paged_mqa_logits.vendor_applies = _vendor_paged_applies
+get_paged_mqa_logits_metadata.vendor_applies = lambda **_: vendor_paged_ok()

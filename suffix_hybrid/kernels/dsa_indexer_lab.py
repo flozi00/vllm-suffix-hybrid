@@ -8,13 +8,14 @@ requests of 1 + 5 DSpark rows:
   * a GPU oracle of every new body (row-group, survivor select, remap, block
     selection) against the f64 spec, adversarial rows included;
   * full-effort Helion autotune of every serving bucket (the autotune runner's
-    recipe: static shapes, oxide/Triton accuracy baseline, check() vs the f64
-    spec), group kernel first;
+    recipe: static shapes, stock-path accuracy baseline, check() vs the f64
+    spec; V4.1 cases are keyed fmt=v41 and timed against the stock DeepGEMM
+    call, never oxide), group kernel first;
   * per-layer-kind timings of the STOCK path (vendored DeepGEMM paged logits ->
     vLLM's candidate mask / block selection -> persistent_topk, exactly what
-    vLLM 39983a5e7 runs on SM120) against ours (oxide row group, Helion per row,
-    Helion row group, fused candidates, valid-block selection, warm-start
-    survivor select), cold L2 per replay;
+    vLLM 39983a5e7 runs on SM120) against ours (Helion per row, Helion row
+    group, fused candidates, valid-block selection, warm-start survivor
+    select), cold L2 per replay;
   * the report: winner table, the stock-vs-ours decode-step total (3 x dense at
     ctx/2 + source + 4 x consumer) and the crossovers (first ctx where each
     lever wins), next to the byte model of kernels/dsa_indexer_cost.py.
@@ -98,15 +99,14 @@ def _emit(row):
 # ---------------------------------------------------------------------------
 # the report: pure functions over the stored bench rows (CPU-tested)
 # ---------------------------------------------------------------------------
-# Arms that can serve V4.1 decode (deployable): oxide only reads contiguous 64-token pages (V4.1's
-# packed / 32- and 128-token pages are Helion-only) so it is a reference arm, never a candidate.
+# Arms that can serve V4.1 decode: Helion only (oxide is retired for V4.1: it is the GLM-5.3 format and
+# cannot read V4.1's packed / 32- and 128-token pages), the stock path is the comparison.
 # groupS = the row-group body under the SERVING policy: the longest-context bucket's config at every
 # context (a decode graph is captured once); group = the config tuned for this very context.
 OURS = {"dense": ("row_us", "groupS_us", "select_us"),
         "source": ("row_us", "groupS_us", "row_candsel_us", "groupS_candsel_us"),
         "consumer": ("row_us", "groupS_us", "cand_fused_us")}
-REFERENCE = {"dense": ("oxide_us", "group_us"), "source": ("oxide_us", "group_us", "group_candsel_us"),
-             "consumer": ("oxide_us", "group_us")}
+REFERENCE = {"dense": ("group_us",), "source": ("group_us", "group_candsel_us"), "consumer": ("group_us",)}
 STOCK = "stock_us"
 
 
@@ -164,7 +164,6 @@ def crossovers(rows):
     levers = {"cand_fused<dense_mask": ("consumer", "cand_fused_us", "groupS_us"),
               "select<group": ("dense", "select_us", "groupS_us"),
               "group<row": ("dense", "groupS_us", "row_us"),
-              "group<oxide": ("dense", "groupS_us", "oxide_us"),
               "candsel<stock_select": ("source", "groupS_candsel_us", "groupS_us")}
     out = {}
     for reqs in REQS:
@@ -321,10 +320,10 @@ def t_oracle(st, _):
     def verdict(ok, msg):
         return f"{'OK' if ok else 'FAIL'} {msg}"
 
-    try:
-        res["lane_oxide_triton"] = di.oracle()[-60:]
+    try:   # the GLM-5.3 oxide lane's own oracle: legacy, needs the native extension (absent = skipped)
+        res["legacy_glm_oxide_oracle"] = di.oracle()[-60:]
     except Exception as exc:  # noqa: BLE001
-        res["lane_oxide_triton"] = f"FAIL {type(exc).__name__}: {str(exc)[:300]}"
+        res["legacy_glm_oxide_oracle"] = f"skipped/failed (not part of the V4.1 route): {type(exc).__name__}: {str(exc)[:200]}"
     # Triton fallback, nightly contracts: compressed prefill
     args = hdi.prefill_problem(HEADS, 300, 5000, dev)
     res["triton_prefill_compressed"] = verdict(*hdi.check(hdi._prefill_tune_baseline(*args, 0),
@@ -346,7 +345,7 @@ def t_oracle(st, _):
         kv, ks, pg, prow, sp = hdi.cache_views(cache)
         out = torch.full((rows, n_cols), float("-inf"), device=dev)
         ref = hdi.decode_reference(q, w, kv, ks, bt, cl, out, pg, prow, sp, 2)
-        tri = di._fallback_mod().fp8_fp4_paged_mqa_logits(
+        tri = di._fallback_mod().triton_paged_mqa_logits(
             (q.view(rows, 1, HEADS, 128), None), cache.unsqueeze(2), w, cl.view(rows, 1), bt, None, n_cols)
         col = torch.arange(n_cols, device=dev)
         tri = torch.where(col[None, :] < cl[:, None], tri, float("-inf"))
@@ -476,27 +475,26 @@ def t_bench_layer(st, spec):
     row_args = hdi.decode_args(pr, width, n_sms)
     q, w, kv, ks, bt, cl = row_args[:6]
     cl1 = pr["cl"].reshape(-1)
-    nn = pr["next_n"]
     topk = _Topk(dev)
     idx = torch.empty((rows, TOPK), dtype=torch.int32, device=dev)
-    ox = torch.full((rows, width), float("-inf"), device=dev)
-    gcase = hdi.group_serving_case(HEADS, rows, G, n)                  # the context's own bucket
-    gcase_s = hdi.group_serving_case(HEADS, rows, G, None)             # serving: the longest bucket
+    v41 = hdi.FMT_V41
+    gcase = hdi.group_serving_case(HEADS, rows, G, n, v41)             # the context's own bucket
+    gcase_s = hdi.group_serving_case(HEADS, rows, G, None, v41)        # serving: the longest bucket
     gcfg = _cfg(st, hdi.GROUP, gcase) or _any_cfg(st, hdi.GROUP)
     gcfg_s = _cfg(st, hdi.GROUP, gcase_s) or _any_cfg(st, hdi.GROUP)
-    rcfg = _cfg(st, hdi.DECODE, hdi.serving_case(hdi.DECODE, HEADS, rows)) or _any_cfg(st, hdi.DECODE)
+    rcfg = _cfg(st, hdi.DECODE, hdi.serving_case(hdi.DECODE, HEADS, rows, fmt=v41)) or _any_cfg(st, hdi.DECODE)
     gargs = hdi.group_args(row_args, G)
     gargs_s = hdi.group_args(hdi.decode_args(pr, width, n_sms), G)
     gkern, gkern_s, rkern = (_kern(hdi.dsa_group_logits, gcfg), _kern(hdi.dsa_group_logits, gcfg_s),
                              _kern(hdi.dsa_decode_logits, rcfg))
     # (logits launcher, the buffer it fills): every top-k / mask below runs on the arm's own output
-    fams = {"oxide": (lambda: hdi.decode_baseline(ox, pr["q"], pr["cache"], pr["w"], pr["cl"], pr["bt"], nn), ox),
-            "row": (lambda: rkern(*row_args), row_args[6]),
+    fams = {"row": (lambda: rkern(*row_args), row_args[6]),
             "group": (lambda: gkern(*gargs), gargs[6]),
             "groupS": (lambda: gkern_s(*gargs_s), gargs_s[6])}
     for arm, (fn, _) in fams.items():
         r[f"{arm}_logits_us"] = us(fn)
-    r["group_vs_oxide_rel"] = _rel(gargs[6], ox, cl1)
+    fams["groupS"][0]()
+    ox = fams["groupS"][1].clone()          # real logits for the stand-alone top-k / mask timings
     r["topk_us"] = us(lambda: topk(ox, cl1, 1, idx, TOPK, n))
     try:
         from vllm.model_executor.kernels.attention.dsa import candidate_blocks as cb
@@ -528,6 +526,7 @@ def t_bench_layer(st, spec):
             if extra is not None:
                 extra(lg)
             topk(lg, cl1, 1, idx, TOPK, n)
+        r["group_vs_stock_rel"] = _rel(fams["groupS"][1], hdi.decode_baseline_dg(*dga), cl1)
         r["dg_logits_us"] = us(lambda: hdi.decode_baseline_dg(*dga))
         r[STOCK] = us(stock, 10)
         r["stock_parts"] = {"logits_us": r["dg_logits_us"], "topk_us": r["topk_us"],
@@ -582,8 +581,8 @@ def _bench_select(st, pr, gargs, dense, cl1, n, topk, idx, us):
     rows, width = dense.shape
     q4, w3, kv, ks, bt, cl, _, page, prow, sp, splits = gargs
     out = {}
-    gkern = _kern(hdi.dsa_group_logits, _cfg(st, hdi.GROUP, hdi.group_serving_case(HEADS, rows, G, n))
-                  or _any_cfg(st, hdi.GROUP))
+    gkern = _kern(hdi.dsa_group_logits,
+                  _cfg(st, hdi.GROUP, hdi.group_serving_case(HEADS, rows, G, n, hdi.FMT_V41)) or _any_cfg(st, hdi.GROUP))
     gkern(*gargs)                                      # dense logits of the current step
     logits = dense
     skern = _kern(hdi.dsa_group_select, _cfg(st, hdi.SELECT, hdi.select_case(HEADS, pr["rows"] // G, n))
@@ -638,8 +637,7 @@ def _bench_select(st, pr, gargs, dense, cl1, n, topk, idx, us):
 
 def t_bench_prefill(st, spec):
     """m Q rows of one request whose K window ends at n (row i sees
-    [0, n - m + 1 + i)): oxide (absolute columns) / Helion compressed /
-    Triton compressed / vLLM DeepGEMM."""
+    [0, n - m + 1 + i)): Helion compressed / Triton compressed / vLLM DeepGEMM."""
     import inspect
     import torch
     from suffix_hybrid.helion_kernels import dsa_indexer as hdi
@@ -654,18 +652,17 @@ def t_bench_prefill(st, spec):
     lo = torch.zeros(m, dtype=torch.int32, device=dev)
     hi = (n - m + 1 + torch.arange(m, device=dev)).to(torch.int32)
     r = {"m": m, "n": n}
-    ab = torch.full((m, n), float("-inf"), device=dev)
-    r["oxide_us"] = us(lambda: hdi.prefill_baseline(q, kv, ksc, w, lo, hi, ab, 0), iters=5)
     fb = di._fallback_mod()
-    r["triton_us"] = us(lambda: fb.fp8_fp4_mqa_logits((q, None), (kv, ksc), w, lo, hi, n), iters=3)
-    cfg = _cfg(st, hdi.PREFILL, hdi.serving_case(hdi.PREFILL, HEADS, m))
+    r["triton_us"] = us(lambda: fb.triton_mqa_logits((q, None), (kv, ksc), w, lo, hi, n), iters=3)
+    cfg = _cfg(st, hdi.PREFILL, hdi.serving_case(hdi.PREFILL, HEADS, m, fmt=hdi.FMT_V41))
     if cfg:
         out = torch.full((m, n), float("-inf"), device=dev)
         kern = _kern(hdi.dsa_prefill_logits, cfg)
         pargs = (q, kv, ksc, w, lo, hi, lo, out, hdi.splits_for(-(-m // 16), n, di._sms(dev)))
         r["helion_us"] = us(lambda: kern(*pargs), iters=5)
-        r["helion_vs_oxide_rel"] = _rel(out, ab, hi)
+        r["helion_vs_stock_rel"] = _rel(out, fb.triton_mqa_logits((q, None), (kv, ksc), w, lo, hi, n), hi)
     try:
+        hdi.vendor_baseline_guard()
         from vllm.utils import deep_gemm as vdg
         fn = vdg.fp8_fp4_mqa_logits
         last = list(inspect.signature(fn).parameters)[-1]

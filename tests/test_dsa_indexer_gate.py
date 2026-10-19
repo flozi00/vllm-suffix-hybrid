@@ -67,6 +67,7 @@ def arm(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda dev=None: types.SimpleNamespace(cuda_stream=0))
     monkeypatch.setenv(di.HELION_ENV, "helion")
     monkeypatch.setenv(di.GROUP_ENV, "6")
+    monkeypatch.setenv(di.GEOMETRY_ENV, "v41")     # the gate is the V4.1 one (main() pins it too)
     cap.reset()
 
 
@@ -91,6 +92,28 @@ def test_every_decode_entry_replays_bit_exact_after_a_warm_up_only(monkeypatch):
     assert all("bit-exact vs eager" in ln and ln.endswith("OK") for ln in lines)
     assert any("helion row-group" in ln for ln in lines)          # the group body ran in the capture
     assert any("fused candidates" in ln and "no vLLM" in ln for ln in lines)
+
+
+def test_the_v41_gate_runs_with_the_native_extension_unimportable(monkeypatch):
+    """The gate is the V4.1 one: no oxide anywhere, not even an import."""
+    monkeypatch.setitem(sys.modules, "suffix_hybrid.oxide_kernels", None)
+    monkeypatch.setitem(sys.modules, "suffix_hybrid._native", None)
+    import suffix_hybrid
+    monkeypatch.delattr(suffix_hybrid, "oxide_kernels", raising=False)
+    monkeypatch.setattr(di, "_native", lambda dev: (_ for _ in ()).throw(AssertionError("oxide touched")))
+    lines = run(monkeypatch, cases=SMALL[:2], trials=2)
+    assert len(lines) == 6 and all(ln.endswith("OK") for ln in lines)
+
+
+def test_an_entry_without_a_shipped_config_is_skipped_loudly_not_run_on_oxide(monkeypatch):
+    """auto + no per-row / group config for the V4.1 key: the shim wrapper would serve the stock path
+    there, so the gate reports it and has nothing to capture."""
+    arm(monkeypatch)
+    monkeypatch.setattr(hk, "config", lambda kernel, case, plat=None: None)
+    monkeypatch.setenv(di.HELION_ENV, "auto")
+    runner = FakeRunner(monkeypatch)
+    lines = gate.run_gate(runner, CPU, SMALL[:1], 2, gate.ENTRIES[:2], log=lambda m: None)
+    assert len(lines) == 2 and all("skipped" in ln and "stock" in ln for ln in lines)
 
 
 def test_the_capture_refuses_what_the_warm_up_missed(monkeypatch):
