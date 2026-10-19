@@ -45,10 +45,14 @@ CASE_S = {"quick": 900, "full": 2400}  # per-case cap (the runner: 1800 at full)
 DS_MODEL = {"name": "deepseek-v4.1-flash-1017-nvfp4", "architecture": "DeepseekV41ForCausalLM",
             "tp": 8, "hidden": 5120, "moe_intermediate": 288, "experts": 384, "topk": 6,
             "quant_format": "nvfp4"}
-# Expert-load distributions (nm.rand_routing dist). The autotune search runs on TUNE_DIST;
-# the winner is then gated and timed on ALL of DISTS, and a row's score is the worse of
-# balanced / skewed (hot, one expert with every row, only has to be correct).
-TUNE_DIST = os.environ.get("NVFP4_MOE_TUNE_DIST", "skewed")
+# Expert-load distributions (nm.rand_routing dist). The autotune search runs on TUNE_DIST; the
+# winner is then gated and timed on ALL of DISTS, and a row's score is the worse of balanced /
+# skewed (hot, one expert with every row, only has to be correct). The search runs on BALANCED
+# since the load is re-derived (nm.expected_load, docs/dsv41-moe.md section 8): EP8 allgather
+# dispatch gives an expert M/64 rows, so production decode is ~1-3 rows per hit expert (the
+# heaviest of a batch ~9 at M=192), a 16-row MMA tile is padding and the skewed tail (80 rows
+# on the top expert at M=192) must not steer the row tile; it still gates and scores.
+TUNE_DIST = os.environ.get("NVFP4_MOE_TUNE_DIST", "balanced")
 DISTS = ("balanced", "skewed", "hot")
 SCORED = ("balanced", "skewed")
 M_ORDER = (8, 1, 32, 192, 6, 16, 64, 128)  # a whole plan for the key Ms first
@@ -59,12 +63,22 @@ def _path(*p):
     return os.path.join(ROOT, *p)
 
 
+def variant_kernels() -> list:
+    """Lab kernels of every non-default body variant in this build (lane I's dot_scaled bodies
+    when helion_kernels/dsv41_moe_fp4mma.py exists): tuned on the same cases so the bench can
+    compare variants per bucket."""
+    from suffix_hybrid.helion_kernels import nvfp4_moe as hm
+    return [k for v in hm.available_variants() if v != hm.DEQUANT
+            for k in hm.variant_module(v).KERNELS]
+
+
 def kernels() -> dict:
-    """{name: lab kernel} of the routed plan's kernels and, with the shared expert fused
-    (SUFFIX_DSV41_MOE_FUSE_SHARED), the three fused ones (helion_kernels/dsv41_moe_shared.py)."""
+    """{name: lab kernel} of the routed plan's kernels, the body variants' (dot_scaled) and,
+    with the shared expert fused (SUFFIX_DSV41_MOE_FUSE_SHARED), the three fused ones
+    (helion_kernels/dsv41_moe_shared.py)."""
     from suffix_hybrid.helion_kernels import dsv41_moe_shared as ds
     from suffix_hybrid.helion_kernels import nvfp4_moe as hm
-    return {k["name"]: k for k in hm.KERNELS + ds.KERNELS}
+    return {k["name"]: k for k in hm.KERNELS + variant_kernels() + ds.KERNELS}
 
 
 def todo() -> list:
@@ -78,8 +92,9 @@ def todo() -> list:
         lay = {k: v for k, v in c.items() if k != "numtokens"}
         if lay not in layouts:
             layouts.append(lay)
-    order = (hm.ROUTE_QUANT, hm.FC1, hm.FC2_COMBINE, hm.FC2, hm.COMBINE, ds.FC1_SH,
-             ds.FC2_COMBINE_SH, ds.COMBINE_SH)
+    order = (hm.ROUTE_QUANT, hm.FC1, hm.FC2_COMBINE, hm.FC2, hm.COMBINE,
+             *[k["name"] for k in variant_kernels()],
+             ds.FC1_SH, ds.FC2_COMBINE_SH, ds.COMBINE_SH)
     out = []
     for lay in layouts:
         sh = {"sh_inter": ds.sh_inter_of(DS_MODEL, lay)}
@@ -89,6 +104,27 @@ def todo() -> list:
                 if case in per[k]:
                     out.append((k, case))
     return out
+
+
+def write_variant_rows(rows: list, benched: list) -> None:
+    """Merge one bench's body-variant selection rows into <ROOT>/configs/dsv41_moe_variant/
+    <platform>.json (the runner's / helion_kernels' format): rows of every benched bucket are
+    replaced by this bench's (a bucket where dequant won again loses its row), others stay."""
+    from suffix_hybrid.helion_kernels import nvfp4_moe as hm
+    path = _path("configs", hm.VARIANT_KERNEL, hk.platform() + ".json")
+    old = []
+    if os.path.isfile(path):
+        with open(path) as f:
+            old = json.load(f)
+    case_of = lambda r: r["key"] if isinstance(r["key"], dict) else json.loads(r["key"])
+    stale = {hk.case_key(c) for c in benched}
+    keep = [r for r in old if hk.case_key(case_of(r)) not in stale]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # by layout, then numerically by bucket
+    order = lambda r: (hk.case_key({k: v for k, v in case_of(r).items() if k != "numtokens"}),
+                       case_of(r).get("numtokens", 0))
+    with open(path, "w") as f:
+        json.dump(sorted(keep + rows, key=order), f, indent=1, sort_keys=True)
 
 
 def records() -> list:
@@ -311,6 +347,9 @@ def gate() -> int:
     from suffix_hybrid.kernels import nvfp4_moe as nm
     nm.bench(cases=((nm.DS_EP, nm.DS_MS),)
              + (((nm.DS_TP8, nm.DS_MS),) if os.environ.get("NVFP4_MOE_TP8_NOEP") == "1" else ()))
+    # the per-bucket body choice of THIS bench (dequant vs dot_scaled), shipped like a config
+    write_variant_rows(list(nm.VARIANT_ROWS), list(nm.VARIANT_BENCHED))
+    print("variant rows: " + json.dumps(nm.VARIANT_ROWS, sort_keys=True), file=sys.stderr)
     from suffix_hybrid.kernels import dsv41_moe_shared  # K4 of the fused shared expert
     try:  # its own verdict; a failure is printed loudly but must not re-run the routed bench forever
         dsv41_moe_shared.bench()

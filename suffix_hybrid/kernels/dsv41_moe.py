@@ -32,15 +32,29 @@ Layouts tuned and served (TP8 + expert parallel; config shapes per rank):
   TP8   384 experts, I = 2304 / 8 = 288           (kernel-only: the lab tunes it,
         the stock lane cannot serve it)
 Anything else carrying the clamp on an NVFP4 layer is a startup error naming the
-supported set: `refuse` returns the reason, nvfp4_moe._sfx_prepare raises it.
+supported set: `refuse` returns the reason, nvfp4_moe._sfx_prepare raises it. So is any
+backend but SUFFIX_HELION_NVFP4_MOE=helion (`backend_refusal`): V4.1 is oxide-free, nothing
+on its route imports `suffix_hybrid._native` or `suffix_hybrid.oxide_kernels`.
 """
 from __future__ import annotations
 
 HIDDEN, TOPK, LIMIT = 5120, 6, 10.0
 E_GLOBAL = 384
-# (E local, I per rank) -> layout name; E_global is always 384
-LAYOUTS = {(48, 2304): "EP8", (384, 288): "TP8-noEP"}
+# (E local, I per rank) -> (layout name, the EP size the layout needs); E_global is always 384
+LAYOUTS = {(48, 2304): ("EP8", 8), (384, 288): ("TP8-noEP", 1)}
 MAX_DECODE_M = 192  # 32 seqs x (1 + DSpark k 5)
+
+
+def backend_refusal(backend: str, env: str, gap: str | None) -> str | None:
+    """The DeepSeek-V4 route is oxide-free (owner direction): it runs on the Helion backend
+    only. `oxide` cannot serve this geometry at all (no swiglu clamp, E <= 256, I % 64: `gap`)
+    and `auto` would import the oxide family for a fallback that does not exist. None when
+    `backend` is helion."""
+    if backend == "helion":
+        return None
+    return (f"{env}={backend!r}: the DeepSeek-V4 route is oxide-free and runs on Helion only"
+            + (f" (the oxide kernel cannot serve {gap})" if gap else "")
+            + f"; set {env}=helion")
 
 
 def refuse(info: dict) -> str | None:
@@ -61,9 +75,9 @@ def refuse(info: dict) -> str | None:
         return f"{info.get('global_e')} routed experts != {E_GLOBAL}"
     if got not in LAYOUTS:
         return (f"layout E_local={got[0]} I={got[1]} not tuned; supported "
-                + ", ".join(f"{n} (E_local {e}, I {i})" for (e, i), n in LAYOUTS.items())
+                + ", ".join(f"{n} (E_local {e}, I {i})" for (e, i), (n, _) in LAYOUTS.items())
                 + " (TP8 + --enable-expert-parallel, or TP8 without EP)")
-    ep = info.get("ep", 1)
-    if (got == (48, 2304)) != (ep == 8):
-        return f"layout {LAYOUTS[got]} needs ep={8 if got == (48, 2304) else 1}, got ep={ep}"
+    name, want_ep = LAYOUTS[got]
+    if info.get("ep", 1) != want_ep:
+        return f"layout {name} needs ep={want_ep}, got ep={info.get('ep', 1)}"
     return None

@@ -47,7 +47,9 @@ back to the oxide op per M, helion makes a gap a load-time error, see
 from __future__ import annotations
 
 import functools
+import importlib
 import os
+import sys
 
 import torch
 
@@ -85,8 +87,11 @@ def buckets_for(limit) -> tuple:
 # Search-space bounds (K2; the lab lesson of ds_mla/fp8_moe: unbounded tiles time out
 # compiling or spill). Every tunable block size is registered with literal [min, max]
 # (powers of two) inside the bodies; tests/test_helion_nvfp4_moe.py reads them back from
-# the bound ConfigSpec. Rows per expert segment never exceed M <= 192, so a 16..64-row
-# dot tile covers decode (more rows loop). fc1: rows 16..64, 16-col N blocks 1..8
+# the bound ConfigSpec. Rows per expert segment (nm.expected_load: EP8 allgather dispatch
+# gives an expert M/64 rows, ~3 per HIT expert and <= ~10 for the heaviest at M=192; skewed
+# puts ~80 on the top expert, hot M): the 16-row minimum is the dot's M floor, mostly
+# padding on balanced loads, and the 64-row maximum only matters for the heavy tail (longer
+# segments loop). fc1: rows 16..64, 16-col N blocks 1..8
 # (16..128 cols), K = 8 * bkb elements per half-dot with bkb 2..8; largest live set
 # = 4 bf16 [128, 64] weight tiles + 2 f32 [64, 128] accumulators. fc2: rows 16..64,
 # H tile 16..256, bkb 2..8. fc2_combine: H tile 16..128, K blocks 1..16. combine: 1..16
@@ -416,35 +421,148 @@ def plan_name(mode: int) -> str:
     return "fused3" if int(mode) == 2 else "front4"
 
 
-def missing(case: dict, mode: int) -> list:
-    """Kernels of mode's plan with no shipped config for `case` ([] = Helion serves it)."""
-    return [k for k in PLANS[plan_name(mode)] if hk.config(k, case) is None]
+# ---------------------------------------------------------------------------
+# body variants per M bucket: the seam to the dot_scaled bodies (docs/dsv41-moe.md section 11)
+#
+# A VARIANT is a whole plan's worth of bodies (the inter-stage carriers differ: this module's
+# dequant bodies hand bf16-dequantized NVFP4 between stages, a dot_scaled plan hands packed
+# e2m1 + e4m3 block scales), so it is selected per M BUCKET, never per stage. Selection is
+# DATA: rows of the pseudo-kernel VARIANT_KERNEL in the shipped config table,
+#   configs/helion/dsv41_moe_variant/<platform>.json = [{"key": <lane_case>, "config": {"body": "dot_scaled"}}]
+# no row = "dequant". The lab writes the rows (the tuner gate's bench compares the variants per
+# bucket and prints/writes them); serving only reads them. A module serving a variant exports
+#   VARIANT PLANS BODIES run_plan KERNELS   (check_variant pins the shape of that contract)
+# and this module is the "dequant" one.
+# ---------------------------------------------------------------------------
+DEQUANT, DOT_SCALED = "dequant", "dot_scaled"
+VARIANT = DEQUANT  # this module is the "dequant" variant
+VARIANT_KERNEL = "dsv41_moe_variant"
+VARIANT_MODULES = {DOT_SCALED: "suffix_hybrid.helion_kernels.dsv41_moe_fp4mma"}
+_VARIANTS: dict = {}  # name -> module-like (imported lazily; tests / lanes may register)
+_KERNEL_KEYS = ("name", "body", "cases", "make", "reference", "check", "baseline")
+
+
+def check_variant(name: str, mod) -> None:
+    """Fail closed on a variant module that does not honour the seam (K5: refuse, never guess)."""
+    bad = []
+    if getattr(mod, "VARIANT", None) != name:
+        bad.append(f"VARIANT {getattr(mod, 'VARIANT', None)!r} != {name!r}")
+    plans = getattr(mod, "PLANS", None)
+    bodies = getattr(mod, "BODIES", None)
+    if not isinstance(plans, dict) or not plans or not set(plans) <= set(PLANS):
+        bad.append(f"PLANS must be a non-empty dict over {sorted(PLANS)}")
+    if not isinstance(bodies, dict):
+        bad.append("BODIES must be {kernel name: undecorated Helion body}")
+    if not callable(getattr(mod, "run_plan", None)):
+        bad.append("run_plan(kerns, plan, x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, "
+                   "out, a1_gscale, a2_gscale, act, id_base, limit) is missing")
+    if not bad:
+        for plan, names in plans.items():
+            for k in names:
+                if k not in bodies and k not in BODIES:
+                    bad.append(f"PLANS[{plan!r}] names {k!r}: no body in BODIES")
+        kerns = getattr(mod, "KERNELS", None)
+        if not isinstance(kerns, list) or not kerns:
+            bad.append("KERNELS (lab ABI list) is missing")
+        else:
+            for e in kerns:
+                lacking = [key for key in _KERNEL_KEYS if key not in e]
+                if lacking:
+                    bad.append(f"KERNELS entry {e.get('name')!r} lacks {lacking}")
+                elif e["name"] in BODIES:
+                    bad.append(f"KERNELS entry {e['name']!r} collides with a dequant kernel name")
+    if bad:
+        raise RuntimeError(f"{MARKER} body variant {name!r} breaks the seam: " + "; ".join(bad))
+
+
+def variant_module(name: str):
+    """The module-like that serves variant `name`."""
+    if name == DEQUANT:
+        return sys.modules[__name__]
+    mod = _VARIANTS.get(name)
+    if mod is None:
+        path = VARIANT_MODULES.get(name)
+        if path is None:
+            raise RuntimeError(f"{MARKER} unknown body variant {name!r} "
+                               f"(known: {[DEQUANT, *VARIANT_MODULES]})")
+        try:
+            mod = importlib.import_module(path)
+        except ModuleNotFoundError as exc:
+            if exc.name != path:
+                raise  # a missing dependency INSIDE the variant module is a real error
+            raise RuntimeError(f"{MARKER} body variant {name!r} is selected but {path} is not "
+                               "part of this build") from exc
+        check_variant(name, mod)
+        _VARIANTS[name] = mod
+    return mod
+
+
+def available_variants() -> tuple:
+    """(dequant, + every variant whose module is in this build): what the lab can compare."""
+    out = [DEQUANT]
+    for name in VARIANT_MODULES:
+        try:
+            variant_module(name)
+            out.append(name)
+        except RuntimeError as exc:
+            if "not part of this build" not in str(exc):
+                raise
+    return tuple(out)
+
+
+def variant_for(case: dict) -> str:
+    """The body variant a bucketed lane case runs: its row in the config table, else dequant."""
+    cfg = hk.config(VARIANT_KERNEL, case)
+    if cfg is None:
+        return DEQUANT
+    name = cfg.get("body")
+    if name != DEQUANT and name not in VARIANT_MODULES and name not in _VARIANTS:
+        raise RuntimeError(f"{MARKER} {VARIANT_KERNEL} row for {hk.case_key(case)} names body "
+                           f"{name!r} (known: {[DEQUANT, *VARIANT_MODULES, *_VARIANTS]})")
+    return name
+
+
+def plan_kernels(variant: str, plan: str) -> tuple:
+    """Kernel names of `plan` under `variant` (launch order)."""
+    names = variant_module(variant).PLANS.get(plan)
+    if names is None:
+        raise RuntimeError(f"{MARKER} body variant {variant!r} has no {plan!r} plan "
+                           f"(it serves {sorted(variant_module(variant).PLANS)})")
+    return tuple(names)
+
+
+def missing(case: dict, mode: int, variant: str | None = None) -> list:
+    """Kernels of mode's plan (under `variant`, default = the case's table row) with no shipped
+    config for `case` ([] = Helion serves it)."""
+    variant = variant_for(case) if variant is None else variant
+    return [k for k in plan_kernels(variant, plan_name(mode)) if hk.config(k, case) is None]
 
 
 def served_ms(backend: str, e_count: int, hdim: int, idim: int, topk: int, act: int,
               max_m: int, mode_for, limit: float | None = None,
               e_global: int | None = None) -> dict:
-    """{M: (bucket, plan)} for every M in 1..max_m that Helion serves under
-    `backend` (mode_for(M) = the lane's plan mode). helion: a gap is a
-    startup error naming every missing (M bucket, kernel); auto: gaps stay on
-    the oxide op; oxide: {}."""
+    """{M: (bucket, plan, variant)} for every M in 1..max_m that Helion serves under
+    `backend` (mode_for(M) = the lane's plan mode; variant = the bucket's table row). helion: a
+    gap is a startup error naming every missing (M bucket, variant, kernel); auto: gaps stay
+    on the oxide op; oxide: {}."""
     if backend == "oxide":
         return {}
     out, gaps = {}, {}
     for m in range(1, max_m + 1):
         case = lane_case(e_count, hdim, idim, topk, act, m, limit, e_global)
         mode = mode_for(m)
-        lack = missing(case, mode)
+        variant = variant_for(case)
+        lack = missing(case, mode, variant)
         if lack:
-            gaps.setdefault((case["numtokens"], plan_name(mode)), lack)
+            gaps.setdefault((case["numtokens"], plan_name(mode), variant), lack)
         else:
-            out[m] = (case["numtokens"], plan_name(mode))
+            out[m] = (case["numtokens"], plan_name(mode), variant)
     if gaps and backend == "helion":
         raise RuntimeError(
             f"{MARKER} {KNOB}=helion (or a layer only Helion can serve) but no tuned config on "
             f"{hk.platform()} for E={e_count}/{e_global or e_count} H={hdim} I={idim} "
             f"topk={topk} {ACT[int(act)]} limit={limit}: "
-            + "; ".join(f"M<={b} {p}: {', '.join(k)}" for (b, p), k in sorted(gaps.items()))
+            + "; ".join(f"M<={b} {p}/{v}: {', '.join(k)}" for (b, p, v), k in sorted(gaps.items()))
             + " (tune them in the autotune lab, ship configs/helion/<kernel>/<platform>.json)")
     return out
 
@@ -454,19 +572,21 @@ BODIES = {ROUTE_QUANT: nvfp4_moe_route_quant, FC1: nvfp4_moe_fc1, FC2: nvfp4_moe
 
 
 @functools.lru_cache(maxsize=None)
-def _kernels(case_key: str, plan: str, untuned_ok: bool = False):
-    """The plan's serving kernels for one bucketed case. untuned_ok (the
-    lane's standalone oracle / bench only, never serving): a kernel with no
-    shipped config runs Helion's default config instead of failing."""
+def _kernels(case_key: str, plan: str, untuned_ok: bool = False, variant: str = DEQUANT):
+    """The plan's serving kernels for one bucketed case under `variant`. untuned_ok (the
+    lane's standalone oracle / bench only, never serving): a kernel with no shipped config
+    runs Helion's default config instead of failing."""
     import json
     case = json.loads(case_key)
+    mod = variant_module(variant)
     out = []
-    for k in PLANS[plan]:
+    for k in plan_kernels(variant, plan):
+        body = mod.BODIES.get(k) or BODIES[k]
         if untuned_ok and hk.config(k, case) is None:
             hk.log(f"nvfp4-moe UNTUNED {k} {case_key}: Helion default config (bench/oracle only)")
-            out.append(helion.kernel(BODIES[k], autotune_effort="none", static_shapes=False))
+            out.append(helion.kernel(body, autotune_effort="none", static_shapes=False))
         else:
-            out.append(hk.compiled(BODIES[k], k, case))
+            out.append(hk.compiled(body, k, case))
     return out
 
 
@@ -486,13 +606,15 @@ def run_plan(kerns, plan, x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, o
 
 
 def serving_op(native, backend: str, limit: float | None = None, e_global: int | None = None,
-               untuned_ok: bool = False):
+               untuned_ok: bool = False, variant: str | None = None):
     """The oxide host op's signature (_native.nvfp4_moe_cuda) on Helion: per M
     the plan's kernels when all are tuned for bucket(M), else (auto) the oxide
-    op itself; helion fails closed. ws_* / tune / stream_ptr are the oxide
+    op itself; helion fails closed (native may then be None: the oxide-free
+    DeepSeek-V4 route never imports it). ws_* / tune / stream_ptr are the oxide
     op's (Helion runs on torch's current stream = the lane's stream). limit /
     e_global: the layer's swiglu clamp and global expert count (case keys).
-    untuned_ok: standalone oracle / bench only (see _kernels)."""
+    untuned_ok: standalone oracle / bench only (see _kernels). variant: force one body
+    variant (the lab's bench compares them); None = each bucket's table row."""
 
     def op(x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter,
            ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, id_base, mode,
@@ -502,18 +624,22 @@ def serving_op(native, backend: str, limit: float | None = None, e_global: int |
         plan = plan_name(mode)
         # ponytail: per-call config lookup (json key, dict get); free under CUDA
         # graphs, ~us per layer eager — memoize per (case, mode) if eager decode matters
-        lack = [] if untuned_ok else missing(case, mode)
+        body = variant or variant_for(case)
+        lack = [] if untuned_ok else missing(case, mode, body)
         if lack:
             if backend == "helion":
                 raise RuntimeError(f"{MARKER} {KNOB}=helion: no tuned {lack} for "
                                    f"{hk.case_key(case)} (load-time check missed it)")
+            if native is None:
+                raise RuntimeError(f"{MARKER} no tuned {lack} for {hk.case_key(case)} and no oxide "
+                                   "kernel to fall back to on this (oxide-free) route")
             return native.nvfp4_moe_cuda(x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2,
                                          ws_aq, ws_asf, ws_inter, ws_hq, ws_hsf, ws_y, ws_route,
                                          out, a1_gscale, a2_gscale, act, id_base, mode, tune,
                                          stream_ptr)
-        return run_plan(_kernels(hk.case_key(case), plan, untuned_ok), plan, x, topk_ids, topk_w,
-                        w13, w13_sf, g1, w2, w2_sf, g2, out, a1_gscale, a2_gscale, act, id_base,
-                        limit)
+        return variant_module(body).run_plan(
+            _kernels(hk.case_key(case), plan, untuned_ok, body), plan, x, topk_ids, topk_w, w13,
+            w13_sf, g1, w2, w2_sf, g2, out, a1_gscale, a2_gscale, act, id_base, limit)
 
     op.backend = backend
     return op
