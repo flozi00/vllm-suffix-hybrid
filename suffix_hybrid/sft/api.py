@@ -548,7 +548,7 @@ async def diag_route(request):
     mask = [0] + [1] * (len(ids) - 1)
     served = await _S.served_nll(ids, mask)
     r = await _S.rpc("diag", dict(ids=ids, mask=mask, seg_lens=[len(ids)], variants=body["variants"]))
-    return dict(tokens=len(ids) - 1, served=served, **{k: v for k, v in r.items() if k != "ms"})
+    return dict(served=served, **{k: v for k, v in r.items() if k != "ms"})
 
 
 class SftEndpointPlugin:
