@@ -36,9 +36,13 @@ Any op this list misses (a fused kernel writing into a preallocated buffer)
 silently cuts the gradient; ``grad_reach`` detects it on the first micro-step
 of every run and the run is refused.
 
+  short conv  -> LFM2 ShortConv: B*x, depthwise causal conv per segment, C*,
+                 out_proj (zero conv state at every segment)
+  MoE block   -> router twin (softmax or sigmoid, selection-only bias,
+                 renormalize, routed scaling) + frozen routed experts
 Unsupported (refused at install, serving untouched): pipeline parallel,
-MoE / routed experts, MLA, attention logit soft-capping, non-GDN mamba
-layers, encoder-only attention.
+MLA, multi-group routing, attention logit soft-capping, non-GDN/short-conv
+mamba layers, encoder-only attention.
 """
 from __future__ import annotations
 

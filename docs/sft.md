@@ -81,9 +81,13 @@ rollback survives restarts.
 ## Support
 
 Dense attention + Qwen GDN hybrids (Qwen3.5 / qwen-fable), Gemma-4 dense
-(sliding + full attention, KV sharing), any TP. Refused with a logged reason,
-serving untouched: MoE, MLA, pipeline parallel, soft-capped attention, other
-recurrent layers. Vision towers are not trained and keep working.
+(sliding + full attention, KV sharing), LFM2-MoE (short-conv + GQA layers,
+sigmoid + expert-bias routing; adapters on attention, short-conv and dense-MLP
+linears, routed experts and router stay frozen), Qwen4Exp (frozen NVFP4
+experts), any TP. Refused with a logged reason, serving untouched: MLA,
+grouped routing with more than one group, pipeline parallel, soft-capped
+attention, other recurrent layers. Vision towers are not trained and keep
+working.
 
 ## Measured on silicon (qwen3.8-27b-fable NVFP4, 1x RTX PRO 6000, v0.30.0, 2026-10-11)
 

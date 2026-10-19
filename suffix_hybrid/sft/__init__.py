@@ -53,9 +53,10 @@ Env (all optional)
   SUFFIX_SFT_RPC_TIMEOUT_S=600
 
 Supported: dense attention + GDN hybrids (Qwen3.5 / qwen-fable, Qwen3-Next
-dense), Gemma-4 dense (sliding + full, KV sharing), TP >= 1. Refused at
-install with a logged reason (serving unaffected): MoE, MLA, PP,
-soft-capped attention, other recurrent layers. Vision towers are never
+dense), Gemma-4 dense (sliding + full, KV sharing), LFM2-MoE (short-conv, FP8
+experts frozen, sigmoid + bias router), Qwen4Exp, TP >= 1. Refused at
+install with a logged reason (serving unaffected): MLA, multi-group routing,
+PP, soft-capped attention, other recurrent layers. Vision towers are never
 touched (text-only SFT; image inputs keep working).
 
 Risks / not proven on silicon (CPU tests: tests/test_sft.py)
