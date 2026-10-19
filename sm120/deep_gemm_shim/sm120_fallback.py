@@ -6,16 +6,20 @@ DeepGEMM, matching the wrapper contract of ``vllm/utils/deep_gemm.py``
 (vLLM 0.30) for the FP8 path:
 
 ``fp8_fp4_mqa_logits(q=(qv, None), kv=(kv, k_scale), weights, ks, ke,
-clean_logits)``
+max_seqlen_k)`` (vLLM nightly >= #61149, 2026-10-12) or ``..., ks, ke,
+clean_logits=bool)`` (vLLM <= 0.31)
     qv  [M, H, D] float8_e4m3fn, kv [N, D] float8_e4m3fn, k_scale [N] fp32,
     weights [M, H] fp32 (the Q scale, softmax_scale and head_scale are all
     folded in upstream by ``fused_indexer_q_rope_quant``), ks/ke [M] int32
-    per-row KV window. Returns [M, N] fp32 with
-    ``logits[m, n] = sum_h relu(dot(q[m, h], kv[n])) * weights[m, h] *
-    k_scale[n]``; with ``clean_logits=True`` columns outside ``[ks[m],
-    ke[m])`` are forced to ``-inf`` (when False the real kernel leaves them
-    undefined — we write the unmasked score, a safe superset: every
-    consumer restricts its read range to the window).
+    per-row KV window, ``logits[m, n] = sum_h relu(dot(q[m, h], kv[n])) *
+    weights[m, h] * k_scale[n]``.
+    An int 6th argument = the new contract: COMPRESSED [M, max_seqlen_k],
+    row m holds K positions [ks[m], ke[m]) from column 0, the tail is not
+    cleaned. A bool (or ``clean_logits=``) = the old one: absolute [M, N];
+    with ``clean_logits=True`` columns outside ``[ks[m], ke[m])`` are forced
+    to ``-inf`` (when False the real kernel leaves them undefined — we write
+    the unmasked score, a safe superset: every consumer restricts its read
+    range to the window).
 
 ``fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables,
 schedule_metadata, max_model_len, clean_logits, indices)``
@@ -75,6 +79,8 @@ def _mqa_logits_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CLEAN: tl.constexpr,
+    COMPRESSED: tl.constexpr,
+    W,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -83,6 +89,12 @@ def _mqa_logits_kernel(
     offs_d = tl.arange(0, D)
     m_ok = offs_m < M
     n_ok = offs_n < N
+    if COMPRESSED:
+        # K tiles no row of this block reads (other requests of a packed
+        # chunk) load nothing (masked); their dots run on zeros.
+        ks = tl.load(ks_ptr + offs_m, mask=m_ok, other=2147483647)
+        ke = tl.load(ke_ptr + offs_m, mask=m_ok, other=0)
+        n_ok = n_ok & (offs_n < tl.max(ke, 0)) & (offs_n >= tl.min(ks, 0))
 
     # K tile: [BLOCK_N, D] fp8 -> bf16 (exact); scales: [BLOCK_N] fp32.
     kv = tl.load(kv_ptr + offs_n[:, None] * stride_kn + offs_d[None, :],
@@ -101,15 +113,36 @@ def _mqa_logits_kernel(
         acc += tl.maximum(dot, 0.0) * w[:, None]
 
     logits = acc * k_scale[None, :]
-    if CLEAN:
-        ks = tl.load(ks_ptr + offs_m, mask=m_ok, other=0)
-        ke = tl.load(ke_ptr + offs_m, mask=m_ok, other=0)
-        in_window = (offs_n[None, :] >= ks[:, None]) & \
-                    (offs_n[None, :] < ke[:, None])
-        logits = tl.where(in_window, logits, float("-inf"))
+    if COMPRESSED:
+        col = offs_n[None, :] - ks[:, None]
+        keep = m_ok[:, None] & n_ok[None, :] & (offs_n[None, :] < ke[:, None]) \
+            & (col >= 0) & (col < W)
+        tl.store(out_ptr + offs_m[:, None].to(tl.int64) * stride_om + col, logits, mask=keep)
+    else:
+        if CLEAN:
+            ks = tl.load(ks_ptr + offs_m, mask=m_ok, other=0)
+            ke = tl.load(ke_ptr + offs_m, mask=m_ok, other=0)
+            in_window = (offs_n[None, :] >= ks[:, None]) & \
+                        (offs_n[None, :] < ke[:, None])
+            logits = tl.where(in_window, logits, float("-inf"))
+        tl.store(out_ptr + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :], logits,
+                 mask=m_ok[:, None] & n_ok[None, :])
 
-    tl.store(out_ptr + offs_m[:, None] * stride_om + offs_n[None, :], logits,
-             mask=m_ok[:, None] & n_ok[None, :])
+
+def mqa_contract(max_seqlen_k, clean_logits):
+    """(compressed width or None, clean) of an fp8_fp4_mqa_logits call: an int
+    6th argument is vLLM nightly's max_seqlen_k (compressed output), a bool
+    the old clean_logits (absolute output). Anything else fails closed."""
+    if isinstance(max_seqlen_k, bool):
+        return None, max_seqlen_k or bool(clean_logits)
+    if max_seqlen_k is None:
+        return None, bool(clean_logits)
+    if not isinstance(max_seqlen_k, int) or max_seqlen_k < 0:
+        raise TypeError(
+            f"sm120 mqa logits: 6th argument {max_seqlen_k!r} is neither "
+            "vLLM's max_seqlen_k (int) nor clean_logits (bool): DeepGEMM "
+            "contract drift, refusing to guess the output layout")
+    return int(max_seqlen_k), False
 
 
 def fp8_fp4_mqa_logits(
@@ -118,9 +151,11 @@ def fp8_fp4_mqa_logits(
     weights: torch.Tensor,
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
+    max_seqlen_k=None,
     clean_logits: bool = False,
 ) -> torch.Tensor:
     """Triton stand-in for deep_gemm.fp8_fp4_mqa_logits (FP8 path only)."""
+    width, clean_logits = mqa_contract(max_seqlen_k, clean_logits)
     qv, q_scale = q
     kv_v, kv_scale = kv
     if q_scale is not None:
@@ -149,12 +184,13 @@ def fp8_fp4_mqa_logits(
             f"sm120 mqa logits: weights must be fp32 [M={M}, H={H}], got "
             f"{tuple(weights.shape)}/{weights.dtype}"
         )
-    if M == 0 or N == 0:
-        return torch.empty((M, N), dtype=torch.float32, device=qv.device)
+    out_w = N if width is None else width
+    if M == 0 or N == 0 or out_w == 0:
+        return torch.empty((M, out_w), dtype=torch.float32, device=qv.device)
     if D != triton.next_power_of_2(D) or H != triton.next_power_of_2(H):
         _bad_dim(max(D, H))
 
-    logits = torch.empty((M, N), dtype=torch.float32, device=qv.device)
+    logits = torch.empty((M, out_w), dtype=torch.float32, device=qv.device)
     BLOCK_M, BLOCK_N = 16, 128
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _mqa_logits_kernel[grid](
@@ -165,7 +201,7 @@ def fp8_fp4_mqa_logits(
         weights.stride(0),
         logits.stride(0),
         H=H, D=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        CLEAN=bool(clean_logits),
+        CLEAN=bool(clean_logits), COMPRESSED=width is not None, W=out_w,
         num_warps=4,
     )
     return logits
