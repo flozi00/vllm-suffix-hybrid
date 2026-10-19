@@ -181,8 +181,9 @@ def test_semaphore_bodies_are_listed_only_under_the_knob():
     code = ("import sys; sys.path.insert(0, '.'); "
             "from suffix_hybrid.helion_kernels import mxfp8_gemm as hx; "
             "print([k['name'] for k in hx.KERNELS])")
-    env = {**os.environ, "HELION_INTERPRET": "1"}
-    env.pop(hx.SEM_ENV, None)
+    # No SUFFIX_* from other tests (a leaked SUFFIX_HYBRID_WRAP=1 arms sitecustomize's wrap).
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SUFFIX_")}
+    env["HELION_INTERPRET"] = "1"
     base = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
     assert base.stdout.strip() == str([hx.A16, hx.A8]), base.stderr[-400:]
     on = subprocess.run([sys.executable, "-c", code], env={**env, hx.SEM_ENV: "1"},

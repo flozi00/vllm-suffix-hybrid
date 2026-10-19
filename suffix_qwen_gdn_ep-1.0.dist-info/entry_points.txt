@@ -5,3 +5,4 @@ suffix_nvfp4_moe = suffix_hybrid.kernels.nvfp4_moe:register
 suffix_fp8_moe = suffix_hybrid.kernels.fp8_moe:register
 suffix_nvfp4_lm_head = suffix_hybrid.kernels.nvfp4_lm_head:register
 suffix_mxfp4_lm_head = suffix_hybrid.kernels.mxfp4_lm_head:register
+suffix_mxfp8_gemm = suffix_hybrid.kernels.mxfp8_linear:register

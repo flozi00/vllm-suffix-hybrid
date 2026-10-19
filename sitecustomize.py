@@ -311,6 +311,14 @@ if os.environ.get("SUFFIX_DSV41_ENGRAM_MXFP4", "").strip() == "1":
 if os.environ.get("SUFFIX_DSV41_SM120_BLOCK64", "").strip() == "1":
     from suffix_hybrid.dsv41_block64 import install_post_import_hook as _dsv41_b64_hook
     _dsv41_b64_hook()
+# DeepSeek-V4.1 Helion kernels (all off by default; with the flags unset behaviour is the previous plugin's).
+# Sparse-MLA decode attention (docs/dsv41-attn.md) and the small-kernel fusions (docs/dsv41-fuse.md).
+if os.environ.get("SUFFIX_HELION_DSV41_ATTN", "oxide").strip().lower() not in ("", "oxide"):
+    from suffix_hybrid.kernels.dsv41_attn import install_post_import_hook as _dsv41_attn_hook
+    _dsv41_attn_hook()
+if os.environ.get("SUFFIX_DSV41_FUSE", "").strip() == "1":
+    from suffix_hybrid.kernels.dsv41_fuse_hook import install_post_import_hook as _dsv41_fuse_hook
+    _dsv41_fuse_hook()
 
 # Hybrid speculator wrap AFTER every sm120 meta_path hook is armed: install_v2
 # imports the V2 model runner, which imports the sparse-MLA backends
@@ -638,6 +646,24 @@ _BOOT_GATES = {
     # dispatch tensors in one group) / all-reduce and the host all-reduce at the padded DP8 token counts
     # 48 / 96 / 192, one TP8 layer (2 host all-reduces) vs one DP8 layer (RS + AG). Lines: [suffix comm-layout].
     "dp_ag_rs_bench_dsv41": (["-m", "suffix_hybrid.comm_layout", "bench"], {}),
+    # DeepSeek-V4.1 Helion lanes: CUDA-graph capture/replay gates (capture on a side stream, replay with
+    # changing inputs, bit-exact vs eager; also runnable under compute-sanitizer) and the K4 benches vs the
+    # stock kernels. docs/dsv41-{dense,moe,indexer,attn,fuse}.md. Evidence only, never blocks serving.
+    "mxfp8_capture_replay": (["-m", "suffix_hybrid.kernels.mxfp8_linear", "capture_replay"], {}),
+    "mxfp8_capture_replay_sem": (["-m", "suffix_hybrid.kernels.mxfp8_linear", "capture_replay",
+                                  "--variant", "semaphore"], {"SUFFIX_MXFP8_GEMM_SEMAPHORE": "1"}),
+    "moe_capture_replay": (["-m", "suffix_hybrid.kernels.dsv41_moe_shared", "moe_capture_replay"], {}),
+    "dsv41_moe_shared_bench": (["-m", "suffix_hybrid.kernels.dsv41_moe_shared", "bench"], {}),
+    "dsa_indexer_capture_replay": (["-m", "suffix_hybrid.kernels.dsa_indexer", "capture_replay",
+                                    "--quick"], {}),
+    "dsv41_attn_capture_replay": (["-m", "suffix_hybrid.kernels.dsv41_attn_capture"], {}),
+    "dsv41_hc_capture_replay": (["-m", "suffix_hybrid.helion_kernels.dsv41_hc", "capture_replay"], {}),
+    "dsv41_router_capture_replay": (["-m", "suffix_hybrid.helion_kernels.dsv41_router",
+                                     "capture_replay"], {}),
+    "dsv41_swiglu_capture_replay": (["-m", "suffix_hybrid.helion_kernels.dsv41_swiglu",
+                                     "capture_replay"], {}),
+    "dsv41_engram_capture_replay": (["-m", "suffix_hybrid.helion_kernels.dsv41_engram",
+                                     "capture_replay"], {}),
     # GLM-5.3 routed MoE per rank, one GPU, cold L2: EP8's busiest rank vs TP8 (no EP) at decode
     # M 1..192 for FlashInfer CUTLASS, our NVFP4 kernel and FlashInfer b12x; numerics vs f64; the
     # TP tune table. Lines: [suffix moe-tp].

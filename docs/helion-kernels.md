@@ -23,6 +23,7 @@ suffix_hybrid/configs/helion/<kernel>/<platform>.json   tuned WINS from the auto
 | dsa_indexer | kernels-oxide/dsa_indexer | kernels/dsa_indexer.py | `SUFFIX_HELION_DSA_INDEXER` |
 | ds_mla | kernels-oxide/nvfp4_ds_mla | sm120/nvfp4_ds_mla_patch/ | `SUFFIX_HELION_DS_MLA` |
 | kgdn1 | kernels-oxide/kgdn1 | kernels/qwen_gdn.py | `SUFFIX_HELION_KGDN1` |
+| dsv41_attn_{partial,row} | none (FlashInfer SM120 sparse MLA is the baseline) | kernels/dsv41_attn.py | `SUFFIX_HELION_DSV41_ATTN` |
 
 Every knob is `helion_kernels.backend(env)`:
 

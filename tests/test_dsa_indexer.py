@@ -594,7 +594,8 @@ bad = [m for m in sys.modules if m.startswith("suffix_hybrid.helion_kernels.dsa_
 assert not bad, bad
 print("OK")
 """
-    env = {k: v for k, v in os.environ.items() if k != di.HELION_ENV}
+    # No SUFFIX_* from other tests (a leaked SUFFIX_HYBRID_WRAP=1 arms sitecustomize's wrap).
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SUFFIX_")}
     env["PYTHONPATH"] = str(ROOT)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=str(ROOT))
     assert out.returncode == 0 and out.stdout.strip().endswith("OK"), out.stderr[-800:]
