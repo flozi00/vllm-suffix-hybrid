@@ -47,6 +47,7 @@ back to the oxide op per M, helion makes a gap a load-time error, see
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 
@@ -66,6 +67,32 @@ MARKER = "[suffix helion nvfp4-moe]"
 # serves above). GLM MTP verify rows: 6 per sequence, up to MAX_M 192.
 BUCKETS = (1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192)
 ACT = {0: "silu", 1: "gelu_tanh"}  # nvfp4_moe.ACT_CODE inverted
+NO_CLAMP = 3.0e38  # fc1 `limit` of an unclamped layer (identity on finite values)
+# DeepSeek-V4 (DeepseekV4*/V41*: swiglu_limit 10, the lab's model dims do not
+# carry it) serves TP8 here: cases() emits both rank layouts of that TP.
+DS_LIMIT, DS_TP = 10.0, 8
+# DS layers have no oxide fallback (clamp, E 384, I 288): the lane's tune
+# table picks fused3 up to M 8, front4 above; the lab tunes each plan's own
+# kernels a bucket past that split (6..16 overlap) so the split is measured.
+FUSED3_MAX, FRONT4_MIN = 16, 6
+# Clamped (Helion-only) layers tune fewer buckets: one config serves its
+# whole bucket (dynamic shapes), DSpark verifies 6 tokens per sequence.
+CLAMP_BUCKETS = (1, 6, 8, 16, 32, 64, 128, 192)
+
+
+def buckets_for(limit) -> tuple:
+    return BUCKETS if limit is None else CLAMP_BUCKETS
+# Search-space bounds (K2; the lab lesson of ds_mla/fp8_moe: unbounded tiles time out
+# compiling or spill). Every tunable block size is registered with literal [min, max]
+# (powers of two) inside the bodies; tests/test_helion_nvfp4_moe.py reads them back from
+# the bound ConfigSpec. Rows per expert segment never exceed M <= 192, so a 16..64-row
+# dot tile covers decode (more rows loop). fc1: rows 16..64, 16-col N blocks 1..8
+# (16..128 cols), K = 8 * bkb elements per half-dot with bkb 2..8; largest live set
+# = 4 bf16 [128, 64] weight tiles + 2 f32 [64, 128] accumulators. fc2: rows 16..64,
+# H tile 16..256, bkb 2..8. fc2_combine: H tile 16..128, K blocks 1..16. combine: 1..16
+# tokens x 16..512 cols. route_quant: 16..64 x 16..128 pair tiles (O(P^2) compare),
+# 1..8 tokens x 1..64 16-col blocks. An over-budget config fails to compile and the
+# autotuner drops it; none ships unvalidated.
 ROUTE_QUANT, FC1, FC2, COMBINE, FC2_COMBINE = (
     "nvfp4_moe_route_quant", "nvfp4_moe_fc1", "nvfp4_moe_fc2", "nvfp4_moe_combine",
     "nvfp4_moe_fc2_combine")
@@ -91,13 +118,17 @@ def nvfp4_moe_route_quant(x: torch.Tensor, topk_ids: torch.Tensor, g: float, g6:
     pair_sorted = torch.empty([pairs + 1], dtype=torch.int32, device=x.device)
     seg = torch.empty([pairs + 1], dtype=torch.int32, device=x.device)
     seg_e = torch.empty([pairs + 1], dtype=torch.int32, device=x.device)
-    for tile_p in hl.tile(pairs):
+    bp = hl.register_block_size(16, 64)
+    bq = hl.register_block_size(16, 128)
+    bm = hl.register_block_size(1, 8)
+    bb = hl.register_block_size(1, 64)
+    for tile_p in hl.tile(pairs, block_size=bp):
         kp = ids[tile_p].to(torch.int32) - id_base
         kp = torch.where((kp >= 0) & (kp < e_count), kp, e_count)
         pos = hl.zeros([tile_p], dtype=torch.int32)
         before = hl.zeros([tile_p], dtype=torch.int32)
         same = hl.zeros([tile_p], dtype=torch.int32)
-        for tile_q in hl.tile(pairs):
+        for tile_q in hl.tile(pairs, block_size=bq):
             kq = ids[tile_q].to(torch.int32) - id_base
             kq = torch.where((kq >= 0) & (kq < e_count), kq, e_count)
             kq = torch.where(tile_q.index < pairs, kq, e_count + 1)  # tail lanes rank nothing
@@ -111,7 +142,7 @@ def nvfp4_moe_route_quant(x: torch.Tensor, topk_ids: torch.Tensor, g: float, g6:
         pair_sorted[dst] = tile_p.index
         seg[dst] = torch.where((before == 0) & (kp < e_count), same, 0)
         seg_e[dst] = kp
-    for tile_m, tile_b in hl.tile([m, hdim // 16]):
+    for tile_m, tile_b in hl.tile([m, hdim // 16], block_size=[bm, bb]):
         v = x3[tile_m, tile_b, :].to(torch.float32)
         amax = torch.amax(torch.abs(v), dim=-1)
         sf = torch.clamp(amax * g6, max=448.0).to(torch.float8_e4m3fn).to(torch.float32)
@@ -132,10 +163,12 @@ def nvfp4_moe_route_quant(x: torch.Tensor, topk_ids: torch.Tensor, g: float, g6:
 
 def nvfp4_moe_fc1(xdq: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tensor,
                   seg_e: torch.Tensor, w13: torch.Tensor, w13_sf: torch.Tensor,
-                  g1: torch.Tensor, a2g: float, a2g6: float, act: int, topk: int):
-    """h bf16 [P+1, I]: NVFP4-dequantized act(g1*gate) * g1*up per routed pair
-    (rows of off-rank pairs unwritten, row P = trash). Grid (sorted position,
-    blocks of 16 I-columns: whole NVFP4 blocks for the requant)."""
+                  g1: torch.Tensor, a2g: float, a2g6: float, act: int, topk: int,
+                  limit: float):
+    """h bf16 [P+1, I]: NVFP4-dequantized act(min(g1*gate, limit)) *
+    clamp(g1*up, -limit, limit) per routed pair (vLLM's swiglu clamp; NO_CLAMP
+    = none), rows of off-rank pairs unwritten, row P = trash. Grid (sorted
+    position, blocks of 16 I-columns: whole NVFP4 blocks for the requant)."""
     m, hdim = xdq.size()
     e_count, two_i, kh = w13.size()
     idim = two_i // 2
@@ -149,23 +182,27 @@ def nvfp4_moe_fc1(xdq: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tenso
     sf = w13_sf.view(-1)
     h = torch.empty([pairs + 1, idim], dtype=torch.bfloat16, device=xdq.device)
     h3 = h.view(pairs + 1, nb, 16)
-    bkb = hl.register_block_size(2, nkb)  # dot K = 8 * bkb >= 16
-    for tile_s, tile_b in hl.tile([pairs, nb], block_size=[1, None]):
+    bkb = hl.register_block_size(2, min(8, nkb))  # dot K = 8 * bkb >= 16
+    brow = hl.register_block_size(16, 64)
+    bcol = hl.register_block_size(1, min(8, nb))
+    for tile_s, tile_b in hl.tile([pairs, nb], block_size=[1, bcol]):
         s = tile_s.begin
         cnt = seg[s]
         e = torch.clamp(seg_e[s], max=e_count - 1)
         alpha = g1[e]
         col = torch.clamp(tile_b.index[:, None] * 16 + hl.arange(16)[None, :], max=idim - 1)
         colg = col + idim
-        rb_u = tile_b.index + 2 * e * nb  # 1-D expert row blocks: no 0-d tensor index
+        rb_u = torch.clamp(tile_b.index, max=nb - 1) + 2 * e * nb  # 1-D expert row blocks (tail-safe)
         rb_g = rb_u + nb
         su_row = (e * estride + (col // 128) * (cp // 4) * 512 + (col % 32) * 16
                   + ((col // 32) % 4) * 4)
         sg_row = (e * estride + (colg // 128) * (cp // 4) * 512 + (colg % 32) * 16
                   + ((colg // 32) % 4) * 4)
-        for tile_r in hl.tile(0, cnt):
-            pair = pair_sorted[s + tile_r.index]
-            tok = pair // topk
+        for tile_r in hl.tile(0, cnt, block_size=brow):
+            # lanes past the segment read the next segment's entries (or the trash slot):
+            # clamp so every gather below stays inside the arrays (their stores go to row P)
+            pair = pair_sorted[torch.clamp(s + tile_r.index, max=pairs)]
+            tok = torch.clamp(pair, max=pairs - 1) // topk
             acc_u = hl.zeros([tile_r, tile_b, 16], dtype=torch.float32)
             acc_u = acc_u.reshape(acc_u.size(0), -1)
             acc_g = hl.zeros([tile_r, tile_b, 16], dtype=torch.float32)
@@ -202,8 +239,8 @@ def nvfp4_moe_fc1(xdq: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tenso
                 acc_u = hl.dot(a_hi, wu_hi.T, acc=acc_u)
                 acc_g = hl.dot(a_lo, wg_lo.T, acc=acc_g)
                 acc_g = hl.dot(a_hi, wg_hi.T, acc=acc_g)
-            gate = alpha * acc_g
-            up = alpha * acc_u
+            gate = torch.clamp(alpha * acc_g, max=limit)
+            up = torch.clamp(alpha * acc_u, min=-limit, max=limit)
             # act: silu (0) | gelu_tanh (1) = x * sigmoid(2u) (oxide `act`); exact blend
             z = (1.5957691216057308 * (gate + 0.044715 * gate * gate * gate)) * act \
                 + gate * (1 - act)
@@ -240,18 +277,20 @@ def nvfp4_moe_fc2(h: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tensor,
     tw = topk_w.view(-1)
     sf = w2_sf.view(-1)
     y = torch.empty([pairs + 1, hdim], dtype=torch.float32, device=h.device)
-    bkb = hl.register_block_size(2, nkb)
-    for tile_s, tile_h in hl.tile([pairs, hdim], block_size=[1, None]):
+    bkb = hl.register_block_size(2, min(8, nkb))
+    brow = hl.register_block_size(16, 64)
+    bh = hl.register_block_size(16, 256)
+    for tile_s, tile_h in hl.tile([pairs, hdim], block_size=[1, bh]):
         s = tile_s.begin
         cnt = seg[s]
         e = torch.clamp(seg_e[s], max=e_count - 1)
         alpha = g2[e]
-        rows = tile_h.index + e * hdim
         row = torch.clamp(tile_h.index, max=hdim - 1)
+        rows = row + e * hdim
         s_row = (e * estride + (row // 128) * (cp // 4) * 512 + (row % 32) * 16
                  + ((row // 32) % 4) * 4)
-        for tile_r in hl.tile(0, cnt):
-            pair = pair_sorted[s + tile_r.index]
+        for tile_r in hl.tile(0, cnt, block_size=brow):
+            pair = torch.clamp(pair_sorted[torch.clamp(s + tile_r.index, max=pairs)], max=pairs - 1)
             acc = hl.zeros([tile_r, tile_h], dtype=torch.float32)
             for tile_k in hl.tile(nkb, block_size=bkb):
                 a_lo = h4[pair, tile_k, :, 0]
@@ -283,7 +322,9 @@ def nvfp4_moe_combine(y: torch.Tensor, topk_ids: torch.Tensor, id_base: int, e_c
     m, topk = topk_ids.size()
     hdim = out.size(1)
     ids = topk_ids.view(-1)
-    for tile_t, tile_h in hl.tile([m, hdim]):
+    bt = hl.register_block_size(1, 16)
+    bh = hl.register_block_size(16, 512)
+    for tile_t, tile_h in hl.tile([m, hdim], block_size=[bt, bh]):
         acc = hl.zeros([tile_t, tile_h], dtype=torch.float32)
         tok = torch.clamp(tile_t.index, max=m - 1)
         for k in hl.grid(topk):
@@ -311,7 +352,9 @@ def nvfp4_moe_fc2_combine(h: torch.Tensor, topk_ids: torch.Tensor, topk_w: torch
     h4 = h.view(h.size(0), nkb, 8, 2)
     w3 = w2.view(e_count * hdim, nkb, 8)
     sf = w2_sf.view(-1)
-    for tile_t, tile_h in hl.tile([m, hdim], block_size=[1, None]):
+    bh = hl.register_block_size(16, 128)
+    bk = hl.register_block_size(1, min(16, nkb))
+    for tile_t, tile_h in hl.tile([m, hdim], block_size=[1, bh]):
         t = tile_t.begin
         row = torch.clamp(tile_h.index, max=hdim - 1)
         s_row = (row // 128) * (cp // 4) * 512 + (row % 32) * 16 + ((row // 32) % 4) * 4
@@ -321,8 +364,8 @@ def nvfp4_moe_fc2_combine(h: torch.Tensor, topk_ids: torch.Tensor, topk_w: torch
             loc = ids[p].to(torch.int32) - id_base
             if (loc >= 0) & (loc < e_count):
                 acc = hl.zeros([tile_h], dtype=torch.float32)
-                rows = tile_h.index + loc * hdim
-                for tile_k in hl.tile(nkb):
+                rows = row + loc * hdim
+                for tile_k in hl.tile(nkb, block_size=bk):
                     a_lo = h4[p, tile_k, :, 0].to(torch.float32)
                     a_hi = h4[p, tile_k, :, 1].to(torch.float32)
                     kb = torch.clamp(tile_k.index, max=nkb - 1)
@@ -356,10 +399,17 @@ def _div6(g: float) -> float:
     return float(np.float32(g) / np.float32(6.0))
 
 
-def lane_case(e_count: int, hdim: int, idim: int, topk: int, act: int, m: int) -> dict:
-    """The tuned case a serving call of M tokens runs as (lab `cases` keys)."""
-    return {"experts": int(e_count), "hidden": int(hdim), "moe_intermediate": int(idim),
-            "topk": int(topk), "act": ACT[int(act)], "numtokens": hk.bucket(m, BUCKETS)}
+def lane_case(e_count: int, hdim: int, idim: int, topk: int, act: int, m: int,
+              limit: float | None = None, e_global: int | None = None) -> dict:
+    """The tuned case a serving call of M tokens runs as (lab `cases` keys;
+    `limit` only on clamped layers, `experts_global` only under EP)."""
+    case = {"experts": int(e_count), "hidden": int(hdim), "moe_intermediate": int(idim),
+            "topk": int(topk), "act": ACT[int(act)], "numtokens": hk.bucket(m, buckets_for(limit))}
+    if limit is not None:
+        case["limit"] = float(limit)
+    if e_global is not None and int(e_global) != int(e_count):
+        case["experts_global"] = int(e_global)
+    return case
 
 
 def plan_name(mode: int) -> str:
@@ -372,7 +422,8 @@ def missing(case: dict, mode: int) -> list:
 
 
 def served_ms(backend: str, e_count: int, hdim: int, idim: int, topk: int, act: int,
-              max_m: int, mode_for) -> dict:
+              max_m: int, mode_for, limit: float | None = None,
+              e_global: int | None = None) -> dict:
     """{M: (bucket, plan)} for every M in 1..max_m that Helion serves under
     `backend` (mode_for(M) = the lane's plan mode). helion: a gap is a
     startup error naming every missing (M bucket, kernel); auto: gaps stay on
@@ -381,7 +432,7 @@ def served_ms(backend: str, e_count: int, hdim: int, idim: int, topk: int, act: 
         return {}
     out, gaps = {}, {}
     for m in range(1, max_m + 1):
-        case = lane_case(e_count, hdim, idim, topk, act, m)
+        case = lane_case(e_count, hdim, idim, topk, act, m, limit, e_global)
         mode = mode_for(m)
         lack = missing(case, mode)
         if lack:
@@ -390,52 +441,68 @@ def served_ms(backend: str, e_count: int, hdim: int, idim: int, topk: int, act: 
             out[m] = (case["numtokens"], plan_name(mode))
     if gaps and backend == "helion":
         raise RuntimeError(
-            f"{MARKER} {KNOB}=helion but no tuned config on {hk.platform()} for E={e_count} "
-            f"H={hdim} I={idim} topk={topk} {ACT[int(act)]}: "
+            f"{MARKER} {KNOB}=helion (or a layer only Helion can serve) but no tuned config on "
+            f"{hk.platform()} for E={e_count}/{e_global or e_count} H={hdim} I={idim} "
+            f"topk={topk} {ACT[int(act)]} limit={limit}: "
             + "; ".join(f"M<={b} {p}: {', '.join(k)}" for (b, p), k in sorted(gaps.items()))
             + " (tune them in the autotune lab, ship configs/helion/<kernel>/<platform>.json)")
     return out
 
 
+BODIES = {ROUTE_QUANT: nvfp4_moe_route_quant, FC1: nvfp4_moe_fc1, FC2: nvfp4_moe_fc2,
+          COMBINE: nvfp4_moe_combine, FC2_COMBINE: nvfp4_moe_fc2_combine}
+
+
 @functools.lru_cache(maxsize=None)
-def _kernels(case_key: str, plan: str):
+def _kernels(case_key: str, plan: str, untuned_ok: bool = False):
+    """The plan's serving kernels for one bucketed case. untuned_ok (the
+    lane's standalone oracle / bench only, never serving): a kernel with no
+    shipped config runs Helion's default config instead of failing."""
     import json
     case = json.loads(case_key)
-    bodies = {ROUTE_QUANT: nvfp4_moe_route_quant, FC1: nvfp4_moe_fc1, FC2: nvfp4_moe_fc2,
-              COMBINE: nvfp4_moe_combine, FC2_COMBINE: nvfp4_moe_fc2_combine}
-    return [hk.compiled(bodies[k], k, case) for k in PLANS[plan]]
+    out = []
+    for k in PLANS[plan]:
+        if untuned_ok and hk.config(k, case) is None:
+            hk.log(f"nvfp4-moe UNTUNED {k} {case_key}: Helion default config (bench/oracle only)")
+            out.append(helion.kernel(BODIES[k], autotune_effort="none", static_shapes=False))
+        else:
+            out.append(hk.compiled(BODIES[k], k, case))
+    return out
 
 
 def run_plan(kerns, plan, x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, out,
-             a1_gscale, a2_gscale, act, id_base):
+             a1_gscale, a2_gscale, act, id_base, limit=None):
     """One MoE forward on Helion kernels `kerns` (PLANS[plan] order) -> out."""
     e_count = w13.shape[0]
     f8 = lambda t: t if t.dtype == torch.float8_e4m3fn else t.view(torch.float8_e4m3fn)
     xdq, ps, seg, seg_e = kerns[0](x, topk_ids, _f32(a1_gscale), _div6(a1_gscale),
                                    e_count, id_base)
     h = kerns[1](xdq, ps, seg, seg_e, w13, f8(w13_sf), g1, _f32(a2_gscale), _div6(a2_gscale),
-                 act, topk_ids.shape[1])
+                 act, topk_ids.shape[1], NO_CLAMP if limit is None else float(limit))
     if plan == "fused3":
         return kerns[2](h, topk_ids, topk_w, w2, f8(w2_sf), g2, id_base, out)
     y = kerns[2](h, ps, seg, seg_e, topk_w, w2, f8(w2_sf), g2)
     return kerns[3](y, topk_ids, id_base, e_count, out)
 
 
-def serving_op(native, backend: str):
+def serving_op(native, backend: str, limit: float | None = None, e_global: int | None = None,
+               untuned_ok: bool = False):
     """The oxide host op's signature (_native.nvfp4_moe_cuda) on Helion: per M
     the plan's kernels when all are tuned for bucket(M), else (auto) the oxide
     op itself; helion fails closed. ws_* / tune / stream_ptr are the oxide
-    op's (Helion runs on torch's current stream = the lane's stream)."""
+    op's (Helion runs on torch's current stream = the lane's stream). limit /
+    e_global: the layer's swiglu clamp and global expert count (case keys).
+    untuned_ok: standalone oracle / bench only (see _kernels)."""
 
     def op(x, topk_ids, topk_w, w13, w13_sf, g1, w2, w2_sf, g2, ws_aq, ws_asf, ws_inter,
            ws_hq, ws_hsf, ws_y, ws_route, out, a1_gscale, a2_gscale, act, id_base, mode,
            tune, stream_ptr):
         case = lane_case(w13.shape[0], x.shape[1], w13.shape[1] // 2, topk_ids.shape[1],
-                         act, x.shape[0])
+                         act, x.shape[0], limit, e_global)
         plan = plan_name(mode)
         # ponytail: per-call config lookup (json key, dict get); free under CUDA
         # graphs, ~us per layer eager — memoize per (case, mode) if eager decode matters
-        lack = missing(case, mode)
+        lack = [] if untuned_ok else missing(case, mode)
         if lack:
             if backend == "helion":
                 raise RuntimeError(f"{MARKER} {KNOB}=helion: no tuned {lack} for "
@@ -444,8 +511,9 @@ def serving_op(native, backend: str):
                                          ws_aq, ws_asf, ws_inter, ws_hq, ws_hsf, ws_y, ws_route,
                                          out, a1_gscale, a2_gscale, act, id_base, mode, tune,
                                          stream_ptr)
-        return run_plan(_kernels(hk.case_key(case), plan), plan, x, topk_ids, topk_w, w13,
-                        w13_sf, g1, w2, w2_sf, g2, out, a1_gscale, a2_gscale, act, id_base)
+        return run_plan(_kernels(hk.case_key(case), plan, untuned_ok), plan, x, topk_ids, topk_w,
+                        w13, w13_sf, g1, w2, w2_sf, g2, out, a1_gscale, a2_gscale, act, id_base,
+                        limit)
 
     op.backend = backend
     return op
@@ -454,27 +522,58 @@ def serving_op(native, backend: str):
 # ---------------------------------------------------------------------------
 # lab ABI (inference-console api/autotune_kernels.py)
 # ---------------------------------------------------------------------------
-def _dims(model: dict) -> dict | None:
-    """Lane-eligible NVFP4 MoE dims of one TP rank (no EP: E global), else None."""
+def _is_ds(arch: str) -> bool:
+    return arch.startswith("deepseekv4")  # DeepseekV4ForCausalLM, DeepseekV41ForCausalLM
+
+
+def _layouts(model: dict) -> list:
+    """Lane-eligible NVFP4 MoE dims of the TP rank(s) to tune, else [].
+    Default: the combination's rank (no EP: E global, I = I/tp). DeepSeek-V4
+    (clamped silu, TP8 serving): the EP8 rank (E/8 local of E, whole I; prod:
+    FlashInfer refuses TP8 without EP) whether the console hands the dims of
+    a TP8 target without EP (experts = global, moe_intermediate = I/8) or of
+    a TP8 + EP8 target (api/autotune.model_dims: experts = this rank's,
+    experts_total = global, moe_intermediate = whole I, ep = 8); the no-EP
+    rank (E, I/8) only with NVFP4_MOE_TP8_NOEP=1 — it has no stock baseline
+    (nvfp4_moe.fi_supported), so a lab row for it can only judge correctness."""
     if model.get("quant_format") != "nvfp4":
-        return None
+        return []
     e, h, i, k = (model.get(n) for n in ("experts", "hidden", "moe_intermediate", "topk"))
-    if not (e and h and i and k) or e > 256 or h % 64 or i % 64:
-        return None
+    if not (e and h and i and k) or h % 64 or i % 16:
+        return []
     arch = str(model.get("architecture") or model.get("name") or "").lower()
-    return {"experts": e, "hidden": h, "moe_intermediate": i, "topk": k,
-            "act": "gelu_tanh" if "gemma" in arch else "silu"}
+    if _is_ds(arch):
+        ep = int(model.get("ep") or 1)
+        eg = int(model.get("experts_total") or e * ep)  # global experts
+        ig = i if ep > 1 else i * int(model.get("tp") or 1)  # whole per-expert intermediate
+        d = {"experts": eg, "hidden": h, "topk": k, "act": "silu",
+             "limit": float(model.get("swiglu_limit") or DS_LIMIT)}
+        # EP8 first (prod: vLLM's FlashInfer CUTLASS refuses TP8 without EP,
+        # "intermediate size padding for w1 and w3"), then the no-EP shard
+        out = [{**d, "experts": eg // DS_TP, "moe_intermediate": ig, "experts_global": eg}] \
+            if eg % DS_TP == 0 else []
+        if ig % (16 * DS_TP) == 0 and os.environ.get("NVFP4_MOE_TP8_NOEP") == "1":
+            out.append({**d, "moe_intermediate": ig // DS_TP})
+        return out
+    if e > 256 or i % 64:  # the oxide baseline's limits (only DS layers are Helion-only)
+        return []
+    return [{"experts": e, "hidden": h, "moe_intermediate": i, "topk": k,
+             "act": "gelu_tanh" if "gemma" in arch else "silu"}]
 
 
-def cases(model: dict) -> list:
-    d = _dims(model)
-    return [] if d is None else [{**d, "numtokens": m} for m in BUCKETS]
+def cases(model: dict, kernel: str | None = None) -> list:
+    """Every layout x M bucket; on a Helion-only (clamped) layout the
+    CLAMP_BUCKETS `kernel`'s plan can serve (FUSED3_MAX / FRONT4_MIN)."""
+    want = {FC2_COMBINE: lambda m: m <= FUSED3_MAX, FC2: lambda m: m >= FRONT4_MIN,
+            COMBINE: lambda m: m >= FRONT4_MIN}.get(kernel, lambda m: True)
+    return [{**d, "numtokens": m} for d in _layouts(model) for m in buckets_for(d.get("limit"))
+            if "limit" not in d or want(m)]
 
 
 @functools.lru_cache(maxsize=2)
-def _weights(e_count, hdim, idim, act, seed):
+def _weights(e_count, hdim, idim, act, seed, limit=None):
     from suffix_hybrid.kernels import nvfp4_moe as nm
-    return nm.make_problem(e_count, hdim, idim, act, device=_device(), seed=seed)
+    return nm.make_problem(e_count, hdim, idim, act, device=_device(), seed=seed, limit=limit)
 
 
 def _device():
@@ -498,22 +597,45 @@ def route_ref(topk_ids, e_count: int, id_base: int):
     return pad(order), pad(seg), pad(sk)
 
 
+def ep_base(case) -> int:
+    """id_base of the lab's EP rank: a middle rank of experts_global/experts."""
+    e = case["experts"]
+    return e * (case.get("experts_global", e) // e // 2)
+
+
+ROUTING = None  # force one nm.ROUTING_DISTS entry (the in-lab tuner / bench sets it)
+LAB_DISTS = ("balanced", "skewed")  # make(case, seed) -> LAB_DISTS[seed % 2]
+
+
+def routing_dist(seed) -> str:
+    """Expert-load distribution of make(case, seed): the runner gates correctness
+    on seed 0 (balanced) and times the rotating copies seed 1, 2.. (skewed,
+    balanced..), so one timed number covers both; baseline and Helion arms see the
+    same routing (same seed)."""
+    return ROUTING or LAB_DISTS[seed % 2]
+
+
 def _problem(case, seed):
     """(p, x, ids, tw) for one lab case: the lane's synthetic layer (random
-    NVFP4 experts, calibrated gscales) + uniform top-k routing."""
+    NVFP4 experts, calibrated gscales, the case's clamp) + top-k routing over
+    the GLOBAL experts (EP: ~1/ep of the pairs are local), balanced or skewed
+    (routing_dist)."""
     from suffix_hybrid.kernels import nvfp4_moe as nm
     e, hd, i, k, m = (case[n] for n in ("experts", "hidden", "moe_intermediate", "topk",
                                         "numtokens"))
-    p = _weights(e, hd, i, case["act"], seed % 2)
+    p = _weights(e, hd, i, case["act"], seed % 2, case.get("limit"))
     dev = p["w13"].device
-    ids, tw = nm.rand_routing(m, e, k, dev, seed=1000 + seed, dead=False)
+    eg = case.get("experts_global", e)
+    ids, tw = nm.rand_routing(m, eg, k, dev, seed=1000 + seed, dead=False,
+                              base=ep_base(case) if eg != e else 0, local=e,
+                              dist=routing_dist(seed))
     gen = torch.Generator(device="cpu").manual_seed(2000 + seed)
     x = torch.randn(m, hd, generator=gen).bfloat16().to(dev)
     return p, x, ids, tw
 
 
 def _h_ref(p, xdq, ps, seg, seg_e, topk):
-    """(h bf16 [P+1, I] = spec requant of the f64 fc1 output, valid rows)."""
+    """(h bf16 [P+1, I] = spec requant of the f64 (clamped) fc1 output, valid rows)."""
     from suffix_hybrid.kernels import nvfp4_moe as nm
     pairs = ps.numel() - 1
     idim = p["w13"].shape[1] // 2
@@ -524,6 +646,7 @@ def _h_ref(p, xdq, ps, seg, seg_e, topk):
         pr = ps[s:s + cnt].long()
         gu = float(p["g1"][e]) * (xdq[pr // topk].double()
                                   @ nm._expert_w(p["w13"], p["w13_sf"], e).double().T)
+        gu = nm.clamp_ref(gu, p.get("limit"))
         h[pr] = nm.act_ref(gu[:, idim:], p["act"]) * gu[:, :idim]
         valid[pr] = True
     return nm.qdq(h.float(), p["a2g"]).bfloat16(), valid
@@ -548,19 +671,20 @@ def _stage_inputs(case, seed):
     p, x, ids, tw = _problem(case, seed)
     from suffix_hybrid.kernels import nvfp4_moe as nm
     xdq = nm.qdq(x.float(), p["a1g"]).bfloat16()
-    ps, seg, seg_e = route_ref(ids, p["w13"].shape[0], 0)
+    ps, seg, seg_e = route_ref(ids, p["w13"].shape[0], ep_base(case))
     return p, x, ids, tw, xdq, ps, seg, seg_e
 
 
 def _make_route_quant(case, seed):
     p, x, ids, _ = _problem(case, seed)
-    return x, ids, _f32(p["a1g"]), _div6(p["a1g"]), p["w13"].shape[0], 0
+    return x, ids, _f32(p["a1g"]), _div6(p["a1g"]), p["w13"].shape[0], ep_base(case)
 
 
 def _make_fc1(case, seed):
     p, _, ids, _, xdq, ps, seg, seg_e = _stage_inputs(case, seed)
+    lim = case.get("limit")
     return (xdq, ps, seg, seg_e, p["w13"], p["w13_sf"], p["g1"], _f32(p["a2g"]),
-            _div6(p["a2g"]), p["act"], ids.shape[1])
+            _div6(p["a2g"]), p["act"], ids.shape[1], NO_CLAMP if lim is None else float(lim))
 
 
 def _make_fc2(case, seed):
@@ -574,14 +698,14 @@ def _make_combine(case, seed):
     h, _ = _h_ref(p, xdq, ps, seg, seg_e, ids.shape[1])
     y, _ = _y_ref(h, ps, seg, seg_e, tw, p["w2"], p["w2_sf"], p["g2"])
     out = torch.empty(ids.shape[0], p["w2"].shape[1], dtype=torch.bfloat16, device=h.device)
-    return y.float(), ids, 0, p["w2"].shape[0], out
+    return y.float(), ids, ep_base(case), p["w2"].shape[0], out
 
 
 def _make_fc2_combine(case, seed):
     p, _, ids, tw, xdq, ps, seg, seg_e = _stage_inputs(case, seed)
     h, _ = _h_ref(p, xdq, ps, seg, seg_e, ids.shape[1])
     out = torch.empty(ids.shape[0], p["w2"].shape[1], dtype=torch.bfloat16, device=h.device)
-    return h, ids, tw, p["w2"], p["w2_sf"], p["g2"], 0, out
+    return h, ids, tw, p["w2"], p["w2_sf"], p["g2"], ep_base(case), out
 
 
 def _ref_route_quant(x, topk_ids, g, g6, e_count, id_base):
@@ -589,9 +713,9 @@ def _ref_route_quant(x, topk_ids, g, g6, e_count, id_base):
     return (nm.qdq(x.float(), g).bfloat16(), *route_ref(topk_ids, e_count, id_base))
 
 
-def _ref_fc1(xdq, ps, seg, seg_e, w13, w13_sf, g1, a2g, a2g6, act, topk):
-    return _h_ref(dict(w13=w13, w13_sf=w13_sf, g1=g1, a2g=a2g, act=act), xdq, ps, seg,
-                  seg_e, topk)
+def _ref_fc1(xdq, ps, seg, seg_e, w13, w13_sf, g1, a2g, a2g6, act, topk, limit):
+    return _h_ref(dict(w13=w13, w13_sf=w13_sf, g1=g1, a2g=a2g, act=act,
+                       limit=None if limit >= NO_CLAMP else limit), xdq, ps, seg, seg_e, topk)
 
 
 def _ref_fc2(h, ps, seg, seg_e, tw, w2, w2_sf, g2):
@@ -685,11 +809,35 @@ def baseline_tune(case: dict):
     return nm.parse_tune(nm.DEFAULT_TUNE), "lane default tune"
 
 
+def oxide_can(case) -> bool:
+    """The oxide kernel runs this case (no clamp, E <= 256, I % 64; nvfp4_moe.oxide_gap)."""
+    return "limit" not in case and case["experts"] <= 256 and case["moe_intermediate"] % 64 == 0
+
+
+def _fi_args(case, seed):
+    """Baseline args where oxide cannot run: vLLM's FLASHINFER_CUTLASS path
+    for the WHOLE layer (x quant + both GEMMs + clamp + finalize, this EP
+    rank's ep_size/ep_rank) — the production op every stage is part of."""
+    from suffix_hybrid.kernels import nvfp4_moe as nm
+    if not nm.fi_supported(case["moe_intermediate"]):
+        raise RuntimeError(f"no FlashInfer baseline for I={case['moe_intermediate']} per rank "
+                           "(it pads w1/w3 to 128 rows: DeepSeek-V4.1 TP8 without EP)")
+    p, x, ids, tw = _problem(case, seed)
+    e, dev = p["w13"].shape[0], p["w13"].device
+    fi = dict(p, a1g_t=torch.full((e,), p["a1g"], dtype=torch.float32, device=dev),
+              a2g_t=torch.full((e,), p["a2g"], dtype=torch.float32, device=dev),
+              ep_size=case.get("experts_global", e) // e, ep_rank=ep_base(case) // e)
+    out = torch.empty(x.shape[0], x.shape[1], dtype=torch.bfloat16, device=dev)
+    return ("fi", fi, x, ids, tw, out)
+
+
 def _oxide_args(case, seed, mode: int, keep: int):
     """The oxide op's argument tuple (stream excluded) that runs ONLY launch
     `keep` of `mode`'s plan (tune skip mask), workspace pre-filled by one full
     run so the kept launch reads real upstream data; prefetch tune = the M's
-    row of baseline_tune (prod)."""
+    row of baseline_tune (prod). Cases oxide cannot run: _fi_args."""
+    if not oxide_can(case):
+        return _fi_args(case, seed)
     from suffix_hybrid import oxide_kernels
     from suffix_hybrid.kernels import nvfp4_moe as nm
     oxide_kernels.ensure_loaded(nm.FAMILY, params=nm.PARAMS)
@@ -709,16 +857,90 @@ def _oxide_args(case, seed, mode: int, keep: int):
 
 
 def _oxide_baseline(*args):
+    if isinstance(args[0], str):  # _fi_args
+        from suffix_hybrid.kernels import nvfp4_moe as nm
+        try:
+            return nm._fi_call(*args[1:])
+        except TypeError:  # a FlashInfer without swiglu_limit: same GEMMs, unclamped (timing only)
+            return nm._fi_call(dict(args[1], limit=None), *args[2:])
     from suffix_hybrid import oxide_kernels
     return oxide_kernels.native().nvfp4_moe_cuda(*args, torch.cuda.current_stream().cuda_stream)
 
 
+# Helion's autotuner compares every candidate with the default config's output over the WHOLE
+# output tensor (settings.autotune_baseline_accuracy_check_fn replaces that check). Ours are not
+# fully written: h / y rows of off-rank pairs and the trash slot P are torch.empty garbage, and
+# the trash slot of the route arrays is a data race between tail lanes, so a whole-tensor
+# comparison rejects (or, by luck of the allocator, accepts) candidates at random. The check
+# below compares only what a consumer reads, masked by the args of the latest make() (the lab
+# calls make(case, 0) right before it autotunes; the in-lab tuner does too).
+LAST_ARGS: dict = {}
+AUTOTUNE_FLIP = 5e-3  # fraction of requantized / bf16 values that may differ between configs
+AUTOTUNE_REL = 2e-3   # rel-L2 between float outputs of two configs (accumulation order)
+
+
+def remember(name, make):
+    """make(case, seed) that records its args under `name` for autotune_check."""
+    def wrapped(case, seed):
+        LAST_ARGS[name] = args = make(case, seed)
+        return args
+    wrapped.__wrapped__ = make
+    return wrapped
+
+
+def autotune_check(name):
+    """autotune_baseline_accuracy_check_fn of kernel `name` (raises AssertionError)."""
+    def check(actual, expected):
+        args = LAST_ARGS.get(name)
+        got = actual if isinstance(actual, (tuple, list)) else (actual,)
+        want = expected if isinstance(expected, (tuple, list)) else (expected,)
+        if len(got) != len(want):
+            raise AssertionError(f"{name}: {len(got)} outputs vs {len(want)}")
+
+        def rows(ps_i, se_i, e_i):  # rows a consumer reads: the local pairs
+            ps, seg_e, e_count = args[ps_i], args[se_i], args[e_i].shape[0]
+            pairs = ps.numel() - 1
+            return ps[:pairs][seg_e[:pairs] < e_count].long()
+
+        def flips(a, b, what):
+            f = _frac(a.float(), b.float())
+            if not bool(torch.isfinite(a.float()).all()) or f > AUTOTUNE_FLIP:
+                raise AssertionError(f"{name}.{what}: {f:.2e} of the values differ (> {AUTOTUNE_FLIP})")
+
+        def close(a, b, what):
+            r = _rel(a.float(), b.float())
+            if not bool(torch.isfinite(a.float()).all()) or r > AUTOTUNE_REL:
+                raise AssertionError(f"{name}.{what}: rel {r:.2e} (> {AUTOTUNE_REL})")
+
+        if name == ROUTE_QUANT:
+            pairs = want[1].numel() - 1
+            flips(got[0], want[0], "xdq")
+            for i, w in zip(range(1, 4), ("pair_sorted", "seg", "seg_e")):
+                if not torch.equal(got[i][:pairs], want[i][:pairs]):
+                    raise AssertionError(f"{name}.{w}: routing differs between configs")
+        elif name in (FC1, "dsv41_moe_fc1_sh"):
+            r = rows(1, 3, 4)
+            flips(got[0][r], want[0][r], "h")
+            if len(got) > 1:
+                close(got[1], want[1], "hs")
+        elif name == FC2:
+            r = rows(1, 3, 5)
+            close(got[0][r], want[0][r], "y")
+        else:  # combine kernels: every row of out is written
+            flips(got[0], want[0], "out")
+    return check
+
+
 def _entry(name, body, make, reference, check, mode, keep, oxide_entry):
-    return {"name": name, "body": body, "cases": cases, "make": make, "reference": reference,
-            "check": check, "baseline": _oxide_baseline,
+    return {"name": name, "body": body, "cases": functools.partial(cases, kernel=name),
+            "make": remember(name, make), "reference": reference, "check": check,
+            "settings": {"autotune_baseline_accuracy_check_fn": autotune_check(name)},
+            "baseline": _oxide_baseline,
             "make_baseline": lambda case, seed: _oxide_args(case, seed, mode, keep),
             "baseline_name": f"oxide nvfp4_moe {oxide_entry} (glm prod tune; env "
-                             f"SUFFIX_NVFP4_MOE_TUNE wins; else lane default tune)",
+                             f"SUFFIX_NVFP4_MOE_TUNE wins; else lane default tune); where oxide "
+                             f"cannot run (clamp, E>256, I%64): vLLM FlashInfer CUTLASS, WHOLE "
+                             f"layer (sum a plan's stages to compare)",
             "replaces": [rf"^{oxide_entry}$"]}
 
 

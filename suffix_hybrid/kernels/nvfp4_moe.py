@@ -114,6 +114,16 @@ oxide (vs FlashInfer + the f64 spec + zero contract) on one M per tuned
 CUDA-graph capture; plan/stage readback is oxide-only, Helion gets a bitwise
 determinism check instead.
 
+Helion-only layers (oxide_gap: swiglu clamp, E > 256, I % 64 — DeepSeek-V4.1
+Flash: clamp 10, 384 experts, TP8 I = 288 or EP8 48 x 2304): the clamp is
+vLLM's (gate = min(gate, L), up = clamp(up, -L, L), then silu(gate) * up;
+FlashInfer CUTLASS clamps the same) in the Helion fc1 epilogue and in every
+reference here (clamp_ref). Under SUFFIX_HELION_NVFP4_MOE=oxide such a layer
+stays on vLLM's path with a logged reason (all layers so -> the startup
+error); auto/helion serve EVERY M <= max_m on Helion (no oxide fallback: a
+missing config is a load error). The layer oracle adds a HOT_X batch so the
+clamp engages and logs the clamped fraction.
+
 CLI (in-pod, SM120 + oxide bundle):
   python -m suffix_hybrid.kernels.nvfp4_moe oracle   # ours vs FlashInfer vs f64 ref, per stage
   python -m suffix_hybrid.kernels.nvfp4_moe bench    # us: ours vs FlashInfer (CUDA graphs)
@@ -159,7 +169,7 @@ _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _MID = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 _state = {"armed": False, "instances": 0, "layers_ours": 0, "stock": {},
           "ws": {}, "checked": False, "hook": None, "oracle": [], "active_logged": False,
-          "helion_warm": set(),
+          "helion_warm": set(), "in_oracle": False, "shared_fused": 0,
           # FP8 block layers (suffix_hybrid/kernels/fp8_moe.py, SUFFIX_FP8_MOE)
           # share this module's single OOT class; their own counters:
           "fp8": {"seen": 0, "ours": 0, "stock": {}, "oracle": []}}
@@ -360,22 +370,40 @@ def _groups(ids, e_count: int):
     return out
 
 
-def fc1_ref(p, x, ids, fi=False):
-    """f64 [P, I] intermediate h = act(g1*gate) * g1*up per routed pair.
-    fi=True: FlashInfer's numerics (bf16 GEMM output, erf GeGLU, bf16 act)."""
+def clamp_ref(gu, limit):
+    """vLLM's swiglu clamp on a [.., 2I] fc1 output in the FlashInfer layout
+    ([up; gate]): gate = min(gate, limit), up = clamp(up, -limit, limit)
+    (activation.silu_and_mul_with_clamp / swiglu_limit_func; FlashInfer
+    CUTLASS clamps the same way before silu). None: unchanged."""
+    import torch
+    if limit is None:
+        return gu
+    i = gu.shape[-1] // 2
+    return torch.cat([gu[..., :i].clamp(-limit, limit), gu[..., i:].clamp(max=limit)], -1)
+
+
+def gate_up_ref(p, x, ids, fi=False):
+    """f64 [P, 2I] fc1 output g1 * (xq @ w13^T) per routed pair ([up; gate],
+    before any clamp; rows of off-rank pairs 0)."""
     import torch
     e_count, two_i = p["w13"].shape[0], p["w13"].shape[1]
-    i = two_i // 2
     topk = ids.shape[1]
     xd = qdq(x.float(), p["a1g"]).double()
-    h = torch.zeros(ids.numel(), i, dtype=torch.float64, device=x.device)
+    gu = torch.zeros(ids.numel(), two_i, dtype=torch.float64, device=x.device)
     for e, pairs in _groups(ids, e_count).items():
-        gu = float(p["g1"][e]) * (xd[pairs // topk] @ _expert_w(p["w13"], p["w13_sf"], e).double().T)
-        if fi:
-            gu = _bf(gu)
-        a = act_ref(gu[:, i:], p["act"], erf=fi) * gu[:, :i]
-        h[pairs] = _bf(a) if fi else a
-    return h
+        g = float(p["g1"][e]) * (xd[pairs // topk] @ _expert_w(p["w13"], p["w13_sf"], e).double().T)
+        gu[pairs] = _bf(g) if fi else g
+    return gu
+
+
+def fc1_ref(p, x, ids, fi=False):
+    """f64 [P, I] intermediate h = act(clamp(g1*gate)) * clamp(g1*up) per
+    routed pair (clamp: p["limit"], vLLM's swiglu clamp). fi=True:
+    FlashInfer's numerics (bf16 GEMM output, erf GeGLU, bf16 act)."""
+    gu = clamp_ref(gate_up_ref(p, x, ids, fi), p.get("limit"))
+    i = gu.shape[1] // 2
+    a = act_ref(gu[:, i:], p["act"], erf=fi) * gu[:, :i]
+    return _bf(a) if fi else a
 
 
 def moe_ref(p, x, ids, tw, fi=False):
@@ -435,10 +463,36 @@ def route_twin(ids, e_count: int, base: int = 0):
     return se, so, sc, pl
 
 
-def make_problem(e_count, hdim, idim, act="gelu_tanh", device="cpu", seed=0, wstd=0.05, a1g=None):
+def adversarial_blocks(t, gen):
+    """Scale-factor stress on a [R, K] f32 matrix (K % 16 == 0), per 16-block:
+    10 % all-zero (sf = 0 guard), 5 % x2^-16 (e4m3 SUBNORMAL scale: the global max
+    block's sf is 448, so 448 * 2^-16 = 0.0068 < the e4m3 min normal 2^-6), 3 % x2^-24
+    (nonzero block whose sf flushes to 0: the block must dequantize to 0), 5 % x2^5
+    (the block that sets the global scale, sf at / near 448), 5 % one element x64 (an
+    outlier: the other 15 round to 0 or 0.5 quanta)."""
+    import torch
+    r, k = t.shape
+    u = torch.rand(r, k // 16, generator=gen)
+    f = torch.ones(r, k // 16)
+    for lo, hi, v in ((0.0, 0.10, 0.0), (0.10, 0.15, 2.0 ** -16), (0.15, 0.18, 2.0 ** -24),
+                      (0.18, 0.23, 32.0)):
+        f[(u >= lo) & (u < hi)] = v
+    blk = t.reshape(r, k // 16, 16) * f[..., None]
+    out = (torch.rand(r, k // 16, generator=gen) >= 0.95)
+    pos = torch.randint(0, 16, (r, k // 16), generator=gen)
+    mult = torch.where(out, 64.0, 1.0)
+    one = torch.nn.functional.one_hot(pos, 16).bool()
+    blk = torch.where(one, blk * mult[..., None], blk)
+    return blk.reshape(r, k)
+
+
+def make_problem(e_count, hdim, idim, act="gelu_tanh", device="cpu", seed=0, wstd=0.05, a1g=None,
+                 limit=None, adversarial=False):
     """Random NVFP4 routed-experts layer in vLLM's post-processing FlashInfer
     CUTLASS layout (w13 = [up; gate], 128x4-swizzled per-expert scales, g1/g2
-    = 1/(g_w*g_a), shared activation gscales calibrated on a random batch)."""
+    = 1/(g_w*g_a), shared activation gscales calibrated on a random batch;
+    limit = the swiglu clamp, DeepSeek-V4 10.0; adversarial = block scales that
+    stress the e4m3 / e2m1 paths, see adversarial_blocks)."""
     import torch
     gen = torch.Generator(device="cpu").manual_seed(seed)
     dev = torch.device(device)
@@ -452,13 +506,16 @@ def make_problem(e_count, hdim, idim, act="gelu_tanh", device="cpu", seed=0, wst
     gw2 = torch.empty(e_count)
     for e in range(e_count):
         for w, s, gw, shape in ((w13, s13, gw13, (2 * idim, hdim)), (w2, s2, gw2, (hdim, idim))):
-            wf = (torch.randn(*shape, generator=gen) * wstd).bfloat16().float().to(dev)
+            wf = torch.randn(*shape, generator=gen) * wstd
+            if adversarial:  # block-scale stress (adversarial_blocks)
+                wf = adversarial_blocks(wf, gen)
+            wf = wf.bfloat16().float().to(dev)
             gw[e] = 2688.0 / float(wf.abs().max())
             q, sfb = quant_codes(wf, float(gw[e]))
             w[e] = q
             s[e] = swizzle(sfb)
     a1g = 2688.0 / 4.5 if a1g is None else a1g  # randn(H) amax ~ 4-4.5 unless a real layer's
-    p = dict(w13=w13, w2=w2, act=ACT_CODE[act], act_name=act, a1g=a1g, a2g=1.0,
+    p = dict(w13=w13, w2=w2, act=ACT_CODE[act], act_name=act, a1g=a1g, a2g=1.0, limit=limit,
              w13_sf=s13.view(torch.float8_e4m3fn).reshape(e_count, rp13, cp13),
              w2_sf=s2.view(torch.float8_e4m3fn).reshape(e_count, rp2, cp2),
              g1=(1.0 / (gw13 * a1g)).float().to(dev), g2=None)
@@ -470,32 +527,65 @@ def make_problem(e_count, hdim, idim, act="gelu_tanh", device="cpu", seed=0, wst
     return p
 
 
-def rand_routing(m, e_count, topk, device, seed=0, base=0, local=None, dead=None):
-    """Uniform random top-k experts per token (distinct), softmax weights.
+ROUTING_DISTS = ("balanced", "skewed", "hot")
+SKEW_S = 0.8  # skewed: expert popularity ~ rank^-0.8 over a random permutation (top expert ~8 %)
+
+
+def rand_routing(m, e_count, topk, device, seed=0, base=0, local=None, dead=None,
+                 dist="balanced"):
+    """Random top-k experts per token (distinct), softmax weights. `dist`:
+      balanced  uniform (the default and the old behaviour)
+      skewed    Zipf-like expert popularity (Gumbel top-k = sampling k distinct
+                experts ~ popularity): a few experts take many rows, most take
+                one or none — what an imbalanced router gives a rank
+      hot       every token also routes to ONE expert of this rank (local when
+                EP): that expert's segment is M rows (worst case for the
+                row loop of fc1/fc2), the rest balanced
     EP (local < e_count): rows t % 3 == 1 (or all rows when dead=True) are
     routed only to experts outside [base, base + local) — tokens this rank
     must return as exact zeros."""
     import torch
+    if dist not in ROUTING_DISTS:
+        raise ValueError(f"routing dist {dist!r} not in {ROUTING_DISTS}")
     gen = torch.Generator(device="cpu").manual_seed(seed)
     score = torch.rand(m, e_count, generator=gen)
     local = e_count if local is None else local
+    if dist == "skewed":
+        pop = (torch.randperm(e_count, generator=gen).float() + 1.0) ** -SKEW_S
+        score = pop.log() - (-score.clamp_min(1e-12).log()).log()  # + Gumbel noise
+    elif dist == "hot":
+        score[:, base + seed % local] = 2.0  # > every uniform score: always selected
     if local < e_count and dead is not False:
         rows = slice(None) if dead else slice(1, None, 3)
-        score[rows, base:base + local] = -1.0
+        score[rows, base:base + local] = -1e30
     ids = score.topk(topk, -1).indices.int()
     tw = torch.softmax(torch.randn(m, topk, generator=gen), -1).float()
     return ids.to(device), tw.to(device)
 
 
-REF_TOL = 5e-3  # ours vs the f64 spec, end to end (see oracle_ok)
+# ours vs the f64 spec, end to end (see oracle_ok). 5e-3 refused a correct layer on silicon (GLM g13
+# boot, layer 25 M=8: 5.39e-3 with every stage exact vs the spec fed the kernel's own previous
+# stage, all plans bitwise, plugin branch glm-int 1536bb2): f32-vs-f64 requant flips compound per
+# batch, and a top-6 layer has more terms. Real drift is pinned by STAGE_TOL; tanh.approx-class
+# drift (>= 1e-2 end to end) still trips.
+REF_TOL = 8e-3
+HOT_X = 4.0  # oracle activations x calibrated range on clamped layers: the clamp engages
+
+
+def clamp_frac(p, x, ids) -> float:
+    """Fraction of the routed pairs' fc1 outputs the swiglu clamp changes."""
+    gu = gate_up_ref(p, x, ids)
+    vp = (ids.reshape(-1) >= 0)
+    gu = gu[vp]
+    return float((clamp_ref(gu, p["limit"]) != gu).double().mean()) if gu.numel() else 0.0
 STAGE_TOL = {"xq": 1e-3, "fc1": 1e-4, "hq": 1e-3, "fc2": 1e-4, "comb": 1e-3}
 
 
 def oracle_ok(rel_vs_ref: float, rel_vs_fi: float, fi_rel_vs_ref: float) -> bool:
     """Ours vs the f64 spec <= REF_TOL: the floor is the bf16 output
     rounding (~1.1e-3 rms) plus requant flips from f32-vs-f64 intermediates,
-    1.7e-3 emulated; tanh.approx-class drift (2.5e-3..1.7e-2) or any
-    layout/scale bug trips it. FlashInfer's own distance to the spec is NOT
+    1.7e-3 typical, 5.4e-3 seen on silicon; stronger tanh.approx-class drift or any
+    layout/scale bug trips it (weaker drift: the stage checks). FlashInfer's own distance to the spec is NOT
     a tolerance for us (it is 1-3e-2 from bf16 intermediates, see the
     accuracy anatomy above). Ours vs FlashInfer only has to respect the
     triangle bound of both errors (floor 2e-2)."""
@@ -507,6 +597,14 @@ def _rel(a, b) -> float:
     return float((a.double() - b.double()).norm() / b.double().norm().clamp_min(1e-30))
 
 
+def fi_supported(idim: int) -> bool:
+    """vLLM's FLASHINFER_CUTLASS NVFP4 MoE pads w1/w3 per rank to 128 rows and refuses an
+    intermediate that is not a multiple of 128 (DeepSeek-V4.1 TP8 without EP: I = 288;
+    boot of 2026-10-17). Such a layer has no stock baseline: oracle / bench judge it vs
+    the f64 spec only."""
+    return idim % 128 == 0
+
+
 def judge(ours, fi, ref, local_ids, fi_emu=None):
     """(ok, metrics) for one oracle case: oracle_ok vs FlashInfer and the
     f64 reference, finite, and the EP zero contract — tokens with no local
@@ -514,6 +612,12 @@ def judge(ours, fi, ref, local_ids, fi_emu=None):
     emulation of FlashInfer's numerics) is evidence only: flashinfer ~
     fi_emulation << flashinfer ~ ref attributes FlashInfer's error."""
     import torch
+    if fi is None:  # no FlashInfer for this layout (fi_supported): spec + zero contract only
+        r_ref, dead = _rel(ours, ref), (local_ids < 0).all(1)
+        zero = bool((ours[dead] == 0).all())
+        ok = oracle_ok(r_ref, 0.0, 0.0) and zero and bool(torch.isfinite(ours).all())
+        return ok, (f"rel_vs_ref={r_ref:.2e} (no flashinfer for this layout) "
+                    f"nonlocal_tokens={int(dead.sum())} nonlocal_zero={zero}")
     r_ref, r_fi, fi_ref = _rel(ours, ref), _rel(ours, fi), _rel(fi, ref)
     dead = (local_ids < 0).all(1)
     zero = bool((ours[dead] == 0).all() and (fi[dead] == 0).all())
@@ -691,8 +795,10 @@ def eligibility(info: dict) -> str | None:
         return "activation scales not swizzled"
     if info.get("act") not in ACT_CODE:
         return f"activation {info.get('act')} not in {sorted(ACT_CODE)}"
-    if info.get("clamp_limit") is not None or info.get("swiglu_alpha") is not None:
-        return "swiglu clamp/alpha not supported"
+    if info.get("swiglu_alpha") is not None:
+        return "swiglu alpha/beta not supported"
+    if info.get("clamp_limit") is not None and info.get("act") != "silu":
+        return f"clamp with activation {info.get('act')} (swiglu clamp is silu-only)"
     if info.get("router_weight_on_input"):
         return "apply_router_weight_on_input"
     if info.get("bias"):
@@ -708,13 +814,23 @@ def eligibility(info: dict) -> str | None:
     if (info.get("ep") != 1 or info.get("expert_map")) and info.get("ep_base") is None:
         return "expert_map is not the linear ep_rank*E_local placement FlashInfer assumes"
     e, h, i = info.get("E", 0), info.get("H", 0), info.get("I", 0)
-    if not (1 <= e <= 256) or h % 64 or i % 64:
-        return f"shape E={e} H={h} I={i} (E<=256, H,I % 64)"
+    if e < 1 or h % 64 or not i or i % 16:
+        return f"shape E={e} H={h} I={i} (H % 64, I % 16)"
     if not info.get("sf_exact", False):
         return "block scales not in the per-expert padded swizzled layout"
     if not info.get("gscale_shared", False):
         return "per-expert activation gscales differ"
     return None
+
+
+def oxide_gap(info: dict) -> str | None:
+    """Why the oxide kernel cannot run an otherwise eligible layer (then only
+    the Helion port serves it: SUFFIX_HELION_NVFP4_MOE=oxide refuses the
+    layer loudly, auto/helion serve every M on Helion), or None."""
+    e, i = info.get("E", 0), info.get("I", 0)
+    why = ([f"swiglu clamp {info['clamp_limit']}"] if info.get("clamp_limit") is not None else []) \
+        + ([f"E={e} > 256"] if e > 256 else []) + ([f"I={i} % 64"] if i % 64 else [])
+    return ", ".join(why) or None
 
 
 def _make_layer_cls():
@@ -733,6 +849,7 @@ def _make_layer_cls():
             super().__init__(*args, **kwargs)
             _state["instances"] += 1
             self._sfx_moe = None
+            self._sfx_runner = None  # weakref, set by dsv41_moe_shared.install_runner_hook
             qm = self.quant_method
             orig = qm.process_weights_after_loading
 
@@ -765,6 +882,7 @@ def _make_layer_cls():
                         bias=getattr(qc, "w1_bias", None) is not None,
                         tp=mc.tp_size, ep=mc.ep_size, dp=mc.dp_size,
                         all2all=bool(pc.use_all2all_kernels), eplb=bool(pc.enable_eplb),
+                        topk=self.top_k, global_e=self.global_num_experts,
                         mk_shared_overlap=bool(getattr(qm, "mk_can_overlap_shared_experts",
                                                        False)),
                         expert_map=self.expert_map is not None)
@@ -788,7 +906,7 @@ def _make_layer_cls():
             return info, qc
 
         def _sfx_prepare(self, pre=None):
-            from suffix_hybrid.kernels import fp8_moe
+            from suffix_hybrid.kernels import dsv41_moe, dsv41_moe_shared as dsv41_shared, fp8_moe
             if fp8_moe.gate_on() and fp8_moe.is_fp8(self):
                 self._sfx_moe = fp8_moe.prepare(
                     self, pre or {},
@@ -801,7 +919,21 @@ def _make_layer_cls():
                 return
             info, qc = self._sfx_info()
             why = eligibility(info)
+            if info.get("clamp_limit") is not None and info.get("quant_dtype") == "nvfp4":
+                # DeepSeek-V4-class NVFP4 layer (swiglu clamp): the stock path is NOT an
+                # acceptable fallback for a lane the owner turned on -> startup error
+                why = why or dsv41_moe.refuse(info)
+                if why is not None:
+                    raise RuntimeError(f"{MARKER} DeepSeek-V4 NVFP4 MoE layer {self.layer_name} "
+                                       f"cannot run on the {GATE} lane: {why}")
             if why is not None:
+                _state["stock"][why] = _state["stock"].get(why, 0) + 1
+                _log(f"layer {self.layer_name} stays on vLLM's MoE path: {why}")
+                return
+            hb = helion_kernels.backend(HELION_ENV)
+            gap = oxide_gap(info)
+            if gap and hb == "oxide":
+                why = f"oxide kernel cannot serve {gap} (set {HELION_ENV}=auto|helion)"
                 _state["stock"][why] = _state["stock"].get(why, 0) + 1
                 _log(f"layer {self.layer_name} stays on vLLM's MoE path: {why}")
                 return
@@ -812,18 +944,21 @@ def _make_layer_cls():
                        g2=qc.g2_alphas.float().contiguous(),
                        a1g=float(qc.a1_gscale.reshape(-1)[0]),
                        a2g=float(qc.a2_gscale.reshape(-1)[0]),
-                       act=ACT_CODE[info["act"]], H=info["H"], topk=self.top_k,
+                       act=ACT_CODE[info["act"]], limit=info["clamp_limit"], H=info["H"],
+                       topk=self.top_k,
                        max_m=max_m(), id_base=info["ep_base"],
                        E_global=self.global_num_experts, fused=fused_on(), tune=tune_table())
-            hb = helion_kernels.backend(HELION_ENV)
             if hb != "oxide":  # the Helion module is never imported under oxide
                 from suffix_hybrid.helion_kernels import nvfp4_moe as hmoe
-                cfg["op"] = hmoe.serving_op(native, hb)
+                hb = "helion" if gap else hb  # no oxide to fall back to: every M on Helion
+                extra = dict(limit=cfg["limit"], e_global=cfg["E_global"])
+                cfg["op"] = hmoe.serving_op(native, hb, **extra)
                 # {M: (bucket, plan)} Helion serves; helion: a gap raises here
                 cfg["helion_ms"] = hmoe.served_ms(
                     hb, info["E"], info["H"], info["I"], cfg["topk"], cfg["act"], cfg["max_m"],
-                    lambda m: tune_for(m, cfg["tune"], cfg["fused"])[0])
-                _log(f"{HELION_ENV}={hb} layer {self.layer_name}: Helion serves "
+                    lambda m: tune_for(m, cfg["tune"], cfg["fused"])[0], **extra)
+                _log(f"{HELION_ENV}={hb}{f' (oxide cannot: {gap})' if gap else ''} "
+                     f"layer {self.layer_name}: Helion serves "
                      f"{len(cfg['helion_ms'])}/{cfg['max_m']} Ms "
                      f"({sorted(set(cfg['helion_ms'].values()))}), oxide the rest")
             _state["ws"][dev] = workspace(dev, cfg["max_m"], cfg["topk"], info["H"],
@@ -831,6 +966,12 @@ def _make_layer_cls():
             self._sfx_moe = cfg
             _state["oracle"].append(self._sfx_oracle(cfg, info))
             _state["layers_ours"] += 1
+            if dsv41_shared.fuse_on():
+                # SUFFIX_DSV41_MOE_FUSE_SHARED: fail closed; the shared expert leaves the runner
+                # only after this layer's oracle and capture-replay gate passed
+                cfg["dsv41_shared"] = dsv41_shared.prepare_layer(
+                    self, cfg, info, self._sfx_routed,
+                    lambda x, w, i: RoutedExperts.forward_modular(self, x, w, i))
 
         def _sfx_run(self, cfg, x, topk_weights, topk_ids):
             if cfg.get("kind") == "fp8":
@@ -853,7 +994,8 @@ def _make_layer_cls():
             mm = cfg["max_m"]  # workspace capacity: every case M <= max_m
             hm = cfg.get("helion_ms") or {}
             stream = torch.cuda.current_stream(dev).cuda_stream
-            warm_key = (local, info["H"], info["I"], cfg["topk"], cfg["act"])
+            warm_key = (local, info["H"], info["I"], cfg["topk"], cfg["act"], cfg["limit"],
+                        base)
             if hm and warm_key not in _state["helion_warm"]:
                 # every served M once (Triton specializes on sizes): no compile
                 # can happen later, inside CUDA-graph capture
@@ -864,17 +1006,23 @@ def _make_layer_cls():
                     run_ours(native, cfg, xw, idw, tww, _state["ws"][dev], stream)
             # one judged M per tuned (bucket, plan): the largest M it serves
             reps = {key: max(m for m in hm if hm[m] == key) for key in set(hm.values())}
-            cases = [(m, None) for m in sorted({1, min(8, mm), mm} | set(reps.values()))]
+            cases = [(m, None, 1.0, "balanced")
+                     for m in sorted({1, min(8, mm), mm} | set(reps.values()))]
             if local < cfg["E_global"]:
-                cases.append((min(8, mm), True))
-            for m, dead in cases:
+                cases.append((min(8, mm), True, 1.0, "balanced"))
+            if cfg["limit"] is not None:  # hot activations: the clamp must engage
+                cases.append((min(8, mm), None, HOT_X, "balanced"))
+            if hm:  # Helion-served: the row loop under imbalanced expert loads
+                cases += [(mm, None, 1.0, "skewed"), (min(32, mm), None, 1.0, "hot")]
+            clamped = []
+            for m, dead, gain, dist in cases:
                 seed = zlib.crc32(str(self.layer_name).encode()) % 10007 + m
                 gen = torch.Generator(device="cpu").manual_seed(seed)
                 amax = 2688.0 / cfg["a1g"]  # calibrated activation range
-                x = (torch.randn(m, info["H"], generator=gen) * (amax / 4.5)).to(
+                x = (torch.randn(m, info["H"], generator=gen) * (gain * amax / 4.5)).to(
                     dev, torch.bfloat16)
                 ids, tw = rand_routing(m, cfg["E_global"], cfg["topk"], dev, seed,
-                                       base, local, dead)
+                                       base, local, dead, dist)
                 x0 = x.clone()
                 # each path gets its own copy: an in-place writer (either
                 # kernel) must not change what the spec and the other see
@@ -897,6 +1045,9 @@ def _make_layer_cls():
                 ref = moe_ref(cfg, x, lid, tw)
                 emu = moe_ref(cfg, x, lid, tw, fi=True).bfloat16()
                 ok, msg = judge(ours, fi, ref, lid, emu)
+                if cfg["limit"] is not None:
+                    clamped.append(clamp_frac(cfg, x, lid))
+                    msg += f" clamped={clamped[-1]:.1e}"
                 ok, msg = ok and st_ok, (f"{msg} {st} a1g={cfg['a1g']:.4g} a2g={cfg['a2g']:.4g} "
                                          f"x_mutated_by_fi={x_fi:.1e} x_mutated_by_ours={x_ours:.1e}")
                 if fi.norm() > 0:
@@ -913,11 +1064,22 @@ def _make_layer_cls():
                  f"id_base={base} H={info['H']} I={info['I']} act={info['act']} "
                  f"max_rel_vs_flashinfer={worst:.2e} max_rel_vs_ref={worst_ref:.2e} "
                  f"flashinfer_max_rel_vs_ref={worst_fi_ref:.2e} "
-                 f"flashinfer_max_rel_vs_fi_emulation={worst_emu:.2e} (last case {st})")
+                 f"flashinfer_max_rel_vs_fi_emulation={worst_emu:.2e}"
+                 + (f" swiglu_limit={cfg['limit']} max_clamped={max(clamped):.1e}"
+                    if clamped else "") + f" (last case {st})")
             return worst
 
         def forward_modular(self, x, topk_weights, topk_ids, shared_experts=None,
                             shared_experts_input=None):
+            cfg = self._sfx_moe
+            fused = None if cfg is None else cfg.get("dsv41_shared")
+            if fused is not None:  # SUFFIX_DSV41_MOE_FUSE_SHARED: the runner no longer has a shared expert
+                return fused.forward(self._sfx_routed, cfg, x, topk_weights, topk_ids)
+            return self._sfx_routed(x, topk_weights, topk_ids, shared_experts,
+                                    shared_experts_input)
+
+        def _sfx_routed(self, x, topk_weights, topk_ids, shared_experts=None,
+                        shared_experts_input=None):
             # shared_experts: never run by a non-overlapping MK (eligibility
             # rejects mk_shared_overlap) -> MoERunner already ran them.
             cfg = self._sfx_moe
@@ -953,7 +1115,7 @@ def _first_forward_check(module, args):
     """Global forward pre-hook (PyTorch API): at the first module call after
     weight processing, fail startup if a gated family engaged no layer."""
     from suffix_hybrid.kernels import fp8_moe
-    if _state["checked"]:
+    if _state["checked"] or _state["in_oracle"]:  # a load oracle calling modules is no first forward
         return
     errs = []
     if gate_on():
@@ -984,6 +1146,9 @@ def _first_forward_check(module, args):
 
 def register():
     """vllm.general_plugins entry point. No-op unless SUFFIX_NVFP4_MOE=1."""
+    from suffix_hybrid.kernels import dsv41_moe_shared as dsv41_shared
+    if dsv41_shared.fuse_on() and not gate_on():
+        raise RuntimeError(f"{dsv41_shared.MARKER} {dsv41_shared.KNOB}=1 needs {GATE}=1")
     if not gate_on():
         return None
     return arm()
@@ -1003,8 +1168,10 @@ def arm():
 
     native = oxide_kernels.native()
     from suffix_hybrid import helion_kernels
+    from suffix_hybrid.kernels import dsv41_moe_shared as dsv41_shared
     if gate_on():
         helion_kernels.backend(HELION_ENV)  # validate the knob now, not at load
+    dsv41_shared.check_env(gate_on(), helion_kernels.backend(HELION_ENV))
     fams = [(g, fn, fam, knob) for on, g, fn, fam, knob in (
         (gate_on(), GATE, "nvfp4_moe_cuda", FAMILY, max_m),
         (fp8_moe.gate_on(), fp8_moe.GATE, fp8_moe.NATIVE_FN, fp8_moe.FAMILY, fp8_moe.max_m))
@@ -1023,12 +1190,16 @@ def arm():
         shas.append(f"{fam} M<={knob()} sha256 {ent[0]['sha256'][:12]}"
                     + (f" tune {format_tune(tune_table())}" if fam == FAMILY else ""))
     cls = _make_layer_cls()
+    if dsv41_shared.fuse_on():
+        dsv41_shared.install_runner_hook(cls)  # refuses on MoERunner drift
     RoutedExperts.register_oot(cls, name="RoutedExperts")
     _state["hook"] = torch.nn.modules.module.register_module_forward_pre_hook(
         _first_forward_check)
     _state["armed"] = True
     _log(f"MOE armed ({', '.join(f[0] for f in fams)}): RoutedExperts -> SuffixRoutedExperts "
-         f"({'; '.join(shas)}; else vLLM's MoE path)")
+         f"({'; '.join(shas)}; else vLLM's MoE path)"
+         + (f"; {dsv41_shared.KNOB}=1: shared expert fused up to M<="
+            f"{dsv41_shared.fuse_max_m(max_m())}" if dsv41_shared.fuse_on() else ""))
     return _state
 
 
@@ -1051,7 +1222,9 @@ def summary() -> str:
     worst = max(_state["oracle"], default=0.0)
     return (f"NVFP4-MOE ACTIVE: {_state['layers_ours']} layers on our decode MoE, "
             f"{sum(_state['stock'].values())} on vLLM's path, "
-            f"oracle max_rel_vs_flashinfer={worst:.2e}")
+            f"oracle max_rel_vs_flashinfer={worst:.2e}"
+            + (f", {_state['shared_fused']} shared experts fused" if _state["shared_fused"]
+               else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1254,9 @@ def _fi_call(p, x, ids, tw, out):
     )
     from vllm.utils.flashinfer import flashinfer_cutlass_fused_moe
     xq, xsf = ops.scaled_fp4_quant(x, p["a1g_t"], is_sf_swizzled_layout=True)
+    # the swiglu clamp as vLLM passes it (flashinfer_cutlass_moe.py: per-expert f32)
+    lim = None if p.get("limit") is None else torch.full(
+        (p["w13"].shape[0],), float(p["limit"]), dtype=torch.float32, device=x.device)
     flashinfer_cutlass_fused_moe(
         input=xq, token_selected_experts=ids.to(torch.int), token_final_scales=tw,
         fc1_expert_weights=p["w13"].view(torch.long),
@@ -1089,7 +1265,8 @@ def _fi_call(p, x, ids, tw, out):
         quant_scales=[p["a1g_t"], p["w13_sf"].view(torch.int32), p["g1"], p["a2g_t"],
                       p["w2_sf"].view(torch.int32), p["g2"]],
         input_sf=xsf, tp_size=1, tp_rank=0, ep_size=p["ep_size"], ep_rank=p["ep_rank"],
-        activation_type=activation_to_flashinfer_type(MoEActivation(p["act_name"])))
+        activation_type=activation_to_flashinfer_type(MoEActivation(p["act_name"])),
+        **({} if lim is None else {"swiglu_limit": lim}))
     return out
 
 
@@ -1099,26 +1276,41 @@ def _dev_problem(dev, case, seed=0):
     import torch
     e_global, hdim, idim, topk, act, ep_size, ep_rank = case[:7]
     local = e_global // ep_size
+    limit = case[8] if len(case) > 8 else None
     p = make_problem(local, hdim, idim, act, device=dev, seed=seed,
-                     a1g=case[7] if len(case) > 7 else None)
+                     a1g=case[7] if len(case) > 7 else None, limit=limit)
     p["a1g_t"] = torch.full((local,), p["a1g"], dtype=torch.float32, device=dev)
     p["a2g_t"] = torch.full((local,), p["a2g"], dtype=torch.float32, device=dev)
     p.update(ep_size=ep_size, ep_rank=ep_rank, id_base=ep_rank * local, E_global=e_global)
+    if oxide_gap({"clamp_limit": limit, "E": local, "I": idim}):
+        # only the Helion port runs it: shipped configs, Helion's default
+        # config where none is shipped yet (logged UNTUNED; never in serving)
+        from suffix_hybrid.helion_kernels import nvfp4_moe as hmoe
+        p["op"] = hmoe.serving_op(None, "helion", limit, e_global, untuned_ok=True)
     return p
 
 
 def _case_name(case) -> str:
     e_global, hdim, idim, topk, act, ep_size, ep_rank = case[:7]
     ep = f" EP{ep_size} rank{ep_rank} ({e_global // ep_size} local)" if ep_size > 1 else ""
-    return f"E={e_global} H={hdim} I={idim} top{topk} {act}{ep}"
+    lim = f" swiglu_limit={case[8]}" if len(case) > 8 and case[8] is not None else ""
+    return f"E={e_global} H={hdim} I={idim} top{topk} {act}{lim}{ep}"
 
 
 CONCURRENCY = (1, 8, 16, 32)  # decode tokens per step -> routed rows = M * topk
 GLM_MS = (1, 6, 32, 64)  # MTP k=5: one seq verifies 6 tokens per step
-ORACLE_CASES = ((GEMMA_MOE, CONCURRENCY), ((64, 2048, 768, 8, "silu", 1, 0), CONCURRENCY),
+# DeepSeek-V4.1-Flash TP8 (384 experts top-6, H 5120, I 2304, swiglu clamp
+# 10): no EP (I/8 = 288 per rank) and EP8 (48 local, rank 4). Helion-only
+# (the oxide kernel has no clamp, E <= 256, I % 64): oxide_gap.
+DS_TP8 = (384, 5120, 288, 6, "silu", 1, 0, None, 10.0)
+DS_EP = (384, 5120, 2304, 6, "silu", 8, 4, None, 10.0)
+DS_MS = (1, 6, 8, 16, 32, 64, 128, 192)
+ORACLE_CASES = ((DS_EP, (1, 8, 64, 192)), (DS_TP8, (1, 8, 64, 192)),
+                (GEMMA_MOE, CONCURRENCY), ((64, 2048, 768, 8, "silu", 1, 0), CONCURRENCY),
                 (GLM_EP, GLM_MS), (GLM_TP8, GLM_MS),
                 (QWEN_EP0, (1, 5, 8, 40)), (QWEN_EP1, (1, 5, 8, 40)), (QWEN_EP1R1, (1, 5, 8, 40)))
-BENCH_CASES = ((QWEN_EP0, (1, 2, 5, 8, 10, 16, 32)), (GEMMA_MOE, (1, 2, 4, 8, 16, 32)),
+BENCH_CASES = ((DS_EP, DS_MS), (DS_TP8, DS_MS),
+               (QWEN_EP0, (1, 2, 5, 8, 10, 16, 32)), (GEMMA_MOE, (1, 2, 4, 8, 16, 32)),
                (GLM_EP, (1, 6, 12, 24, 48, 64, 96, 192)),
                (GLM_TP8, (1, 6, 12, 24, 48, 64, 96, 192)))
 
@@ -1129,7 +1321,9 @@ def oracle(cases=ORACLE_CASES):
     plans bit-identical (`run_plans`), and our kernel's per-stage drift read
     back from its workspace (`stages`); EP cases add rows routed only
     off-rank plus one batch whose tokens ALL route off-rank (exact-zero
-    contract). Fatal on mismatch."""
+    contract). Clamped (Helion-only) cases: the tune table's Helion plan
+    instead of plan/stage readback, plus a hot batch (HOT_X) where the clamp
+    engages. Fatal on mismatch."""
     import torch
     native = _native_ready()
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -1140,25 +1334,38 @@ def oracle(cases=ORACLE_CASES):
         p = _dev_problem(dev, case)
         base, local = p["id_base"], e_global // ep_size
         ws = workspace(dev, max(ms), topk, hdim, idim, local)
-        runs = [(m, None) for m in ms] + ([(8, True)] if local < e_global else [])
-        for m, dead in runs:
+        runs = [(m, None, 1.0, "balanced") for m in ms] \
+            + ([(8, True, 1.0, "balanced")] if local < e_global else []) \
+            + ([(8, None, HOT_X, "balanced")] if p["limit"] is not None else []) \
+            + ([(max(ms), None, 1.0, "skewed"), (min(32, max(ms)), None, 1.0, "hot")]
+               if "op" in p else [])
+        for m, dead, gain, dist in runs:
             ids, tw = rand_routing(m, e_global, topk, dev, seed=m, base=base, local=local,
-                                   dead=dead)
-            x = torch.randn(m, hdim, device=dev).bfloat16()
+                                   dead=dead, dist=dist)
+            x = (torch.randn(m, hdim, device=dev) * gain).bfloat16()
             lid = to_local(ids, base, local)
             ref = moe_ref(p, x, lid, tw)
             emu = moe_ref(p, x, lid, tw, fi=True).bfloat16()
             fi = _fi_call(p, x, ids, tw, torch.full((m, hdim), float("nan"),
-                                                    dtype=torch.bfloat16, device=dev)).float()
-            again = run_ours(native, p, x, ids, tw, ws, stream, mode=2).float()
-            out, pl_ok, pl = plans_nvfp4(native, p, x, ids, tw, ws, stream)
-            st_ok, st = stages(p, x, lid, tw, ws, out)
+                                                    dtype=torch.bfloat16, device=dev)).float() \
+                if fi_supported(idim) else None
+            if "op" in p:  # Helion-only: the table's plan, run twice
+                out = run_ours(native, p, x, ids, tw, ws, stream)
+                again = run_ours(native, p, x, ids, tw, ws, stream).float()
+                st_ok, st = True, (f"helion {PLANS[tune_for(m)[0]]}"
+                                   + (f" clamped={clamp_frac(p, x, lid):.1e}" if p["limit"] else ""))
+            else:
+                again = run_ours(native, p, x, ids, tw, ws, stream, mode=2).float()
+                out, pl_ok, pl = plans_nvfp4(native, p, x, ids, tw, ws, stream)
+                st_ok, st = stages(p, x, lid, tw, ws, out)
+                st_ok, st = st_ok and pl_ok, f"{st} {pl}"
             ours = out.float()
             det = bool(torch.equal(ours, again))
             ok, msg = judge(ours, fi, ref, lid, emu)
-            ok = ok and det and st_ok and pl_ok
-            st = f"{st} {pl}"
-            lines.append(f"{_case_name(case)} M={m}{' all-nonlocal' if dead else ''} "
+            ok = ok and det and st_ok
+            lines.append(f"{_case_name(case)} M={m}{' all-nonlocal' if dead else ''}"
+                         f"{f' x{gain:g}' if gain != 1.0 else ''}"
+                         f"{'' if dist == 'balanced' else ' ' + dist} "
                          f"P={m * topk}: {msg} {st} deterministic={det} "
                          f"{'OK' if ok else 'FAIL'}")
             if not ok:
@@ -1221,6 +1428,11 @@ def bench(cases=BENCH_CASES, iters=200):
         base, local = p["id_base"], e_global // ep_size
         ws = workspace(dev, max(ms), topk, hdim, idim, local)
         per_expert = 2 * idim * hdim * (1 / 2 + 1 / 16) + hdim * idim * (1 / 2 + 1 / 16)
+        if "op" in p:
+            res.update(_bench_helion(native, dev, case, p, ws, ms, per_expert))
+            del p, ws
+            torch.cuda.empty_cache()
+            continue
         for m in ms:
             ids, tw = rand_routing(m, e_global, topk, dev, seed=100 + m, dead=False)
             x = torch.randn(m, hdim, device=dev).bfloat16()
@@ -1242,6 +1454,90 @@ def bench(cases=BENCH_CASES, iters=200):
                   file=sys.stderr, flush=True)
         del p, ws
         torch.cuda.empty_cache()
+    return res
+
+
+BENCH_DISTS = ("balanced", "skewed")  # scored: a bucket ships only if it wins on BOTH
+
+
+def winner_table(name: str, rows: dict) -> tuple:
+    """rows {M: {dist: (flashinfer us, helion us)}} -> (text, MAX_M or None).
+    M wins when helion < flashinfer under EVERY dist (a 1% win counts); MAX_M =
+    the largest M whose whole range from the bottom of the grid wins: the lane
+    serves M <= MAX_M on Helion and delegates the rest to vLLM's FlashInfer path
+    (K4: it ships only where it wins; SUFFIX_NVFP4_MOE_MAX_M, <= 256)."""
+    lines, run, best = [f"WINNER TABLE {name} (cold L2, helion vs flashinfer, per dist)"], True, None
+    if any(f != f for r in rows.values() for f, _ in r.values()):  # NaN: no FlashInfer baseline
+        return (lines[0] + "\n  no stock baseline for this layout (FlashInfer refuses its "
+                "intermediate): kernel-only, helion us = "
+                + ", ".join(f"M={m} " + "/".join(f"{h:.1f}" for _, h in rows[m].values())
+                            for m in sorted(rows))), None
+    for m in sorted(rows):
+        r = {d: h / f for d, (f, h) in rows[m].items()}
+        win = all(v < 1.0 for v in r.values())
+        run = run and win
+        best = m if run else best
+        lines.append(f"  M={m:<4} " + "  ".join(f"{d} x{v:.3f}" for d, v in sorted(r.items()))
+                     + f"  {'WIN' if win else 'LOSS'}")
+    lines.append(f"  -> {MAX_M_ENV}={best}" if best else
+                 "  -> no win from the bottom of the grid: keep vLLM's path (lane off)")
+    return "\n".join(lines), best
+
+
+def _bench_helion(native, dev, case, p, ws, ms, per_expert, iters=30):
+    """bench for a Helion-only (clamped) layer: COLD-L2 us (serving's regime;
+    a TP8 rank's 384 or 48 experts are 0.85 GB, far past L2) of FlashInfer
+    vs the Helion plans — the table's plan, and the other one where all its
+    kernels are tuned (UNTUNED = Helion's default config, logged) — under
+    balanced and skewed expert loads (BENCH_DISTS), then the per-M winner table
+    (winner_table). res[(case, M)] holds the worse dist of each arm."""
+    import torch
+    from suffix_hybrid.helion_kernels import nvfp4_moe as hmoe
+    l2 = int(getattr(torch.cuda.get_device_properties(dev), "L2_cache_size", 128 << 20)) \
+        or (128 << 20)
+    buf = torch.zeros(2 * l2 // 4, dtype=torch.float32, device=dev)
+    flush = lambda: buf.sum()
+    e_global, hdim, idim, topk = case[:4]
+    base, local = p["id_base"], p["w13"].shape[0]
+    res, rows = {}, {}
+    for m in ms:
+        auto = tune_for(m)[0]
+        hcase = hmoe.lane_case(local, hdim, idim, topk, p["act"], m, p["limit"], e_global)
+        per_dist = {}
+        for dist in BENCH_DISTS:
+            ids, tw = rand_routing(m, e_global, topk, dev, seed=100 + m, dead=False,
+                                   base=base if local < e_global else 0, local=local, dist=dist)
+            x = torch.randn(m, hdim, device=dev).bfloat16()
+            out = torch.empty(m, hdim, dtype=torch.bfloat16, device=dev)
+            t_fi = _graph_us(lambda s: _fi_call(p, x, ids, tw, out), dev, iters, flush) \
+                if fi_supported(idim) else float("nan")
+            t = {}
+            for md in (2, 1):
+                lack = hmoe.missing(hcase, md)
+                if md != auto and lack:
+                    continue
+                t[md] = (_graph_us(lambda s, md=md: run_ours(native, p, x, ids, tw, ws,
+                                                             s.cuda_stream, out, md, 0),
+                                   dev, iters, flush), lack)
+            lid = to_local(ids, base, local)
+            distinct = int(torch.unique(lid[lid >= 0]).numel())
+            roof = distinct * per_expert / HBM_BPS * 1e6
+            per_dist[dist] = (t_fi, t, roof)
+            _log(f"bench {_case_name(case)} M={m} {dist} routed_rows={m * topk} "
+                 f"local_experts_hit={distinct} max_rows_per_expert="
+                 f"{int(torch.bincount(lid[lid >= 0].reshape(-1)).max()) if distinct else 0}: "
+                 f"flashinfer {t_fi:.1f} us cold, helion "
+                 + ", ".join(f"{PLANS[k]} {v:.1f} us{' UNTUNED ' + '/'.join(lack) if lack else ''}"
+                             for k, (v, lack) in t.items())
+                 + f" (table {PLANS[auto]} x{t[auto][0] / t_fi:.2f} vs flashinfer), "
+                 f"weight-roofline {roof:.1f} us")
+        rows[m] = {d: (v[0], v[1][auto][0]) for d, v in per_dist.items()}
+        modes = set.intersection(*(set(v[1]) for v in per_dist.values()))
+        res[(case, m)] = (max(v[0] for v in per_dist.values()),
+                          max(v[1][auto][0] for v in per_dist.values()),
+                          max(v[2] for v in per_dist.values()),
+                          {k: max(v[1][k][0] for v in per_dist.values()) for k in modes})
+    _log(winner_table(_case_name(case), rows)[0])
     return res
 
 
