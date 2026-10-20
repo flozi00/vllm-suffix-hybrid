@@ -100,6 +100,7 @@ class Config:
     offload_saved: bool = False
     mem_trace: bool = False
     host_ckpt: bool = False
+    swap_keep: int = 0
     saved_min_mb: int = 1
     free_kv: bool = False
     duty: float = 0.5
@@ -125,6 +126,7 @@ class Config:
                    offload_saved=bool(int(_env("OFFLOAD_SAVED", 0))),
                    mem_trace=bool(int(_env("MEM_TRACE", 0))),
                    host_ckpt=bool(int(_env("HOST_CKPT", 0))),
+                   swap_keep=int(_env("SWAP_KEEP", 0)),
                    saved_min_mb=int(_env("SAVED_MIN_MB", 1)),
                    free_kv=bool(int(_env("FREE_KV", 0))),
                    duty=min(1.0, max(0.05, float(_env("DUTY", 0.5)))),

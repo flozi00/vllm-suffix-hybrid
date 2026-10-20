@@ -422,6 +422,19 @@ def _to_host(t):
     return h
 
 
+def _swap_out(mod):
+    """Move a frozen layer's weights to host (block swap, Unsloth-style)."""
+    for p in mod.parameters():
+        if p.is_cuda:
+            p.data = p.data.to("cpu", non_blocking=False)
+
+
+def _swap_in(mod, dev):
+    for p in mod.parameters():
+        if not p.is_cuda:
+            p.data = p.data.to(dev, non_blocking=False)
+
+
 class _HostCkpt(torch.autograd.Function):
     """Checkpoint whose saved inputs live in pinned host memory.
 
@@ -435,8 +448,8 @@ class _HostCkpt(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, fn, device, dummy, *args):
-        ctx.fn, ctx.device = fn, device
+    def forward(ctx, fn, device, dummy, mod, *args):
+        ctx.fn, ctx.device, ctx.mod = fn, device, mod
         ctx.host = []
         for a in args:
             if torch.is_tensor(a) and a.is_floating_point():
@@ -466,9 +479,16 @@ class _HostCkpt(torch.autograd.Function):
             out = (out,)
         need = [a for a in args if torch.is_tensor(a) and a.is_floating_point()]
         g = [x.to(ctx.device, non_blocking=False) if torch.is_tensor(x) else x for x in grads]
+        # autograd.grad only fills the *input* grads; the LoRA leaves need
+        # autograd.backward to accumulate into .grad, so do both.
+        torch.autograd.backward(out, g, retain_graph=True)
         got = torch.autograd.grad(out, need, g, allow_unused=True)
+        if ctx.mod is not None:
+            _swap_out(ctx.mod)   # only after the recompute's gradient is taken
+        # inputs were host tensors, so their gradients must be host tensors too
+        got = [x.to("cpu", non_blocking=False) if torch.is_tensor(x) else x for x in got]
         it = iter(got)
-        return (None, None, None) + tuple(
+        return (None, None, None, None) + tuple(
             next(it) if (torch.is_tensor(a) and a.is_floating_point()) else None for a in args)
 
 
@@ -572,9 +592,19 @@ class TrainMode(contextlib.ContextDecorator):
                     if getattr(m, flag):
                         self._set(m, flag, False)
             _layers = list(self.s.inner.layers)
+            _keep = int(getattr(self.s.cfg, "swap_keep", 0) or 0)
             for _i, layer in enumerate(_layers):
+                _swap = bool(_keep) and _i >= _keep
+                if _swap:
+                    _swap_out(layer)   # start every step with the tail on host
                 self._set(layer, "forward",
-                          self._checkpointed(layer.forward, last=(_i == len(_layers) - 1)))
+                          self._checkpointed(layer.forward, last=(_i == len(_layers) - 1),
+                                             mod=layer, swap=_swap))
+            if _keep:
+                # serving shares these modules: put every layer back before the
+                # context exits, or the parity check runs against CPU weights
+                self._stack.callback(
+                    lambda: [_swap_in(l, self.s.device) for l in _layers])
             if self.g.world_size > 1:
                 raw = _Raw(self.g, self.g.all_reduce)
                 self._set(self.g, "all_reduce", lambda x: _ReduceFromTP.apply(x, raw))
@@ -641,10 +671,15 @@ class TrainMode(contextlib.ContextDecorator):
                 if isinstance(op, IrOp) and op.get_priority():
                     st.enter_context(op.set_priority(["native"]))
 
-    def _checkpointed(self, fwd, last=False):
+    def _checkpointed(self, fwd, last=False, mod=None, swap=False):
         def run(*args, **kwargs):
             if not torch.is_grad_enabled():
-                return fwd(*args, **kwargs)
+                if swap:
+                    _swap_in(mod, self.s.device)
+                out = fwd(*args, **kwargs)
+                if swap:
+                    _swap_out(mod)
+                return out
             # float tensors (hidden states / residual) travel through the
             # checkpoint as host copies; ints (positions) and the rest stay
             slots = [(i, a) for i, a in enumerate(args)] + list(kwargs.items())
@@ -668,7 +703,14 @@ class TrainMode(contextlib.ContextDecorator):
                           f"parked={bool(parked)} left={self.offload_left / 2**30:.1f} GiB, "
                           f"size={size / 2**20:.0f} MB",
                           file=sys.stderr, flush=True)
+                if swap:
+                    _swap_in(mod, self.s.device)
                 out = fwd(*a, **kw)
+                if swap and not torch.is_grad_enabled():
+                    # forward pass only: no graph holds the weights, so they can
+                    # go back to host. The recompute's swap-out happens in
+                    # _HostCkpt.backward, after autograd.grad has read them.
+                    _swap_out(mod)
                 return out
 
             # Two parking designs. HF's `offload=True` lets the checkpoint save
@@ -679,6 +721,7 @@ class TrainMode(contextlib.ContextDecorator):
             # When offload_saved is on, use the HF design and skip _Park.
             if self.host_ckpt:
                 out = _HostCkpt.apply(body, self.s.device, self._dummy,
+                                      mod if swap else None,
                                       *[v for k, v in slots if k in keys])
                 if last:   # the model's own norm/CE expect device tensors
                     out = tuple(o.to(self.s.device, non_blocking=False)
