@@ -47,6 +47,7 @@ mamba layers, encoder-only attention.
 from __future__ import annotations
 
 import contextlib
+import os
 import fnmatch
 import inspect
 import sys
@@ -69,7 +70,7 @@ DEFAULT_TARGETS = (
 )
 FUSED_FLAGS = ("use_fused_qk_norm_rope_gate",)    # Qwen3NextAttention Triton fusion
 QSA_DENSE_MAX = 2048        # QSA selects every key up to its 2048-block budget: dense = exact
-CE_BYTES = 256 << 20                              # fp32 logits per CE chunk
+CE_BYTES = int(os.environ.get("SUFFIX_SFT_CE_MB", "256")) << 20   # fp32 logits per CE chunk
 GDN_HEAD_GROUP = None       # heads per delta-rule backward group; None = from GDN_GROUP_BYTES
 GDN_GROUP_BYTES = 3 << 29   # ~1.5 GiB of fp32 intermediates (~8 KiB per head-token)
 
@@ -393,7 +394,7 @@ class _Park(torch.autograd.Function):
             h = torch.empty(x.shape, dtype=x.dtype, pin_memory=x.is_cuda)
         except RuntimeError:   # pinned pool exhausted: pageable works, just slower
             h = torch.empty(x.shape, dtype=x.dtype)
-        slot.append(h.copy_(x.detach(), non_blocking=True))
+        slot.append(h.copy_(x.detach(), non_blocking=False))
         return x.new_zeros(()).expand(x.shape)
 
     @staticmethod
@@ -411,6 +412,66 @@ class _Unpark(torch.autograd.Function):
         return g, None
 
 
+def _to_host(t):
+    """Pinned host copy of a device tensor (pageable if the pinned pool is full)."""
+    try:
+        h = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    except RuntimeError:
+        h = torch.empty(t.shape, dtype=t.dtype)
+    h.copy_(t.detach(), non_blocking=False)
+    return h
+
+
+class _HostCkpt(torch.autograd.Function):
+    """Checkpoint whose saved inputs live in pinned host memory.
+
+    ``torch.utils.checkpoint`` keeps one activation per layer on the device --
+    layers x seq x hidden x bytes, which is 7.6 GiB at 32k for this model and
+    more than the card has. This saves the same tensors to host and recomputes
+    the layer in backward, which is what HF's
+    ``gradient_checkpointing(offload=True)`` does. It also cannot be expressed
+    with ``saved_tensors_hooks``: checkpoint installs its own hooks inside the
+    region and shadows any outer ones.
+    """
+
+    @staticmethod
+    def forward(ctx, fn, device, dummy, *args):
+        ctx.fn, ctx.device = fn, device
+        ctx.host = []
+        for a in args:
+            if torch.is_tensor(a) and a.is_floating_point():
+                h = a if not a.is_cuda else _to_host(a)
+                ctx.host.append(h)
+            else:
+                ctx.host.append(a)
+        dev = [h.to(device, non_blocking=False) if torch.is_tensor(h) else h for h in ctx.host]
+        with torch.no_grad():
+            out = fn(*dev)
+        if not isinstance(out, tuple):
+            out = (out,)
+        # Return host tensors: the graph then holds host memory between layers,
+        # so no device activation survives the forward.
+        return tuple(_to_host(o) if torch.is_tensor(o) else o for o in out)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        args = [h.to(ctx.device, non_blocking=False) if torch.is_tensor(h) else h
+                for h in ctx.host]
+        for a in args:
+            if torch.is_tensor(a) and a.is_floating_point():
+                a.requires_grad_(True)
+        with torch.enable_grad():
+            out = ctx.fn(*args)
+        if not isinstance(out, tuple):
+            out = (out,)
+        need = [a for a in args if torch.is_tensor(a) and a.is_floating_point()]
+        g = [x.to(ctx.device, non_blocking=False) if torch.is_tensor(x) else x for x in grads]
+        got = torch.autograd.grad(out, need, g, allow_unused=True)
+        it = iter(got)
+        return (None, None, None) + tuple(
+            next(it) if (torch.is_tensor(a) and a.is_floating_point()) else None for a in args)
+
+
 class TrainMode(contextlib.ContextDecorator):
     """Context in which ``lm``'s live modules compute with autograd.
     ``params``: {id(layer): (A, B, scale)} trainable views; ``segments``:
@@ -423,6 +484,12 @@ class TrainMode(contextlib.ContextDecorator):
         self.offload_left = offload_bytes   # host budget for parked layer inputs
         self.mlp_tile = int(getattr(sft.cfg, "mlp_tile", 0) or 0)
         self.offload_saved = bool(getattr(sft.cfg, "offload_saved", False))
+        self.mem_trace = bool(getattr(sft.cfg, "mem_trace", False))
+        self.host_ckpt = bool(getattr(sft.cfg, "host_ckpt", False))
+        # LoRA freezes the base weights, so hidden states never require grad and
+        # autograd.Function.apply would attach no node. This forces one.
+        self._dummy = torch.zeros(1, device=self.s.device, requires_grad=True)
+        self._trace_n = 0
         self.saved_min = int(getattr(sft.cfg, "saved_min_mb", 1) or 1) * 2**20
         self.cut = []      # modules whose output lost the input's grad (check=True)
         self.g = sft.g
@@ -504,8 +571,10 @@ class TrainMode(contextlib.ContextDecorator):
                 for flag in flags:
                     if getattr(m, flag):
                         self._set(m, flag, False)
-            for layer in self.s.inner.layers:
-                self._set(layer, "forward", self._checkpointed(layer.forward))
+            _layers = list(self.s.inner.layers)
+            for _i, layer in enumerate(_layers):
+                self._set(layer, "forward",
+                          self._checkpointed(layer.forward, last=(_i == len(_layers) - 1)))
             if self.g.world_size > 1:
                 raw = _Raw(self.g, self.g.all_reduce)
                 self._set(self.g, "all_reduce", lambda x: _ReduceFromTP.apply(x, raw))
@@ -572,7 +641,7 @@ class TrainMode(contextlib.ContextDecorator):
                 if isinstance(op, IrOp) and op.get_priority():
                     st.enter_context(op.set_priority(["native"]))
 
-    def _checkpointed(self, fwd):
+    def _checkpointed(self, fwd, last=False):
         def run(*args, **kwargs):
             if not torch.is_grad_enabled():
                 return fwd(*args, **kwargs)
@@ -582,7 +651,7 @@ class TrainMode(contextlib.ContextDecorator):
             keys = [k for k, v in slots if torch.is_tensor(v) and v.is_floating_point()]
             size = sum(v.numel() * v.element_size() for k, v in slots if k in keys)
             parked = {}
-            if size <= self.offload_left:   # past the host budget inputs stay on the GPU
+            if not (self.offload_saved or self.host_ckpt) and size <= self.offload_left:   # past the host budget inputs stay on the GPU
                 self.offload_left -= size
                 parked = {k: [] for k in keys}
 
@@ -590,16 +659,41 @@ class TrainMode(contextlib.ContextDecorator):
                 got = {k: (_Unpark.apply(v, parked[k]) if parked else v) for k, v in zip(keys, vals)}
                 a = [got.get(i, v) for i, v in enumerate(args)]
                 kw = {k: got.get(k, v) for k, v in kwargs.items()}
-                return fwd(*a, **kw)
+                if self.mem_trace:
+                    self._trace_n += 1
+                    free, _ = torch.cuda.mem_get_info()
+                    print(f"[sft mem] layer {self._trace_n} enter: free {free / 2**30:.2f} GiB, "
+                          f"alloc {torch.cuda.memory_allocated() / 2**30:.2f} GiB, "
+                          f"peak {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB, "
+                          f"parked={bool(parked)} left={self.offload_left / 2**30:.1f} GiB, "
+                          f"size={size / 2**20:.0f} MB",
+                          file=sys.stderr, flush=True)
+                out = fwd(*a, **kw)
+                return out
 
-            vals = [(_Park.apply(v, parked[k]) if parked else v) for k, v in slots if k in keys]
+            # Two parking designs. HF's `offload=True` lets the checkpoint save
+            # the real activation and moves *that* to host via saved_tensors_hooks
+            # -- the graph then holds a host tensor, not a device one. Our _Park
+            # handle is smaller still, but the autograd edge from _Park keeps the
+            # producer's device tensor alive, so it does not actually free it.
+            # When offload_saved is on, use the HF design and skip _Park.
+            if self.host_ckpt:
+                out = _HostCkpt.apply(body, self.s.device, self._dummy,
+                                      *[v for k, v in slots if k in keys])
+                if last:   # the model's own norm/CE expect device tensors
+                    out = tuple(o.to(self.s.device, non_blocking=False)
+                                if torch.is_tensor(o) else o for o in out)
+                return out
+            if self.offload_saved:
+                vals = [v for k, v in slots if k in keys]
+            else:
+                vals = [(_Park.apply(v, parked[k]) if parked else v) for k, v in slots if k in keys]
             return checkpoint(body, *vals, use_reentrant=False)
         return run
 
     def _pack_saved(self, t):
         """saved_tensors_hooks pack: park a tensor the backward will need."""
-        if (t.is_cuda and t.is_floating_point() and t.numel() * t.element_size() >= self.saved_min
-                and not t.requires_grad):
+        if (t.is_cuda and t.is_floating_point() and t.numel() * t.element_size() >= self.saved_min):
             try:
                 h = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
             except RuntimeError:   # pinned pool exhausted: pageable still works
