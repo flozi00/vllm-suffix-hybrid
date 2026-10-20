@@ -94,6 +94,8 @@ class Config:
     max_tokens: int = 4096
     min_free_gib: float = 4.0
     offload_gib: float = 2.0
+    mlp_tile: int = 4096
+    free_kv: bool = False
     duty: float = 0.5
     max_examples: int = 256
     max_steps: int = 1000
@@ -111,6 +113,8 @@ class Config:
                    targets=t or DEFAULT_TARGETS, max_tokens=int(_env("MAX_TOKENS", 4096)),
                    min_free_gib=float(_env("MIN_FREE_GIB", 4)),
                    offload_gib=float(_env("OFFLOAD_GIB", 2)),
+                   mlp_tile=int(_env("MLP_TILE", 4096)),
+                   free_kv=bool(int(_env("FREE_KV", 0))),
                    duty=min(1.0, max(0.05, float(_env("DUTY", 0.5)))),
                    max_examples=int(_env("MAX_EXAMPLES", 256)),
                    max_steps=int(_env("MAX_STEPS", 1000)), repo_id=_env("REPO_ID", ""),

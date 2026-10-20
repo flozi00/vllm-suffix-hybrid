@@ -126,8 +126,9 @@ def _numel(shp):
 
 
 class WorkerSFT:
-    def __init__(self, model, vllm_config, cfg, group=None):
+    def __init__(self, model, vllm_config, cfg, group=None, worker=None):
         self.cfg, self.vllm_config = cfg, vllm_config
+        self.vw = worker          # the vLLM Worker: sleep/wake_up live there
         self.g = group if group is not None and group.world_size > 1 else SingleGroup()
         self.lm, self.inner, self.head, self.lp = M.language_model(model)
         M.check_supported(self.lm, vllm_config)
@@ -152,6 +153,34 @@ class WorkerSFT:
             sort_keys=True).encode()).hexdigest()[:16]
 
     # ------------------------------------------------------------------ ops
+    def kv_free(self, _p=None):
+        """Unmap the KV cache for the duration of a run (vLLM sleep mode).
+
+        ``sleep(1)`` offloads the weights to host and *discards* every other
+        tagged allocation -- the KV cache. ``wake_up(["weights"])`` brings the
+        weights back and leaves the KV cache unmapped, so training gets the
+        whole card minus the weights. ``kv_restore`` maps it back at the same
+        virtual address, so the captured CUDA graphs stay valid. Serving is
+        paused while the cache is gone: the run owns the card.
+        """
+        if not self.cfg.free_kv or self.vw is None:
+            return dict(ok=False, reason="free_kv off")
+        try:
+            self.vw.sleep(1)
+            self.vw.wake_up(["weights"])
+        except Exception as exc:  # noqa: BLE001 - fall back to sharing the card
+            return dict(ok=False, reason=f"{type(exc).__name__}: {exc}")
+        return dict(ok=True, free_gib=round(torch.cuda.mem_get_info()[0] / 2**30, 2))
+
+    def kv_restore(self, _p=None):
+        if not self.cfg.free_kv or self.vw is None:
+            return dict(ok=False, reason="free_kv off")
+        try:
+            self.vw.wake_up()
+        except Exception as exc:  # noqa: BLE001
+            return dict(ok=False, reason=f"{type(exc).__name__}: {exc}")
+        return dict(ok=True, free_gib=round(torch.cuda.mem_get_info()[0] / 2**30, 2))
+
     def info(self, _p=None):
         n = sum(lo.A.numel() + lo.B.numel() for _, lo in self.adapters.values())
         return dict(adapters=len(self.adapters), params=n * self.g.world_size, rank=self.cfg.rank,
@@ -186,12 +215,17 @@ class WorkerSFT:
             loss = tm.nll(ids, rows, tgt)
             fwd = float(loss.detach())        # syncs: forward time
             t1 = time.perf_counter()
+            fwd_peak = (torch.cuda.max_memory_allocated(self.device)
+                        if self.device.type == "cuda" else 0)
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
             (loss / float(p["norm"])).backward()
             _sync()
         out = dict(loss_sum=fwd, tokens=int(tgt.numel()), fwd_ms=round((t1 - t0) * 1e3, 1),
                    bwd_ms=round((time.perf_counter() - t1) * 1e3, 1))
         if self.device.type == "cuda":   # what training adds on top of serving's resident set
             out.update(peak_gib=round((torch.cuda.max_memory_allocated(self.device) - base) / 2**30, 3),
+                       fwd_peak_gib=round((fwd_peak - base) / 2**30, 3),
                        free_gib=round(free / 2**30, 2), host_pinned_gib=_pinned_gib())
         if check:
             bad = M.grad_reach(self.adapters, self.run.grad_of)
@@ -332,7 +366,8 @@ def shard_name(rank, world):
     return f"adapter-tp{rank}-of-{world}.safetensors"
 
 
-OPS = ("info", "begin", "micro", "step", "eval", "save", "commit", "abort", "load", "reset", "diag")
+OPS = ("info", "begin", "micro", "step", "eval", "save", "commit", "abort", "load", "reset", "diag",
+       "kv_free", "kv_restore")
 RUN_OPS = ("micro", "step", "commit")    # need the run on EVERY rank
 
 
@@ -385,7 +420,7 @@ def patch_worker(mod, cfg):
         out = orig(self, *args, **kwargs)
         global SFT, INSTALL_ERROR
         try:
-            SFT = WorkerSFT(self.get_model(), self.vllm_config, cfg, _tp_group())
+            SFT = WorkerSFT(self.get_model(), self.vllm_config, cfg, _tp_group(), worker=self)
             info = SFT.info()
             _log(f"installed: {info['adapters']} adapters, {info['params'] / 1e6:.1f}M params, "
                  f"r={cfg.rank} tp={info['tp']} fingerprint={info['fingerprint']}")

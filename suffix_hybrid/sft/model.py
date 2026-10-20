@@ -127,6 +127,11 @@ def is_ple(m) -> bool:      # Qwen4Exp per-layer n-gram embedding + short conv
     return hasattr(m, "ple_embedding") and hasattr(m, "kv_proj") and hasattr(m, "norm_conv")
 
 
+def is_mlp(m) -> bool:      # dense MLP block: token-wise, so it can be tiled
+    return ((hasattr(m, "w13") and hasattr(m, "w2"))
+            or (hasattr(m, "gate_up_proj") and hasattr(m, "down_proj")))
+
+
 def check_supported(lm, vllm_config=None):
     """Raise NotImplementedError naming the first module SFT cannot train."""
     if vllm_config is not None and vllm_config.parallel_config.pipeline_parallel_size > 1:
@@ -382,7 +387,10 @@ class _Park(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, slot):
-        h = torch.empty(x.shape, dtype=x.dtype, pin_memory=x.is_cuda)
+        try:
+            h = torch.empty(x.shape, dtype=x.dtype, pin_memory=x.is_cuda)
+        except RuntimeError:   # pinned pool exhausted: pageable works, just slower
+            h = torch.empty(x.shape, dtype=x.dtype)
         slot.append(h.copy_(x.detach(), non_blocking=True))
         return x.new_zeros(()).expand(x.shape)
 
@@ -411,6 +419,7 @@ class TrainMode(contextlib.ContextDecorator):
         self.s, self.params, self.segments = sft, params, segments
         self.grad, self.check = grad, check
         self.offload_left = offload_bytes   # host budget for parked layer inputs
+        self.mlp_tile = int(getattr(sft.cfg, "mlp_tile", 0) or 0)
         self.cut = []      # modules whose output lost the input's grad (check=True)
         self.g = sft.g
         self.kv = {}
@@ -439,6 +448,7 @@ class TrainMode(contextlib.ContextDecorator):
                      "sconv" if is_shortconv(m) else
                      "hc" if is_hc(m) else "ple" if is_ple(m) else
                      "attn" if is_attention(m) else "gdn" if is_gdn(m) else
+                     "mlp" if is_mlp(m) else
                      "op" if hasattr(m, "_forward_method") and hasattr(m, "forward_native") else None,
                      hasattr(m, "do_not_compile"), [f for f in FUSED_FLAGS if hasattr(m, f)])
                     for m in self.s.lm.modules()]
@@ -472,6 +482,9 @@ class TrainMode(contextlib.ContextDecorator):
                 elif kind == "sconv":
                     self._set(m, "forward", lambda hidden_states, output, _m=m:
                               self.shortconv(_m, hidden_states, output))
+                elif kind == "mlp":
+                    orig = m.forward
+                    self._set(m, "forward", lambda x, _o=orig: self._tiled_mlp(_o, x))
                 elif kind == "op":
                     self._set(m, "_forward_method", m.forward_native)
                 if compiled:
@@ -570,6 +583,19 @@ class TrainMode(contextlib.ContextDecorator):
             vals = [(_Park.apply(v, parked[k]) if parked else v) for k, v in slots if k in keys]
             return checkpoint(body, *vals, use_reentrant=False)
         return run
+
+    def _tiled_mlp(self, orig, x):
+        """Run a token-wise MLP in sequence tiles.
+
+        The gate/up intermediate is [T, 2*ff] and dominates peak memory at
+        long context: 64k tokens x 21504 x 2 B = 2.7 GB for LFM2.5-2.6B, plus
+        the activated copy. Tiling bounds the transient to tile x 2*ff and is
+        exact -- an MLP has no cross-token mixing, so the tiles are independent.
+        """
+        tile = self.mlp_tile
+        if tile <= 0 or x.shape[0] <= tile:
+            return orig(x)
+        return torch.cat([orig(x[i:i + tile]) for i in range(0, x.shape[0], tile)], 0)
 
     # -- swapped ops ---------------------------------------------------------
     def linear(self, layer, x, bias):

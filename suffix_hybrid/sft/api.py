@@ -393,10 +393,13 @@ class State:
                 raise _http(409, {"message": "training forward diverges from serving; refusing "
                                              "(SUFFIX_SFT_PARITY_NATS + up to 3 standard errors)", "parity": pre})
             stage = "training"
+            mem = dict(train_peak_gib=0.0, fwd_peak_gib=0.0, min_free_gib=None, host_pinned_gib=None,
+                       max_micro_ms=0.0, fwd_ms=0.0, bwd_ms=0.0, tokens=0)
+            kv = await self.rpc("kv_free")
+            if kv.get("ok"):
+                mem["kv_freed_gib"] = round(kv.get("free_gib", 0.0), 2)
             await self.rpc("begin", dict(lr=lr, weight_decay=wd))
             losses, first, checked = [], None, False
-            mem = dict(train_peak_gib=0.0, min_free_gib=None, host_pinned_gib=None, max_micro_ms=0.0,
-                       fwd_ms=0.0, bwd_ms=0.0, tokens=0)
             for step, idx in enumerate(schedule(len(data), steps, bs, int(req.get("seed", 0)))):
                 batch = [data[i] for i in idx]
                 norm = sum(sum(m[1:]) for _, m in batch)
@@ -410,6 +413,8 @@ class State:
                         mem[k] += r.get(k, 0)
                     if "peak_gib" in r:
                         mem["train_peak_gib"] = max(mem["train_peak_gib"], r["peak_gib"])
+                        mem["fwd_peak_gib"] = max(float(mem["fwd_peak_gib"] or 0.0),
+                                                  float(r.get("fwd_peak_gib") or 0.0))
                         mem["min_free_gib"] = min(mem["min_free_gib"] or 1e9, r["free_gib"])
                         mem["host_pinned_gib"] = r.get("host_pinned_gib")
                     await self.yield_to_serving(r["ms"])
@@ -440,6 +445,7 @@ class State:
                 self.hub.publish, api, parent, meta, run_dir,
                 f"SFT {run_id}: {steps} steps, {len(data)} examples")
             stage = "serve"
+            await self.rpc("kv_restore")
             await self.rpc("commit")
             await self.reset_cache()
             post = await self.parity(*data[0])
@@ -451,6 +457,7 @@ class State:
             self.status.pop("error", None)
             return result
         except BaseException as exc:
+            await self.rpc("kv_restore", check=False)
             await self.rpc("abort", check=False)
             if stage == "serve":   # partial commit: keep every TP rank on the same weights
                 await self.rpc("reset", check=False)
