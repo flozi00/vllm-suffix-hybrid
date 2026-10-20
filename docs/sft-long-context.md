@@ -136,3 +136,50 @@ curl -X POST localhost:8000/v1/sft/train --data-binary @results/one_32k.json
 
 `memory` in the response reports `kv_freed_gib`, `fwd_peak_gib`, `min_free_gib`
 and `host_pinned_gib` alongside the loss.
+
+## Block swap: works for training, incompatible with CUDA graphs
+
+`SUFFIX_SFT_SWAP_KEEP=N` offloads the last N layers' frozen weights to host
+around each layer's forward and recompute. Measured at 16k on the A2000:
+
+| | host checkpoint only | + block swap (N=10) |
+|---|---|---|
+| `alloc` | 7.82 GiB | **4.84 GiB** |
+| `free` | 0.87 GiB | **1.20 GiB** |
+| backward recompute | OOM at layer 31 | **all 30 layers ran** |
+
+So the technique does what the Unsloth report predicted: ~3 GiB back, and the
+backward finally completes. Three bugs had to be fixed to get there:
+
+1. The no-grad (eval) path returned `fwd(*args)` directly and skipped the
+   swap-in, so the post-training parity check ran against CPU weights.
+2. Swapping out inside `body` ran *before* `autograd.grad` had read the
+   weights, giving `mat2 is on cpu`.
+3. `autograd.grad(out, need, g)` only fills the **input** grads. The LoRA
+   leaves never got `.grad`, and the plugin's own grad-reach check caught it
+   (`gradient cut in the training forward`). `autograd.backward` is needed as
+   well, with `retain_graph=True`.
+
+### The blocker
+
+Replacing `p.data` frees the GPU storage the captured CUDA graphs point at.
+The next graph replay faults: `CUDA error: an illegal memory access was
+encountered`. Restoring the weights allocates *new* storage, so the pointers
+never come back.
+
+The obvious escape — `--enforce-eager`, which disables CUDA graphs entirely —
+does not work on this build. Engine init OOMs inside
+`determine_available_memory` even at `--gpu-memory-utilization 0.60` and
+`--max-model-len 32768`, with 11.2 GiB free on the card. Eager mode is not a
+usable fallback here.
+
+Two ways forward, neither implemented yet:
+
+- **Re-capture the graphs after a swap run.** The run already owns the card
+  and the KV cache is unmapped, so a re-capture is cheap relative to a step.
+- **Restore into the original storage.** Keep the GPU tensor allocated and
+  `copy_()` the host copy back, so the address never changes. This only works
+  if the swap-out is a `copy_()` to host plus a *zero-fill* rather than a
+  free — which saves no memory, so it is really the first option.
+
+Until one of those lands, `SWAP_KEEP` defaults to 0.
