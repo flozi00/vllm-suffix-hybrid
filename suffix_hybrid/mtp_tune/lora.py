@@ -152,9 +152,11 @@ class LoRA:
     """Persistent adapter tensors; values change only through copy_."""
 
     def __init__(self, name, k, n, rank, alpha, kind, tp_rank=0, tp_size=1,
-                 dtype=torch.bfloat16, device="cpu"):
+                 dtype=torch.bfloat16, device="cpu", rslora=False):
         self.name, self.kind, self.r = name, kind, int(rank)
-        self.scale = float(alpha) / float(rank)
+        # rsLoRA: alpha/sqrt(r) instead of alpha/r, so raising the rank adds
+        # capacity without scaling the delta up with it (Kalajdzievski 2023).
+        self.scale = float(alpha) / (float(rank) ** 0.5 if rslora else float(rank))
         gen = torch.Generator().manual_seed(zlib.crc32(name.encode()))
         k_total = k * tp_size if kind == "row" else k
         a_full = torch.randn(k_total, self.r, generator=gen) / (k_total ** 0.5)

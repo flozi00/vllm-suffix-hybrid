@@ -43,7 +43,7 @@ class Run:
     adapter, replicated TP factors first so their grads all-reduce as one
     slice), fp32 master + AdamW on the host."""
 
-    def __init__(self, sft, lr, weight_decay=0.0, clip=1.0):
+    def __init__(self, sft, lr, weight_decay=0.0, clip=1.0, lr_b_ratio=1.0):
         self.s, self.clip = sft, clip
         spans, off = {}, 0
         for want_rep in (True, False):
@@ -65,7 +65,19 @@ class Run:
         self.master = self.flat.detach().float().cpu()
         if torch.cuda.is_available():
             self.master = self.master.pin_memory()
-        self.opt = torch.optim.AdamW([self.master], lr=lr, weight_decay=weight_decay)
+        # LoRA+ (Hayou et al. 2024): B starts at zero, so its gradient is the
+        # one that actually moves the function. A larger step on B converges in
+        # far fewer optimizer steps -- which is the binding constraint here.
+        self.lr_vec = torch.full((off,), float(lr), dtype=torch.float32)
+        for (name, f), (o, shp) in spans.items():
+            if f == "B":
+                self.lr_vec[o:o + _numel(shp)] = float(lr) * lr_b_ratio
+        self.b1, self.b2, self.eps = 0.9, 0.999, 1e-8
+        self.wd, self.t = float(weight_decay), 0
+        self.m = torch.zeros_like(self.master)
+        self.v = torch.zeros_like(self.master)
+        if torch.cuda.is_available():
+            self.m, self.v = self.m.pin_memory(), self.v.pin_memory()
         self.steps = 0
 
     def view(self, name, f):
@@ -106,9 +118,15 @@ class Run:
             raise FloatingPointError(f"non-finite grad norm {norm}")
         g = self.flat.grad
         with torch.no_grad():
-            self.master.grad = g.float().cpu() * min(1.0, self.clip / (norm + 1e-6))
-            self.opt.step()
-            self.opt.zero_grad(set_to_none=True)
+            g = g.float().cpu() * min(1.0, self.clip / (norm + 1e-6))
+            self.t += 1
+            self.m.mul_(self.b1).add_(g, alpha=1 - self.b1)
+            self.v.mul_(self.b2).addcmul_(g, g, value=1 - self.b2)
+            upd = (self.m / (1 - self.b1 ** self.t)) / (
+                (self.v / (1 - self.b2 ** self.t)).sqrt() + self.eps)
+            if self.wd:
+                upd.add_(self.master, alpha=self.wd)
+            self.master.addcmul_(upd, self.lr_vec, value=-1.0)
             self.flat.grad = None
             self.flat.copy_(self.master)
         self.steps += 1
@@ -135,7 +153,8 @@ class WorkerSFT:
         mc = getattr(vllm_config, "model_config", None)
         self.mrope = bool(getattr(mc, "uses_mrope", False))
         self.adapters = M.install_adapters(self.lm, cfg.targets, cfg.rank, cfg.alpha,
-                                           self.g.rank_in_group, getattr(mc, "dtype", None))
+                                           self.g.rank_in_group, getattr(mc, "dtype", None),
+                                           rslora=cfg.rslora)
         ac = getattr(vllm_config, "additional_config", None)
         if isinstance(ac, dict):   # compile-cache key: graphs built for these adapters only
             ac["suffix_sft"] = dict(rank=cfg.rank, alpha=cfg.alpha, targets=list(cfg.targets))
@@ -166,6 +185,12 @@ class WorkerSFT:
         if not self.cfg.free_kv or self.vw is None:
             return dict(ok=False, reason="free_kv off")
         try:
+            # The captured CUDA graphs (0.61 GiB here) are only needed to
+            # *serve*; keep them asleep for the run too. vLLM only defers
+            # weights and kv_cache by default, so widen the deferrable set.
+            from vllm.device_allocator import cumem
+            if "cudagraph" not in cumem.DEFERRABLE_TAGS:
+                cumem.DEFERRABLE_TAGS = (*cumem.DEFERRABLE_TAGS, "cudagraph")
             self.vw.sleep(1)
             self.vw.wake_up(["weights"])
         except Exception as exc:  # noqa: BLE001 - fall back to sharing the card
@@ -190,7 +215,7 @@ class WorkerSFT:
 
     def begin(self, p):
         self.run = Run(self, float(p["lr"]), float(p.get("weight_decay", 0.0)),
-                       float(p.get("clip", 1.0)))
+                       float(p.get("clip", 1.0)), lr_b_ratio=self.cfg.lora_plus)
         return dict(ok=True)
 
     def _batch(self, p):
@@ -210,6 +235,9 @@ class WorkerSFT:
             torch.cuda.reset_peak_memory_stats(self.device)
             base = torch.cuda.memory_allocated(self.device)
         t0 = time.perf_counter()
+        if self.device.type == "cuda":
+            _log(f"micro: {int(tgt.numel())} loss tokens, free {free / 2**30:.2f} GiB "
+                 f"before forward")
         with M.TrainMode(self, self.run.params(), segs, grad=True,
                          offload_bytes=int(self.cfg.offload_gib * 2**30), check=check) as tm:
             loss = tm.nll(ids, rows, tgt)

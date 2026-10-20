@@ -90,11 +90,15 @@ def _env(name, default):
 class Config:
     rank: int = 16
     alpha: float = 32.0
+    rslora: bool = False
+    lora_plus: float = 1.0
     targets: tuple = field(default_factory=tuple)
     max_tokens: int = 4096
     min_free_gib: float = 4.0
     offload_gib: float = 2.0
     mlp_tile: int = 4096
+    offload_saved: bool = False
+    saved_min_mb: int = 1
     free_kv: bool = False
     duty: float = 0.5
     max_examples: int = 256
@@ -110,10 +114,14 @@ class Config:
         t = tuple(x.strip() for x in _env("TARGETS", "").split(",") if x.strip())
         home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
         return cls(rank=int(_env("RANK", 16)), alpha=float(_env("ALPHA", 32)),
+                   rslora=bool(int(_env("RSLORA", 0))),
+                   lora_plus=float(_env("LORA_PLUS", 1.0)),
                    targets=t or DEFAULT_TARGETS, max_tokens=int(_env("MAX_TOKENS", 4096)),
                    min_free_gib=float(_env("MIN_FREE_GIB", 4)),
                    offload_gib=float(_env("OFFLOAD_GIB", 2)),
                    mlp_tile=int(_env("MLP_TILE", 4096)),
+                   offload_saved=bool(int(_env("OFFLOAD_SAVED", 0))),
+                   saved_min_mb=int(_env("SAVED_MIN_MB", 1)),
                    free_kv=bool(int(_env("FREE_KV", 0))),
                    duty=min(1.0, max(0.05, float(_env("DUTY", 0.5)))),
                    max_examples=int(_env("MAX_EXAMPLES", 256)),

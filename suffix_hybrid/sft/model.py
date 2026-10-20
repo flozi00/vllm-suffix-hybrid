@@ -195,7 +195,8 @@ def _sft_class(cls):
     return _CLASSES[cls]
 
 
-def install_adapters(lm, targets=DEFAULT_TARGETS, rank=16, alpha=32.0, tp_rank=0, dtype=None):
+def install_adapters(lm, targets=DEFAULT_TARGETS, rank=16, alpha=32.0, tp_rank=0, dtype=None,
+                     rslora=False):
     """Re-class every linear's quant method; zero-init adapters (in the
     model's activation `dtype`) on the linears matching `targets`. Returns
     {name: (layer, LoRA)} (LM-relative names, sorted). Every LM parameter is
@@ -214,7 +215,8 @@ def install_adapters(lm, targets=DEFAULT_TARGETS, rank=16, alpha=32.0, tp_rank=0
         dt = dtype or (w.dtype if w is not None and w.dtype in (torch.bfloat16, torch.float16,
                                                                  torch.float32) else torch.bfloat16)
         lora = LoRA(name, k, n, rank, alpha, tp_kind(m), tp_rank,
-                    int(getattr(m, "tp_size", 1) or 1), dt, next(m.parameters()).device)
+                    int(getattr(m, "tp_size", 1) or 1), dt, next(m.parameters()).device,
+                    rslora=rslora)
         m.requires_unquantized_input = True    # the delta reads the bf16 input (as vLLM LoRA)
         m.register_buffer("sft_A", lora.A, persistent=False)
         m.register_buffer("sft_B", lora.B, persistent=False)
@@ -420,6 +422,8 @@ class TrainMode(contextlib.ContextDecorator):
         self.grad, self.check = grad, check
         self.offload_left = offload_bytes   # host budget for parked layer inputs
         self.mlp_tile = int(getattr(sft.cfg, "mlp_tile", 0) or 0)
+        self.offload_saved = bool(getattr(sft.cfg, "offload_saved", False))
+        self.saved_min = int(getattr(sft.cfg, "saved_min_mb", 1) or 1) * 2**20
         self.cut = []      # modules whose output lost the input's grad (check=True)
         self.g = sft.g
         self.kv = {}
@@ -441,6 +445,14 @@ class TrainMode(contextlib.ContextDecorator):
         try:
             st.enter_context(torch.inference_mode(False))
             st.enter_context(torch.enable_grad() if self.grad else torch.no_grad())
+            if self.offload_saved:
+                # Unsloth's offload_activations, generalised: every tensor the
+                # backward will need (activations *and* the frozen base weights
+                # the linear backward reads) is parked in pinned host memory and
+                # pulled back on unpack. This is what makes a 64k micro-batch
+                # fit on a 12 GB card that is also serving 128k.
+                st.enter_context(torch.autograd.graph.saved_tensors_hooks(
+                    self._pack_saved, self._unpack_saved))
             mods = self.s.__dict__.get("_sft_mods")
             if mods is None:   # classify once per model (thousands of modules)
                 mods = self.s.__dict__["_sft_mods"] = [
@@ -583,6 +595,24 @@ class TrainMode(contextlib.ContextDecorator):
             vals = [(_Park.apply(v, parked[k]) if parked else v) for k, v in slots if k in keys]
             return checkpoint(body, *vals, use_reentrant=False)
         return run
+
+    def _pack_saved(self, t):
+        """saved_tensors_hooks pack: park a tensor the backward will need."""
+        if (t.is_cuda and t.is_floating_point() and t.numel() * t.element_size() >= self.saved_min
+                and not t.requires_grad):
+            try:
+                h = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            except RuntimeError:   # pinned pool exhausted: pageable still works
+                h = torch.empty(t.shape, dtype=t.dtype)
+            h.copy_(t, non_blocking=True)
+            return ("h", h)
+        return ("g", t)
+
+    def _unpack_saved(self, h):
+        tag, t = h
+        if tag == "g":
+            return t
+        return t.to(self.s.device, non_blocking=True)
 
     def _tiled_mlp(self, orig, x):
         """Run a token-wise MLP in sequence tiles.
