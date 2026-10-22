@@ -102,6 +102,29 @@ def _tiny_checkpoint(d):
     return t
 
 
+@pytest.mark.parametrize("name", [
+    "model.audio_tower.layers.0.feed_forward1.ffw_layer_1",
+    "model.audio_tower.output_proj",
+    "model.vision_tower.encoder.layers.0.self_attn.q_proj",
+    "model.embed_audio.embedding_projection",
+    "model.embed_vision.embedding_projection",
+    "model.language_model.per_layer_model_projection",
+    "model.language_model.layers.3.per_layer_input_gate",
+    "model.language_model.layers.3.per_layer_projection",
+])
+def test_gemma4_non_text_linears_are_excluded(name):
+    """vLLM applies modelopt to EVERY linear unless excluded (substring match):
+    the Gemma 4 towers / PLE linears stay bf16 in the checkpoint, so they must
+    be on the exclude list or the loader asserts on a shape mismatch."""
+    assert any(e in name for e in q.EXCLUDE_MODULES)
+
+
+@pytest.mark.parametrize("key", [L + "self_attn.q_proj.weight", L + "mlp.down_proj.weight"])
+def test_text_linears_not_swallowed_by_gemma4_excludes(key):
+    """The new substrings must not exclude the quantized language-model linears."""
+    assert not any(e in key[: -len(".weight")] for e in q.EXCLUDE_MODULES)
+
+
 def test_end_to_end_write(tmp_path):
     src, out = tmp_path / "src", tmp_path / "out"
     src.mkdir()

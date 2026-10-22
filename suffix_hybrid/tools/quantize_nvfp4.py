@@ -72,7 +72,14 @@ FUSED = {
 # vLLM exclude_modules (substring + fnmatch semantics, modelopt.py:181-215).
 # 'visual' is required: vLLM's hard-coded vision skip only matches
 # vision_tower/vision_model, not Qwen's `visual.` (modelopt.py:233-241).
-EXCLUDE_MODULES = ["lm_head", "embed_tokens", "visual", "mtp", "in_proj_b", "in_proj_a"]
+# Gemma 4 (E2B/E4B): the audio and vision towers and the per-layer-embedding
+# (PLE) projections are linears the allowlist never quantizes, but vLLM would
+# still build them as modelopt-NVFP4 params unless they are excluded here —
+# loading then dies on "Tried to load weights of size [4096, 1024] to a
+# parameter of size [4096, 512]" (a bf16 audio_tower FFN into a packed param).
+# vLLM's own skip only knows vision_tower/vision_model.
+EXCLUDE_MODULES = ["lm_head", "embed_tokens", "visual", "mtp", "in_proj_b", "in_proj_a",
+                   "audio", "vision", "per_layer"]
 COPY_FILES = (".json", ".jinja", ".txt", ".model", ".tiktoken", ".py")
 
 
