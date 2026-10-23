@@ -102,6 +102,46 @@ def _tiny_checkpoint(d):
     return t
 
 
+@pytest.mark.parametrize("name", [
+    "model.audio_tower.layers.0.feed_forward1.ffw_layer_1",
+    "model.audio_tower.output_proj",
+    "model.vision_tower.encoder.layers.0.self_attn.q_proj",
+    "model.embed_audio.embedding_projection",
+    "model.embed_vision.embedding_projection",
+    "model.language_model.per_layer_model_projection",
+    "model.language_model.layers.3.per_layer_input_gate",
+    "model.language_model.layers.3.per_layer_projection",
+])
+def test_gemma4_non_text_linears_are_excluded(name):
+    """vLLM applies modelopt to EVERY linear unless excluded (substring match):
+    the Gemma 4 towers / PLE linears stay bf16 in the checkpoint, so they must
+    be on the exclude list or the loader asserts on a shape mismatch."""
+    assert any(e in name for e in q.EXCLUDE_MODULES)
+
+
+@pytest.mark.parametrize("key", [L + "self_attn.q_proj.weight", L + "mlp.down_proj.weight"])
+def test_text_linears_not_swallowed_by_gemma4_excludes(key):
+    """The new substrings must not exclude the quantized language-model linears."""
+    assert not any(e in key[: -len(".weight")] for e in q.EXCLUDE_MODULES)
+
+
+def test_scale_search_lowers_error_and_keeps_the_format():
+    """mse block scales: never worse than amax/6 per block, valid e4m3 scales and codes."""
+    g = torch.Generator().manual_seed(7)
+    w = (torch.randn(64, 256, generator=g) * torch.rand(64, 256, generator=g) ** 3).to(torch.bfloat16)
+    amax = float(w.float().abs().max())
+    p1, s1, g1 = q.quantize_weight(w, amax)
+    p2, s2, g2 = q.quantize_weight(w, amax, q.SCALE_SEARCH["mse"])
+    assert torch.equal(g1, g2) and s2.dtype == torch.float8_e4m3fn and p2.shape == p1.shape
+    e1 = ((q.dequantize_weight(p1, s1, g1) - w.float()) ** 2).reshape(64, -1, q.GROUP).sum(-1)
+    e2 = ((q.dequantize_weight(p2, s2, g2) - w.float()) ** 2).reshape(64, -1, q.GROUP).sum(-1)
+    assert bool((e2 <= e1 + 1e-9).all()) and float(e2.sum()) < float(e1.sum())
+    assert float(s2.float().max()) <= q.E4M3_MAX
+    # the none recipe is the v1 bytes
+    pn, sn, gn = q.quantize_weight(w, amax, q.SCALE_SEARCH["none"])
+    assert torch.equal(pn, p1) and torch.equal(sn.float(), s1.float())
+
+
 def test_end_to_end_write(tmp_path):
     src, out = tmp_path / "src", tmp_path / "out"
     src.mkdir()
