@@ -110,6 +110,20 @@ def test_rescore_restores_stock_greedy_where_w4a4_alone_flips():
                                rtol=2 ** -7, atol=1e-3)  # bf16 rows, not W4A4
 
 
+def test_exact_rows_matches_bf16_matmul_without_cublas():
+    """The rescore must not call cuBLAS (a captured graph would hold its
+    workspace, which empty_cache frees: illegal address at TP1, 2026-10-23)."""
+    import inspect
+    w, x, _g_w, _ = _lm_problem(n=2048, k=512, m=5)
+    top = torch.randint(0, 2048, (5, lh.RESCORE))
+    got = lh.exact_rows(w, top, x)
+    want = torch.bmm(w[top], x.unsqueeze(-1)).squeeze(-1)
+    assert got.dtype == torch.bfloat16 and got.shape == want.shape
+    torch.testing.assert_close(got.float(), want.float(), rtol=2 ** -7, atol=1e-3)
+    assert "bmm" not in inspect.getsource(lh.exact_rows).split('"""')[2]
+    assert "bmm" not in inspect.getsource(lh.logits_nvfp4)
+
+
 def test_greedy_ok_tolerates_only_bf16_ties():
     ref = torch.tensor([[10.0, 9.99, 0.0], [1.0, 3.0, 2.0]])
     assert lh.greedy_ok(ref, torch.tensor([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]))  # tie
