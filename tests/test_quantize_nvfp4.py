@@ -125,6 +125,23 @@ def test_text_linears_not_swallowed_by_gemma4_excludes(key):
     assert not any(e in key[: -len(".weight")] for e in q.EXCLUDE_MODULES)
 
 
+def test_scale_search_lowers_error_and_keeps_the_format():
+    """mse block scales: never worse than amax/6 per block, valid e4m3 scales and codes."""
+    g = torch.Generator().manual_seed(7)
+    w = (torch.randn(64, 256, generator=g) * torch.rand(64, 256, generator=g) ** 3).to(torch.bfloat16)
+    amax = float(w.float().abs().max())
+    p1, s1, g1 = q.quantize_weight(w, amax)
+    p2, s2, g2 = q.quantize_weight(w, amax, q.SCALE_SEARCH["mse"])
+    assert torch.equal(g1, g2) and s2.dtype == torch.float8_e4m3fn and p2.shape == p1.shape
+    e1 = ((q.dequantize_weight(p1, s1, g1) - w.float()) ** 2).reshape(64, -1, q.GROUP).sum(-1)
+    e2 = ((q.dequantize_weight(p2, s2, g2) - w.float()) ** 2).reshape(64, -1, q.GROUP).sum(-1)
+    assert bool((e2 <= e1 + 1e-9).all()) and float(e2.sum()) < float(e1.sum())
+    assert float(s2.float().max()) <= q.E4M3_MAX
+    # the none recipe is the v1 bytes
+    pn, sn, gn = q.quantize_weight(w, amax, q.SCALE_SEARCH["none"])
+    assert torch.equal(pn, p1) and torch.equal(sn.float(), s1.float())
+
+
 def test_end_to_end_write(tmp_path):
     src, out = tmp_path / "src", tmp_path / "out"
     src.mkdir()

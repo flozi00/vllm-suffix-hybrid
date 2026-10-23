@@ -50,7 +50,7 @@ FP4_MAX = 6.0
 E4M3_MAX = 448.0
 GLOBAL = FP4_MAX * E4M3_MAX  # 2688
 GROUP = 16
-TOOL_VERSION = "1"
+TOOL_VERSION = "2"  # 2: --scale-search (default mse); 1: amax/6 only
 
 # Allowlist: the ONLY tensors quantized. Everything else (embeddings, lm_head,
 # vision tower, MTP head, conv1d, in_proj_b / in_proj_a gates, A_log,
@@ -168,9 +168,19 @@ def e2m1_codes(x):
     return code | ((x < 0).to(torch.uint8) << 3)
 
 
-def quantize_weight(w, amax: float):
+# Block-scale candidates: the block max maps to code c (6 = the plain amax/6 recipe;
+# a smaller c spends the grid on the bulk of the block and clips its max).
+SCALE_SEARCH = {"none": (FP4_MAX,), "mse": (6.0, 5.0, 4.5, 4.0)}
+
+
+def quantize_weight(w, amax: float, search=(FP4_MAX,)):
     """w [N, K] -> (packed uint8 [N, K/2], scales float8_e4m3fn [N, K/16],
-    weight_scale_2 float32 []). `amax` is the fused group's global |w| max."""
+    weight_scale_2 float32 []). `amax` is the fused group's global |w| max.
+
+    `search` lists block-scale candidates (block max -> code c); with more than
+    one, each block keeps the candidate with the lowest squared error after the
+    e4m3 rounding of its scale (same format: vLLM and our kernels load it as is).
+    The default (6,) is the bit-exact amax/6 recipe."""
     import torch
     n, k = w.shape
     if k % GROUP:
@@ -178,12 +188,29 @@ def quantize_weight(w, amax: float):
     wf = w.float()
     g = GLOBAL / max(float(amax), 1e-12)  # quant multiplier
     blk = wf.reshape(n, k // GROUP, GROUP)
-    sf = (blk.abs().amax(-1) * (g / FP4_MAX)).clamp(max=E4M3_MAX).to(torch.float8_e4m3fn)
-    sf_f = sf.float()
-    inv = torch.where(sf_f == 0, torch.zeros_like(sf_f), g / sf_f.clamp_min(1e-30))
-    code = e2m1_codes(blk * inv.unsqueeze(-1)).reshape(n, k)
+    bmax = blk.abs().amax(-1)
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32, device=wf.device)
+    best_err = best_sf = best_code = None
+    for c in search:
+        sf = (bmax * (g / c)).clamp(max=E4M3_MAX).to(torch.float8_e4m3fn)
+        sf_f = sf.float()
+        inv = torch.where(sf_f == 0, torch.zeros_like(sf_f), g / sf_f.clamp_min(1e-30))
+        code = e2m1_codes(blk * inv.unsqueeze(-1))
+        if len(search) == 1:
+            best_sf, best_code = sf, code
+            break
+        val = lut[(code & 7).long()] * torch.where(code & 8 > 0, -1.0, 1.0)
+        err = ((val * sf_f.unsqueeze(-1) / g - blk) ** 2).sum(-1)
+        if best_err is None:
+            best_err, best_sf, best_code = err, sf, code
+        else:
+            take = err < best_err
+            best_err = torch.where(take, err, best_err)
+            best_sf = torch.where(take, sf, best_sf)
+            best_code = torch.where(take.unsqueeze(-1), code, best_code)
+    code = best_code.reshape(n, k)
     packed = (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous()
-    return packed, sf.contiguous(), torch.tensor(1.0 / g, dtype=torch.float32)
+    return packed, best_sf.contiguous(), torch.tensor(1.0 / g, dtype=torch.float32)
 
 
 def dequantize_weight(packed, sf, ws2):
@@ -217,11 +244,13 @@ def quant_config() -> dict:
 def recipe(args) -> dict:
     return {
         "format": "modelopt_fp4 (NVFP4 W4A4, group 16, e4m3 block scales, fp32 global)",
-        "weights": "RTN, per-fused-group global amax",
+        "weights": "RTN, per-fused-group global amax; block scale = lowest-MSE of max->"
+                   + "/".join(str(c) for c in SCALE_SEARCH[getattr(args, "scale_search", "none")]),
         "activations": "static per-tensor input_scale = calibrated amax / 2688",
         "quantized": QUANT_RE.pattern,
         "fused_groups": sorted(set(FUSED.values())),
         "exclude_modules": EXCLUDE_MODULES,
+        "scale_search": getattr(args, "scale_search", "none"),
         "calibration": {"mode": args.calib, "samples": args.samples,
                         "gen_tokens": args.gen_tokens, "seed": args.seed,
                         "source": "self-generated from suffix_hybrid/tools/calib_prompts.py"},
@@ -431,7 +460,8 @@ def act_group_amax(act: dict[str, float], key_group: dict[str, str]) -> dict[str
     return out
 
 
-def write_checkpoint(src: Path, out: Path, w_amax, key_group, a_amax, device: str) -> dict:
+def write_checkpoint(src: Path, out: Path, w_amax, key_group, a_amax, device: str,
+                     search=(FP4_MAX,)) -> dict:
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -449,7 +479,7 @@ def write_checkpoint(src: Path, out: Path, w_amax, key_group, a_amax, device: st
                     tensors[key] = t
                     stats["copied"] += 1
                     continue
-                packed, sf, ws2 = quantize_weight(t.to(device), w_amax[g])
+                packed, sf, ws2 = quantize_weight(t.to(device), w_amax[g], search)
                 base = module_name(key)
                 tensors[base + ".weight"] = packed.cpu()
                 tensors[base + ".weight_scale"] = sf.cpu()
@@ -496,6 +526,9 @@ def main(argv=None) -> int:
     ap.add_argument("--calib", choices=["auto", "selfgen", "embed", "none"], default="auto",
                     help="auto = embed for embedding models (is_embedding_model), else "
                          "selfgen; none = input_scale from weights only (TEST ONLY)")
+    ap.add_argument("--scale-search", choices=sorted(SCALE_SEARCH), default="mse",
+                    help="block-scale choice: mse = per block the lowest-error of "
+                         "max->6/5/4.5/4 (default); none = plain amax/6 (v1 recipe)")
     ap.add_argument("--samples", type=int, default=256)
     ap.add_argument("--gen-tokens", type=int, default=192)
     ap.add_argument("--batch", type=int, default=16)
@@ -526,7 +559,8 @@ def main(argv=None) -> int:
     a_amax = act_group_amax(act, key_group)
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    stats = write_checkpoint(src, out, w_amax, key_group, a_amax, device)
+    stats = write_checkpoint(src, out, w_amax, key_group, a_amax, device,
+                             SCALE_SEARCH[args.scale_search])
     copy_side_files(src, out)
     stats["seconds"] = round(time.time() - t0, 1)
     stats["act_amax_min_max"] = [min(a_amax.values()), max(a_amax.values())]
