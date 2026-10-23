@@ -57,7 +57,10 @@ MARKER = "[suffix helion k2]"
 LOG2E = 1.4426950408889634
 WINDOW_FULL = 1 << 30           # window_left < 0 (full attention) in the body
 BATCHES = (1, 8, 32)            # numtokens buckets (decode batch)
-WIDTHS = (1, 4)                 # q-width buckets: plain decode, MTP k=3 verify
+# Keep each supported width distinct. A width-4 win says nothing about the
+# width-2/k1 or width-6/k5 shapes in a dynamic speculative schedule. Existing
+# width-1/4 configs retain their keys; other widths stay on oxide until tuned.
+WIDTHS = tuple(range(1, 9))
 PAGE = 64                       # gemma pools' KV page size (oracle PAGE)
 # Gemma 4 per-rank attention layouts beyond model_dims(): full-attention
 # layers use global_head_dim = 2 x head_dim with num_global_key_value_heads =
@@ -70,8 +73,16 @@ REL_MAX = 2e-2
 # index_dtype: KV caches exceed 2^31 bytes. autotune_max_generations: LFBO full
 # runs up to 20 generations at ~2 min each for b32 x 32k contexts, past the lab's
 # 30 min case limit (run 20261017T172102Z-rtx-pro-6000-9236); searches converged
-# by generation 7-10 in every run so far.
-SETTINGS = {"index_dtype": torch.int64, "autotune_max_generations": 10}
+# by generation 7-10 in every run so far. LFBO's subsequent polish descent
+# has its own rounds (not covered by max_generations): the 5090 d512/b1/w4
+# experiment spent another ~10 minutes rechecking an unchanged incumbent.
+# Budget the whole search, including polish, below the lab's 30-minute case
+# timeout so the best-so-far config is checked and saved instead of lost.
+# Serving binds shipped configs and never runs this search.
+# The lab defaults to static shapes; serving uses dynamic shapes within
+# each batch/width bucket. Override the lab default to tune that same code.
+SETTINGS = {"index_dtype": torch.int64, "static_shapes": False, "autotune_max_generations": 10,
+            "autotune_budget_seconds": 900}
 MAX_COUNTERS = 1 << 16                   # B * HKV per launch
 
 
@@ -247,7 +258,7 @@ def case(d, hq, hkv, page, window_left, batch, q_max) -> dict:
     """The tuned case a launch runs as (bucketed batch and q width)."""
     return {"head_dim": d, "heads": hq, "kv_heads": hkv, "page": page,
             "window": -1 if window_left < 0 else int(window_left),
-            "width": hk.bucket(q_max, WIDTHS), "numtokens": hk.bucket(batch, BATCHES)}
+            "width": int(q_max), "numtokens": hk.bucket(batch, BATCHES)}
 
 
 _ROUTE: dict = {}
@@ -315,7 +326,7 @@ def prepare(served, q_max, device) -> str:
     if key in _PREPARED:  # one builder per KV group asks for the same shape
         return _PREPARED[key]
     on, off = [], []
-    for w in sorted({hk.bucket(x, WIDTHS) for x in range(1, q_max + 1)}):
+    for w in range(1, q_max + 1):
         for nb in BATCHES:
             c = case(d, hq, hkv, page, wl, nb, w)
             if kernel_for(c) is None:
@@ -324,11 +335,15 @@ def prepare(served, q_max, device) -> str:
             i = BATCHES.index(nb)
             kern = kernel_for(c)
             for batch in sorted({nb, BATCHES[i - 1] + 1 if i else 1}):  # bucket edges
-                args = _problem(d, hq, hkv, page, wl, batch, w, 0, device,
-                                ctx=lambda j, n: 300 + 397 * j, pad=3)
-                ok, msg = check(kern(*args), reference(*args))
-                if not ok:
-                    raise RuntimeError(f"{MARKER} load-time oracle FAILED for {c} batch {batch}: {msg}")
+                # Gemma4 uses 1.0; retain coverage of standard attention too.
+                for sm_scale in (1 / math.sqrt(d), 1.0):
+                    args = _problem(d, hq, hkv, page, wl, batch, w, 0, device,
+                                    ctx=lambda j, n: 300 + 397 * j, pad=3,
+                                    sm_scale=sm_scale)
+                    ok, msg = check(kern(*args), reference(*args))
+                    if not ok:
+                        raise RuntimeError(f"{MARKER} load-time oracle FAILED for {c} batch {batch} "
+                                           f"scale {sm_scale}: {msg}")
             on.append(f"b{nb}w{w}")
     _PREPARED[key] = (f"Helion K2 d{d} {hq}/{hkv} wl={wl}: helion {on or '-'}"
                       + (f", oxide {off}" if off else ""))
@@ -401,7 +416,8 @@ def _ctx(i, n):
     return 8192 if n == 1 else int(2048 * 16 ** (i / (n - 1)))
 
 
-def _problem(d, hq, hkv, page, window_left, batch, width, seed, device, ctx=_ctx, pad=0):
+def _problem(d, hq, hkv, page, window_left, batch, width, seed, device, ctx=_ctx, pad=0,
+             sm_scale=None):
     """Random paged NVFP4 cache in vLLM's HND byte layout (page = [K data |
     K sf | V data | V sf], head-major), shuffled page table, uniform q width,
     `pad` graph-padding tokens -> body args."""
@@ -436,8 +452,9 @@ def _problem(d, hq, hkv, page, window_left, batch, width, seed, device, ctx=_ctx
     i32 = dict(dtype=torch.int32, device=device)
     qo = torch.arange(batch + 1, **i32) * width
     cnt = counters(device) if torch.device(device).type == "cuda" else torch.zeros(MAX_COUNTERS, **i32)
+    sm_scale = 1 / math.sqrt(d) if sm_scale is None else float(sm_scale)
     return body_args(q, k_data, k_sf, v_data, v_sf, bt.to(device), torch.tensor(lens, **i32), qo,
-                     out, cnt, window_left, LOG2E / math.sqrt(d), 1.0)
+                     out, cnt, window_left, LOG2E * sm_scale, 1.0)
 
 
 # ---- lab ABI (inference-console api/autotune_kernels.py) ----------------------
@@ -454,9 +471,39 @@ def cases(model) -> list:
             for hd, kv, wl in layers for w in WIDTHS for nb in BATCHES]
 
 
+def working_set_bytes(args):
+    """Lab-only upper bound of the distinct bytes touched by one call.
+
+    ``body_args`` exposes four overlapping as_strided views of ONE KV
+    storage. Their numel sum counts storage gaps repeatedly (especially V
+    scales). Also, SWA reads only the tail window, regardless of the full
+    context allocation. Count active physical pages once, plus small inputs,
+    output and counters, so rotating-copy timing actually spills L2. Page
+    rounding conservatively includes the partially touched boundary pages.
+    This synchronizes metadata; never call it in serving/graph capture.
+    """
+    q, bt, sl, qo, out = args[0], args[5], args[6], args[7], args[8]
+    hkv, page, window = args[10], args[11], args[13]
+    lens, offsets = sl.tolist(), qo.tolist()
+    active = set()
+    for b, n in enumerate(lens):
+        width = offsets[b + 1] - offsets[b]
+        if width <= 0 or n <= 0:
+            continue
+        lo = max(0, n - width - window)
+        active.update(bt[b, lo // page:math.ceil(n / page)].tolist())
+    page_bytes = 2 * hkv * page * (q.shape[-1] // 2 + q.shape[-1] // 16)
+    # Metadata is tiny; use allocated sizes as a conservative bound. The
+    # large shared counter allocation is only indexed at [batch * Hkv].
+    metadata = sum(t.numel() * t.element_size() for t in (bt, sl, qo))
+    return (len(active) * page_bytes + metadata + len(lens) * hkv * 4
+            + q.numel() * q.element_size() + out.numel() * out.element_size())
+
+
 def make(c, seed):
+    # cases() is Gemma4-only; its Q/K normalization uses scale=1.0.
     return _problem(c["head_dim"], c["heads"], c["kv_heads"], c["page"], c["window"],
-                    c["numtokens"], c["width"], seed, "cuda")
+                    c["numtokens"], c["width"], seed, "cuda", sm_scale=1.0)
 
 
 def make_baseline(c, seed):
@@ -494,6 +541,7 @@ def baseline(*args):
 KERNELS = [
     {"name": KERNEL, "body": _k2_nvfp4_attn, "cases": cases, "make": make,
      "make_baseline": make_baseline, "reference": reference, "check": check,
+     "working_set_bytes": working_set_bytes,
      "baseline": baseline, "baseline_name": "oxide k2_nvfp4_attn", "settings": SETTINGS,
      "replaces": [r"nvfp4_attn_partial", r"nvfp4_attn_merge"]},
 ]

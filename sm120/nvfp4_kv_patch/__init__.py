@@ -433,8 +433,15 @@ def _nvfp4_kv_mm_resplit(cm, num_decodes):
             "suffix sm120 nvfp4-kv mm-prefix: CommonAttentionMetadata has "
             "mm ranges but no is_prefilling; cannot route short extends."
         )
-    qsl = cm.query_start_loc_cpu[: num_decodes + 1]
-    hit = ((qsl[1:] - qsl[:-1]) >= 2) & cm.is_prefilling[:num_decodes].cpu()
+    # FULL graphs may pad the query offsets/decode count to a capture bucket
+    # while is_prefilling describes only the real requests (e.g. 32 vs 31).
+    # Padding cannot hold an image range; inspect real requests only, and
+    # preserve the original padded split when no real short extend needs it.
+    real_decodes = min(num_decodes, cm.is_prefilling.numel())
+    if real_decodes == 0:
+        return None
+    qsl = cm.query_start_loc_cpu[: real_decodes + 1]
+    hit = ((qsl[1:] - qsl[:-1]) >= 2) & cm.is_prefilling[:real_decodes].cpu()
     if not bool(hit.any()):
         return None
     first = int(hit.int().argmax())
@@ -1296,9 +1303,11 @@ def apply(module=None, *, force: bool = False) -> bool:
     fi_ver = getattr(fi_mod, "__version__", "")
 
     drift = []
-    if not vllm_ver.startswith(PINNED_VLLM):
+    v032 = (vllm_ver.split("+")[0] == "0.32.0"
+            and fi_ver == "0.7.0.post1")
+    if not v032 and not vllm_ver.startswith(PINNED_VLLM):
         drift.append(f"vllm {vllm_ver!r} != {PINNED_VLLM}")
-    if not fi_ver.startswith(PINNED_FLASHINFER):
+    if not v032 and not fi_ver.startswith(PINNED_FLASHINFER):
         drift.append(f"flashinfer {fi_ver!r} != {PINNED_FLASHINFER}")
     if drift:
         message = (
@@ -1315,7 +1324,11 @@ def apply(module=None, *, force: bool = False) -> bool:
     # 2. Header/codegen probe: overlay patches 01-03 must be no-ops on the
     # installed FlashInfer. Never write into the flashinfer package.
     files = read_installed_flashinfer(fi_root)
-    probe = probe_flashinfer_headers(files)
+    if v032:
+        from . import v032 as v032_port
+        probe = v032_port.probe_headers(files, probe_flashinfer_headers)
+    else:
+        probe = probe_flashinfer_headers(files)
     # mm_* checks gate only the mm-prefix capability (fail closed there).
     missing = sorted(k for k, ok in probe.items()
                      if not ok and (mm_gate_enabled() or not k.startswith("mm_")))
@@ -1349,7 +1362,11 @@ def apply(module=None, *, force: bool = False) -> bool:
         # the anchors (they would match the *unpatched* text zero times).
         setattr(module, MARKER_ATTR, PATCH_REVISION)
         return True
-    new_src, applied = patch_backend_source(src)
+    if v032:
+        from .v032 import patch_backend_source as patch_v032
+        new_src, applied = patch_v032(src, sys.modules[__name__])
+    else:
+        new_src, applied = patch_backend_source(src)
     # K2-NVFP4 adapter (inert unless SUFFIX_SM120_NVP4KV_OWN_ATTN=1).
     module.__dict__["_nvfp4_own_attn"] = own_attn_module()
     exec_patched_source(module, new_src, src_path)

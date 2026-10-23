@@ -37,3 +37,19 @@ fixture + anchor set is required.
   flashinfer_mla_sparse{,_sm120}.py, model_loader utils.py, cuda_communicator.py.
   `test_vllm_nightly_anchors.py` replays every GLM-5.3 patch on them (glm pool's
   "always latest vLLM" lane; other pools stay on 0.30.0).
+
+- `vllm_0.32.0/` — exact `vllm/v1/attention/backends/flashinfer.py` and
+  `vllm/model_executor/model_loader/utils.py` from tag `v0.32.0`, plus the
+  unchanged `gather_batch_req_state` method from
+  `vllm/v1/worker/gpu/model_runner.py` in a minimal source container. The
+  tests pin their hashes, replay the K2/image-mask adapter and verify that
+  its C++ cache writer cannot be mixed with linear V-scale readers. The
+  graph guard checks the installed method's source hash before enabling
+  FULL verify graphs and keeps every real prefill on the masked path.
+
+- `vllm_0.30.0/flashinfer_cutlass_moe.py` and
+  `vllm_0.32.0/flashinfer_cutlass_moe.py` — exact
+  `vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py`
+  from their named tags. `test_nvfp4_ordered_finalize.py` pins hashes and
+  checks the optional ordered NVFP4 reduction keeps other quantization paths
+  on their default fused finalize. Upstream diagnosis: vllm-project/vllm#54945.

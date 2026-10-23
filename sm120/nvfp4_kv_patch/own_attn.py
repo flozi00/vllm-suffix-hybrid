@@ -191,7 +191,17 @@ def uniform_decode_excludes_prefill(func=None) -> bool:
         src = inspect.getsource(func)
     except Exception:
         return False
-    return "if not has_prefill and" in src
+    if "if not has_prefill and" in src:
+        return True
+    # v0.32 moved eligibility into GPUModelRunner request state and admits
+    # one-token prompt extends. Restore the stricter invariant before
+    # advertising FULL K2 verify graphs, preserving masked image prefills.
+    if "if decode_graph_eligible and is_uniform_query_len(" in src:
+        import vllm
+        if getattr(vllm, "__version__", "").split("+")[0] == "0.32.0":
+            from .v032 import install_prefill_graph_guard
+            return install_prefill_graph_guard()
+    return False
 
 
 def install_uniform_graph_lens() -> bool:

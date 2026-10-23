@@ -282,6 +282,7 @@ if os.environ.get("SUFFIX_SM120_NVP4DSMLA", "").strip() == "1":
 # NVFP4 W4A4 layers (static activation global scale from proven input bounds).
 if (os.environ.get("SUFFIX_FP8_DENSE", "").strip() == "1"
         or os.environ.get("SUFFIX_NVFP4_DENSE", "").strip() == "1"
+        or os.environ.get("SUFFIX_WEIGHT_RECEIPT", "").strip() == "1"
         or os.environ.get("SUFFIX_ACT_AMAX_RECORD", "").strip()):
     try:
         from fp8_dense_patch import install_post_import_hook as _fp8d_hook
@@ -366,7 +367,8 @@ if any(os.environ.get(_g, "").strip() == "1"
                   "SUFFIX_JIT_LOG", "SUFFIX_ROCM_QSA_NOSPEC", "SUFFIX_MTP_MOE_NVFP4",
                   "SUFFIX_SILU_GRID_CLAMP", "SUFFIX_SILU_SKIP_PAD",
                   "SUFFIX_POW2_MIRROR", "SUFFIX_BF16_SKINNY",
-                  "SUFFIX_SHORTCONV_FP8", "SUFFIX_MAMBA_BT_HOST")) or any(
+                  "SUFFIX_SHORTCONV_FP8", "SUFFIX_MAMBA_BT_HOST",
+                  "SUFFIX_NVFP4_MOE_ORDERED_FINALIZE")) or any(
         os.environ.get(_g, "").strip() not in ("", "0")
         for _g in ("SUFFIX_ROCM_HC_WQ", "SUFFIX_NVFP4_MOE_BACKEND")):
     if (os.environ.get("SUFFIX_ROCM_GDN_DEFER", "").strip() == "1"
@@ -486,6 +488,11 @@ _BOOT_GATES = {
     # cold-L2 us of every tune candidate per M (qwen EP0, gemma, GLM EP/TP8)
     # vs FlashInfer -> paste-able SUFFIX_NVFP4_MOE_TUNE + recommended MAX_M.
     "nvfp4_moe_sweep": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "sweep"], {}),
+    # Gemma-only cold-L2 sweep, including M=128 for c32 MTP k=3.
+    # Same BF16 precision, screen only; no serving hook is enabled by this gate.
+    "gemma_k2_cold_screen": (["-m", "suffix_hybrid.tools.gemma_k2_cold_screen"], {}),
+    "gemma_bf16_skinny_bench": (["-m", "suffix_hybrid.kernels.bf16_skinny", "gemma4"], {}),
+    "gemma_nvfp4_moe_sweep": (["-m", "suffix_hybrid.kernels.nvfp4_moe", "sweep-gemma"], {}),
     # FP8 128x128-block routed experts (SUFFIX_FP8_MOE, qwen3.8 MTP draft
     # shape E 512 / EP2 ranks 0+1, H 2560, I 640, top-10; one GPU = one rank):
     # ours vs vLLM Triton vs f64 spec + per-stage readback; then us/call.

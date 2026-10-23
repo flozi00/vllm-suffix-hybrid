@@ -22,6 +22,12 @@ def test_categories():
     assert sp.category("flashinfer::BatchPrefillWithPagedKVCacheKernel<>"
                        ).startswith("attn FlashInfer")
     assert sp.category("flashinfer::cutlass_moe_gemm") == "MoE"
+    assert sp.category("_ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversal"
+                       "INS1_17GroupProblemShapeIN4cute5tupleIJlllEEEEENS1") == "MoE"
+    assert sp.category("_gemma4_routing_kernel") == "MoE"
+    assert sp.category("_topk_topp_kernel") == "sampling/spec"
+    assert sp.category("_temperature_kernel") == "sampling/spec"
+    assert sp.category("cutlass::Kernel2<cutlass_80_tensorop_bf16_gemm>") == "dense GEMM"
     assert sp.category("kernel_unified_attention_2d").startswith("attn other")
     assert sp.category("Memcpy DtoH (Device -> Pinned)") == "copies/memset"
 

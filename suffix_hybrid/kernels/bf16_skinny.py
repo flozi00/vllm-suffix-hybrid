@@ -175,7 +175,7 @@ def bench(shapes=((6144, 2048), (2048, 2048), (128000, 2048)), ms=(1, 2, 4, 8, 1
     graph so W is not L2-resident) vs cuBLAS (F.linear) + achieved GB/s."""
     import torch
     dev = torch.device("cuda", torch.cuda.current_device())
-    res = {}
+    res, failures = {}, []
     for n, k in shapes:
         nl = layers if n * k * 2 * layers < 6e9 else 2
         ws = [torch.randn(n, k, device=dev).bfloat16() for _ in range(nl)]
@@ -203,16 +203,36 @@ def bench(shapes=((6144, 2048), (2048, 2048), (128000, 2048)), ms=(1, 2, 4, 8, 1
             gbs = n * k * 2 / (outs["ours"] * 1e-6) / 1e9
             ok, msg = check(skinny(x, ws[0]), torch.nn.functional.linear(x, ws[0]))
             res[(n, k, m)] = outs
+            if not ok:
+                failures.append((n, k, m, msg))
             _log(f"bench N={n} K={k} M={m}: cublas {outs['cublas']:.2f} us, ours {outs['ours']:.2f} us "
                  f"(x{outs['ours'] / outs['cublas']:.2f}, {gbs:.0f} GB/s) {msg} {'OK' if ok else 'FAIL'}")
         del ws
         torch.cuda.empty_cache()
+    if failures:
+        raise RuntimeError(f"BF16 oracle failed in {len(failures)} cases: {failures}")
     return res
 
 
+# Exact checkpoint dimensions: google/gemma-4-26B-A4B-it-assistant at
+# 6e5aaaf4c42b98394530b8fda2e95cadd65c151c, plus the target BF16 down_proj.
+# Diagnostic screen only: do not enable a serving wrapper without real-layer
+# oracles and an end-to-end A/B. No weight or activation quantization.
+GEMMA4_SHAPES = ((4096, 1024), (8192, 1024), (1024, 4096),
+                 (1024, 8192), (16384, 1024), (1024, 2816),
+                 (2816, 1024), (2816, 2112))
+
+
 def main(argv=None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", nargs="?", choices=("lfm", "gemma4"), default="lfm")
+    args = parser.parse_args(argv)
     try:
-        bench()
+        if args.mode == "gemma4":
+            bench(shapes=GEMMA4_SHAPES, ms=(1, 8, 32), layers=30)
+        else:
+            bench()
         return 0
     except Exception as exc:  # noqa: BLE001
         _log(f"BENCH FAIL: {type(exc).__name__}: {exc}")
