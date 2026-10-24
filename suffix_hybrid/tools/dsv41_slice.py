@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import functools
 import hashlib
 import json
 import math
@@ -59,6 +60,25 @@ LIVE_STEP_MS = {1: 12.2, 8: 25.9, 32: 55.3}
 # Estimated per-step collective time that the slice does not have (docs/dsv41-comms.md section 3:
 # host all-reduce, 81 verify + 7 drafter all-reduces; section 11: vocab logits gather). Estimates.
 COLLECTIVE_MS_BY_C = ((1, 1.75), (8, 7.0), (16, 13.1), (32, 25.1))
+
+# The router kernel behind `fused_topk_bias` for sqrtsoftplus gating (csrc/moe/topk_softplus_sqrt_kernels.cu,
+# switch at :786-841) is instantiated for exactly these expert counts and throws "Unsupported expert number"
+# otherwise. Prod's target layers (384 experts, top-6) never reach it: `dsv4_topk` (Triton, router/dsv4_topk.py:26)
+# takes 256/384 experts with top-6. A slice has neither, so its expert count must come from this table.
+GATE_KERNEL_EXPERTS = (1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 320, 384, 448, 512, 576)
+SLICE_EXPERTS = tuple(n for n in GATE_KERNEL_EXPERTS if 16 <= n <= 192)  # (16, 32, 64, 128, 192)
+PROD_RANK_EXPERTS = 48  # 384 routed experts / EP8
+CARD_GIB = 94.97  # RTX PRO 6000 Blackwell (Server Edition and Max-Q)
+# Memory model, from the glm boot (ROLL.md, boot5.log) and the first slice boot (Model loading took 39.45 GiB
+# at 48 experts = 38.46 modeled + 0.99): GiB per card outside the weights and the KV pool.
+UNMODELLED_GIB = 0.99  # rope caches, buffers: logged "Model loading took" minus rank_modules()
+VISION_GIB = 0.97  # prod logged 40.66 - 38.70 modeled - 0.99 unmodelled: the ViT + aligner the slice does not build
+NONTORCH_GIB = 1.72  # CUDA context etc. (ROLL.md: 42.38 weights+non-torch against 40.66 weights)
+ACTIVATION_GIB = 5.66  # profile run at max_num_batched_tokens=8192 (ROLL.md)
+GRAPH_GIB = 2.69  # CUDA graph pool (boot5.log: "Graph capturing finished ... took 2.69 GiB")
+KV_TOKENS_PER_GIB = 292000  # glm: 10,867,561 tokens in 37.17 GiB at 262144 (390k at 524288): the lower, hybrid-cache figure
+KV_MIN_GIB = 1.0  # below this the weights leave no KV pool: refused at parse time
+KV_WARN_GIB = 8.0
 
 # Exact bytes of LibertAIDAI/DeepSeek-V4.1-Flash-1017-NVFP4 config.json (hf download, 2026-10-19).
 REAL_CONFIG_SHA256 = "fbb1660e71f4d05dad68aa1849188791a1e80a8b1d2a031ce543ff24c65a448e"
@@ -651,6 +671,13 @@ SCHEMA = {
                           "8 = all 24 columns at TP=1 (8x lookup rows and wkv bytes)", enum=(1, 8)),
     "engram_rows": _spec("int", 1048576, "Engram rows per hash column (prod: 16,000,000; pinned host memory)",
                          1024, 16000000),
+    "slice_experts": _spec("experts", 64, "routed experts RESIDENT per layer. The model router kernel only exists for "
+                           "16|32|64|128|192 here (csrc/moe/topk_softplus_sqrt_kernels.cu:786-841), so the EP8 rank's 48 is "
+                           "impossible; 128 and 192 do not fit the card. moe_routing=uniform_random|normal_routing bypasses "
+                           "the kernel and accepts any count in 16-192", 16, 192),
+    "active_experts": _spec("int", None, "experts the router may pick; the other slice_experts - active_experts stay "
+                            "resident but get gate bias -1e4 right after the engine is up, so the weight traffic is the "
+                            "EP8 rank's. null = 48 (moe_routing=model) or all (the simulator)", 1, 192, nullable=True),
     "moe_topk": _spec("int", 1, "routed experts per token in the slice (prod rank: 6/8 = 0.75 pairs; 1 is the nearest "
                       "integer above; raise it only if a backend refuses top-1)", 1, 6),
     "shared_expert_tp": _spec("bool", True, "patch the shared expert to its TP8 width (288) in-process; "
@@ -682,7 +709,7 @@ def _coerce(name: str, v, spec: dict):
         if not isinstance(v, bool):
             raise _bad(f"{name} must be true/false, got {v!r}")
         return v
-    if kind == "int":
+    if kind in ("int", "experts"):
         if not _is_int(v) or not lo <= v <= hi:
             raise _bad(f"{name} must be an integer in [{lo}, {hi}], got {v!r}")
         return v
@@ -741,6 +768,23 @@ def validate_schedule(v) -> list:
     if out[0][0] != 1:
         raise _bad("the first schedule range must start at batch size 1")
     return out
+
+
+def effective_k(o: dict, c: int) -> int:
+    """Draft tokens per stream the scheduler uses at batch size c: vLLM's build_dynamic_sd_schedule_lookup
+    (v1/spec_decode/dynamic/utils.py:74-140): ranges are inclusive, a gap or the tail carries the previous k forward,
+    every k is clamped to num_speculative_tokens. No schedule: k."""
+    k, sched = o["k"], o["num_speculative_tokens_per_batch_size"]
+    if not sched:
+        return k
+    last = sched[0][2]
+    for a, b, kk in sched:
+        if c < a:
+            break  # in the gap before this range: the previous range's k carries forward
+        last = kk
+        if c <= b:
+            break
+    return min(k, last)
 
 
 def validate_env(v) -> dict:
@@ -850,7 +894,36 @@ def parse_opts(raw) -> dict:
     if gib > MAX_ENGRAM_HOST_GIB:
         raise _bad(f"engram_rows={o['engram_rows']} x engram_heads={o['engram_heads']} would pin "
                    f"{gib:.1f} GiB of host memory (limit {MAX_ENGRAM_HOST_GIB:.0f})")
+    _check_experts(o)
+    broken = [c for c in kernel_contracts(o) if not c["ok"]]
+    if broken:
+        raise _bad("kernel contract violated: " + "; ".join(f"{c['id']}: {c['detail']} [{c['source']}]" for c in broken))
+    mem = memory_plan(o)
+    if mem["kv_gib_est"] < KV_MIN_GIB:
+        raise _bad(f"slice_experts={o['slice_experts']}: the weights alone need ~{mem['weights_gib_logged_est']} GiB and "
+                   f"the card budget is {mem['budget_gib']} GiB ({o['gpu_memory_utilization']} x {CARD_GIB}); with "
+                   f"{NONTORCH_GIB + ACTIVATION_GIB + GRAPH_GIB:.1f} GiB of context/activations/graphs that leaves "
+                   f"{mem['kv_gib_est']} GiB for KV. Use slice_experts 64 or fewer")
     return o
+
+
+def _check_experts(o: dict) -> None:
+    """slice_experts must have a router kernel instance (model routing); active_experts is a subset of it."""
+    n, routing = o["slice_experts"], o["moe_routing"]
+    if routing == "model" and n not in SLICE_EXPERTS:
+        raise _bad(f"slice_experts={n}: the model router kernel (csrc/moe/topk_softplus_sqrt_kernels.cu:786-841) is "
+                   f"instantiated only for {list(SLICE_EXPERTS)} experts in this range (the EP8 rank's {PROD_RANK_EXPERTS} "
+                   "throws 'Unsupported expert number'); moe_routing=uniform_random|normal_routing bypasses the kernel "
+                   "and takes any count in 16-192")
+    act = o["active_experts"]
+    if act is None:
+        act = min(n, PROD_RANK_EXPERTS) if routing == "model" else n
+    elif routing != "model" and act != n:
+        raise _bad("active_experts masks the model router's gate bias; the routing simulator picks over all "
+                   f"slice_experts={n}")
+    if not o["moe_topk"] <= act <= n:
+        raise _bad(f"active_experts={act} must be in [moe_topk={o['moe_topk']}, slice_experts={n}]")
+    o["active_experts"] = act
 
 
 def schema_doc() -> dict:
@@ -883,12 +956,16 @@ def slice_text(real_text: dict, o: dict, tp: int = PROD_TP, ep: int = PROD_EP):
                      ("dspark_n_routed_experts", ep)):
         if t[key] % div:
             raise SliceError(f"{key}={t[key]} is not divisible by {div}", 1)
+    per_rank = t["n_routed_experts"] // ep
     put("num_attention_heads", t["num_attention_heads"] // tp, "heads/TP",
         "wq_b is column-parallel over heads*head_dim; attention n_local_heads = heads/TP")
     put("o_groups", t["o_groups"] // tp, "o_groups/TP",
         "wo_a (out) and wo_b (in) shard by group: n_local_groups = o_groups/TP; wo_a input = heads*head_dim/o_groups stays 4096")
-    put("n_routed_experts", t["n_routed_experts"] // ep, "experts/EP",
-        "EP8 = whole experts per rank at the full moe_intermediate_size (2304, unchanged)")
+    put("n_routed_experts", o["slice_experts"], "slice_experts (EP8 rank: %d)" % per_rank,
+        "EP8 = %d whole experts per rank at the full moe_intermediate_size (2304, unchanged). The slice holds slice_experts "
+        "because the router kernel (csrc/moe/topk_softplus_sqrt_kernels.cu:786-841) has no instance for %d; only "
+        "active_experts=%d of them are ever selected (gate bias mask), so the per-step weight traffic is the rank's"
+        % (per_rank, per_rank, o["active_experts"]))
     put("num_experts_per_tok", o["moe_topk"], "pairs per token -> moe_topk",
         "a prod rank sees top_k/EP = 0.75 expert pairs per token; the integer nearest above is 1 "
         "(+33% pairs, touched experts +32%/+20%/+3% at M=6/48/192: see non-equivalences)")
@@ -923,6 +1000,22 @@ def slice_config(o: dict, tp: int = PROD_TP, ep: int = PROD_EP):
     cfg = real_config()
     cfg["text_config"], rules = slice_text(cfg["text_config"], o, tp, ep)
     return cfg, rules
+
+
+def memory_plan(o: dict) -> dict:
+    """GiB per card: weights (modeled + what the model leaves out), the fixed overheads, and what is left for KV.
+    Constants come from the glm boot and the first slice boot; the KV token figure is the conservative one."""
+    patched = o["shared_expert_tp"]
+    modeled = resident_bytes(rank_modules(slice_config(o)[0], 1, 1, shared_tp=PROD_TP if patched else 1)) / 2 ** 30
+    weights = modeled + UNMODELLED_GIB
+    budget = o["gpu_memory_utilization"] * CARD_GIB
+    kv_gib = budget - weights - NONTORCH_GIB - ACTIVATION_GIB - GRAPH_GIB
+    per_request = o["prompt_tokens"] + max_tokens_for(o) + 1
+    kv_tokens = max(kv_gib, 0.0) * KV_TOKENS_PER_GIB
+    return {"weights_gib_modeled": round(modeled, 2), "weights_gib_logged_est": round(weights, 2),
+            "budget_gib": round(budget, 2), "kv_gib_est": round(kv_gib, 2), "kv_tokens_est": int(kv_tokens),
+            "tokens_needed": {str(c): c * per_request for c in o["conc"]},
+            "fits": {str(c): c * per_request <= 0.9 * kv_tokens for c in o["conc"]}}
 
 
 def _flatten(d, prefix=""):
@@ -1041,8 +1134,10 @@ def rank_diff(real: dict, sl: dict) -> dict:
     return out
 
 
-def step_bytes(cfg: dict, tp: int, ep: int, c: int, k: int, shared_tp: int | None = None) -> dict:
-    """Bytes one rank streams from HBM in one decode step (weights only): the roofline view."""
+def step_bytes(cfg: dict, tp: int, ep: int, c: int, k: int, shared_tp: int | None = None,
+               active_experts: int | None = None) -> dict:
+    """Bytes one rank streams from HBM in one decode step (weights only): the roofline view.
+    active_experts: routed experts the router can reach (slice: the unmasked ones; default: all of them)."""
     t = cfg["text_config"]
     mods = rank_modules(cfg, tp, ep, shared_tp)
     m_tok, m_draft = c * (k + 1), c * k
@@ -1052,7 +1147,7 @@ def step_bytes(cfg: dict, tp: int, ep: int, c: int, k: int, shared_tp: int | Non
             continue
         streams = k if name == "draft.markov_w2" else (1 if k == 0 and name == "lm_head" else m["streams"])
         out["dense"][name] = m["layers"] * m["elems"] * m["bpe"] * streams
-    ne = t["n_routed_experts"]
+    ne = active_experts or t["n_routed_experts"]
     per_expert = 3 * t["hidden_size"] * t["moe_intermediate_size"]
     out["experts"] = (t["num_hidden_layers"] * touched_experts(m_tok, t["num_experts_per_tok"], ne, ep)
                       * per_expert * BPE["nvfp4"])
@@ -1079,15 +1174,18 @@ def _ms(nbytes: float, bw_gbs: float = ASSUMED_BW_GBS) -> float:
     return nbytes / (bw_gbs * 1e9) * 1e3
 
 
-def bias_terms(o: dict, c: int, bw_gbs: float = ASSUMED_BW_GBS) -> dict:
+def bias_terms(o: dict, c: int, bw_gbs: float = ASSUMED_BW_GBS, active: int | None = None) -> dict:
     """(slice - prod) contribution in ms/step, per effect, for c streams. Positive = the slice is slower.
-    Only effects that follow from bytes (or a cited table) are quantified; see non_equivalences()."""
-    k = o["k"]
+    Only effects that follow from bytes (or a cited table) are quantified; see non_equivalences().
+    active: experts the router actually reaches (default o["active_experts"]; the run passes slice_experts
+    when the routing mask could not be applied)."""
+    k = effective_k(o, c)  # the draft tokens verified per stream at this batch size (the schedule's, if any)
     real = real_config()
     sl, _ = slice_config(o)
     patched = o["shared_expert_tp"]
     r = step_bytes(real, PROD_TP, PROD_EP, c, k)
-    s = step_bytes(sl, 1, 1, c, k, shared_tp=PROD_TP if patched else 1)
+    s = step_bytes(sl, 1, 1, c, k, shared_tp=PROD_TP if patched else 1,
+                   active_experts=active if active is not None else o["active_experts"])
     dense = lambda d, *names: sum(d["dense"].get(n, 0.0) for n in names)  # noqa: E731
     vocab_real, vocab_slice = real["text_config"]["vocab_size"], sl["text_config"]["vocab_size"]
     tokens = c * (k + 1) + c * k
@@ -1114,6 +1212,8 @@ def non_equivalences(o: dict) -> list:
 
     none = {str(c): None for c in o["conc"]}
     shared_on = o["shared_expert_tp"]
+    st = slice_config(o)[0]["text_config"]
+    layers = st["num_hidden_layers"]
     return [
         {"id": "collectives", "basis": "estimate (docs/dsv41-comms.md section 3 host all-reduce table; not measured on this model)",
          "prod": "TP8: 2 all-reduces per layer x 43 + embedding + vocab-logits gather + 2 Engram head gathers (~88/step)",
@@ -1121,8 +1221,27 @@ def non_equivalences(o: dict) -> list:
          "note": "the slice step is SHORTER by this much; add it back to compare with the live pool"},
         {"id": "moe_pairs", "basis": "computed (touched experts x 19.9 MB at %.0f GB/s)" % ASSUMED_BW_GBS,
          "prod": "6 of 384 experts per token, 48 local: 0.75 pairs/token, E[distinct local experts]=48(1-(63/64)^M)",
-         "slice": "top-%d of 48 experts: %d pairs/token (opts.moe_topk)" % (o["moe_topk"], o["moe_topk"]), "ms": per_c("moe_pairs"),
-         "note": "balanced random routing assumed on both sides; real routers are skewed (fewer distinct experts)"},
+         "slice": "top-%d of %d reachable experts: %d pairs/token, E=%d(1-(1-%d/%d)^M)"
+                  % (o["moe_topk"], o["active_experts"], o["moe_topk"], o["active_experts"], o["moe_topk"], o["active_experts"]),
+         "ms": per_c("moe_pairs"),
+         "note": "balanced random routing assumed on both sides; real routers are skewed (fewer distinct experts). "
+                 + ("The gate-bias mask keeps the other %d resident experts untouched, so this is the %d-expert bias."
+                    % (o["slice_experts"] - o["active_experts"], o["active_experts"])
+                    if o["active_experts"] < o["slice_experts"] else
+                    "No mask (active_experts = slice_experts): every resident expert is reachable.")},
+        {"id": "resident_experts", "basis": "computed (memory)",
+         "prod": "%d experts resident per layer" % PROD_RANK_EXPERTS,
+         "slice": "%d resident (the router kernel has no %d-expert instance)" % (o["slice_experts"], PROD_RANK_EXPERTS),
+         "ms": none, "note": "%+d experts x %d layers x 19.9 MB = %+.1f GiB of weights, so the KV pool is that much smaller "
+                             "(plan.memory_estimate); no time effect while the extra experts are masked"
+                             % (o["slice_experts"] - PROD_RANK_EXPERTS, layers,
+                                (o["slice_experts"] - PROD_RANK_EXPERTS) * layers * 3 * st["hidden_size"]
+                                * st["moe_intermediate_size"] * BPE["nvfp4"] / 2 ** 30)},
+        {"id": "router_kernel", "basis": "unquantified (a few us per layer)",
+         "prod": "target layers: dsv4_topk (Triton, 384 experts, top-6; router/dsv4_topk.py:26); draft layers: topkGatingSoftplusSqrt<128>",
+         "slice": "topkGatingSoftplusSqrt<%d> (CUDA) on the target layers, <%d> on the draft layers: not the kernel prod's target "
+                  "layers run" % (st["n_routed_experts"], st["dspark_n_routed_experts"]),
+         "ms": none, "note": "<= ~0.2 ms per step over 43 layers; prod also filters non-local pairs inside the MoE kernel"},
         {"id": "draft_moe_pairs", "basis": "computed",
          "prod": "DSpark MoE: top-3 of 128, 16 local", "slice": "top-1 of 16", "ms": per_c("draft_moe_pairs"), "note": ""},
         {"id": "shared_expert", "basis": "computed",
@@ -1131,7 +1250,10 @@ def non_equivalences(o: dict) -> list:
          "ms": per_c("shared_expert"), "note": "opts.shared_expert_tp"},
         {"id": "gate_and_router", "basis": "gate computed; router top-k kernel width and EP filtering unquantified (<~0.3 ms, prod-only)",
          "prod": "gate [5120 x 384] (and [5120 x 128] in the draft); top-6 over 384; non-local pairs filtered in the kernel",
-         "slice": "[5120 x 48] / [5120 x 16]; top-1 over 48", "ms": per_c("gate_width"), "note": ""},
+         "slice": "[%d x %d] / [%d x %d]; top-%d over %d resident (%d reachable)"
+                  % (st["hidden_size"], st["n_routed_experts"], st["hidden_size"], st["dspark_n_routed_experts"],
+                     o["moe_topk"], st["n_routed_experts"], o["active_experts"]),
+         "ms": per_c("gate_width"), "note": ""},
         {"id": "vocab", "basis": "markov head computed; sampler assumes %d fp32 passes over [tokens, vocab]" % SAMPLER_PASSES,
          "prod": "lm_head/embedding 16160 per rank, logits all-gathered to 129280 for the sampler and rejection kernels; "
                  "Markov head (replicated) 129280 x 256",
@@ -1143,7 +1265,7 @@ def non_equivalences(o: dict) -> list:
          "ms": none, "note": "<= ~0.1 ms either way; lookups from a smaller table are more cache-friendly; host NUMA differs from worker-06"},
         {"id": "vision_tower", "basis": "memory only", "prod": "ViT + aligner resident (data-parallel mm encoder)",
          "slice": "not built: limit_mm_per_prompt image=0 (no tokenizer files exist for the MM processor)",
-         "ms": none, "note": "decode never runs the encoder; KV pool ~0.6-1.1 GiB larger. AGENTS rule 1.5 is about pools"},
+         "ms": none, "note": "decode never runs the encoder; ~0.97 GiB less weight than a prod rank. AGENTS rule 1.5 is about pools"},
         {"id": "inprocess_engine", "basis": "unquantified", "prod": "scheduler and worker are separate processes (async scheduling overlaps them)",
          "slice": "one process, VLLM_ENABLE_V1_MULTIPROCESSING=0 (needed for the profiler and the shared-expert patch)",
          "ms": none, "note": "adds at most the scheduler's CPU time per step when the GPU would otherwise wait"},
@@ -1178,6 +1300,124 @@ def expected_slice_ms(o: dict, c: int):
 def prod_equivalent_ms(o: dict, c: int, slice_step_ms: float) -> float:
     """slice step minus the quantified (slice - prod) bias: the number to compare with LIVE_STEP_MS."""
     return round(slice_step_ms - bias_terms(o, c)["quantified_total"], 3)
+
+
+# --------------------------------------------------------------------------------------------
+# Kernel contracts: the hard allowlists and integer tables that the shrunken dimensions must satisfy.
+# Each entry cites the pinned vLLM source; parse_opts refuses a violated one (exit 2) instead of
+# spending a 10-minute boot to find it. The first silicon run found one by running into it: the
+# router kernel has no 48-expert instance (csrc/moe/topk_softplus_sqrt_kernels.cu:841).
+# --------------------------------------------------------------------------------------------
+def mxfp8_linears(cfg: dict, tp: int, shared_tp: int | None = None) -> dict:
+    """(N, K) of every MXFP8 linear one rank runs through FlashInferCutlassMxfp8LinearKernel. wo_a is a BMM and
+    takes the emulation kernel on SM12x (kernels/linear/__init__.py:961, mxfp8/deep_gemm.py:35): no shape rule."""
+    t = cfg["text_config"]
+    h, hd, heads, ql = t["hidden_size"], t["head_dim"], t["num_attention_heads"], t["q_lora_rank"]
+    shared = _cdiv((t["moe_intermediate_size"] * (t["n_shared_experts"] or 0)) // 32, shared_tp or tp) * 32
+    cols = (t["engram_max_ngram_size"] - 1) * t["engram_n_heads"]
+    return {
+        "attn.fused_wqa_wkv": (ql + hd, h),
+        "attn.wq_b": (heads * hd // tp, ql),
+        "attn.wo_b": (h, t["o_groups"] * t["o_lora_rank"] // tp),
+        "shared_expert.gate_up": (2 * shared, h),
+        "shared_expert.down": (h, shared),
+        "indexer.wq_b": (t["index_n_heads"] * t["index_head_dim"], ql),
+        "engram.wkv": (h * (t["hc_mult"] + 1) // tp, cols * t["engram_head_dim"]),
+        "draft.main_proj": (h, len(t["dspark_target_layer_ids"]) * h),
+    }
+
+
+def kernel_contracts(o: dict) -> list:
+    cfg, _ = slice_config(o)
+    t = cfg["text_config"]
+    simulated = o["moe_routing"] != "model"
+    out: list = []
+
+    def add(name, ok, detail, source):
+        out.append({"id": name, "ok": bool(ok), "detail": detail, "source": source})
+
+    router_src = "csrc/moe/topk_softplus_sqrt_kernels.cu:786-841"
+    add("router_experts_target", simulated or t["n_routed_experts"] in GATE_KERNEL_EXPERTS,
+        f"{t['n_routed_experts']} experts; kernel instances exist for {list(GATE_KERNEL_EXPERTS)}"
+        + ("; bypassed by the routing simulator (router/router_factory.py:120)" if simulated else ""), router_src)
+    add("router_experts_draft", simulated or t["dspark_n_routed_experts"] in GATE_KERNEL_EXPERTS,
+        f"{t['dspark_n_routed_experts']} draft experts", router_src)
+    shapes = mxfp8_linears(cfg, 1, PROD_TP if o["shared_expert_tp"] else 1)
+    bad = {n: (N, K) for n, (N, K) in shapes.items() if not (K >= 128 and K % 32 == 0 and N >= 128 and N % 32 == 0)}
+    add("mxfp8_linear_shapes", not bad,
+        "all (N,K) satisfy K>=128, K%32==0, N>=128, N%32==0 (SM12x): " + ", ".join(f"{n}={nk}" for n, nk in shapes.items())
+        if not bad else f"violated by {bad}", "vllm/model_executor/kernels/linear/mxfp8/flashinfer.py:27-70")
+    inter = t["moe_intermediate_size"]
+    aligned = t["hidden_size"] % 128 == 0 and inter % 128 == 0
+    add("flashinfer_cutlass_moe_alignment", aligned,
+        f"hidden_size={t['hidden_size']}, moe_intermediate_size={inter}: " + ("both multiples of 128" if aligned else
+                                                                             "must both be multiples of 128")
+        + " (the strictest of the binding's alignment checks); no expert-count or top-k allowlist exists: the fused "
+        "expert-map prologue returns false for top-k outside {1,2,4,6,8}, more than 256 tokens or more than 510 experts "
+        "and the three-step path takes over; EP=1 here",
+        "flashinfer 0.7.2 csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu:422-438; "
+        "cutlass_fused_moe_kernels.cuh:552-648,4148-4191,4319-4336")
+    heads = t["num_attention_heads"]
+    add("sparse_mla_heads", heads <= 128,
+        f"{heads} local heads -> padded {next((h for h in (8, 16, 32, 64, 128) if heads <= h), None)} "
+        "(natively supported h_q: 8, 16, 32, 64, 128; the prod rank has 8 too)",
+        "vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py:75-86")
+    window, k = t["sliding_window"], o["k"]
+    draft_topk = -(-(window + k) // 64) * 64 if k else window
+    add("sm120_sparse_mla_dispatch", draft_topk == 192 or k == 0,
+        f"vLLM refuses the backend unless FlashInfer's DSV4 decode envelope contains ({heads}, {draft_topk}); in 0.7.2 that is a "
+        "predicate (1 <= heads <= 128 and top_k >= 1: top-k is a runtime argument, there is no table of instances) and the C++ "
+        "dispatcher stays authoritative. k > 0: ceil((window+k)/64)*64 = 192 for every k <= 64, the (8, 192) pair prod's k=5 rank "
+        f"runs; k = 0: ({heads}, {window}), a pair prod never ran",
+        "vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py:88-100,633; vllm/utils/flashinfer.py:473-486; "
+        "v1/attention/backends/mla/compressor_utils.py:19-28; flashinfer 0.7.2 flashinfer/mla/_sparse_mla_sm120/_policy.py:98-182")
+    add("noise_token_in_vocab", 0 <= t["dspark_noise_token_id"] < t["vocab_size"],
+        f"dspark_noise_token_id={t['dspark_noise_token_id']} feeds the draft embedding as the parallel-drafting mask token; "
+        f"vocab_size={t['vocab_size']} (TP=1 embedding has no out-of-shard masking)",
+        "vllm/v1/worker/gpu/spec_decode/utils.py:92-114")
+    primes = engram_rows(t["engram_layer_ids"], t["engram_max_ngram_size"], t["engram_n_heads"], t["engram_vocab_size"])
+    add("engram_rows_cover_primes", all(n >= r for n, r in zip(t["engram_num_embeddings"], primes)),
+        f"engram_num_embeddings={t['engram_num_embeddings']} vs sum of bucket ranges {primes}",
+        "vllm/models/deepseek_v41/common/engram.py:965")
+    add("engram_tokenizer_vocab", t["engram_compressed_vocab_size"] == t["vocab_size"],
+        "the model dir's tokenizer has vocab_size distinct tokens, so its compressed vocab is vocab_size",
+        "vllm/models/deepseek_v41/common/engram.py:449-461")
+    add("hash_tables_absent", True,
+        "V4.1 builds every MoE with num_hash_layers=0: no tid2eid table, so no integer expert-id table to violate",
+        "vllm/models/deepseek_v41/nvidia/model.py:150; vllm/models/deepseek_v4/nvidia/model.py:284-300")
+    add("routing_within_experts", o["moe_topk"] <= o["active_experts"] <= t["n_routed_experts"],
+        f"top-{o['moe_topk']} of {o['active_experts']} reachable of {t['n_routed_experts']} resident experts",
+        "csrc/moe/topk_softplus_sqrt_kernels.cu:510-516 (gate bias added before the top-k)")
+    padded = _pad64(t["vocab_size"])
+    add("vocab_stride", True,
+        f"lm_head is {padded} rows for vocab {t['vocab_size']}; logits[..., :vocab] is a row-strided view"
+        if padded != t["vocab_size"] else "no vocab padding",
+        "vllm/model_executor/layers/logits_processor.py:198; v1/worker/gpu/sample/gumbel.py:41; "
+        "v1/worker/gpu/spec_decode/rejection_sampler_utils.py:1061 (stride(-1)==1 only)")
+    return out
+
+
+ENGINE_HINTS = (
+    (r"Unsupported expert number: (\d+)",
+     "the router kernel has no instance for that expert count; slice_experts must be one of "
+     + "/".join(str(n) for n in SLICE_EXPERTS) + " (csrc/moe/topk_softplus_sqrt_kernels.cu:786-841)"),
+    (r"larger than the available KV cache memory|To serve at least one request with the model's max seq len",
+     "the weights leave too little KV memory for max_model_len: the tool never shrinks the context silently; lower "
+     "max_model_len, slice_experts, or raise gpu_memory_utilization"),
+    (r"Free memory on device|less than desired GPU memory utilization",
+     "another process holds memory on this GPU: lower gpu_memory_utilization or free the card"),
+    (r"out of memory|OutOfMemoryError",
+     "GPU or host memory exhausted: check engram_rows (pinned host RAM), slice_experts and gpu_memory_utilization"),
+    (r"No available memory for the cache blocks|Insufficient GPU memory|Available KV cache memory.*negative",
+     "no memory left for KV after the weights: lower slice_experts or raise gpu_memory_utilization"),
+)
+
+
+def engine_hint(text: str) -> str | None:
+    for rx, hint in ENGINE_HINTS:
+        if re.search(rx, text):
+            return hint
+    return None
 
 
 # --------------------------------------------------------------------------------------------
@@ -1248,12 +1488,30 @@ def engine_kwargs(o: dict, model_dir: str) -> dict:
     return kw
 
 
+def plan_warnings(o: dict, mem: dict) -> list:
+    """Things worth knowing before a 10-minute boot (none of them is a refusal)."""
+    out = []
+    if mem["kv_gib_est"] < KV_WARN_GIB:
+        out.append(f"estimated KV pool {mem['kv_gib_est']} GiB (~{mem['kv_tokens_est']:,} tokens at the conservative "
+                   f"{KV_TOKENS_PER_GIB:,} tokens/GiB): long prompts at high concurrency may not fit")
+    for c, fits in mem["fits"].items():
+        if not fits:
+            out.append(f"c={c}: needs ~{mem['tokens_needed'][c]:,} KV tokens, the estimate is ~{mem['kv_tokens_est']:,}: "
+                       "that concurrency is skipped with a warning if the booted pool is smaller")
+    if o["active_experts"] < o["slice_experts"]:
+        out.append(f"routing mask: {o['slice_experts'] - o['active_experts']} of {o['slice_experts']} experts per layer get "
+                   "gate bias -1e4 after boot; if that cannot be applied the run keeps going, records "
+                   "routing_mask.applied=false and charges the unmasked MoE bias")
+    return out
+
+
 def build_plan(o: dict, model_dir: str | None = None, files: dict | None = None) -> dict:
     cfg, rules = slice_config(o)
     real, sl = real_config(), cfg
     patched = o["shared_expert_tp"]
     mods_real = rank_modules(real, PROD_TP, PROD_EP)
     mods_slice = rank_modules(sl, 1, 1, shared_tp=PROD_TP if patched else 1)
+    mem = memory_plan(o)
     return {
         "engine_kwargs": engine_kwargs(o, model_dir or "<model_dir>"),
         "env": env_plan(o),
@@ -1267,14 +1525,25 @@ def build_plan(o: dict, model_dir: str | None = None, files: dict | None = None)
             "slice_modeled": round(resident_bytes(mods_slice) / 2 ** 30, 3),
             "prod_rank_logged": 40.66,
             "note": "modeled = linears/experts/gates/mHC/embeddings; logged = vLLM 'Model loading took' on glm "
-                    "(adds the vision tower, rope caches, buffers); the slice's logged value should be ~40.66 - "
-                    "(vision 0.6-1.1) - 0.24",
+                    "(adds the vision tower ~0.97, rope caches, buffers ~0.99). The slice has no vision tower: its logged "
+                    "value should be slice_modeled + 0.99 (the 48-expert slice logged 39.45 for 38.458 modeled on silicon); "
+                    "memory_estimate.weights_gib_logged_est is that number",
         },
         "rank_diff_mb": {n: [round(a / 1e6, 2), round(b / 1e6, 2)] for n, (a, b) in rank_diff(mods_real, mods_slice).items()},
-        "step_stream_gb": {str(c): {"prod_rank": round(step_bytes(real, PROD_TP, PROD_EP, c, o["k"])["total"] / 1e9, 2),
-                                    "slice": round(step_bytes(sl, 1, 1, c, o["k"], PROD_TP if patched else 1)["total"] / 1e9, 2)}
+        "step_stream_gb": {str(c): {"prod_rank": round(step_bytes(real, PROD_TP, PROD_EP, c, effective_k(o, c))["total"] / 1e9, 2),
+                                    "slice": round(step_bytes(sl, 1, 1, c, effective_k(o, c), PROD_TP if patched else 1,
+                                                              active_experts=o["active_experts"])["total"] / 1e9, 2)}
                            for c in o["conc"]},
         "engram_host_gib": round(engram_host_gib(o, sl["text_config"]), 3),
+        "k_per_conc": {str(c): effective_k(o, c) for c in o["conc"]},
+        "memory_estimate": mem,
+        "contracts": kernel_contracts(o),
+        "routing": {"moe_routing": o["moe_routing"], "slice_experts": o["slice_experts"],
+                    "active_experts": o["active_experts"], "moe_topk": o["moe_topk"],
+                    "mask": ("gate bias -1e4 on experts >= active_experts, applied with LLM.apply_model after the engine "
+                             "is up (CUDA graphs read the same storage)")
+                    if o["active_experts"] < o["slice_experts"] else None},
+        "warnings": plan_warnings(o, mem),
         "non_equivalences": non_equivalences(o),
         "bias_terms_ms": {str(c): bias_terms(o, c) for c in o["conc"]},
         "live_reference_ms": {str(c): LIVE_STEP_MS[c] for c in o["conc"] if c in LIVE_STEP_MS},
@@ -1695,6 +1964,59 @@ def apply_shared_expert_patch(factor: int = PROD_TP) -> None:
     log(f"shared expert patched to 1/{factor} width (anchors ok)")
 
 
+ROUTING_MASK_BIAS = -1.0e4
+
+
+def _mask_routing(model, active: int, width: int) -> dict:
+    """Runs inside the worker (LLM.apply_model). Writes gate bias -1e4 for routed experts >= `active` into every
+    [width] e_score_correction_bias reachable from `model` (the gate parameter and the router's reference), then
+    routes random logits through the first live router to show that its top-k never leaves [0, active)."""
+    import torch
+    seen: dict = {}
+    routers: list = []
+    for _, mod in model.named_modules():
+        router = getattr(mod, "router", None)
+        if router is not None and hasattr(router, "select_experts"):
+            routers.append(router)
+        for tensor in (getattr(mod, "e_score_correction_bias", None), getattr(router, "e_score_correction_bias", None)):
+            if isinstance(tensor, torch.Tensor) and tensor.ndim == 1 and tensor.shape[0] == width:
+                seen.setdefault(tensor.data_ptr(), tensor)
+    with torch.no_grad():
+        for tensor in seen.values():
+            tensor.data[active:] = ROUTING_MASK_BIAS
+    probe: dict = {}
+    if routers and seen:
+        dev = next(iter(seen.values())).device
+        if dev.type == "cuda":
+            torch.cuda.synchronize(dev)
+        try:
+            _, ids = routers[0].select_experts(
+                hidden_states=torch.zeros(512, 8, dtype=torch.bfloat16, device=dev),
+                router_logits=torch.randn(512, width, dtype=torch.float32, device=dev),
+                topk_indices_dtype=torch.int32,
+                input_ids=torch.randint(0, 1000, (512,), device=dev))
+            probe = {"max_expert_id": int(ids.max())}
+        except Exception as exc:  # noqa: BLE001 - the probe is evidence; its failure is reported, not raised
+            probe = {"error": f"{type(exc).__name__}: {exc}"}
+    return {"bias_tensors": len(seen), "routers": len(routers), "probe": probe}
+
+
+def apply_routing_mask(llm, active: int, width: int, layers: int) -> dict:
+    """Mask routed experts >= `active` after the engine is up, in place. The router adds the bias to its scores
+    before the top-k (csrc/moe/topk_softplus_sqrt_kernels.cu:510-516) and reads `e_score_correction_bias.data` on
+    every call (router/fused_topk_bias_router.py:439); the captured CUDA graphs read the same storage, so the write
+    needs no recapture. In-process engine only (LLM.apply_model -> UniProcExecutor.collective_rpc, no pickling).
+    `applied` is true only if >= `layers` bias tensors were written AND the probe saw no expert id >= active."""
+    try:
+        got = llm.apply_model(functools.partial(_mask_routing, active=active, width=width))[0]
+    except Exception as exc:  # noqa: BLE001
+        return {"applied": False, "active": active, "error": f"{type(exc).__name__}: {exc}"}
+    ok = got["bias_tensors"] >= layers and got["probe"].get("max_expert_id", active) < active and "max_expert_id" in got["probe"]
+    return {"applied": ok, "active": active, **got,
+            **({} if ok else {"error": "mask not proven: need >= %d bias tensors and a probe whose largest expert id is "
+                                       "< %d, got %s" % (layers, active, got)})}
+
+
 ENGINE_CHECKS = (
     # name, regex over the captured log, regex the prod value must match (boot5.log / ROLL.md)
     ("nvfp4_moe_backend", r"Using '(\w+)' NvFp4 MoE backend", r"^FLASHINFER_CUTLASS$"),
@@ -1725,6 +2047,13 @@ def evaluate_checks(text: str) -> dict:
         out[name] = {"found": got, "expected_prod": want,
                      "match": (None if want is None else (got is not None and re.search(want, got) is not None))}
     return out
+
+
+def _int(text) -> int | None:
+    try:
+        return int(str(text).replace(",", ""))
+    except ValueError:
+        return None
 
 
 def _verbatim(exc: BaseException) -> str:
@@ -1843,6 +2172,12 @@ def measure_concurrency(llm, c: int, o: dict, vocab: int, clock: Clock, tel: Tel
             res["telemetry"] = tel.stop()
         res.update(step_stats(gaps, toks, wall, c))
         res["spec"] = spec_delta(before, spec_snapshot(llm), c)
+        res["k_effective"] = k_eff = effective_k(o, c)
+        vps = (res["spec"] or {}).get("verified_per_stream")
+        if vps is not None and abs(vps - (k_eff + 1)) > 0.05:
+            rec.warn(f"c={c}: vLLM verified {vps:.2f} tokens per stream per step, k={o['k']} with the schedule "
+                     f"{o['num_speculative_tokens_per_batch_size']} says {k_eff + 1}: the schedule is not in effect "
+                     "for this batch size")
         if finished:
             rec.warn(f"c={c}: {len(finished)} stream(s) finished inside the window; step stats are not steady state")
         res["slice_step_ms"] = res["step_ms"]["mean"]
@@ -1887,6 +2222,8 @@ def run_slice(o: dict, rec: Recorder, tee: Tee, clock: Clock, model_dir: str, pl
     log("engine kwargs: " + json.dumps(plan["engine_kwargs"], default=str))
     log("config diff vs real: " + json.dumps(plan["config_diff"], default=str))
     log(f"versions: torch {versions['torch']} vllm {versions['vllm']} cuda {versions.get('cuda')}")
+    for w in plan.get("warnings", []):  # the pre-flight estimates (KV pool, routing mask) belong in the result too
+        rec.warn(w)
     if o["shared_expert_tp"]:
         apply_shared_expert_patch()
     with phase(rec, "engine_init"):
@@ -1895,9 +2232,13 @@ def run_slice(o: dict, rec: Recorder, tee: Tee, clock: Clock, model_dir: str, pl
         except BaseException as exc:  # noqa: BLE001 - verbatim, whatever vLLM (or the plugin's SystemExit) raised
             if isinstance(exc, (SliceError, KeyboardInterrupt)):
                 raise
-            rec.set("engine_error", f"{type(exc).__name__}: {exc}")
+            text = f"{type(exc).__name__}: {exc}"
+            hint = engine_hint(text)
+            rec.set("engine_error", text)
             rec.set("engine_traceback", _verbatim(exc))
-            raise SliceError(f"the engine refused this configuration: {type(exc).__name__}: {str(exc)[:500]}", 3) from exc
+            rec.set("engine_hint", hint)
+            raise SliceError(f"the engine refused this configuration: {text[:500]}" + (f" -- hint: {hint}" if hint else ""),
+                             3) from exc
     with contextlib.suppress(Exception):
         versions["gpu"] = gpu_properties()
         log(f"gpu: {versions['gpu']}")
@@ -1918,11 +2259,31 @@ def run_slice(o: dict, rec: Recorder, tee: Tee, clock: Clock, model_dir: str, pl
             rec.warn(f"engine check {name}: got {ch['found']!r}, prod has {ch['expected_prod']!r}")
         elif ch["match"] is None and ch["expected_prod"] and ch["found"] is None:
             rec.warn(f"engine check {name}: not seen in the log (prod logs it)")
+    o_run = o
+    if o["active_experts"] < o["slice_experts"]:
+        with phase(rec, "routing_mask"):
+            mask = apply_routing_mask(llm, o["active_experts"], o["slice_experts"], plan["layers"])
+        rec.set("routing_mask", mask)
+        if mask["applied"]:
+            log(f"routing mask applied: {mask}")
+        else:
+            o_run = {**o, "active_experts": o["slice_experts"]}
+            rec.warn(f"routing mask NOT applied ({mask.get('error')}): all {o['slice_experts']} resident experts are "
+                     "reachable, so the MoE term is charged unmasked in prod_equivalent_ms_est / expected_slice_ms")
+    kv_tokens = _int(checks["kv_cache_tokens"]["found"])
     vocab = plan["slice_vocab"]
     for c in o["conc"]:
+        need = c * (o["prompt_tokens"] + max_tokens_for(o) + 1)
+        if kv_tokens and need > 0.9 * kv_tokens:
+            why = (f"c={c}: needs ~{need:,} KV tokens (c x (prompt_tokens + max_tokens)), the booted pool holds "
+                   f"{kv_tokens:,} (vLLM's own count): skipped")
+            rec.warn(why)
+            with rec.lock:
+                rec.doc["results"][str(c)] = {"c": c, "skipped": why, "tokens_needed": need, "kv_cache_tokens": kv_tokens}
+            continue
         with phase(rec, f"measure_c{c}"):
             try:
-                res = measure_concurrency(llm, c, o, vocab, clock, tel, rec)
+                res = measure_concurrency(llm, c, o_run, vocab, clock, tel, rec)
             except SliceError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -1932,6 +2293,9 @@ def run_slice(o: dict, rec: Recorder, tee: Tee, clock: Clock, model_dir: str, pl
         with rec.lock:
             rec.doc["results"][str(c)] = res
         rec.checkpoint()
+    if not any("skipped" not in r for r in rec.doc["results"].values()):
+        raise SliceError("no concurrency fit the KV pool: lower prompt_tokens/conc or free memory "
+                         "(slice_experts, gpu_memory_utilization)", 5)
     return 0
 
 
@@ -1969,6 +2333,7 @@ def real_run(o: dict, args) -> int:
             state["dir"] = model_dir
             plan = build_plan(o, model_dir, files)
             plan["slice_vocab"] = cfg["text_config"]["vocab_size"]
+            plan["layers"] = cfg["text_config"]["num_hidden_layers"]
         rec.set("opts", o)
         rec.set("model_dir", model_dir if args.keep_dir else "<removed at exit>")
         rec.set("plan", plan)
@@ -2009,6 +2374,7 @@ def dry_run(o: dict, args, stdout) -> int:
     try:
         plan = build_plan(o, model_dir, files)
         plan["slice_vocab"] = cfg["text_config"]["vocab_size"]
+        plan["layers"] = cfg["text_config"]["num_hidden_layers"]
         doc = {"schema": RESULT_SCHEMA, "ok": True, "exit": 0, "dry": True, "opts": o, "plan": plan,
                "model_dir": model_dir if args.keep_dir else "<removed after the dry run>"}
         text = json.dumps(_clean(doc), default=str, indent=None if not args.pretty else 1)
