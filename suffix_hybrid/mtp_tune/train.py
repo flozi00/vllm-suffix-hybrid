@@ -75,7 +75,7 @@ class FrozenLinear(torch.autograd.Function):
         if w is not None:   # plain float weight (bf16 head, unquantized): no probe
             with torch.no_grad():
                 return dy @ w[:dy.shape[-1]].to(dy.dtype), None
-        rows = nvfp4_rows(ctx.layer, k)
+        rows = nvfp4_rows(ctx.layer, k) or mxfp8_rows(ctx.layer, k)
         if rows is not None and nvfp4_verified(ctx.layer, k, rows, dy.dtype):
             n, step = dy.shape[-1], max(1, (1 << 24) // k)
             dx = torch.zeros(*dy.shape[:-1], k, dtype=torch.float32, device=dy.device)
@@ -133,6 +133,30 @@ def nvfp4_rows(layer, k):
         v = lut[w[r0:r1].int()].view(r1 - r0, k // 16, 16)
         s = sfu[r0:r1].contiguous().view(torch.float8_e4m3fn).to(torch.bfloat16)
         return (v * s[..., None]).reshape(r1 - r0, k) * factor
+    return rows
+
+
+def mxfp8_rows(layer, k):
+    """fn(r0, r1) -> bf16 weight rows [r1 - r0, K] of an MXFP8 (e4m3 weight
+    [N, K], one UE8M0 scale per 32 along K, 128x4-swizzled after load:
+    FlashInfer CUTLASS MXFP8) linear; exact (e4m3 x 2^e fits bf16). None
+    when the layer does not carry that layout; trusted only after the probe
+    check (``nvfp4_verified`` compares with the layer's own kernel)."""
+    w, sf = getattr(layer, "weight", None), getattr(layer, "weight_scale", None)
+    n = getattr(layer, "output_size_per_partition", None)
+    if (w is None or sf is None or n is None or w.dtype != torch.float8_e4m3fn or w.dim() != 2
+            or int(w.shape[1]) != k or k % 32 or sf.element_size() != 1):
+        return None
+    from suffix_hybrid.kernels.nvfp4_gemm import unswizzle_sf
+    nb = k // 32
+    if sf.dim() == 2 and tuple(sf.shape) == (int(w.shape[0]), nb):
+        su = sf.view(torch.uint8)                     # not swizzled (other backends)
+    else:
+        su = unswizzle_sf(sf, int(w.shape[0]), nb)
+    scale = torch.exp2(su.float() - 127.0)            # [N, K/32]
+
+    def rows(r0, r1):
+        return (w[r0:r1].float().view(r1 - r0, nb, 32) * scale[r0:r1, :, None]).reshape(r1 - r0, k).to(torch.bfloat16)
     return rows
 
 
