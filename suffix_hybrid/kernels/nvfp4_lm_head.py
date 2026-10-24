@@ -179,6 +179,17 @@ def eligible(n: int, k: int, dtype: str) -> str | None:
     return None
 
 
+def exact_rows(w, top, x2):
+    """[M, R] bf16 = x2 . w[top] with fp32 products and sum. Deliberately no
+    torch.bmm: cuBLAS keeps a per-(handle, stream) workspace that
+    torch.cuda.empty_cache() frees, and a CUDA graph captured at load still
+    points at it. vLLM empties the cache after load, so at TP1 (the 262144 x
+    5376 head: its freed segment goes back to the driver) the first replay
+    faults with an illegal address (gemma-4-31b, 2026-10-23); where the block
+    is shared with live allocations the stale pointer is silently reused."""
+    return (w[top].float() * x2.float().unsqueeze(1)).sum(-1).to(w.dtype)
+
+
 def logits_nvfp4(x2, w, g_w: float, quant, gemm):
     """The hot path with its two device ops injected (vLLM scaled_fp4_quant,
     our GEMM; CPU twins in tests). x2 bf16 [M, K], w the bf16 head [N, K]
@@ -192,7 +203,7 @@ def logits_nvfp4(x2, w, g_w: float, quant, gemm):
     out = gemm(xq, xsf, 1.0 / g_w)  # = acc / g_w
     out.mul_(amax / FP4_RANGE)  # * 1/g_x, on device
     top = out.topk(min(RESCORE, out.shape[-1]), dim=-1).indices  # [M, R]
-    exact = torch.bmm(w[top], x2.unsqueeze(-1)).squeeze(-1)  # [M, R] bf16
+    exact = exact_rows(w, top, x2)  # [M, R] bf16
     return out.scatter_(1, top, exact)
 
 
@@ -353,6 +364,14 @@ def _device_ops(native):
             if not torch.equal(replay(st, x), want):
                 raise RuntimeError(f"{MARKER} GRAPH CHECK FAIL N={st['n']} K={st['k']} "
                                    f"M={m}: graph replay != eager (set {GRAPH_ENV}=0)")
+        # vLLM empties the allocator cache after load: replay again afterwards so a
+        # graph that depends on cache-owned memory dies here, not mid-warmup
+        torch.cuda.empty_cache()
+        for m in (m for m in ORACLE_MS if m <= max_m):
+            x = torch.randn(m, st["k"], generator=gen, device=dev, dtype=torch.bfloat16)
+            if not torch.equal(replay(st, x), run(st, x)):
+                raise RuntimeError(f"{MARKER} GRAPH CHECK FAIL N={st['n']} K={st['k']} "
+                                   f"M={m}: graph replay != eager after empty_cache")
         torch.cuda.synchronize(dev)
 
     def select(st, mode=None):
