@@ -100,7 +100,8 @@ def test_engram_all_24_columns_variant_and_host_cap():
 def test_slice_config_dimensions_are_one_rank():
     t = d.slice_config(opts())[0]["text_config"]
     assert (t["num_attention_heads"], t["o_groups"]) == (8, 1)
-    assert (t["n_routed_experts"], t["num_experts_per_tok"]) == (48, 1)
+    # 64 resident experts, not the EP8 rank's 48: the router kernel has no 48-expert instance (first silicon run)
+    assert (t["n_routed_experts"], t["num_experts_per_tok"]) == (64, 1) and 64 in d.SLICE_EXPERTS
     assert t["moe_intermediate_size"] == 2304  # EP: whole experts at the full width
     assert t["vocab_size"] == 16160 == 129280 // 8
     assert (t["dspark_n_routed_experts"], t["dspark_num_experts_per_tok"]) == (16, 1)
@@ -132,14 +133,17 @@ def test_rank_equivalence_is_exact_except_the_documented_set():
     mr = d.rank_modules(real, 8, 8)
     ms = d.rank_modules(sl, 1, 1, shared_tp=8)  # the shared-expert patch emulates TP8 width
     diff = d.rank_diff(mr, ms)
-    assert set(diff) == {"moe.gate", "draft.gate", "draft.markov_w1", "draft.markov_w2", "embed", "lm_head"}
+    # moe.experts: 64 resident experts against the rank's 48 (+33% weight bytes, memory only while the extra 16 are masked)
+    assert set(diff) == {"moe.experts", "moe.gate", "draft.gate", "draft.markov_w1", "draft.markov_w2", "embed", "lm_head"}
+    assert diff["moe.experts"][1] / diff["moe.experts"][0] == pytest.approx(64 / 48)
     # lm_head / embedding differ only by vocab padding (16192 vs 16160 rows)
     assert diff["lm_head"][1] / diff["lm_head"][0] == pytest.approx(16192 / 16160)
     # the per-rank GEMM shapes themselves are identical
     assert ms["attn.wq_b"]["elems"] == mr["attn.wq_b"]["elems"] == 1280 * 4096
     assert ms["attn.wo_a"]["elems"] == mr["attn.wo_a"]["elems"] == 4096 * 1024
     assert ms["attn.wo_b"]["elems"] == mr["attn.wo_b"]["elems"] == 1024 * 5120
-    assert ms["moe.experts"]["elems"] == mr["moe.experts"]["elems"] == 48 * 3 * 5120 * 2304
+    assert mr["moe.experts"]["elems"] == 48 * 3 * 5120 * 2304 and ms["moe.experts"]["elems"] == 64 * 3 * 5120 * 2304
+    assert ms["moe.experts"]["bpe"] == mr["moe.experts"]["bpe"]  # the same NVFP4 expert, just more of them
     assert ms["engram.wkv"]["elems"] == mr["engram.wkv"]["elems"] == 768 * 25600 == 6144 * 3200
     assert ms["moe.shared"]["elems"] == mr["moe.shared"]["elems"] == 3 * 5120 * 288
 
@@ -154,11 +158,22 @@ def test_shared_expert_is_8x_without_the_patch():
 
 def test_weight_model_is_anchored_to_the_logged_40_66_gib():
     real = d.resident_bytes(d.rank_modules(d.real_config(), 8, 8)) / 2 ** 30
-    # vLLM logged "Model loading took 40.66 GiB" on glm; the model leaves out the vision tower (0.6-1.1),
+    # vLLM logged "Model loading took 40.66 GiB" on glm; the model leaves out the vision tower (~0.97),
     # rope caches and buffers, so it must land a little below
     assert 37.5 < real < 40.66
     sl = d.resident_bytes(d.rank_modules(d.slice_config(opts())[0], 1, 1, shared_tp=8)) / 2 ** 30
-    assert abs(sl - real) < 0.5
+    # +16 experts x 40 layers x 19.9 MB = +11.86 GiB, less the gate/Markov under-count (0.24)
+    assert sl - real == pytest.approx(11.86 - 0.24, abs=0.1)
+
+
+def test_weight_model_is_anchored_to_the_first_silicon_boot():
+    # First slice boot (48 experts via the routing simulator would be the same bytes): "Model loading took 39.45 GiB".
+    # The 48-expert slice this tool computes is 38.46 GiB modeled + the 0.99 GiB the model leaves out.
+    mem = d.memory_plan(opts(slice_experts=48, moe_routing="uniform_random"))
+    assert mem["weights_gib_modeled"] == pytest.approx(38.46, abs=0.01)
+    assert mem["weights_gib_logged_est"] == pytest.approx(39.45, abs=0.01)
+    # default 64 experts: the lane brief's ~51.4 GiB
+    assert d.memory_plan(opts())["weights_gib_logged_est"] == pytest.approx(51.32, abs=0.05)
 
 
 def test_expert_streaming_matches_the_comms_doc_table():
@@ -258,7 +273,7 @@ def test_opts_enums_and_types(key, bad):
 def test_opts_accept_the_boundaries():
     assert opts(prompt_tokens=16, warmup_steps=0, measure_steps=4, k=0, temperature=0.0)["k"] == 0
     assert opts(max_num_seqs=256, conc=[256], max_num_batched_tokens=131072)["conc"] == [256]
-    assert opts(gpu_memory_utilization=0.3, engram_rows=1024)["engram_rows"] == 1024
+    assert opts(gpu_memory_utilization=0.3, engram_rows=1024, slice_experts=16)["engram_rows"] == 1024  # 64 experts need ~51 GiB
     assert opts(conc=[32, 1, 8])["conc"] == [1, 8, 32]  # sorted
     assert opts(cudagraph_mode="FULL_AND_PIECEWISE", moe_backend="flashinfer_cutlass")["moe_backend"]
 
@@ -652,6 +667,11 @@ def install_fake_vllm(monkeypatch, engine=None, boom=None):
             FakeLLM.last_kwargs = kw
             self.llm_engine = engine
 
+        mask_result = {"bias_tensors": 40, "routers": 40, "probe": {"max_expert_id": 47}}
+
+        def apply_model(self, fn):
+            return [type(self).mask_result]
+
         def get_metrics(self):
             return [ns(name="vllm:spec_decode_num_drafts", value=engine.drafts),
                     ns(name="vllm:spec_decode_num_draft_tokens", value=engine.draft_tokens),
@@ -680,7 +700,7 @@ def run_fake(o, rec=None, tee_text=PROD_LOG):
     pytest.importorskip("torch")
     rec = rec or d.Recorder(io.StringIO())
     plan = d.build_plan(o, "/m")
-    plan["slice_vocab"] = 16160
+    plan["slice_vocab"], plan["layers"] = 16160, 40
     tee = types.SimpleNamespace(sync=lambda *a, **k: None, text=lambda: tee_text)
     code = d.run_slice(o, rec, tee, d.Clock(60), "/m", plan)
     return code, rec
@@ -754,7 +774,7 @@ def test_deadline_stops_the_loop(monkeypatch):
     pytest.importorskip("torch")
     o = opts(conc=[2])
     plan = d.build_plan(o, "/m")
-    plan["slice_vocab"] = 16160
+    plan["slice_vocab"], plan["layers"] = 16160, 40
     tee = types.SimpleNamespace(sync=lambda *a, **k: None, text=lambda: "")
     with pytest.raises(d.SliceError) as ei:
         d.run_slice(o, d.Recorder(io.StringIO()), tee, d.Clock(-1), "/m", plan)
@@ -808,3 +828,412 @@ def test_shared_expert_patch_shards_only_the_shared_experts(monkeypatch):
     mod.DeepseekV4MLP(hidden_size=5120, intermediate_size=2304, prefix="layers.3.ffn.experts.0")
     assert built == [("layers.3.ffn.shared_experts", 288), ("layers.3.ffn.experts.0", 2304)]
     assert src  # the real anchors are pinned strings
+
+
+# ---------------------------------------------------------------- slice_experts / active_experts / memory / contracts
+# First silicon run (worker-01 Max-Q, nightly-39983a5e7): exit 3, "topkGatingSoftplusSqrtKernelLauncher,
+# csrc/moe/topk_softplus_sqrt_kernels.cu:841: Unsupported expert number: 48".
+def test_slice_experts_must_have_a_router_kernel_instance():
+    assert d.SLICE_EXPERTS == (16, 32, 64, 128, 192) and 48 not in d.GATE_KERNEL_EXPERTS
+    assert set(d.GATE_KERNEL_EXPERTS) == {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 192, 320, 384, 448, 576}  # the switch at :786-841
+    assert opts()["slice_experts"] == 64 and opts(slice_experts=32)["slice_experts"] == 32
+    msg = fails(slice_experts=48)
+    assert "topk_softplus_sqrt_kernels.cu:786-841" in msg and "[16, 32, 64, 128, 192]" in msg and "Unsupported expert number" in msg
+    for bad in (20, 100, 47, 256, 384):  # in [16, 192] but without an instance, or outside the range
+        fails(slice_experts=bad)
+    for bad in (15, 193, 0, True, "64", 64.0):
+        with pytest.raises(d.SliceError) as ei:
+            d.parse_opts({"slice_experts": bad})
+        assert ei.value.code == 2
+
+
+def test_the_routing_simulator_bypasses_the_router_kernel():
+    o = opts(slice_experts=48, moe_routing="uniform_random")  # exactly the rank's experts, no kernel involved
+    assert o["slice_experts"] == o["active_experts"] == 48
+    assert opts(slice_experts=48, moe_routing="normal_routing")["active_experts"] == 48
+    assert all(c["ok"] for c in d.kernel_contracts(o))
+    assert "bypassed by the routing simulator" in [c for c in d.kernel_contracts(o) if c["id"] == "router_experts_target"][0]["detail"]
+    assert opts(slice_experts=20, moe_routing="uniform_random")["slice_experts"] == 20  # any count in [16, 192] there
+
+
+def test_active_experts_is_a_subset_and_defaults_to_the_rank():
+    o = opts()
+    assert (o["slice_experts"], o["active_experts"]) == (64, 48)  # 48 = 384 / EP8
+    assert opts(slice_experts=32)["active_experts"] == 32 and opts(slice_experts=16)["active_experts"] == 16
+    assert opts(active_experts=64)["active_experts"] == 64 and opts(active_experts=8)["active_experts"] == 8
+    assert "must be in [moe_topk=1, slice_experts=64]" in fails(active_experts=65)
+    assert "must be in" in fails(active_experts=2, moe_topk=3)
+    assert "routing simulator" in fails(active_experts=40, moe_routing="uniform_random")
+    assert opts(active_experts=64, moe_routing="uniform_random")["active_experts"] == 64
+    with pytest.raises(d.SliceError):
+        d.parse_opts({"active_experts": 0})
+
+
+def test_slice_config_follows_slice_experts():
+    assert d.slice_config(opts(slice_experts=32))[0]["text_config"]["n_routed_experts"] == 32
+    cfg, rules = d.slice_config(opts())
+    assert d.config_diff(d.REAL_CONFIG, cfg)["text_config.n_routed_experts"] == [384, 64]
+    rule = [r for r in rules if r["key"] == "n_routed_experts"][0]
+    assert rule["slice"] == 64 and "topk_softplus_sqrt_kernels.cu:786-841" in rule["why"] and "active_experts=48" in rule["why"]
+    # weights move by the experts (x 40 layers x 19.9 MB) plus the gate GEMM [5120 x experts] in bf16
+    gib = lambda n: d.resident_bytes(d.rank_modules(d.slice_config(opts(slice_experts=n))[0], 1, 1, shared_tp=8)) / 2 ** 30  # noqa: E731
+    per_expert_layers = 40 * 3 * 5120 * 2304 * d.BPE["nvfp4"] / 2 ** 30
+    gate_per_expert = 40 * 5120 * 2 / 2 ** 30
+    assert gib(64) - gib(32) == pytest.approx(32 * (per_expert_layers + gate_per_expert), abs=1e-6)
+    assert gib(64) == pytest.approx(50.33, abs=0.01)
+
+
+def test_the_moe_bias_follows_the_reachable_experts():
+    o = opts(conc=[1, 8, 32])
+    masked = [d.bias_terms(o, c)["moe_pairs"] for c in (1, 8, 32)]
+    assert masked == pytest.approx([0.78, 2.88, 0.85], abs=0.01)  # the 48-expert bias, with 64 resident
+    unmasked = [d.bias_terms(o, c, active=64)["moe_pairs"] for c in (1, 8, 32)]
+    assert unmasked == pytest.approx([0.82, 4.83, 8.66], abs=0.01)
+    assert d.bias_terms(opts(active_experts=64), 8)["moe_pairs"] == pytest.approx(4.83, abs=0.01)  # same via the option
+    # the unmasked 64-expert slice over-counts MoE traffic by (60.9 - 45.7) experts at c=32
+    assert d.touched_experts(192, 1, 64, 1) == pytest.approx(60.89, abs=0.01)
+    assert d.touched_experts(192, 1, 48, 1) == pytest.approx(47.16, abs=0.01)
+    # slice_experts=16/32 would under-count at high c (saturation): why 64 + a mask is the design
+    assert d.bias_terms(opts(slice_experts=32), 32)["moe_pairs"] < -5 and d.bias_terms(opts(slice_experts=16), 8)["moe_pairs"] < -5
+    # the calibration target does not move with the mask, only without it
+    assert [d.expected_slice_ms(o, c) for c in (1, 8, 32)] == pytest.approx([11.02, 21.57, 30.3], abs=0.01)
+    assert [d.expected_slice_ms({**o, "active_experts": 64}, c) for c in (1, 8, 32)] == pytest.approx([11.06, 23.51, 38.12], abs=0.01)
+
+
+def test_step_stream_bytes_use_the_reachable_experts_not_the_resident_ones():
+    o = opts()
+    sl = d.slice_config(o)[0]
+    masked = d.step_bytes(sl, 1, 1, 32, 5, 8, active_experts=48)
+    full = d.step_bytes(sl, 1, 1, 32, 5, 8)
+    assert full["experts"] > masked["experts"] * 1.25
+    plan = d.build_plan(o, "/m")
+    assert plan["step_stream_gb"]["32"]["slice"] == pytest.approx(masked["total"] / 1e9, abs=0.01)
+
+
+def test_memory_plan_default_and_the_refusal_of_cards_that_cannot_hold_it():
+    mem = d.memory_plan(opts())
+    assert mem["weights_gib_logged_est"] == pytest.approx(51.32, abs=0.05) and mem["budget_gib"] == pytest.approx(88.32, abs=0.01)
+    assert mem["kv_gib_est"] == pytest.approx(26.9, abs=0.1) and 7e6 < mem["kv_tokens_est"] < 8.5e6
+    assert mem["tokens_needed"] == {"1": 2578, "8": 20624, "32": 82496} and all(mem["fits"].values())
+    assert d.memory_plan(opts(slice_experts=32))["kv_gib_est"] > 50
+    for n in (128, 192):
+        msg = fails(slice_experts=n)
+        assert "weights alone need" in msg and "slice_experts 64 or fewer" in msg
+    assert "KV" in fails(gpu_memory_utilization=0.6)  # 64 experts do not leave a KV pool at 0.6 x 94.97 GiB
+
+
+def test_the_kv_pool_estimate_warns_instead_of_refusing():
+    big = opts(prompt_tokens=262144, conc=[8, 32], max_model_len=524288)
+    mem = d.memory_plan(big)
+    assert mem["fits"] == {"8": True, "32": False}
+    plan = d.build_plan(big, "/m")
+    assert any("c=32" in w and "skipped" in w for w in plan["warnings"])
+    assert any("routing mask" in w for w in plan["warnings"])
+    assert not any("c=8" in w for w in plan["warnings"])
+    small = d.plan_warnings(opts(), {**d.memory_plan(opts()), "kv_gib_est": 3.0, "kv_tokens_est": 876000})
+    assert any("estimated KV pool 3.0 GiB" in w for w in small)
+
+
+def test_kernel_contracts_hold_for_valid_options_and_catch_violations():
+    ok = d.kernel_contracts(opts())
+    assert all(c["ok"] for c in ok) and {c["id"] for c in ok} >= {
+        "router_experts_target", "router_experts_draft", "mxfp8_linear_shapes", "flashinfer_cutlass_moe_alignment",
+        "sparse_mla_heads", "sm120_sparse_mla_dispatch",
+        "noise_token_in_vocab", "engram_rows_cover_primes", "engram_tokenizer_vocab", "hash_tables_absent",
+        "routing_within_experts", "vocab_stride"}
+    assert all(c["source"] and ":" in c["source"] for c in ok)
+    shapes = d.mxfp8_linears(d.slice_config(opts())[0], 1, 8)
+    assert shapes["shared_expert.gate_up"] == (576, 5120) and shapes["shared_expert.down"] == (5120, 288)  # the rank's, K=288 is a multiple of 32
+    assert shapes["engram.wkv"] == (25600, 768) and shapes["attn.wo_b"] == (5120, 1024) and shapes["attn.wq_b"] == (4096, 1280)
+    # parse_opts bypassed: a 48-expert model-routed config, a noise id outside the vocab, top-k above the reachable experts
+    broken = {**opts(), "slice_experts": 48, "active_experts": 48}
+    assert [c["id"] for c in d.kernel_contracts(broken) if not c["ok"]] == ["router_experts_target"]
+    assert [c["id"] for c in d.kernel_contracts({**opts(), "moe_topk": 5, "active_experts": 3}) if not c["ok"]] == ["routing_within_experts"]
+    # an unshardable shared expert would break the K%32 rule: 2304 wide at tp=1 is fine, the check sees the real shapes
+    assert d.mxfp8_linears(d.slice_config(opts())[0], 1, 1)["shared_expert.down"] == (5120, 2304)
+
+
+def test_flashinfer_cutlass_moe_alignment_contract(monkeypatch):
+    ids = {c["id"]: c for c in d.kernel_contracts(opts())}
+    assert ids["flashinfer_cutlass_moe_alignment"]["ok"] and "flashinfer 0.7.2" in ids["flashinfer_cutlass_moe_alignment"]["source"]
+    o, real = opts(), d.slice_config
+
+    def narrow(o, *a, **k):
+        cfg, rules = real(o, *a, **k)
+        cfg["text_config"]["moe_intermediate_size"] = 2300  # not a multiple of 128
+        return cfg, rules
+
+    monkeypatch.setattr(d, "slice_config", narrow)
+    bad = [c for c in d.kernel_contracts(o) if not c["ok"]]
+    assert [c["id"] for c in bad] == ["flashinfer_cutlass_moe_alignment"] and "must both be multiples of 128" in bad[0]["detail"]
+
+
+# ---------------------------------------------------------------- the candidate config: dynamic k schedule, 4096 batched tokens
+CANDIDATE = {"num_speculative_tokens_per_batch_size": [[1, 4, 5], [5, 32, 3]], "max_num_batched_tokens": 4096,
+             "conc": [1, 8, 32, 5, 12, 16]}
+
+
+def test_effective_k_is_vllms_dense_schedule_lookup():
+    e = lambda k, sched, c: d.effective_k({"k": k, "num_speculative_tokens_per_batch_size": sched}, c)  # noqa: E731
+    assert [e(5, None, c) for c in (1, 32)] == [5, 5]
+    # the docstring example of build_dynamic_sd_schedule_lookup: 17-31 carry the previous k forward
+    assert [e(5, [[1, 16, 3], [32, 128, 2]], c) for c in (1, 16, 17, 31, 32, 128, 500)] == [3, 3, 3, 3, 2, 2, 2]
+    assert [e(5, [[1, 4, 5], [5, 32, 3]], c) for c in (1, 4, 5, 8, 12, 16, 32)] == [5, 5, 3, 3, 3, 3, 3]
+    assert e(2, [[1, 4, 5]], 3) == 2 and e(5, [[1, 4, 0], [5, 8, 4]], 2) == 0  # clamped to k; k=0 = no speculation
+
+
+def test_candidate_config_validates_and_reaches_the_engine():
+    o = d.parse_opts(CANDIDATE)
+    assert o["conc"] == [1, 5, 8, 12, 16, 32]  # measured in ascending order
+    kw = d.engine_kwargs(o, "/m")
+    assert kw["max_num_batched_tokens"] == 4096 and kw["max_num_seqs"] == 32
+    spec = kw["speculative_config"]
+    assert spec["num_speculative_tokens"] == 5 and spec["num_speculative_tokens_per_batch_size"] == [(1, 4, 5), (5, 32, 3)]
+    plan = d.build_plan(o, "/m")
+    assert plan["k_per_conc"] == {"1": 5, "5": 3, "8": 3, "12": 3, "16": 3, "32": 3}
+    assert plan["expected_slice_ms"] == {c: None for c in plan["k_per_conc"]}  # no live reference for a schedule
+    assert not any("exceeds" in w for w in plan["warnings"]) and all(c["ok"] for c in plan["contracts"])
+
+
+def test_schedule_validation_follows_vllm():
+    for bad in ([[2, 4, 3]], [[1, 4, 3], [4, 8, 2]], [[1, 8, 3], [5, 12, 2]], [[5, 4, 3], [1, 2, 2]], [], [[1, 4]], [[1, 4, 9]]):
+        with pytest.raises(d.SliceError):
+            d.parse_opts({"num_speculative_tokens_per_batch_size": bad})
+    with pytest.raises(d.SliceError, match="exceeds k=3"):
+        d.parse_opts({"k": 3, "synthetic": "chat", "num_speculative_tokens_per_batch_size": [[1, 4, 5]]})
+    with pytest.raises(d.SliceError, match="exceeds max_num_seqs"):
+        d.parse_opts({**CANDIDATE, "conc": [1, 33]})
+    assert d.parse_opts({"num_speculative_tokens_per_batch_size": [[8, 16, 2], [1, 7, 5]]})["num_speculative_tokens_per_batch_size"] \
+        == [[1, 7, 5], [8, 16, 2]]  # sorted like vLLM does
+
+
+def test_bias_follows_the_k_the_scheduler_uses_at_each_batch_size():
+    sched = d.parse_opts(CANDIDATE)
+    plain5, plain3 = d.parse_opts({"conc": [8]}), d.parse_opts({"conc": [8], "k": 3})
+    assert d.bias_terms(sched, 1) == d.bias_terms(plain5, 1)  # c=1 is in the k=5 tier
+    assert d.bias_terms(sched, 8) == d.bias_terms(plain3, 8)  # c=8 is in the k=3 tier
+    assert d.bias_terms(sched, 8)["moe_pairs"] != d.bias_terms(plain5, 8)["moe_pairs"]
+    assert d.bias_terms(sched, 12)["quantified_total"] != d.bias_terms(plain5, 12)["quantified_total"]
+
+
+def test_candidate_run_measures_all_six_concurrencies_and_checks_the_tier(monkeypatch):
+    engine, llm_cls = install_fake_vllm(monkeypatch, FakeEngine(k=3, per_step=2))
+    o = d.parse_opts({**CANDIDATE, "warmup_steps": 0, "measure_steps": 4})
+    code, rec = run_fake(o)
+    assert code == 0 and sorted(map(int, rec.doc["results"])) == [1, 5, 8, 12, 16, 32]
+    assert llm_cls.last_kwargs["speculative_config"]["num_speculative_tokens_per_batch_size"] == [(1, 4, 5), (5, 32, 3)]
+    r8 = rec.doc["results"]["8"]
+    assert r8["k_effective"] == 3 and r8["step_ms"]["mean"] > 0 and r8["spec"]["verified_per_stream"] == pytest.approx(4.0)
+    assert rec.doc["results"]["1"]["k_effective"] == 5
+    # the fake engine drafts 3 tokens at every batch size: that matches c>=5 only, c=1 must be flagged
+    assert any(w.startswith("c=1: vLLM verified 4.00") for w in rec.doc["warnings"])
+    assert not any(w.startswith("c=8: vLLM verified") for w in rec.doc["warnings"])
+
+
+def test_engine_hints_name_the_fix():
+    assert "16/32/64/128/192" in d.engine_hint("RuntimeError: Unsupported expert number: 48")
+    assert "lower max_model_len" in d.engine_hint("ValueError: To serve at least one request with the model's max seq len (524288), "
+                                                   "5.2 GiB KV cache is needed, which is larger than the available KV cache memory")
+    assert "lower gpu_memory_utilization" in d.engine_hint("Free memory on device (80/94 GiB) on startup is less than desired GPU memory utilization")
+    assert "engram_rows" in d.engine_hint("torch.OutOfMemoryError: CUDA out of memory")
+    assert d.engine_hint("ValueError: something else") is None
+
+
+class _FakeRouter:
+    """Stands in for FusedTopKBiasRouter: top-1 of logits + e_score_correction_bias (the gating kernel's selection rule)."""
+
+    def __init__(self, bias, honour_bias=True):
+        self.e_score_correction_bias, self.honour = bias, honour_bias
+
+    def select_experts(self, hidden_states, router_logits, topk_indices_dtype=None, input_ids=None):
+        import torch
+        scores = router_logits + (self.e_score_correction_bias.data if self.honour else 0)
+        ids = scores.topk(1, dim=-1).indices.to(topk_indices_dtype or torch.int32)
+        return torch.ones_like(ids, dtype=torch.float32), ids
+
+
+def _fake_model(layers=3, width=64, honour_bias=True, router_copy=False):
+    import torch
+    root = torch.nn.Module()
+    root.layers = torch.nn.ModuleList()
+    for _ in range(layers):
+        layer, ffn, gate, runner = (torch.nn.Module() for _ in range(4))
+        gate.e_score_correction_bias = torch.nn.Parameter(torch.zeros(width), requires_grad=False)
+        bias = gate.e_score_correction_bias.clone() if router_copy else gate.e_score_correction_bias
+        runner.router = _FakeRouter(bias, honour_bias)
+        ffn.gate, ffn.experts, layer.ffn = gate, runner, ffn
+        root.layers.append(layer)
+    return root
+
+
+def test_the_routing_mask_writes_the_bias_and_proves_it_through_the_live_router():
+    torch = pytest.importorskip("torch")
+    model = _fake_model()
+    got = d._mask_routing(model, 48, 64)
+    assert got["bias_tensors"] == 3 and got["routers"] == 3 and got["probe"]["max_expert_id"] < 48
+    for layer in model.layers:
+        b = layer.ffn.gate.e_score_correction_bias
+        assert bool((b[48:] == d.ROUTING_MASK_BIAS).all()) and bool((b[:48] == 0).all())
+    # a router that holds its own copy of the bias is masked too (both tensors are reachable)
+    both = d._mask_routing(_fake_model(router_copy=True), 48, 64)
+    assert both["bias_tensors"] == 6 and both["probe"]["max_expert_id"] < 48
+    # a router that ignores the bias is caught by the probe
+    ignored = d._mask_routing(_fake_model(honour_bias=False), 48, 64)
+    assert ignored["probe"]["max_expert_id"] >= 48
+    # other widths (the 16-expert draft) are left alone
+    mixed = _fake_model(width=16)
+    assert d._mask_routing(mixed, 8, 64)["bias_tensors"] == 0 and bool((mixed.layers[0].ffn.gate.e_score_correction_bias == 0).all())
+
+
+def test_apply_routing_mask_needs_enough_tensors_and_a_clean_probe():
+    class LLM:
+        def __init__(self, result=None, boom=None):
+            self.result, self.boom = result, boom
+
+        def apply_model(self, fn):
+            if self.boom:
+                raise self.boom
+            return [self.result]
+
+    good = {"bias_tensors": 40, "routers": 40, "probe": {"max_expert_id": 47}}
+    assert d.apply_routing_mask(LLM(good), 48, 64, 40)["applied"] is True
+    short = d.apply_routing_mask(LLM({**good, "bias_tensors": 12}), 48, 64, 40)
+    assert short["applied"] is False and "mask not proven" in short["error"]
+    leaky = d.apply_routing_mask(LLM({**good, "probe": {"max_expert_id": 63}}), 48, 64, 40)
+    assert leaky["applied"] is False
+    assert d.apply_routing_mask(LLM({**good, "probe": {"error": "TypeError: x"}}), 48, 64, 40)["applied"] is False
+    err = d.apply_routing_mask(LLM(boom=RuntimeError("no apply_model")), 48, 64, 40)
+    assert err["applied"] is False and "no apply_model" in err["error"]
+
+
+def test_run_slice_applies_the_mask_and_records_it(monkeypatch):
+    engine, llm_cls = install_fake_vllm(monkeypatch)
+    code, rec = run_fake(opts(conc=[8], warmup_steps=0, measure_steps=4))
+    assert code == 0 and rec.doc["routing_mask"]["applied"] is True
+    assert rec.doc["results"]["8"]["expected_slice_ms"] == pytest.approx(21.57, abs=0.01)  # masked bias
+    assert "routing_mask" in rec.doc["phases"]
+
+
+def test_run_slice_charges_the_unmasked_bias_when_the_mask_cannot_be_applied(monkeypatch):
+    engine, llm_cls = install_fake_vllm(monkeypatch)
+    llm_cls.mask_result = {"bias_tensors": 0, "routers": 0, "probe": {}}
+    code, rec = run_fake(opts(conc=[8], warmup_steps=0, measure_steps=4))
+    assert code == 0 and rec.doc["routing_mask"]["applied"] is False
+    assert any("routing mask NOT applied" in w for w in rec.doc["warnings"])
+    r = rec.doc["results"]["8"]
+    assert r["expected_slice_ms"] == pytest.approx(23.51, abs=0.01)  # all 64 experts reachable: +1.9 ms at c=8
+    assert r["prod_equivalent_ms_est"] == pytest.approx(r["slice_step_ms"] + 2.39, abs=0.01)
+
+
+def test_no_mask_when_every_resident_expert_is_reachable(monkeypatch):
+    engine, llm_cls = install_fake_vllm(monkeypatch)
+    llm_cls.apply_model = lambda self, fn: (_ for _ in ()).throw(AssertionError("mask must not run"))
+    code, rec = run_fake(opts(conc=[1], warmup_steps=0, measure_steps=4, slice_experts=32))
+    assert code == 0 and "routing_mask" not in rec.doc
+
+
+def _log_with_kv(tokens):
+    return PROD_LOG.replace("10,867,561", f"{tokens:,}")
+
+
+def test_a_concurrency_that_does_not_fit_the_booted_kv_pool_is_skipped_with_a_warning(monkeypatch):
+    install_fake_vllm(monkeypatch)
+    o = opts(conc=[2, 32], warmup_steps=0, measure_steps=4, prompt_tokens=2048)
+    need32 = 32 * (2048 + d.max_tokens_for(o) + 1)
+    code, rec = run_fake(o, tee_text=_log_with_kv(need32 - 1))
+    assert code == 0 and "skipped" in rec.doc["results"]["32"] and "steps" in rec.doc["results"]["2"]
+    assert rec.doc["results"]["32"]["tokens_needed"] == need32 and rec.doc["results"]["32"]["kv_cache_tokens"] == need32 - 1
+    assert any("c=32" in w and "skipped" in w for w in rec.doc["warnings"])
+
+
+def test_all_concurrencies_skipped_is_an_error_not_a_silent_success(monkeypatch):
+    install_fake_vllm(monkeypatch)
+    with pytest.raises(d.SliceError) as ei:
+        run_fake(opts(conc=[8, 32], warmup_steps=0, measure_steps=4), tee_text=_log_with_kv(1000))
+    assert ei.value.code == 5 and "no concurrency fit" in str(ei.value)
+
+
+def test_preflight_warnings_land_in_the_run_record(monkeypatch):
+    install_fake_vllm(monkeypatch)
+    o = opts(conc=[32], warmup_steps=0, measure_steps=4, prompt_tokens=16384, gpu_memory_utilization=0.66)
+    assert d.memory_plan(o)["fits"] == {"32": False}
+    code, rec = run_fake(o)  # the fake pool log says 10.8M tokens, so the run goes on: the warning is the estimate's
+    assert code == 0 and "steps" in rec.doc["results"]["32"]
+    assert any("estimated KV pool" in w for w in rec.doc["warnings"])
+    assert any(w.startswith("c=32: needs ~") and "skipped with a warning" in w for w in rec.doc["warnings"])
+    assert any("routing mask: 16 of 64 experts" in w for w in rec.doc["warnings"])
+
+
+def test_an_unknown_kv_pool_does_not_block_the_run(monkeypatch):
+    install_fake_vllm(monkeypatch)
+    code, rec = run_fake(opts(conc=[2], warmup_steps=0, measure_steps=4), tee_text="no kv line here")
+    assert code == 0 and "steps" in rec.doc["results"]["2"]
+
+
+def test_engine_error_carries_the_hint(monkeypatch):
+    install_fake_vllm(monkeypatch, boom=RuntimeError("topkGatingSoftplusSqrtKernelLauncher, "
+                                                     "/workspace/csrc/moe/topk_softplus_sqrt_kernels.cu:841, "
+                                                     "Unsupported expert number: 48"))
+    rec = d.Recorder(io.StringIO())
+    with pytest.raises(d.SliceError) as ei:
+        run_fake(opts(), rec)
+    assert ei.value.code == 3 and "Unsupported expert number: 48" in rec.doc["engine_error"]
+    assert "slice_experts must be one of 16/32/64/128/192" in rec.doc["engine_hint"] and "hint:" in str(ei.value)
+
+
+def test_dry_plan_reports_memory_routing_and_contracts():
+    rc, text = run_cli(["--dry", "--opts", json.dumps({"conc": [1, 8, 32]})])
+    plan = json.loads(text)["plan"]
+    assert rc == 0 and plan["memory_estimate"]["weights_gib_logged_est"] == pytest.approx(51.32, abs=0.05)
+    assert plan["routing"]["slice_experts"] == 64 and plan["routing"]["active_experts"] == 48 and plan["routing"]["mask"]
+    assert all(c["ok"] for c in plan["contracts"]) and plan["layers"] == 40
+    assert plan["config_diff"]["text_config.n_routed_experts"] == [384, 64]
+    assert plan["rank_diff_mb"]["moe.experts"] == pytest.approx([38220.6, 50960.8], abs=0.1)
+    assert plan["expected_slice_ms"] == {"1": pytest.approx(11.017, abs=0.01), "8": pytest.approx(21.567, abs=0.01),
+                                          "32": pytest.approx(30.305, abs=0.01)}
+    assert {n["id"] for n in plan["non_equivalences"]} >= {"resident_experts", "router_kernel", "moe_pairs"}
+    ne = {n["id"]: n for n in plan["non_equivalences"]}
+    assert "top-1 of 48 reachable experts" in ne["moe_pairs"]["slice"] and "+16 experts" in ne["resident_experts"]["note"]
+    assert ne["gate_and_router"]["slice"] == "[5120 x 64] / [5120 x 16]; top-1 over 64 resident (48 reachable)"
+    assert "<64> (CUDA) on the target layers, <16> on the draft layers" in ne["router_kernel"]["slice"]
+
+
+def test_non_equivalence_texts_follow_the_expert_options_not_a_hard_48():
+    o = opts(slice_experts=32, active_experts=24)
+    ne = {n["id"]: n for n in d.non_equivalences(o)}
+    assert "[5120 x 32] / [5120 x 16]; top-1 over 32 resident (24 reachable)" == ne["gate_and_router"]["slice"]
+    assert "top-1 of 24 reachable" in ne["moe_pairs"]["slice"] and "this is the 24-expert bias" in ne["moe_pairs"]["note"]
+    assert "the other 8 resident experts" in ne["moe_pairs"]["note"] and "-16 experts x 40 layers" in ne["resident_experts"]["note"]
+    assert "<32> (CUDA)" in ne["router_kernel"]["slice"]
+
+
+def test_cli_refuses_48_experts_with_the_router_kernel(capsys):
+    assert d.main(["--dry", "--opts", '{"slice_experts": 48}']) == 2
+    err = capsys.readouterr().err
+    assert "topk_softplus_sqrt_kernels.cu:786-841" in err and "[16, 32, 64, 128, 192]" in err
+    out = io.StringIO()
+    assert d.main(["--dry", "--opts", '{"slice_experts": 48, "moe_routing": "uniform_random"}'], stdout=out) == 0
+    assert json.loads(out.getvalue())["plan"]["engine_kwargs"]["speculative_config"]["num_speculative_tokens"] == 5
+
+
+def test_print_schema_lists_the_new_options():
+    rc, text = run_cli(["--print-schema"])
+    doc = json.loads(text)["opts"]
+    assert doc["slice_experts"]["default"] == 64 and doc["slice_experts"]["min"] == 16 and doc["slice_experts"]["max"] == 192
+    assert doc["active_experts"]["default"] is None and doc["active_experts"]["nullable"] is True
+
+
+@pytest.mark.parametrize("routing", ["model", "uniform_random", "normal_routing"])
+@pytest.mark.parametrize("n", [16, 20, 32, 48, 64, 100, 128, 192])
+def test_expert_option_grid_is_consistent(routing, n):
+    """Every (routing, count) either parses into a config whose contracts hold, or is refused with exit 2."""
+    try:
+        o = d.parse_opts({"slice_experts": n, "moe_routing": routing})
+    except d.SliceError as exc:
+        assert exc.code == 2
+        if routing == "model":
+            assert n not in d.SLICE_EXPERTS or n in (128, 192)  # kernel set, or memory
+        return
+    assert routing != "model" or n in d.SLICE_EXPERTS
+    assert all(c["ok"] for c in d.kernel_contracts(o)) and o["active_experts"] <= n
+    assert d.memory_plan(o)["kv_gib_est"] >= d.KV_MIN_GIB
