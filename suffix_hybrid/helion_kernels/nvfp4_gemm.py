@@ -30,9 +30,12 @@ Both GEMMs split K by the tunable split_k (1 = no split, the default): each
 acq_rel ticket per (M, N) tile; the LAST arriver sums the splits in order
 0..S-1 and re-zeroes its counter (the oxide FUSE_REDUCE fixup: deterministic,
 no spin -> no residency deadlock, graph-replay safe).
-tl.dot_scaled only takes e8m0 block-32 (MX) scales, so NVFP4's e4m3 block-16
-scales are applied in registers: e2m1 x e4m3 is exact in bf16, hl.dot
-accumulates fp32. Weights load as 2-D byte rows [BN, BK] (16 B+ vectors,
+This body applies NVFP4's e4m3 block-16 scales in registers (e2m1 x e4m3 is
+exact in bf16, hl.dot accumulates fp32). NOTE (2026-10-19): the earlier claim here
+that tl.dot_scaled only takes e8m0 block-32 scales is true for FP8 data but FALSE
+for e2m1 x e2m1: Triton >= 3.6 lowers that with e4m3 block-16 scales to
+mma.sync kind::mxf4nvf4 on sm_120 (triton PR #8494). The native arm is
+nvfp4_gemm_fp4mma.py (docs/dsv41-fp4.md); this ALU-decode body is its baseline. Weights load as 2-D byte rows [BN, BK] (16 B+ vectors,
 tensor-descriptor capable), the nibbles become f16 BITS (e2m1 s.ee.m placed
 at f16 bit 15 / 10..9: value * 2^-14, subnormals included) -> f32 * (scale *
 2^14) -> bf16, one e4m3 scale per 16-k block. Tuned by Helion: block sizes

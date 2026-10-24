@@ -23,6 +23,9 @@ suffix_hybrid/configs/helion/<kernel>/<platform>.json   tuned WINS from the auto
 | dsa_indexer | kernels-oxide/dsa_indexer | kernels/dsa_indexer.py | `SUFFIX_HELION_DSA_INDEXER` |
 | ds_mla | kernels-oxide/nvfp4_ds_mla | sm120/nvfp4_ds_mla_patch/ | `SUFFIX_HELION_DS_MLA` |
 | kgdn1 | kernels-oxide/kgdn1 | kernels/qwen_gdn.py | `SUFFIX_HELION_KGDN1` |
+| dsv41_attn_{partial,row} | none (FlashInfer SM120 sparse MLA is the baseline) | kernels/dsv41_attn.py | `SUFFIX_HELION_DSV41_ATTN` |
+| nvfp4_gemm_fp4mma | none (arm of nvfp4_gemm; lab baseline FlashInfer CUTLASS) | kernels/nvfp4_linear.py, kernels/nvfp4_lm_head.py via `hx` | `SUFFIX_HELION_NVFP4_GEMM_FP4MMA` (+ `_STRICT`) |
+| dsv41_moe_fp4mma | none (alternative body set to nvfp4_moe's dequant bodies, chosen per M bucket by the `dsv41_moe_variant` config row) | kernels/nvfp4_moe.py (variant seam) | config row (no env knob) |
 
 Every knob is `helion_kernels.backend(env)`:
 
@@ -88,18 +91,39 @@ ride in the wheel like `configs/afp4` (maturin ships every file under
 of PyPI torch 2.14.x, matching the CPU torch it installs) so the interpret
 checks run instead of skipping.
 
-## Results (inference-console lab, RTX PRO 6000, LFBO full effort)
+## mxfp8_gemm (no oxide twin: DeepSeek-V4.1 FP8 linears on SM120)
 
-Kernel time, Helion vs the oxide kernel at its production launch (> 1 = Helion faster).
+`helion_kernels/mxfp8_gemm.py` + lane `kernels/mxfp8_linear.py`, knob
+`SUFFIX_HELION_MXFP8_GEMM` = oxide (default: lane off, vLLM unchanged) |
+auto | helion, `SUFFIX_MXFP8_GEMM_MAX_M` (default 192). The baseline is
+vLLM's own SM120 pick, not an oxide kernel: FlashInfer CUTLASS `mm_mxfp8` +
+dynamic MXFP8 quant for the plain linears (pre-quantized input at K = 1280,
+the fused q/kv-RMSNorm producer), and for `wo_a` (is_bmm: DeepGEMM BMM is
+SM100-only) the emulation kernel's BF16-at-load weight + `torch.bmm`.
+Bodies: `mxfp8_gemm` (A16: bf16 x, e4m3 weight dequantized in registers,
+fp32 accumulate — better numerics than vLLM's W8A8; the only wo_a route)
+and `mxfp8_gemm_a8` (vLLM's MX activation quant in the prologue + FP8
+`dot_scaled`). Cases: `cases(model)` keys on `deepseek-v4` in the model
+name (shapes hard-coded from the checkpoint's config.json, TP8 then TP4,
+buckets 8 / 192 / 32 / 64); `wo_a` cases carry `g: 1` (one launch per local
+group). The lane swaps `modelopt.select_linear_kernel` (where vLLM picked
+FlashInfer CUTLASS; `.engram.` prefixes excluded) and the bmm's
+`init_mxfp8_linear_kernel`, and wraps `deep_gemm_fp8_o_proj` in
+`deepseek_v41/nvidia/ops/o_proj.py`; M > max M and unplanned buckets stay on
+vLLM's kernel. `lab_main(plan)` is a kernel-lab driver (runner-equivalent
+autotune + graph timing vs vLLM's kernel, JSON lines on stdout).
+`validate_weight` (load, fatal) refuses e4m3 NaN codes and e8m0 scales above 246 (the A16
+decode builds 2^(ws - 119) from f32 bits). `lab_main` also times vLLM's Marlin MXFP8 W8A16 kernel
+(`marlin_us`, `vs_marlin`) as a second reference. Checkpoint anatomy, ranking, drift-gate plans:
+`docs/dsv41-dense.md`.
 
-| family | status | evidence |
-|---|---|---|
-| dsa_indexer | **wins** decode rows 1-192: 1.22-2.12x; configs shipped (`configs/helion/dsa_indexer_decode`) | GLM-5.3, runs 20261017T100330Z-...-9020, ...134337Z-...-af3f |
-| k2_attn | **wins** hd256 sliding layers b1/b8: 1.22-1.53x (hd512 full layers still tuning) | gemma-4-26b/31b, runs ...145256Z-...-6a8c, ...145859Z-...-3050 |
-| nvfp4_gemm | **loses** 0.17-0.62x on every shape: stays on oxide | Triton 3.8 `tl.dot_scaled` has no native NVFP4 MMA on sm_120 (tcgen05 is sm_100 only; cc 12.x decomposes to a bf16 upcast), so Helion cannot reach oxide's native block-scaled FP4 MMA. Revisit when Triton lowers sm_120 `mma.sync ... block_scale`. |
-| nvfp4_moe, fp8_moe, ds_mla, kgdn1 | in the lab | |
-
-Lessons that changed the ports: `hl.barrier()` persistent kernels deadlock on silicon (use
-last-arriver merges or separate launches); Helion's autotuner checks a candidate's whole
-output, so nothing may stay `torch.empty`; pass `autotune_baseline_fn`, because without it a
-reference config runs in-process with no timeout; and `make()` must not build fresh weights per seed.
+Split-K is two-stage only in serving (capture-safe): the Helion kernel writes fp32 partials
+(`torch.empty` per call, graph-private under capture), host code in the same body then launches
+`out.copy_(partial[:n_split].sum(0))` on the same stream; no semaphore, no counter, no module-level
+scratch, so the lab times the composite that serves. The old last-arriver bodies (`mxfp8_gemm_sem`,
+`mxfp8_gemm_a8_sem`) stay behind `SUFFIX_MXFP8_GEMM_SEMAPHORE=1` for lab and boot-gate comparison;
+`prepare()` / `register()` raise with the knob set (unproven under CUDA-graph capture, glm g14). The
+layer oracle poisons out / partials with NaN and replays a CUDA-graph capture bit-exactly per bucket;
+the `mxfp8_capture_replay` boot gate (`python -m suffix_hybrid.kernels.mxfp8_linear capture_replay`,
+sanitizer-ready) and the one-command lab session (`kernels/dsv41_dense_lab.py`: Markov bench first,
+then the gate, then the cases) are described in `docs/dsv41-dense.md` section 3b / 5.

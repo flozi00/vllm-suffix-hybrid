@@ -378,6 +378,8 @@ def test_mtp_rows_from_config():
     assert di.mtp_rows(C()) == 6
     S.parallel_drafting = True
     assert di.mtp_rows(C()) == 11
+    S.method = "dspark"  # DeepSeek-V4.1 DSpark block 5: parallel drafter, 1 + 5 verify rows
+    assert di.mtp_rows(C()) == 6
     assert di.mtp_rows(None) is None
 
 
@@ -391,7 +393,13 @@ def test_eligibility_reasons():
     assert "MXFP4" in di.paged_ineligible(q, kv, w, bt, torch.zeros(1), None)
     assert "indices" in di.paged_ineligible(q, kv, w, bt, None, torch.zeros(1))
     assert "H 32|64" in di.paged_ineligible(torch.zeros((2, 6, 16, D), dtype=f8), kv, w, bt, None, None)
-    assert "64, 132" in di.paged_ineligible(q, torch.zeros((4, 32, 1, 132), dtype=torch.uint8), w, bt, None, None)
+    assert "P % 32" in di.paged_ineligible(q, torch.zeros((4, 16, 1, 132), dtype=torch.uint8), w, bt, None, None)
+    # DeepSeek-V4.1 ratio-1 pages (128 tokens) and packed page strides: eligible, not oxide's
+    p128 = torch.zeros((4, 128, 1, 132), dtype=torch.uint8)
+    strided = torch.zeros(4 * 8704, dtype=torch.uint8).as_strided((4, T, 132), (8704, 132, 1))
+    for c in (p128, strided):
+        assert di.paged_ineligible(q, c, w, bt, None, None) is None and not di.oxide_layout(c)
+    assert di.oxide_layout(kv)
     kvc = torch.zeros((9, D), dtype=f8)
     assert di.mqa_ineligible(q[0], kvc, torch.zeros(9), w[:6], None) is None
     assert "k_scale" in di.mqa_ineligible(q[0], kvc, torch.zeros(8), w[:6], None)
@@ -410,10 +418,205 @@ def test_shim_wrappers_route(monkeypatch):
     bt = torch.zeros((2, 4), dtype=torch.int32)
     cl = torch.ones((2, 1), dtype=torch.int32)
     assert paged((q, None), kv, w, cl, bt, None, 100, False, None) == "ours"
-    assert paged((q, None), kv, w, cl, bt, None, 100, False, torch.zeros(1)) == "triton"
+    assert paged((q, None), kv, w, cl, bt, None, 100, indices=torch.zeros(1)) == "triton"
+    # vLLM nightly call form (no clean_logits); a 128-token page under the oxide
+    # backend has no oxide layout -> Triton
+    assert paged((q, None), kv, w, cl, bt, None, 100) == "ours"
+    p128 = torch.zeros((4, 128, 1, 132), dtype=torch.uint8)
+    assert paged((q, None), p128, w, cl, bt, None, 100) == "triton"
     kvc = torch.zeros((9, D), dtype=f8)
     assert mqa((q[:, 0], None), (kvc, torch.zeros(9)), w, cl[:, 0], cl[:, 0], False) == "ours-mqa"
+    assert mqa((q[:, 0], None), (kvc, torch.zeros(9)), w, cl[:, 0], cl[:, 0],
+               clean_logits=True) == "ours-mqa"
     assert mqa((q[:, 0].to(torch.uint8), torch.zeros(1)), (kvc, torch.zeros(9)), w, cl[:, 0], cl[:, 0], False) == "triton-mqa"
+    # vLLM nightly: an int max_seqlen_k = compressed logits; oxide cannot, no
+    # Helion config here -> Triton (which honours the compressed contract)
+    assert mqa((q[:, 0], None), (kvc, torch.zeros(9)), w, cl[:, 0], cl[:, 0], 5) == "triton-mqa"
+    assert calls == ["ours", "ours", "ours-mqa", "ours-mqa"]
+
+
+def test_compressed_prefill_routes_to_helion(monkeypatch):
+    from suffix_hybrid.helion_kernels import dsa_indexer as hdi
+    got = []
+    monkeypatch.setenv(di.HELION_ENV, "auto")
+    monkeypatch.setattr(hdi, "has_config", lambda kernel, heads, rows, **kw: kernel == hdi.PREFILL)
+    monkeypatch.setattr(hdi, "prefill_logits", lambda *a, **k: got.append((a[-1].shape, k)) or "helion")
+    mqa = di.wrap_mqa(lambda *a: "triton-mqa")
+    f8 = torch.float8_e4m3fn
+    q, kvc, w = torch.zeros((2, 32, D), dtype=f8), torch.zeros((9, D), dtype=f8), torch.zeros((2, 32))
+    one = torch.ones(2, dtype=torch.int32)
+    assert mqa((q, None), (kvc, torch.zeros(9)), w, one - 1, one, 7) == "helion"
+    assert got == [((2, 7), {"compressed": True, "v41": False})]
+
+
+def _cfg_for(monkeypatch, ctxs):
+    """Pretend the lab shipped row-group configs for these context buckets."""
+    from suffix_hybrid import helion_kernels as hk
+    from suffix_hybrid.helion_kernels import dsa_indexer as hdi
+    monkeypatch.setattr(hk, "config", lambda kernel, case, plat=None:
+                        {"block_sizes": [32]} if kernel == hdi.GROUP and case["ctx"] in ctxs else None)
+    return hdi
+
+
+def test_group_route_follows_config_and_context(monkeypatch):
+    f8 = torch.float8_e4m3fn
+    hdi = _cfg_for(monkeypatch, {524288})
+    monkeypatch.setenv(di.HELION_ENV, "auto")
+    monkeypatch.setenv(di.GROUP_ENV, "6")
+    q = torch.zeros((12, 1, 32, D), dtype=f8)           # flattened: 2 requests x (1 + 5)
+    kv = torch.zeros((4, T, 1, 132), dtype=torch.uint8)
+    assert di.paged_route(q, kv) == "helion-group"      # unknown ctx -> the longest bucket
+    assert di.paged_route(q, kv, 400000) == "helion-group"
+    assert di.paged_route(q, kv, 20000) == "oxide"      # the 32768 bucket has no config
+    assert hdi.ctx_bucket(33000) == 524288 and hdi.ctx_bucket(1) == 32768 and hdi.ctx_bucket(None) == 524288
+    # 5 requests > the tuned 524288 buckets (1, 2, 4): the largest request bucket serves
+    assert hdi.group_serving_case(32, 30, 6, 400000)["numtokens"] == 4
+    _cfg_for(monkeypatch, {32768, 524288})
+    assert hdi.group_serving_case(32, 60, 6, 20000) == {
+        "heads": 32, "rows": 96, "group": 6, "ctx": 32768, "numtokens": 16}   # 10 requests -> bucket 16
+    assert di.paged_route(q, kv, 20000) == "helion-group"
+    # never: oxide backend, native next_n > 1 rows, a group of 1, an untuned G
+    monkeypatch.setenv(di.HELION_ENV, "oxide")
+    assert di.paged_route(q, kv, 400000) == "oxide"
+    monkeypatch.setenv(di.HELION_ENV, "auto")
+    assert di.paged_route(torch.zeros((2, 6, 32, D), dtype=f8), kv, 400000) == "oxide"
+    monkeypatch.setenv(di.GROUP_ENV, "1")
+    assert di.paged_route(q, kv, 400000) == "oxide"
+    monkeypatch.setenv(di.GROUP_ENV, "5")
+    assert di.paged_route(q, kv, 400000) == "oxide"
+
+
+def test_paged_logits_dispatches_the_group_body(monkeypatch):
+    f8 = torch.float8_e4m3fn
+    hdi = _cfg_for(monkeypatch, {524288})
+    monkeypatch.setenv(di.HELION_ENV, "auto")
+    monkeypatch.setenv(di.GROUP_ENV, "6")
+    got = []
+    monkeypatch.setattr(hdi, "group_logits", lambda *a, **k: got.append(a) or a[5])
+    q = torch.zeros((11, 1, 32, D), dtype=f8)           # 11 rows: the last group is partial
+    kv = torch.zeros((4, T, 1, 132), dtype=torch.uint8)
+    bt = torch.zeros((11, 3), dtype=torch.int32)
+    cl = torch.arange(1, 12, dtype=torch.int32).view(11, 1)
+    out = di.paged_logits(q, kv, torch.zeros((11, 32)), cl, bt, 200, ctx=300000)
+    (qq, w, cache, btt, cll, o, n_cols, g, ctx), = got
+    assert out is o and o.shape == (11, 200) and (n_cols, g, ctx) == (200, 6, 300000)
+    assert qq.shape == (11, 32, D) and cll.tolist() == list(range(1, 12)) and btt is bt
+
+
+def test_serving_ctx_is_the_longest_bucket_unless_pinned(monkeypatch):
+    monkeypatch.delenv(di.CTX_ENV, raising=False)
+    assert di.serving_ctx() is None                      # a graph is captured once: no per-step context
+    monkeypatch.setenv(di.CTX_ENV, "32768")
+    assert di.serving_ctx() == 32768
+
+
+def test_indexer_locals_finds_the_vllm_frame():
+    assert di.indexer_locals() is None
+
+    def sparse_attn_indexer(k_cache_prefix):
+        def deeper():
+            return di.indexer_locals()
+        return deeper()
+    assert sparse_attn_indexer("model.layers.2.attn.indexer.k_cache")["k_cache_prefix"].startswith("model")
+
+
+def test_k5_logs_each_layers_path_once_and_strict_refuses_the_stock_fallback(monkeypatch, capsys):
+    monkeypatch.setitem(di._state, "layers", {})
+    monkeypatch.setitem(di._state, "stock", [])
+    monkeypatch.setitem(di._state, "vendor", [])
+    l20 = {"k_cache_prefix": "model.layers.20.attn.indexer.k_cache"}
+    l24 = {"k_cache_prefix": "model.layers.24.attn.indexer.k_cache"}
+    monkeypatch.delenv(di.STRICT_ENV, raising=False)
+    di.note_path(l20, "decode", "helion-group", "ctx 524288")
+    di.note_path(l20, "decode", "helion-group")
+    di.note_path(l24, "decode", "cand-fused")
+    di.note_path(l24, "decode", di.STOCK, "no config")      # loud, allowed (strict off)
+    di.note_path(l24, "decode", di.STOCK, "no config")      # ... and logged once
+    err = capsys.readouterr().err
+    assert err.count("layer model.layers.20.attn.indexer.k_cache: decode path helion-group") == 1
+    assert err.count("STOCK FALLBACK layer model.layers.24.attn.indexer.k_cache: decode path stock (no config)") == 1
+    assert "not a Helion kernel" in err
+    assert di.layer_paths() == {l20["k_cache_prefix"]: [("decode", "helion-group")],
+                                l24["k_cache_prefix"]: [("decode", "cand-fused"), ("decode", "stock")]}
+    assert di.stock_fallbacks() == [(l24["k_cache_prefix"], "decode", "no config")]
+    assert di.vendor_fallbacks() == []
+    # the vendored DeepGEMM serving the call is a fallback too: its own loud line and list
+    di.note_path(l24, "prefill", di.VENDOR, "no config")
+    di.note_path(l24, "prefill", di.VENDOR, "no config")
+    err = capsys.readouterr().err
+    assert err.count("VENDOR FALLBACK layer model.layers.24.attn.indexer.k_cache: prefill path vendor (no config)") == 1
+    assert "STOCK FALLBACK" not in err and "vendored DeepGEMM serves it verbatim" in err
+    assert di.vendor_fallbacks() == [(l24["k_cache_prefix"], "prefill", "no config")]
+    assert di.stock_fallbacks() == [(l24["k_cache_prefix"], "decode", "no config")]
+    monkeypatch.setenv(di.STRICT_ENV, "1")
+    di.note_path(l24, "decode", "cand-fused")                # a kernel path is fine
+    with pytest.raises(RuntimeError, match="stock"):
+        di.note_path(l20, "prefill", di.STOCK, "MXFP4")
+    with pytest.raises(RuntimeError, match="stock"):
+        di.note_path(None, "decode", di.STOCK)               # outside vLLM: still refused
+    with pytest.raises(RuntimeError, match="vendored DeepGEMM"):
+        di.note_path(l20, "decode", di.VENDOR, "no config") # STRICT refuses the vendor fallback as well
+    with pytest.raises(RuntimeError, match="vendored DeepGEMM"):
+        di.note_path(l24, "prefill", di.VENDOR, "no config")  # ... even where it was logged before
+
+
+def test_wrap_paged_passes_layer_and_the_bucket_pin_to_the_lane(monkeypatch):
+    """Under vLLM's sparse_attn_indexer the shim call carries the layer name (K5);
+    the row-group context bucket is the pinned one or None (the longest)."""
+    f8 = torch.float8_e4m3fn
+    seen = []
+    monkeypatch.setitem(di._state, "layers", {})
+    monkeypatch.setattr(di, "paged_logits", lambda *a, **k: seen.append(k.get("ctx")) or "ours")
+    monkeypatch.setattr(di, "paged_route", lambda q, kv, ctx=None, v41=None: "helion-group")
+    paged = di.wrap_paged(lambda *a: "triton")
+    q = torch.zeros((2, 1, 32, D), dtype=f8)
+    kv = torch.zeros((4, T, 1, 132), dtype=torch.uint8)
+    args = ((q, None), kv, torch.zeros((2, 32)), torch.ones((2, 1), dtype=torch.int32),
+            torch.zeros((2, 4), dtype=torch.int32), None, 262144)
+
+    def sparse_attn_indexer(k_cache_prefix):
+        return paged(*args)
+    monkeypatch.delenv(di.CTX_ENV, raising=False)
+    assert sparse_attn_indexer("model.layers.8.attn.indexer.k_cache") == "ours"
+    monkeypatch.setenv(di.CTX_ENV, "32768")
+    assert sparse_attn_indexer("model.layers.8.attn.indexer.k_cache") == "ours"
+    assert seen == [None, 32768]
+    assert di.layer_paths() == {"model.layers.8.attn.indexer.k_cache": [("decode", "helion-group")]}
+
+
+def test_oxide_backend_never_imports_the_helion_module():
+    """Flags off == the previous plugin: with SUFFIX_HELION_DSA_INDEXER unset the shim wrappers
+    (decode, compressed and absolute prefill, eligibility, routing) never import the Helion port."""
+    import os
+    import subprocess
+    import sys
+    code = """
+import sys, torch
+from suffix_hybrid.kernels import dsa_indexer as di
+di.paged_logits = lambda *a, **k: "ours"
+di.mqa_logits = lambda *a, **k: "ours-mqa"
+f8 = torch.float8_e4m3fn
+q = torch.zeros((2, 1, 32, 128), dtype=f8)
+kv = torch.zeros((4, 64, 1, 132), dtype=torch.uint8)
+w, bt = torch.zeros((2, 32)), torch.zeros((2, 4), dtype=torch.int32)
+cl = torch.ones((2, 1), dtype=torch.int32)
+paged = di.wrap_paged(lambda *a: "triton")
+mqa = di.wrap_mqa(lambda *a: "triton-mqa")
+assert paged((q, None), kv, w, cl, bt, None, 100) == "ours"
+assert di.paged_route(q, kv) == "oxide"
+kvc = torch.zeros((9, 128), dtype=f8)
+assert mqa((q[:, 0], None), (kvc, torch.zeros(9)), w, cl[:, 0], cl[:, 0], False) == "ours-mqa"
+assert mqa((q[:, 0], None), (kvc, torch.zeros(9)), w, cl[:, 0], cl[:, 0], 5) == "triton-mqa"
+assert di.layout_reason(kv) is None and "P % 32" in di.layout_reason(torch.zeros((4, 16, 132), dtype=torch.uint8))
+bad = [m for m in sys.modules if m.startswith("suffix_hybrid.helion_kernels.dsa_indexer")]
+assert not bad, bad
+print("OK")
+"""
+    # No SUFFIX_* from other tests (a leaked SUFFIX_HYBRID_WRAP=1 arms sitecustomize's wrap).
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SUFFIX_")}
+    env["PYTHONPATH"] = str(ROOT)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=str(ROOT))
+    assert out.returncode == 0 and out.stdout.strip().endswith("OK"), out.stderr[-800:]
 
 
 def test_topk_set_helpers():
