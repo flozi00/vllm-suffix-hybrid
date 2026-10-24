@@ -135,6 +135,9 @@ def is_mlp(m) -> bool:      # dense MLP block: token-wise, so it can be tiled
 
 def check_supported(lm, vllm_config=None):
     """Raise NotImplementedError naming the first module SFT cannot train."""
+    from suffix_hybrid.sft import dsv41
+    if dsv41.is_dsv4(getattr(lm, "model", None)):
+        return dsv41.check(lm, vllm_config)
     if vllm_config is not None and vllm_config.parallel_config.pipeline_parallel_size > 1:
         raise NotImplementedError("pipeline parallel")
     if vllm_config is not None and getattr(vllm_config.cache_config, "kv_sharing_fast_prefill", False):
@@ -186,6 +189,8 @@ def _sft_class(cls):
             a = getattr(layer, "sft_A", None)
             if a is None:
                 return out
+            if not torch.is_tensor(x):   # a pre-quantized activation: the delta needs bf16
+                raise RuntimeError(f"SFT adapter on a layer fed a {type(x).__name__}")
             # 2 kernels per adapter: shrink GEMM + expand GEMM whose epilogue
             # does the scale and the add (decode runs ~250 of these per step)
             x2 = x.reshape(-1, x.shape[-1]).to(a.dtype)
@@ -610,6 +615,11 @@ class TrainMode(contextlib.ContextDecorator):
                 self._set(self.g, "all_reduce", lambda x: _ReduceFromTP.apply(x, raw))
             self._native_ir(st)
             self._workspace()
+            from suffix_hybrid.sft import dsv41
+            if dsv41.is_dsv4(self.s.inner):   # drive the layers ourselves (see dsv41.py)
+                self._set(self.s.inner, "forward",
+                          lambda input_ids=None, positions=None, intermediate_tensors=None, **kw:
+                          dsv41.forward(self, self.s.inner, input_ids, positions))
             if self.s.vllm_config is not None:
                 from vllm.forward_context import set_forward_context
                 st.enter_context(set_forward_context(None, self.s.vllm_config))

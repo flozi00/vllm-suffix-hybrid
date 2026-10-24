@@ -202,10 +202,15 @@ class FrozenExperts(torch.autograd.Function):
 
     @staticmethod
     def _expert(handle, e, xe):
+        """(w13, w2, g, u, h, y); g / u post-clamp when handle["limit"]
+        (swiglu_limit: silu(min(g, L)) * clamp(u, -L, L))."""
         w13, w2 = expert_weights(handle, e)
         gu = _qdq(xe, handle, "x") @ w13.T
         i = gu.shape[-1] // 2
         g, u = gu[:, :i], gu[:, i:]
+        lim = handle.get("limit")
+        if lim:
+            g, u = g.clamp(max=lim), u.clamp(-lim, lim)
         h = F.silu(g) * u
         return w13, w2, g, u, h, _qdq(h, handle, "h") @ w2.T
 
@@ -240,6 +245,10 @@ class FrozenExperts(torch.autograd.Function):
                 sg = torch.sigmoid(g)
                 dg = dh * u * (sg * (1 + g * (1 - sg)))
                 du = dh * g * sg
+                lim = handle.get("limit")
+                if lim:   # clamped values pass no gradient (g == L / |u| == L: at the clamp)
+                    dg = dg * (g < lim)
+                    du = du * (u.abs() < lim)
                 dx.index_add_(0, rows, torch.cat([dg, du], -1) @ w13)
         return dx.to(x.dtype), dtw.view_as(tw).to(tw.dtype), None, None
 

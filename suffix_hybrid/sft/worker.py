@@ -152,14 +152,20 @@ class WorkerSFT:
         M.check_supported(self.lm, vllm_config)
         mc = getattr(vllm_config, "model_config", None)
         self.mrope = bool(getattr(mc, "uses_mrope", False))
-        self.adapters = M.install_adapters(self.lm, cfg.targets, cfg.rank, cfg.alpha,
+        from suffix_hybrid.sft import dsv41
+        dsv4 = dsv41.is_dsv4(self.inner)
+        self.targets = (dsv41.TARGETS if dsv4 and tuple(cfg.targets) == tuple(M.DEFAULT_TARGETS)
+                        else tuple(cfg.targets))
+        self.adapters = M.install_adapters(self.lm, self.targets, cfg.rank, cfg.alpha,
                                            self.g.rank_in_group, getattr(mc, "dtype", None),
                                            rslora=cfg.rslora)
+        if dsv4:
+            dsv41.install(self.lm, self.adapters)
         ac = getattr(vllm_config, "additional_config", None)
         if isinstance(ac, dict):   # compile-cache key: graphs built for these adapters only
-            ac["suffix_sft"] = dict(rank=cfg.rank, alpha=cfg.alpha, targets=list(cfg.targets))
+            ac["suffix_sft"] = dict(rank=cfg.rank, alpha=cfg.alpha, targets=list(self.targets))
         if not self.adapters:
-            raise RuntimeError(f"no linear matched {cfg.targets}")
+            raise RuntimeError(f"no linear matched {self.targets}")
         first = next(iter(self.adapters.values()))[1]
         self.device, self.dtype = first.A.device, first.A.dtype
         self.run = None
@@ -210,7 +216,7 @@ class WorkerSFT:
         n = sum(lo.A.numel() + lo.B.numel() for _, lo in self.adapters.values())
         return dict(adapters=len(self.adapters), params=n * self.g.world_size, rank=self.cfg.rank,
                     alpha=self.cfg.alpha, tp=self.g.world_size, fingerprint=self.fingerprint,
-                    model=self.model_id, targets=list(self.cfg.targets),
+                    model=self.model_id, targets=list(self.targets),
                     run=self.run is not None)
 
     def begin(self, p):
