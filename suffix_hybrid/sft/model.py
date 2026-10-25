@@ -483,11 +483,14 @@ class _HostCkpt(torch.autograd.Function):
         if not isinstance(out, tuple):
             out = (out,)
         need = [a for a in args if torch.is_tensor(a) and a.is_floating_point()]
-        g = [x.to(ctx.device, non_blocking=False) if torch.is_tensor(x) else x for x in grads]
+        # only differentiable outputs (int carries, no-grad side outputs are skipped)
+        pairs = [(o, x.to(ctx.device, non_blocking=False)) for o, x in zip(out, grads)
+                 if torch.is_tensor(o) and o.requires_grad and torch.is_tensor(x)]
+        outs, g = [o for o, _ in pairs], [x for _, x in pairs]
         # autograd.grad only fills the *input* grads; the LoRA leaves need
         # autograd.backward to accumulate into .grad, so do both.
-        torch.autograd.backward(out, g, retain_graph=True)
-        got = torch.autograd.grad(out, need, g, allow_unused=True)
+        torch.autograd.backward(outs, g, retain_graph=True)
+        got = torch.autograd.grad(outs, need, g, allow_unused=True)
         if ctx.mod is not None:
             _swap_out(ctx.mod)   # only after the recompute's gradient is taken
         # inputs were host tensors, so their gradients must be host tensors too
