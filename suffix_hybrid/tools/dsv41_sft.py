@@ -26,6 +26,7 @@ SFT_SCHEMA = {   # name: (default, lo, hi)
     "lr": (1e-3, 1e-7, 1.0), "offload_gib": (2.0, 0.0, 64.0), "min_free_gib": (1.0, 0.0, 64.0),
     "parity_window": (1024, 16, 65536), "mem_trace": (False, None, None), "host_ckpt": (False, None, None),
     "targets": ("", None, None), "lora_plus": (1.0, 1.0, 64.0), "diag": (False, None, None),
+    "profile": (False, None, None),
 }
 SLICE_DEFAULTS = {"k": 0, "conc": [1], "gpu_memory_utilization": 0.8, "max_model_len": 65536}
 
@@ -148,6 +149,13 @@ def run(o, s, doc):
                 loss += r["loss_sum"]
                 micro.append({k: r.get(k) for k in ("ms", "fwd_ms", "bwd_ms", "peak_gib", "fwd_peak_gib",
                                                      "free_gib", "host_pinned_gib", "tokens")})
+            if s["profile"] and step == 1:
+                from torch.profiler import ProfilerActivity, profile
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                    rpc("micro", dict(ids=data[0][0], mask=data[0][1], seg_lens=[len(data[0][0])], norm=1e9))
+                ka = prof.key_averages()
+                doc["profile_cuda"] = ka.table(sort_by="cuda_time_total", row_limit=30, max_name_column_width=70)
+                doc["profile_cpu"] = ka.table(sort_by="cpu_time_total", row_limit=25, max_name_column_width=70)
             g = rpc("step")
             row = dict(step=step, loss=round(loss / norm, 5), grad_norm=round(g["grad_norm"], 5),
                        step_ms=g["ms"], micro=micro)
