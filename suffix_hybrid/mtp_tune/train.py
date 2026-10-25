@@ -45,6 +45,8 @@ from __future__ import annotations
 import math
 import time
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
 
@@ -220,6 +222,18 @@ def _groups(ids, e_count):
     return out
 
 
+@contextlib.contextmanager
+def _tf32():
+    """fp32 expert GEMMs on tensor cores (TF32: 10-bit mantissa; the dequantized
+    NVFP4 / FP8 operands carry <= 7 significant bits before the global scale)."""
+    old = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old
+
+
 class FrozenExperts(torch.autograd.Function):
     """y[t] = sum_k tw[t,k] * W2_e (silu(g) * u), [g; u] = W13_e x[t],
     e = ids[t,k] (local id; off-rank pairs contribute 0)."""
@@ -239,6 +253,7 @@ class FrozenExperts(torch.autograd.Function):
         return w13, w2, g, u, h, _qdq(h, handle, "h") @ w2.T
 
     @staticmethod
+    @_tf32()
     def forward(ctx, x, tw, ids, handle):
         ctx.handle = handle
         ctx.save_for_backward(x, tw, ids)
@@ -252,6 +267,7 @@ class FrozenExperts(torch.autograd.Function):
         return out.to(x.dtype)
 
     @staticmethod
+    @_tf32()
     def backward(ctx, dy):
         x, tw, ids = ctx.saved_tensors
         handle = ctx.handle
