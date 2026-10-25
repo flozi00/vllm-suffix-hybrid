@@ -70,7 +70,11 @@ LAUNCH_APIS = ("cudaLaunchKernel", "cudaLaunchKernelExC", "cuLaunchKernel",
 # Ordered: first match wins. MoE before attention (flashinfer ships both).
 CATEGORIES = [
     ("attn K2 own (verify)", r"nvfp4_attn_"),
-    ("MoE", r"moe|expert|topk|router|grouped|align_block|expandinput|b12x"),
+    # FlashInfer's sampler shares "topk" with expert routing. Its grouped
+    # CUTLASS MoE GEMMs instead name GroupProblemShape (also when mangled).
+    ("sampling/spec", r"_topk_topp_kernel|_temperature_kernel"),
+    ("MoE", r"moe|expert|topk|router|grouped|groupproblemshape"
+     r"|gemma4_routing|align_block|expandinput|b12x"),
     ("attn FlashInfer fa2 (prefill/mm + q1 decode)",
      r"batchprefillwith|batchdecodewith|singleprefillwith|singledecodewith"
      r"|mergestate|variablelengthmerge|batchpodwith"),

@@ -112,6 +112,32 @@ def test_scan_once_empty_root(tmp_path, capsys):
     _scan_once({})
     assert _markers(capsys) == []
 
+
+def test_scan_legacy_and_version_arch_hash_layouts(tmp_path, monkeypatch, capsys):
+    from sm120 import ficache
+    import base64
+    import gzip
+    import json
+
+    monkeypatch.setattr(ficache, "_cache_roots", lambda: [tmp_path])
+    caches = [tmp_path / "workspace" / "legacy_hash" / "autotune_configs.json",
+              tmp_path / "0.7.0.post1" / "120f" / "current_hash" / "autotune_configs.json"]
+    for i, path in enumerate(caches):
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"tactic": i}))
+    (tmp_path / "unrelated.json").write_text('{"tactic": 99}')
+    seen = {}
+    _scan_once(seen)
+    lines = _markers(capsys)
+    payloads = {line.split()[1]: json.loads(gzip.decompress(
+        base64.b64decode(line.split()[2]))) for line in lines}
+    assert payloads == {"legacy_hash": {"tactic": 0}, "current_hash": {"tactic": 1}}
+    _scan_once(seen)
+    assert _markers(capsys) == []
+    caches[1].write_text('{"tactic": 22}')
+    _scan_once(seen)
+    assert len(_markers(capsys)) == 1
+
 def test_encode_dump_roundtrip(cache_root):
     import base64
     import gzip
@@ -122,3 +148,37 @@ def test_encode_dump_roundtrip(cache_root):
     assert prefix == "SUFFIX_FICACHE_DUMP"
     assert hash_dir == cfg.parent.name
     assert gzip.decompress(base64.b64decode(payload)) == cfg.read_bytes()
+
+
+def test_ranked_cache_receipts_and_seeds_do_not_collide(tmp_path, monkeypatch, capsys):
+    from sm120 import ficache
+    import base64
+    import gzip
+    import json
+
+    root = tmp_path / "cache"
+    folder = root / "0.7.0.post1" / "120f" / "same_hash"
+    folder.mkdir(parents=True)
+    monkeypatch.setattr(ficache, "_cache_roots", lambda: [root])
+    seeds = tmp_path / "seeds"
+    seeds.mkdir()
+    monkeypatch.setattr(ficache, "_SEEDS_DIR", seeds)
+    expected = {}
+    for dp, rank in [(0, 0), (0, 1), (1, 0)]:
+        path = folder / f"autotune_configs_dp{dp}_rank{rank}.json"
+        path.write_text(json.dumps({"dp": dp, "rank": rank}))
+        expected[ficache._cache_key(path)] = path.read_bytes()
+    for name in ["autotune_configs_notes.json", "autotune_configs_dp0_rankx.json"]:
+        (folder / name).write_text('{}')
+    _scan_once({})
+    lines = _markers(capsys)
+    assert len(lines) == 3
+    for line in lines:
+        _, key, payload = line.split()
+        assert gzip.decompress(base64.b64decode(payload)) == expected[key]
+        (seeds / f"{key}.json.gz").write_bytes(base64.b64decode(payload))
+    for path in folder.glob("autotune_configs_dp[01]_rank[01].json"):
+        key = ficache._cache_key(path)
+        path.unlink()
+        ficache._seed_if_missing(path)
+        assert path.read_bytes() == expected[key]
