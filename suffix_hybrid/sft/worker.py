@@ -234,6 +234,7 @@ class WorkerSFT:
             raise RuntimeError("micro without begin")
         free = self._mem_vote()
         ids, segs, rows, tgt = self._batch(p)
+        self._host_vote(int(ids.numel()))
         if not tgt.numel():
             raise ValueError("micro-batch without completion tokens")
         check = bool(p.get("check"))
@@ -362,6 +363,49 @@ class WorkerSFT:
             lo.zero_()
         return dict(ok=True)
 
+    def host_bytes_per_token(self):
+        """Pinned host bytes one rank parks per training token with host
+        checkpoints: every layer's float inputs (DeepSeek-V4.1: the 4-copy hc
+        stream + the layer output + a compressed entry; else hidden + residual),
+        x2 for the pinned caching allocator's power-of-two rounding."""
+        from suffix_hybrid.sft import dsv41
+        layers = list(getattr(self.inner, "layers", []))
+        if dsv41.is_dsv4(self.inner):
+            a = layers[0].attn
+            per_layer = 2 * (layers[0].hc_mult + 1) * a.hidden_size + 2 * a.head_dim
+        else:
+            emb = getattr(getattr(self.inner, "embed_tokens", None), "weight", None)
+            h = (int(self.vllm_config.model_config.get_hidden_size()) if self.vllm_config is not None
+                 else int(emb.shape[-1]) if emb is not None else 0)
+            if not h:
+                raise RuntimeError("host checkpoint guard: hidden size unknown")   # fail closed
+            per_layer = 2 * 2 * h
+        return 2 * per_layer * len(layers)
+
+    def _host_vote(self, tokens):
+        """Fail closed before a micro-step whose host checkpoints would not fit
+        the container: every rank of the pod parks its own copy under ONE cgroup
+        limit, and running past it gets the whole serving pod OOM-killed. The
+        decision uses rank-summed numbers, so it is identical on every rank
+        (MemoryError -> the run fails, serving continues)."""
+        if not self.cfg.host_ckpt:
+            return
+        room = _cgroup_headroom()
+        if room is None:
+            return
+        v = torch.tensor([float(tokens * self.host_bytes_per_token()), float(_pinned_reserved()),
+                          float(room)], dtype=torch.float64, device=self.device)
+        if self.g.world_size > 1:
+            v = self.g.all_reduce(v)
+        need, cached, room = float(v[0]), float(v[1]), float(v[2]) / self.g.world_size
+        avail = room + cached - self.cfg.host_reserve_gib * 2**30   # cached pinned blocks are reused
+        if need > avail:
+            fit = int(max(0.0, avail) // max(1.0, need / max(1, tokens)))
+            raise MemoryError(
+                f"host checkpoints need {need / 2**30:.1f} GiB pinned for {tokens} tokens on "
+                f"{self.g.world_size} rank(s); the container has {avail / 2**30:.1f} GiB after the "
+                f"{self.cfg.host_reserve_gib:g} GiB reserve: at most ~{fit} tokens per micro-batch here")
+
     def _mem_vote(self):
         """Uniform refusal (no rank enters a collective-heavy forward alone)
         when any rank has less than min_free_gib free (driver free + cached)."""
@@ -380,6 +424,40 @@ class WorkerSFT:
         if float(flag[0]):
             raise MemoryError(f"less than {self.cfg.min_free_gib} GiB free VRAM on a rank")
         return free
+
+
+def _cgroup_headroom():
+    """Bytes this container may still allocate (cgroup v2 or v1 limit minus
+    usage, reclaimable page cache not counted); None without a limit."""
+    for lim_p, cur_p, stat_p in (("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current",
+                                  "/sys/fs/cgroup/memory.stat"),
+                                 ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                                  "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+                                  "/sys/fs/cgroup/memory/memory.stat")):
+        try:
+            lim, cur = open(lim_p).read().strip(), int(open(cur_p).read())
+        except (OSError, ValueError):
+            continue
+        if lim == "max" or int(lim) >= 1 << 60:
+            return None
+        inactive = 0
+        try:
+            for line in open(stat_p):
+                k, v = line.split()
+                if k in ("inactive_file", "total_inactive_file"):
+                    inactive = int(v)
+        except (OSError, ValueError):
+            pass
+        return int(lim) - (cur - inactive)
+    return None
+
+
+def _pinned_reserved():
+    try:
+        st = torch.cuda.host_memory_stats()
+        return int(st.get("reserved_bytes.current", st.get("allocated_bytes.current", 0)) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _pinned_gib():
