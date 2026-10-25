@@ -45,6 +45,8 @@ from __future__ import annotations
 import math
 import time
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
 
@@ -75,7 +77,7 @@ class FrozenLinear(torch.autograd.Function):
         if w is not None:   # plain float weight (bf16 head, unquantized): no probe
             with torch.no_grad():
                 return dy @ w[:dy.shape[-1]].to(dy.dtype), None
-        rows = nvfp4_rows(ctx.layer, k)
+        rows = nvfp4_rows(ctx.layer, k) or mxfp8_rows(ctx.layer, k)
         if rows is not None and nvfp4_verified(ctx.layer, k, rows, dy.dtype):
             n, step = dy.shape[-1], max(1, (1 << 24) // k)
             dx = torch.zeros(*dy.shape[:-1], k, dtype=torch.float32, device=dy.device)
@@ -133,6 +135,30 @@ def nvfp4_rows(layer, k):
         v = lut[w[r0:r1].int()].view(r1 - r0, k // 16, 16)
         s = sfu[r0:r1].contiguous().view(torch.float8_e4m3fn).to(torch.bfloat16)
         return (v * s[..., None]).reshape(r1 - r0, k) * factor
+    return rows
+
+
+def mxfp8_rows(layer, k):
+    """fn(r0, r1) -> bf16 weight rows [r1 - r0, K] of an MXFP8 (e4m3 weight
+    [N, K], one UE8M0 scale per 32 along K, 128x4-swizzled after load:
+    FlashInfer CUTLASS MXFP8) linear; exact (e4m3 x 2^e fits bf16). None
+    when the layer does not carry that layout; trusted only after the probe
+    check (``nvfp4_verified`` compares with the layer's own kernel)."""
+    w, sf = getattr(layer, "weight", None), getattr(layer, "weight_scale", None)
+    n = getattr(layer, "output_size_per_partition", None)
+    if (w is None or sf is None or n is None or w.dtype != torch.float8_e4m3fn or w.dim() != 2
+            or int(w.shape[1]) != k or k % 32 or sf.element_size() != 1):
+        return None
+    from suffix_hybrid.kernels.nvfp4_gemm import unswizzle_sf
+    nb = k // 32
+    if sf.dim() == 2 and tuple(sf.shape) == (int(w.shape[0]), nb):
+        su = sf.view(torch.uint8)                     # not swizzled (other backends)
+    else:
+        su = unswizzle_sf(sf, int(w.shape[0]), nb)
+    scale = torch.exp2(su.float() - 127.0)            # [N, K/32]
+
+    def rows(r0, r1):
+        return (w[r0:r1].float().view(r1 - r0, nb, 32) * scale[r0:r1, :, None]).reshape(r1 - r0, k).to(torch.bfloat16)
     return rows
 
 
@@ -196,20 +222,38 @@ def _groups(ids, e_count):
     return out
 
 
+@contextlib.contextmanager
+def _tf32():
+    """fp32 expert GEMMs on tensor cores (TF32: 10-bit mantissa; the dequantized
+    NVFP4 / FP8 operands carry <= 7 significant bits before the global scale)."""
+    old = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old
+
+
 class FrozenExperts(torch.autograd.Function):
     """y[t] = sum_k tw[t,k] * W2_e (silu(g) * u), [g; u] = W13_e x[t],
     e = ids[t,k] (local id; off-rank pairs contribute 0)."""
 
     @staticmethod
     def _expert(handle, e, xe):
+        """(w13, w2, g, u, h, y); g / u post-clamp when handle["limit"]
+        (swiglu_limit: silu(min(g, L)) * clamp(u, -L, L))."""
         w13, w2 = expert_weights(handle, e)
         gu = _qdq(xe, handle, "x") @ w13.T
         i = gu.shape[-1] // 2
         g, u = gu[:, :i], gu[:, i:]
+        lim = handle.get("limit")
+        if lim:
+            g, u = g.clamp(max=lim), u.clamp(-lim, lim)
         h = F.silu(g) * u
         return w13, w2, g, u, h, _qdq(h, handle, "h") @ w2.T
 
     @staticmethod
+    @_tf32()
     def forward(ctx, x, tw, ids, handle):
         ctx.handle = handle
         ctx.save_for_backward(x, tw, ids)
@@ -223,6 +267,7 @@ class FrozenExperts(torch.autograd.Function):
         return out.to(x.dtype)
 
     @staticmethod
+    @_tf32()
     def backward(ctx, dy):
         x, tw, ids = ctx.saved_tensors
         handle = ctx.handle
@@ -240,6 +285,10 @@ class FrozenExperts(torch.autograd.Function):
                 sg = torch.sigmoid(g)
                 dg = dh * u * (sg * (1 + g * (1 - sg)))
                 du = dh * g * sg
+                lim = handle.get("limit")
+                if lim:   # clamped values pass no gradient (g == L / |u| == L: at the clamp)
+                    dg = dg * (g < lim)
+                    du = du * (u.abs() < lim)
                 dx.index_add_(0, rows, torch.cat([dg, du], -1) @ w13)
         return dx.to(x.dtype), dtw.view_as(tw).to(tw.dtype), None, None
 

@@ -1162,3 +1162,31 @@ def test_rejections_are_recorded_after_an_earlier_failure_and_loads_do_not_hide_
         assert "rejected" not in s.status and s.status["state"] == "idle"
     finally:
         W.SFT, A._S = None, None
+
+
+def test_sft_token_guards_mutating_routes(tmp_path, monkeypatch):
+    """SUFFIX_SFT_TOKEN: train / load need X-SFT-Token (wrong or missing -> 401, nothing runs);
+    status stays readable. A server with neither --api-key nor a token never enables SFT."""
+    import asyncio
+    import types
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("SUFFIX_SFT", "1")
+    monkeypatch.setenv("SUFFIX_SFT_TOKEN", "s3cret")
+    app = FastAPI()
+    A.SftEndpointPlugin().attach_router(app)
+    A._S = _state(tmp_path, sft_for(build()))
+    try:
+        with TestClient(app) as cl:
+            body = dict(prompt="x", run_id="base")
+            assert cl.post("/v1/sft/load", json=body).status_code == 401
+            assert cl.post("/v1/sft/load", json=body, headers={"X-SFT-Token": "nope"}).status_code == 401
+            assert cl.post("/v1/sft/train", json=dict(prompt="x", examples=CHATS)).status_code == 401
+            assert A._S.running is None
+            assert cl.get("/v1/sft/status").status_code == 200
+            assert cl.post("/v1/sft/load", json=body, headers={"X-SFT-Token": "s3cret"}).status_code == 200
+    finally:
+        W.SFT, A._S = None, None
+    monkeypatch.delenv("SUFFIX_SFT_TOKEN")
+    asyncio.run(A.SftEndpointPlugin().init_state(object(), {}, types.SimpleNamespace(api_key=None)))
+    assert A._S is None

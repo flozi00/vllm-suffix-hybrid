@@ -281,7 +281,9 @@ GLM_TP8 = dict(GOOD, act="silu", tp=8, E=256, H=6144, I=256)
     ({"quant_dtype": None}, "not NVFP4"),
     ({"backend": "FLASHINFER_TRTLLM"}, "backend"),
     ({"act": "swigluoai"}, "activation"),
-    ({"clamp_limit": 7.0}, "clamp"),
+    ({"clamp_limit": 7.0}, "silu-only"),  # gelu_tanh layer
+    ({"act": "silu", "clamp_limit": 10.0}, None),  # DeepSeek-V4: Helion-only (oxide_gap)
+    ({"swiglu_alpha": 1.702}, "alpha"),
     ({"router_weight_on_input": True}, "router_weight"),
     ({"tp": 2}, None),  # TP-sharded intermediate: partial sums, vLLM all-reduces
     ({"dp": 2}, "DP/all2all"),
@@ -291,8 +293,10 @@ GLM_TP8 = dict(GOOD, act="silu", tp=8, E=256, H=6144, I=256)
     ({"tp": 2, "ep": 2, "expert_map": True, "ep_base": 0}, "not both"),
     ({"expert_map": True, "ep_base": None}, "linear"),
     ({"ep": 8, "ep_base": None}, "linear"),
-    ({"I": 720}, "shape"),
-    ({"E": 512}, "shape"),
+    ({"I": 720}, None),  # I % 16: Helion-only (oxide_gap)
+    ({"I": 712}, "shape"),
+    ({"E": 512}, None),  # E > 256: Helion-only (oxide_gap)
+    ({"H": 2848}, "shape"),
     ({"sf_exact": False}, "swizzled layout"),
     ({"gscale_shared": False}, "gscales"),
 ])
@@ -305,7 +309,7 @@ def test_eligibility(change, needle):
     ({}, None),
     ({"ep_base": None, "expert_map": True}, "linear"),  # round_robin placement
     ({"eplb": True}, "EPLB"),
-    ({"I": 2048 // 3}, "shape"),
+    ({"I": 2048 // 3}, "shape"),  # 682: not whole NVFP4 blocks
     # GLM MTP draft layer: experts in the modelopt ignore list -> bf16
     ({"quant_dtype": None}, "not NVFP4"),
 ])
@@ -313,6 +317,145 @@ def test_eligibility(change, needle):
 def test_eligibility_glm(glm, change, needle):
     why = nm.eligibility({**glm, **change})
     assert (why is None) if needle is None else (needle in why)
+
+
+DS_TP8 = dict(GOOD, act="silu", clamp_limit=10.0, tp=8, E=384, H=5120, I=288)
+DS_EP = dict(DS_TP8, tp=1, ep=8, expert_map=True, ep_base=192, E=48, I=2304)
+
+
+def test_oxide_gap_routes_deepseek_v4_to_helion():
+    for info in (DS_TP8, DS_EP):
+        assert nm.eligibility(info) is None
+    assert nm.oxide_gap(DS_TP8) == "swiglu clamp 10.0, E=384 > 256, I=288 % 64"
+    assert nm.oxide_gap(DS_EP) == "swiglu clamp 10.0"
+    assert nm.oxide_gap(GLM_EP) is None and nm.oxide_gap(GLM_TP8) is None
+    assert nm.oxide_gap(GOOD) is None
+
+
+def test_clamp_ref_is_vllms_silu_and_mul_with_clamp():
+    """FlashInfer layout [up; gate] through clamp_ref + act_ref == vLLM's
+    reference (activation.silu_and_mul_with_clamp, XPU branch) on its own
+    layout [gate; up]: gate clamped from above only, up both sides."""
+    gu = torch.randn(64, 2 * 48, dtype=torch.float64) * 8
+    lim = 5.0
+    up, gate = gu[:, :48], gu[:, 48:]
+    g = torch.clamp(gate, max=lim)  # vLLM: input[..., :d] is the gate
+    want = g * torch.sigmoid(g) * torch.clamp(up, min=-lim, max=lim)
+    c = nm.clamp_ref(gu, lim)
+    got = nm.act_ref(c[:, 48:], 0) * c[:, :48]
+    assert torch.equal(got, want) and (c != gu).any()
+    assert nm.clamp_ref(gu, None) is gu
+
+
+def test_clamped_reference_changes_only_when_the_clamp_engages():
+    p = nm.make_problem(4, 128, 48, "silu", seed=3)
+    ids, tw = nm.rand_routing(6, 4, 2, "cpu", seed=3)
+    x = torch.randn(6, 128).bfloat16()
+    free = nm.moe_ref(p, x, ids, tw)
+    assert torch.equal(nm.moe_ref({**p, "limit": 1e9}, x, ids, tw), free)
+    assert nm.clamp_frac({**p, "limit": 0.3}, x, ids) > 0.05
+    assert not torch.equal(nm.moe_ref({**p, "limit": 0.3}, x, ids, tw), free)
+
+
+def test_clamp_edge_table():
+    """gate = min(gate, L) (NOT clamped below), up = clamp(up, -L, L), on the fc1 output
+    in the FlashInfer layout [up; gate]: at, just above and below +-L, negative gate."""
+    from suffix_hybrid.kernels import dsv41_moe
+    L = dsv41_moe.LIMIT
+    vals = [-12.0, -10.01, -10.0, -9.99, -1.0, 0.0, 9.99, 10.0, 10.01, 12.0]
+    up = torch.tensor(vals, dtype=torch.float64)
+    gate = torch.tensor(vals, dtype=torch.float64).flip(0)
+    gu = torch.cat([up, gate])[None]
+    c = nm.clamp_ref(gu, L)[0]
+    assert c[:10].tolist() == [-10.0, -10.0, -10.0, -9.99, -1.0, 0.0, 9.99, 10.0, 10.0, 10.0]
+    assert c[10:].tolist() == [10.0, 10.0, 10.0, 9.99, 0.0, -1.0, -9.99, -10.0, -10.01, -12.0]
+    h = nm.act_ref(c[None, 10:], 0) * c[None, :10]
+    assert float(h[0, 9]) == float(nm.act_ref(torch.tensor(-12.0, dtype=torch.float64), 0)) * 10.0
+    assert float(h[0, 0]) == float(nm.act_ref(torch.tensor(10.0, dtype=torch.float64), 0)) * -10.0
+    # a symmetric (wrong) gate clamp would turn gate -12 into -10: it must differ
+    assert float(c[19]) == -12.0
+
+
+def test_dsv41_refuse():
+    from suffix_hybrid.kernels import dsv41_moe as dm
+    ok_ep = dict(DS_EP, topk=6, global_e=384)
+    ok_tp = dict(DS_TP8, topk=6, global_e=384)
+    assert dm.refuse(ok_ep) is None and dm.refuse(ok_tp) is None
+    for change, needle in (({"H": 4096}, "hidden"), ({"act": "gelu_tanh"}, "silu"),
+                           ({"topk": 8}, "topk"), ({"clamp_limit": 7.0}, "swiglu_limit"),
+                           ({"global_e": 256}, "routed experts"), ({"I": 1152}, "not tuned"),
+                           ({"E": 96}, "not tuned"), ({"ep": 4}, "ep=8")):
+        why = dm.refuse(dict(ok_ep, **change))
+        assert why is not None and needle in why, (change, why)
+    assert "ep=1" in dm.refuse(dict(ok_tp, ep=8))
+    assert "EP8" in dm.refuse(dict(ok_ep, I=1))  # names the supported layouts
+
+
+@pytest.mark.parametrize("dist", nm.ROUTING_DISTS)
+def test_rand_routing_dists(dist):
+    ids, tw = nm.rand_routing(192, 384, 6, "cpu", seed=3, dist=dist)
+    assert ids.shape == (192, 6) and all(len(set(r)) == 6 for r in ids.tolist())  # distinct
+    assert torch.allclose(tw.sum(-1), torch.ones(192))
+    rows = torch.bincount(ids.reshape(-1).long(), minlength=384)
+    again, _ = nm.rand_routing(192, 384, 6, "cpu", seed=3, dist=dist)
+    assert torch.equal(ids, again)
+    if dist == "balanced":
+        assert int(rows.max()) < 40
+    elif dist == "skewed":
+        assert int(rows.max()) > 60 and int((rows == 0).sum()) > 10  # heavy head, dead tail
+    else:
+        assert int(rows.max()) == 192  # one expert takes every token's row
+    # EP: the hot expert is on THIS rank; dead rows stay off-rank for every dist
+    ids, _ = nm.rand_routing(48, 384, 6, "cpu", seed=5, base=192, local=48, dist=dist)
+    loc = nm.to_local(ids, 192, 48)
+    assert bool((loc[1::3] < 0).all())
+    if dist == "hot":
+        assert int(torch.bincount(loc[loc >= 0]).max()) >= 32
+    with pytest.raises(ValueError):
+        nm.rand_routing(4, 8, 2, "cpu", dist="zipf")
+
+
+def test_adversarial_blocks_hit_every_scale_corner():
+    p = nm.make_problem(2, 256, 64, "silu", seed=1, adversarial=True)
+    bits = nm.unswizzle(p["w13_sf"][0].reshape(-1).view(torch.uint8), 128, 16)
+    sf = bits.view(torch.float8_e4m3fn).float()
+    assert bool((sf == 0).any())                                       # zero / flushed blocks
+    assert bool(((sf > 0) & (sf < 2.0 ** -6)).any())                   # e4m3 subnormal scales
+    assert float(sf.max()) <= 448.0 and float(sf.max()) >= 224.0       # the global-max block
+    w = nm._expert_w(p["w13"], p["w13_sf"], 0)
+    assert torch.isfinite(w).all()
+    zero_blocks = (sf == 0).reshape(-1)
+    assert bool((w.reshape(128, 16, 16)[(sf == 0)] == 0).all()) and zero_blocks.any()
+    ids, tw = nm.rand_routing(6, 2, 2, "cpu", seed=2)
+    x = nm.adversarial_blocks(torch.randn(6, 256), torch.Generator().manual_seed(4)).bfloat16()
+    ref = nm.moe_ref(p, x, ids, tw)
+    assert torch.isfinite(ref).all()
+
+
+def test_winner_table_ships_only_the_unbroken_prefix():
+    rows = {1: {"balanced": (10.0, 8.0), "skewed": (10.0, 9.0)},
+            8: {"balanced": (20.0, 19.0), "skewed": (20.0, 19.9)},
+            32: {"balanced": (50.0, 49.0), "skewed": (50.0, 51.0)},   # skewed loses
+            64: {"balanced": (90.0, 80.0), "skewed": (90.0, 70.0)}}   # wins again: not served
+    text, best = nm.winner_table("t", rows)
+    assert best == 8 and "M=32   balanced x0.980  skewed x1.020  LOSS" in text
+    assert f"{nm.MAX_M_ENV}=8" in text
+    assert nm.winner_table("t", {1: {"balanced": (1.0, 1.1)}})[1] is None
+    text, best = nm.winner_table("tp8", {1: {"balanced": (float("nan"), 7.0)}})
+    assert best is None and "no stock baseline" in text and "7.0" in text
+
+
+def test_no_flashinfer_baseline_for_tp8_without_ep():
+    """FlashInfer CUTLASS pads to 128 rows: I = 288 (TP8 no EP) has no stock path, so the
+    oracle judges it vs the f64 spec only (judge fi=None); EP8 (I 2304) keeps FlashInfer."""
+    assert not nm.fi_supported(288) and nm.fi_supported(2304) and nm.fi_supported(2048)
+    p = nm.make_problem(3, 128, 64, "silu", seed=2)
+    ids, tw = nm.rand_routing(5, 3, 2, "cpu", seed=2)
+    x = torch.randn(5, 128).bfloat16()
+    ref = nm.moe_ref(p, x, ids, tw)
+    ok, msg = nm.judge(ref.bfloat16().float(), None, ref, ids)
+    assert ok and "no flashinfer" in msg
+    assert not nm.judge(ref.bfloat16().float() * 1.1, None, ref, ids)[0]
 
 
 def test_verdict_fails_loud():

@@ -135,6 +135,9 @@ def is_mlp(m) -> bool:      # dense MLP block: token-wise, so it can be tiled
 
 def check_supported(lm, vllm_config=None):
     """Raise NotImplementedError naming the first module SFT cannot train."""
+    from suffix_hybrid.sft import dsv41
+    if dsv41.is_dsv4(getattr(lm, "model", None)):
+        return dsv41.check(lm, vllm_config)
     if vllm_config is not None and vllm_config.parallel_config.pipeline_parallel_size > 1:
         raise NotImplementedError("pipeline parallel")
     if vllm_config is not None and getattr(vllm_config.cache_config, "kv_sharing_fast_prefill", False):
@@ -186,6 +189,8 @@ def _sft_class(cls):
             a = getattr(layer, "sft_A", None)
             if a is None:
                 return out
+            if not torch.is_tensor(x):   # a pre-quantized activation: the delta needs bf16
+                raise RuntimeError(f"SFT adapter on a layer fed a {type(x).__name__}")
             # 2 kernels per adapter: shrink GEMM + expand GEMM whose epilogue
             # does the scale and the add (decode runs ~250 of these per step)
             x2 = x.reshape(-1, x.shape[-1]).to(a.dtype)
@@ -412,13 +417,16 @@ class _Unpark(torch.autograd.Function):
         return g, None
 
 
-def _to_host(t):
-    """Pinned host copy of a device tensor (pageable if the pinned pool is full)."""
+def _to_host(t, non_blocking=False):
+    """Pinned host copy of a device tensor (pageable if the pinned pool is full).
+    non_blocking only for copies the CPU never reads (they come back to the
+    device on the same stream, so stream order makes them safe)."""
     try:
         h = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
     except RuntimeError:
         h = torch.empty(t.shape, dtype=t.dtype)
-    h.copy_(t.detach(), non_blocking=False)
+        non_blocking = False
+    h.copy_(t.detach(), non_blocking=non_blocking)
     return h
 
 
@@ -445,31 +453,35 @@ class _HostCkpt(torch.autograd.Function):
     ``gradient_checkpointing(offload=True)`` does. It also cannot be expressed
     with ``saved_tensors_hooks``: checkpoint installs its own hooks inside the
     region and shadows any outer ones.
+
+    Outputs and gradients stay on the device: nothing saves an output (the
+    next layer parks its own copy of it on the host), so it is freed once the
+    caller rebinds it, and no gradient crosses PCIe (a host round trip per
+    layer of pageable grads cost ~2 s per 2k-token step on DeepSeek-V4.1).
     """
 
     @staticmethod
     def forward(ctx, fn, device, dummy, mod, *args):
         ctx.fn, ctx.device, ctx.mod = fn, device, mod
+        ctx.on_dev = [torch.is_tensor(a) and a.is_cuda for a in args]
         ctx.host = []
         for a in args:
             if torch.is_tensor(a) and a.is_floating_point():
-                h = a if not a.is_cuda else _to_host(a)
+                h = a if not a.is_cuda else _to_host(a, non_blocking=True)
                 ctx.host.append(h)
             else:
                 ctx.host.append(a)
-        dev = [h.to(device, non_blocking=False) if torch.is_tensor(h) else h for h in ctx.host]
+        dev = [h.to(device, non_blocking=True) if torch.is_tensor(h) else h for h in ctx.host]
         with torch.no_grad():
             out = fn(*dev)
         if not isinstance(out, tuple):
             out = (out,)
-        # Return host tensors: the graph then holds host memory between layers,
-        # so no device activation survives the forward.
-        return tuple(_to_host(o) if torch.is_tensor(o) else o for o in out)
+        return out
 
     @staticmethod
     def backward(ctx, *grads):
-        args = [h.to(ctx.device, non_blocking=False) if torch.is_tensor(h) else h
-                for h in ctx.host]
+        args = [h.to(ctx.device, non_blocking=True).detach() if torch.is_tensor(h) else h
+                for h in ctx.host]   # detach: fresh leaves even when .to() is a no-op
         for a in args:
             if torch.is_tensor(a) and a.is_floating_point():
                 a.requires_grad_(True)
@@ -478,18 +490,23 @@ class _HostCkpt(torch.autograd.Function):
         if not isinstance(out, tuple):
             out = (out,)
         need = [a for a in args if torch.is_tensor(a) and a.is_floating_point()]
-        g = [x.to(ctx.device, non_blocking=False) if torch.is_tensor(x) else x for x in grads]
-        # autograd.grad only fills the *input* grads; the LoRA leaves need
-        # autograd.backward to accumulate into .grad, so do both.
-        torch.autograd.backward(out, g, retain_graph=True)
-        got = torch.autograd.grad(out, need, g, allow_unused=True)
+        # only differentiable outputs (int carries, no-grad side outputs are skipped)
+        pairs = [(o, x.to(ctx.device, non_blocking=True)) for o, x in zip(out, grads)
+                 if torch.is_tensor(o) and o.requires_grad and torch.is_tensor(x)]
+        outs, g = [o for o, _ in pairs], [x for _, x in pairs]
+        # ONE backward pass: the recomputed inputs are leaves (requires_grad_
+        # above), so backward accumulates their .grad next to the LoRA leaves'
+        # (autograd.backward + autograd.grad would traverse the layer twice)
+        torch.autograd.backward(outs, g)
+        got = [a.grad for a in need]
         if ctx.mod is not None:
             _swap_out(ctx.mod)   # only after the recompute's gradient is taken
-        # inputs were host tensors, so their gradients must be host tensors too
-        got = [x.to("cpu", non_blocking=False) if torch.is_tensor(x) else x for x in got]
+        # each gradient on its input's device (host inputs: the first layer of a CPU test)
         it = iter(got)
         return (None, None, None, None) + tuple(
-            next(it) if (torch.is_tensor(a) and a.is_floating_point()) else None for a in args)
+            ((lambda x: x if (dev or x is None) else x.cpu())(next(it)))
+            if (torch.is_tensor(a) and a.is_floating_point()) else None
+            for a, dev in zip(args, ctx.on_dev))
 
 
 class TrainMode(contextlib.ContextDecorator):
@@ -610,6 +627,11 @@ class TrainMode(contextlib.ContextDecorator):
                 self._set(self.g, "all_reduce", lambda x: _ReduceFromTP.apply(x, raw))
             self._native_ir(st)
             self._workspace()
+            from suffix_hybrid.sft import dsv41
+            if dsv41.is_dsv4(self.s.inner):   # drive the layers ourselves (see dsv41.py)
+                self._set(self.s.inner, "forward",
+                          lambda input_ids=None, positions=None, intermediate_tensors=None, **kw:
+                          dsv41.forward(self, self.s.inner, input_ids, positions))
             if self.s.vllm_config is not None:
                 from vllm.forward_context import set_forward_context
                 st.enter_context(set_forward_context(None, self.s.vllm_config))
@@ -690,10 +712,17 @@ class TrainMode(contextlib.ContextDecorator):
                 self.offload_left -= size
                 parked = {k: [] for k in keys}
 
+            # the body is kept by the checkpoint (ctx.fn) until backward: it must not
+            # hold the float inputs themselves (they arrive as `vals`), or every
+            # layer's device input outlives the forward
+            key_set = set(keys)
+            rest = [None if i in key_set else v for i, v in enumerate(args)]
+            rest_kw = {k: (None if k in key_set else v) for k, v in kwargs.items()}
+
             def body(*vals):
                 got = {k: (_Unpark.apply(v, parked[k]) if parked else v) for k, v in zip(keys, vals)}
-                a = [got.get(i, v) for i, v in enumerate(args)]
-                kw = {k: got.get(k, v) for k, v in kwargs.items()}
+                a = [got.get(i, v) for i, v in enumerate(rest)]
+                kw = {k: got.get(k, v) for k, v in rest_kw.items()}
                 if self.mem_trace:
                     self._trace_n += 1
                     free, _ = torch.cuda.mem_get_info()

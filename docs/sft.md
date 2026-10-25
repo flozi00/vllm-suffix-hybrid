@@ -19,6 +19,8 @@ docstring (`suffix_hybrid/sft/__init__.py`). Tests: `tests/test_sft.py` (CPU).
 | `SUFFIX_SFT_REPO_ID` | private model repo, e.g. `primeline/qwen-fable-sft` (unset = local checkpoints only) |
 | `HF_TOKEN` | write token for that repo |
 
+| `SUFFIX_SFT_TOKEN` | shared secret; `train` / `load` / `diag` then need `X-SFT-Token: <token>` (required when the pool has no `--api-key`, e.g. prod: SFT refuses to enable with neither) |
+
 Leave VRAM headroom for training: `(1 - gpu_memory_utilization) * 96 GB`
 must cover `SUFFIX_SFT_MIN_FREE_GIB` (default 4) plus 2x the adapter size.
 With `--api-key` set, `/v1/sft/*` require it like every `/v1` route. Call the
@@ -80,7 +82,7 @@ rollback survives restarts.
 
 ## Support
 
-Dense attention + Qwen GDN hybrids (Qwen3.5 / qwen-fable), Gemma-4 dense
+DeepSeek-V4.1 (section above), dense attention + Qwen GDN hybrids (Qwen3.5 / qwen-fable), Gemma-4 dense
 (sliding + full attention, KV sharing), LFM2-MoE (short-conv + GQA layers,
 sigmoid + expert-bias routing; adapters on attention, short-conv and dense-MLP
 linears, routed experts and router stay frozen), Qwen4Exp (frozen NVFP4
@@ -88,6 +90,37 @@ experts), any TP. Refused with a logged reason, serving untouched: MLA,
 grouped routing with more than one group, pipeline parallel, soft-capped
 attention, other recurrent layers. Vision towers are not trained and keep
 working.
+
+## DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`, nvidia path)
+
+vLLM's V4.1 forward has no autograd path and, without attention metadata, produces
+wrong-but-finite output (sparse MLA zero-fills, the compressor returns None, KV inserts
+and Engram are skipped). SFT therefore never calls `DeepseekV4Model.forward`:
+`suffix_hybrid/sft/dsv41.py` drives the decoder layers in torch over the live weights
+(linears through the serving kernels via FrozenLinear + the LoRA delta):
+
+- mHC pre/post with Sinkhorn (vLLM's torch reference math, delayed pre-mix);
+- Engram gate (hashes, host-table lookup and `wkv` are token-id constants);
+- attention: own 128-token window (fp8 V4-record qdq, straight-through) + the kv-source
+  layer's compressed entries (ratio 2: per-dim softmax pooling of pairs, ratio 1: per
+  token), selected by the index-source layer's top-512 (torch twin of the DSA indexer,
+  no gradient), one softmax with the per-head sink, V = K, inverse RoPE, grouped `wo_a`
+  (bf16 bmm), `wo_b`;
+- MoE: sqrt(softplus) scores, top-6 by score + bias, renormalised to the routed scaling,
+  frozen NVFP4 experts with the swiglu clamp (TF32), clamped shared MLP.
+
+Adapters (default targets for this arch): `attn.fused_wqa_wkv`, `attn.wq_b`, `attn.wo_b`,
+`shared_experts.gate_up_proj`, `shared_experts.down_proj` (r=16: 18.9M params per TP8
+rank). An adapted `wq_b` switches the attention's fused q/kv-RMSNorm + MXFP8 quant producer
+off (the delta needs the bf16 q). Use `SUFFIX_SFT_HOST_CKPT=1`: every layer's inputs live
+in pinned host memory, outputs and gradients stay on the GPU.
+
+Slice lab (`dsv41_sft` gate: one TP8 rank's dims, 40 layers, dummy weights, prod image,
+2026-10-25): served vs trained per-token NLL correlation 0.99988 (ablations: attention off
+-0.04, compressed KV off 0.05-0.18, Engram off 0.24-0.36, MoE off 0.96), at 512 and 2048
+tokens (indexer top-k active); every adapter receives gradient; commit -> served NLL ==
+trained. 2048-token micro-step ~4 s, +3.2 GiB peak GPU, ~7.6 GiB pinned host.
+Not yet measured on real weights (parity on real text, KV qdq effect, TP8 collectives).
 
 ## Measured on silicon (qwen3.8-27b-fable NVFP4, 1x RTX PRO 6000, v0.30.0, 2026-10-11)
 
