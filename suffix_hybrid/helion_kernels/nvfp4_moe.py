@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+import logging
 import os
 import sys
 
@@ -91,9 +92,10 @@ def buckets_for(limit) -> tuple:
 # gives an expert M/64 rows, ~3 per HIT expert and <= ~10 for the heaviest at M=192; skewed
 # puts ~80 on the top expert, hot M): the 16-row minimum is the dot's M floor, mostly
 # padding on balanced loads, and the 64-row maximum only matters for the heavy tail (longer
-# segments loop). fc1: rows 16..64, 16-col N blocks 1..8
-# (16..128 cols), K = 8 * bkb elements per half-dot with bkb 2..8; largest live set
-# = 4 bf16 [128, 64] weight tiles + 2 f32 [64, 128] accumulators. fc2: rows 16..64,
+# segments loop). fc1: rows 16..64, 16-col N blocks 1..4
+# (16..64 cols: the four dots + reshape scratch overflowed sm_120's ~99 KB smem at
+# N 256 x K 128 on gemma), K = 8 * bkb elements per half-dot with bkb 2..8; largest live
+# set = 4 bf16 [64, 64] weight tiles + 2 f32 [64, 64] accumulators. fc2: rows 16..64,
 # H tile 16..256, bkb 2..8. fc2_combine: H tile 16..128, K blocks 1..16. combine: 1..16
 # tokens x 16..512 cols. route_quant: 16..64 x 16..128 pair tiles (O(P^2) compare),
 # 1..8 tokens x 1..64 16-col blocks. An over-budget config fails to compile and the
@@ -173,7 +175,9 @@ def nvfp4_moe_fc1(xdq: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tenso
     """h bf16 [P+1, I]: NVFP4-dequantized act(min(g1*gate, limit)) *
     clamp(g1*up, -limit, limit) per routed pair (vLLM's swiglu clamp; NO_CLAMP
     = none), rows of off-rank pairs unwritten, row P = trash. Grid (sorted
-    position, blocks of 16 I-columns: whole NVFP4 blocks for the requant)."""
+    position, blocks of 16 I-columns: whole NVFP4 blocks for the requant). Block
+    caps keep the 4 dot operands + reshape scratch inside sm_120's ~99 KB smem
+    (N <= 64, K <= 64)."""
     m, hdim = xdq.size()
     e_count, two_i, kh = w13.size()
     idim = two_i // 2
@@ -189,7 +193,7 @@ def nvfp4_moe_fc1(xdq: torch.Tensor, pair_sorted: torch.Tensor, seg: torch.Tenso
     h3 = h.view(pairs + 1, nb, 16)
     bkb = hl.register_block_size(2, min(8, nkb))  # dot K = 8 * bkb >= 16
     brow = hl.register_block_size(16, 64)
-    bcol = hl.register_block_size(1, min(8, nb))
+    bcol = hl.register_block_size(1, min(4, nb))  # dot N = 16 * bcol <= 64
     for tile_s, tile_b in hl.tile([pairs, nb], block_size=[1, bcol]):
         s = tile_s.begin
         cnt = seg[s]
@@ -999,7 +1003,9 @@ def _oxide_baseline(*args):
 # the trash slot of the route arrays is a data race between tail lanes, so a whole-tensor
 # comparison rejects (or, by luck of the allocator, accepts) candidates at random. The check
 # below compares only what a consumer reads, masked by the args of the latest make() (the lab
-# calls make(case, 0) right before it autotunes; the in-lab tuner does too).
+# calls make(case, 0) right before it autotunes; the in-lab tuner does too). This module's own
+# KERNELS skip that: their baseline is the exact eager reference and the lab check judges each
+# candidate (_tune_check, masked the same way); dsv41_moe_shared's kernels use autotune_check.
 LAST_ARGS: dict = {}
 AUTOTUNE_FLIP = 5e-3  # fraction of requantized / bf16 values that may differ between configs
 AUTOTUNE_REL = 2e-3   # rel-L2 between float outputs of two configs (accumulation order)
@@ -1057,10 +1063,26 @@ def autotune_check(name):
     return check
 
 
+def _tune_check(check):
+    """Autotuner accuracy check = the lab gate (defined rows only, requant-flip
+    tolerant); raises AssertionError like torch.testing."""
+    def tune_check(actual, expected):
+        ok, msg = check(actual, expected)
+        if not ok:
+            raise AssertionError(msg)
+    return tune_check
+
+
 def _entry(name, body, make, reference, check, mode, keep, oxide_entry):
+    # Lab-only settings (serving never autotunes): the autotuner's baseline is
+    # the exact eager reference (the oxide launches write packed/slot formats,
+    # not these outputs), so a failing default config cannot abort a case;
+    # candidates are judged by the lab check; DEBUG logs show real errors.
     return {"name": name, "body": body, "cases": functools.partial(cases, kernel=name),
-            "make": remember(name, make), "reference": reference, "check": check,
-            "settings": {"autotune_baseline_accuracy_check_fn": autotune_check(name)},
+            "make": make, "reference": reference, "check": check,
+            "settings": {"autotune_baseline_fn": reference,
+                         "autotune_baseline_accuracy_check_fn": _tune_check(check),
+                         "autotune_log_level": logging.DEBUG},
             "baseline": _oxide_baseline,
             "make_baseline": lambda case, seed: _oxide_args(case, seed, mode, keep),
             "baseline_name": f"oxide nvfp4_moe {oxide_entry} (glm prod tune; env "

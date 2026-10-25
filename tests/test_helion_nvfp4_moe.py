@@ -87,6 +87,8 @@ def test_kernels_abi():
         assert k["baseline_name"].startswith("oxide nvfp4_moe ")
         oxide = [e for e in nm.PARAMS if any(re.search(r, e) for r in k["replaces"])]
         assert len(oxide) == 1 and oxide[0] in k["baseline_name"]
+        st = k["settings"]  # lab-only: eager baseline, lab check as the tuner's check
+        assert st["autotune_baseline_fn"] is k["reference"] and "autotune_log_level" in st
 
 
 def test_baseline_runs_the_prod_tune(monkeypatch):
@@ -178,14 +180,17 @@ def _case(m, e=6, hd=128, i=64, k=3, act="silu", limit=None, eg=None):
                                   _case(7, e=4, k=3, i=48, limit=0.3, eg=16),
                                   _case(3, e=20, k=2, i=80, limit=0.3),
                                   # I = 288 (18 NVFP4 blocks: masked tails), EP of 32
-                                  _case(6, e=4, k=6, i=288, limit=0.3, eg=32)])
+                                  _case(6, e=4, k=6, i=288, limit=0.3, eg=32),
+                                  _case(3, e=8, hd=2816, i=704, k=8, act="gelu_tanh")])  # gemma H, I
 @pytest.mark.parametrize("name", [k["name"] for k in hm.KERNELS])
 def test_body_matches_reference(helion, case, name):
     kern = next(k for k in hm.KERNELS if k["name"] == name)
     args = kern["make"](case, 0)
     ref = kern["reference"](*args)
-    ok, msg = kern["check"](helion.kernel(kern["body"])(*args), ref)
+    out = helion.kernel(kern["body"])(*args)
+    ok, msg = kern["check"](out, ref)
     assert ok, msg
+    kern["settings"]["autotune_baseline_accuracy_check_fn"](out, ref)  # the tuner accepts it
 
 
 @pytest.mark.parametrize("plan", sorted(hm.PLANS))
@@ -331,10 +336,11 @@ def test_in_lab_tuner_plan_and_config_files(tmp_path, monkeypatch):
 
 
 def test_autotune_check_compares_only_what_a_consumer_reads(helion):
-    """Helion's autotuner compares every candidate with the default config's output over the WHOLE
-    tensor. Rows of off-rank pairs, the trash row P and the trash slot of the route arrays are
-    garbage that differs between configs: the lab's accuracy check masks them (and still
-    rejects a real difference)."""
+    """Helion's autotuner compares every candidate with the baseline over the WHOLE tensor. Rows
+    of off-rank pairs, the trash row P and the trash slot of the route arrays are garbage that
+    differs between configs: the accuracy check masks them (and still rejects a real
+    difference). This module's kernels compare against the eager reference (the lab check),
+    the fused-shared ones config vs config (autotune_check)."""
     case = {"experts": 6, "hidden": 128, "moe_intermediate": 48, "topk": 3, "act": "silu",
             "numtokens": 20, "limit": 0.3, "experts_global": 24}
     kerns = {k["name"]: k for k in hm.KERNELS}
@@ -342,29 +348,29 @@ def test_autotune_check_compares_only_what_a_consumer_reads(helion):
     # route_quant: the trash slot differs, a routing entry does not
     k = kerns[hm.ROUTE_QUANT]
     args = k["make"](case, 0)
-    want = helion.kernel(k["body"])(*args)
-    got = tuple(t.clone() for t in want)
+    want = k["settings"]["autotune_baseline_fn"](*args)
+    got = tuple(t.clone() for t in helion.kernel(k["body"])(*args))
     check = k["settings"]["autotune_baseline_accuracy_check_fn"]
     for t in got[1:]:
         t[-1] += 7  # the racy trash slot P
     check(got, want)
     got[2][0] += 1
-    with pytest.raises(AssertionError, match="routing differs"):
+    with pytest.raises(AssertionError, match="route exact=False"):
         check(got, want)
     # fc1: garbage in the rows no consumer reads is ignored, one flipped local row is not
     k = kerns[hm.FC1]
     args = k["make"](case, 0)
-    want = helion.kernel(k["body"])(*args)
+    want = k["settings"]["autotune_baseline_fn"](*args)
     ps, seg_e = args[1], args[3]
     local = ps[:-1][seg_e[:-1] < 6].long()
-    off = torch.ones(want.shape[0], dtype=torch.bool)
+    got = helion.kernel(k["body"])(*args)
+    off = torch.ones(got.shape[0], dtype=torch.bool)
     off[local] = False
-    got = want.clone()
     got[off] = torch.nan
     check = k["settings"]["autotune_baseline_accuracy_check_fn"]
     check(got, want)
-    got[local] = want[local] * 0 + 1.0
-    with pytest.raises(AssertionError, match="values differ"):
+    got[local] = 1.0
+    with pytest.raises(AssertionError, match="differing"):
         check(got, want)
     # the fused-shared fc1 additionally compares hs
     from suffix_hybrid.helion_kernels import dsv41_moe_shared as hs

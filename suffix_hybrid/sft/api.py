@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """SFT HTTP API (vLLM endpoint plugin ``suffix_sft``) + Hub checkpoints.
 
-Routes (API-key protected like every /v1 route when --api-key is set):
+Routes (API-key protected like every /v1 route when --api-key is set; with
+SUFFIX_SFT_TOKEN set, train / load / diag also need the header
+``X-SFT-Token: <token>``, so a pool serving without --api-key (prod) does not
+let every client retrain it; a server with neither refuses to enable SFT):
   POST /v1/sft/train   {"examples": [{"messages": [...]} | {"prompt": str,
                         "completion": str}], "steps": 1, "batch_size": 1,
                         "learning_rate": 1e-4, "weight_decay": 0.0,
@@ -527,11 +530,27 @@ def _public(meta):
 # ---------------------------------------------------------------------------
 # endpoint plugin
 # ---------------------------------------------------------------------------
+TOKEN_HEADER = "x-sft-token"
+
+
+def _authorized(request):
+    """Constant-time check of X-SFT-Token against SUFFIX_SFT_TOKEN (unset: the
+    --api-key middleware is the only gate; init_state refused a pod with neither)."""
+    import hmac
+    want = os.environ.get("SUFFIX_SFT_TOKEN", "")
+    if not want:
+        return
+    got = request.headers.get(TOKEN_HEADER, "")
+    if not hmac.compare_digest(got.encode(), want.encode()):
+        raise _http(401, "missing or wrong X-SFT-Token")
+
+
 async def _exclusive(request, run):
     """One run / load at a time per server; an accepted one finishes (and
     publishes) even if the client disconnects."""
     if _S is None:
         raise _http(503, "SFT is not available on this server (see [suffix sft] log lines)")
+    _authorized(request)
     try:
         body = await request.json()
     except ValueError:
@@ -578,6 +597,7 @@ async def diag_route(request):
     one text under forward variants."""
     if _S is None:
         raise _http(503, "SFT is not available on this server")
+    _authorized(request)
     if _S.running is not None and not _S.running.done():
         raise _http(409, "an SFT run or load is in progress")
     body = await request.json()
@@ -623,6 +643,9 @@ class SftEndpointPlugin:
     async def init_state(self, engine_client, state, args) -> None:
         global _S
         if os.environ.get("SUFFIX_SFT", "").strip() != "1" or engine_client is None:
+            return
+        if not getattr(args, "api_key", None) and not os.environ.get("SUFFIX_SFT_TOKEN", ""):
+            _log("disabled: /v1/sft would be open to every client; set --api-key or SUFFIX_SFT_TOKEN")
             return
         if int(getattr(args, "api_server_count", 1) or 1) > 1 or int(
                 getattr(args, "data_parallel_size", 1) or 1) > 1:

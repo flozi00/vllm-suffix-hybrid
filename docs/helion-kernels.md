@@ -127,3 +127,19 @@ layer oracle poisons out / partials with NaN and replays a CUDA-graph capture bi
 the `mxfp8_capture_replay` boot gate (`python -m suffix_hybrid.kernels.mxfp8_linear capture_replay`,
 sanitizer-ready) and the one-command lab session (`kernels/dsv41_dense_lab.py`: Markov bench first,
 then the gate, then the cases) are described in `docs/dsv41-dense.md` section 3b / 5.
+
+## Results (inference-console lab, RTX PRO 6000, LFBO full effort)
+
+Kernel time, Helion vs the oxide kernel at its production launch (> 1 = Helion faster).
+
+| family | status | evidence |
+|---|---|---|
+| dsa_indexer | **wins** decode rows 1-192: 1.22-2.12x; configs shipped (`configs/helion/dsa_indexer_decode`) | GLM-5.3, runs 20261017T100330Z-...-9020, ...134337Z-...-af3f |
+| k2_attn | **wins** hd256 sliding layers b1/b8: 1.22-1.53x (hd512 full layers still tuning) | gemma-4-26b/31b, runs ...145256Z-...-6a8c, ...145859Z-...-3050 |
+| nvfp4_gemm | **loses** 0.17-0.62x on every shape: stays on oxide | Triton 3.8 `tl.dot_scaled` has no native NVFP4 MMA on sm_120 (tcgen05 is sm_100 only; cc 12.x decomposes to a bf16 upcast), so Helion cannot reach oxide's native block-scaled FP4 MMA. Revisit when Triton lowers sm_120 `mma.sync ... block_scale`. |
+| nvfp4_moe, fp8_moe, ds_mla, kgdn1 | in the lab | |
+
+Lessons that changed the ports: `hl.barrier()` persistent kernels deadlock on silicon (use
+last-arriver merges or separate launches); Helion's autotuner checks a candidate's whole
+output, so nothing may stay `torch.empty`; pass `autotune_baseline_fn`, because without it a
+reference config runs in-process with no timeout; and `make()` must not build fresh weights per seed.
