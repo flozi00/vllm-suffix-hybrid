@@ -26,7 +26,7 @@ SFT_SCHEMA = {   # name: (default, lo, hi)
     "lr": (1e-3, 1e-7, 1.0), "offload_gib": (2.0, 0.0, 64.0), "min_free_gib": (1.0, 0.0, 64.0),
     "parity_window": (1024, 16, 65536), "mem_trace": (False, None, None), "host_ckpt": (False, None, None),
     "targets": ("", None, None), "lora_plus": (1.0, 1.0, 64.0), "diag": (False, None, None),
-    "profile": (False, None, None),
+    "profile": (False, None, None), "timing": (False, None, None),
 }
 SLICE_DEFAULTS = {"k": 0, "conc": [1], "gpu_memory_utilization": 0.8, "max_model_len": 65536}
 
@@ -65,6 +65,37 @@ def sft_env(s):
     if s["diag"]:
         env["SUFFIX_SFT_DIAG"] = "1"
     return env
+
+
+def _instrument():
+    """Synchronized wall timers (inclusive, seconds) around the twin's pieces and the frozen-op
+    autograd Functions; in-process engine, so the worker runs these very module objects."""
+    import collections
+    import functools
+
+    import torch
+    from suffix_hybrid.mtp_tune import train as T
+    from suffix_hybrid.sft import dsv41 as D
+    times = collections.defaultdict(float)
+
+    def wrap(fn, key):
+        @functools.wraps(fn)
+        def inner(*a, **kw):
+            torch.cuda.synchronize()
+            t = time.perf_counter()
+            try:
+                return fn(*a, **kw)
+            finally:
+                torch.cuda.synchronize()
+                times[key] += time.perf_counter() - t
+        return inner
+    for name in ("attention", "moe", "_mhc_pre", "_mhc_post", "engram", "engram_kv", "_select", "_compress",
+                 "_attend", "_index_k"):
+        setattr(D, name, wrap(getattr(D, name), name))
+    for cls in (T.FrozenExperts, T.FrozenLinear):
+        for m in ("forward", "backward"):
+            setattr(cls, m, staticmethod(wrap(getattr(cls, m), f"{cls.__name__}.{m}")))
+    return times
 
 
 def run(o, s, doc):
@@ -149,13 +180,13 @@ def run(o, s, doc):
                 loss += r["loss_sum"]
                 micro.append({k: r.get(k) for k in ("ms", "fwd_ms", "bwd_ms", "peak_gib", "fwd_peak_gib",
                                                      "free_gib", "host_pinned_gib", "tokens")})
-            if s["profile"] and step == 1:
-                from torch.profiler import ProfilerActivity, profile
-                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-                    rpc("micro", dict(ids=data[0][0], mask=data[0][1], seg_lens=[len(data[0][0])], norm=1e9))
-                ka = prof.key_averages()
-                doc["profile_cuda"] = ka.table(sort_by="cuda_time_total", row_limit=30, max_name_column_width=70)
-                doc["profile_cpu"] = ka.table(sort_by="cpu_time_total", row_limit=25, max_name_column_width=70)
+            if s["timing"] and step == 1:
+                times = _instrument()
+                t0 = time.perf_counter()
+                rpc("micro", dict(ids=data[0][0], mask=data[0][1], seg_lens=[len(data[0][0])], norm=1e9))
+                times["total"] = time.perf_counter() - t0
+                doc["timing_s"] = {k: round(v, 3) for k, v in sorted(times.items(), key=lambda kv: -kv[1])}
+                log(f"timing {doc['timing_s']}")
             g = rpc("step")
             row = dict(step=step, loss=round(loss / norm, 5), grad_norm=round(g["grad_norm"], 5),
                        step_ms=g["ms"], micro=micro)
