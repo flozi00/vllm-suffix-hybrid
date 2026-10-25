@@ -164,8 +164,11 @@ def test_segments_independent():
     with torch.no_grad():
         a = D.forward(tm_for(segs), inner, ids, pos)
         b = D.forward(tm_for(segs), inner, ids2, pos)
-    assert not torch.allclose(a[:13], b[:13])
-    torch.testing.assert_close(a[13:], b[13:], atol=1e-6, rtol=1e-6)
+    own = float((a[:13] - b[:13]).abs().max())
+    other = float((a[13:] - b[13:]).abs().max())
+    # a leak moves segment 2 by the order of segment 1's own change; rounding (expert GEMMs
+    # with a different row count, then fp8 KV flips) stays orders of magnitude below it
+    assert own > 0.1 and other < 1e-2 * own, (own, other)
 
 
 def test_indexer_long_matches_select_all_when_topk_covers():
