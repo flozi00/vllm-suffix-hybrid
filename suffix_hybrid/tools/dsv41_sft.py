@@ -26,7 +26,7 @@ SFT_SCHEMA = {   # name: (default, lo, hi)
     "lr": (1e-3, 1e-7, 1.0), "offload_gib": (2.0, 0.0, 64.0), "min_free_gib": (1.0, 0.0, 64.0),
     "parity_window": (1024, 16, 65536), "mem_trace": (False, None, None), "host_ckpt": (False, None, None),
     "targets": ("", None, None), "lora_plus": (1.0, 1.0, 64.0), "diag": (False, None, None),
-    "profile": (False, None, None), "timing": (False, None, None),
+    "profile": (False, None, None), "timing": (False, None, None), "cprofile": (False, None, None),
 }
 SLICE_DEFAULTS = {"k": 0, "conc": [1], "gpu_memory_utilization": 0.8, "max_model_len": 65536}
 
@@ -187,6 +187,17 @@ def run(o, s, doc):
                 times["total"] = time.perf_counter() - t0
                 doc["timing_s"] = {k: round(v, 3) for k, v in sorted(times.items(), key=lambda kv: -kv[1])}
                 log(f"timing {doc['timing_s']}")
+            if s["cprofile"] and step == 1:
+                import cProfile
+                import io
+                import pstats
+                pr = cProfile.Profile()
+                pr.enable()
+                rpc("micro", dict(ids=data[0][0], mask=data[0][1], seg_lens=[len(data[0][0])], norm=1e9))
+                pr.disable()
+                buf = io.StringIO()
+                pstats.Stats(pr, stream=buf).sort_stats("tottime").print_stats(45)
+                doc["cprofile"] = buf.getvalue()[-12000:]
             g = rpc("step")
             row = dict(step=step, loss=round(loss / norm, 5), grad_norm=round(g["grad_norm"], 5),
                        step_ms=g["ms"], micro=micro)
