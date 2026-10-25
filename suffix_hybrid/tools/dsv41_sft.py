@@ -99,7 +99,7 @@ def run(o, s, doc):
 
     def parity(ids, mask, tag):
         w = s["parity_window"]
-        ids, mask = ids[:w], mask[:w]
+        ids, mask = (ids[:w], mask[:w]) if any(mask[1:w]) else (ids[-w:], mask[-w:])
         a = served(ids, mask)
         r = rpc("eval", dict(ids=ids, mask=mask, seg_lens=[len(ids)], per_token=True))
         b = r["nll"]
