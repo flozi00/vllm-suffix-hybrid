@@ -117,6 +117,25 @@ def run(o, s, doc):
         mask = [0] * (s["seq_len"] // 2) + [1] * (s["seq_len"] - s["seq_len"] // 2)
         data.append((ids, mask))
     doc["parity_before"] = parity(*data[0], "before")
+    if s["diag"]:   # sensitivity: does the parity see each component? (corr of per-token NLL patterns)
+        ids, mask = data[0][0][:s["parity_window"]], data[0][1][:s["parity_window"]]
+        a = served(ids, mask)
+        variants = {"base": {}, "no_attn": {"dsv4_no_attn": 1}, "no_moe": {"dsv4_no_moe": 1},
+                    "no_engram": {"dsv4_no_engram": 1}, "no_comp": {"dsv4_no_comp": 1},
+                    "no_kvqdq": {"dsv4_no_kvqdq": 1}}
+        r = rpc("diag", dict(ids=ids, mask=mask, seg_lens=[len(ids)], variants=variants))
+
+        def corr(x, y):
+            mx, my = sum(x) / len(x), sum(y) / len(y)
+            cx = [v - mx for v in x]
+            cy = [v - my for v in y]
+            den = (sum(v * v for v in cx) * sum(v * v for v in cy)) ** 0.5
+            return sum(p * q for p, q in zip(cx, cy)) / den if den else float("nan")
+        sd = (sum((v - sum(a) / len(a)) ** 2 for v in a) / len(a)) ** 0.5
+        doc["diag"] = {"served_sd": round(sd, 6), **{k: dict(
+            corr=round(corr(a, v), 6), mean_delta=round(abs(sum(a) - sum(v)) / len(a), 6),
+            max_delta=round(max(abs(p - q) for p, q in zip(a, v)), 5)) for k, v in r["nll"].items()}}
+        log(f"diag {doc['diag']}")
     if s["steps"]:
         rpc("begin", dict(lr=s["lr"]))
         doc["steps"] = []

@@ -99,6 +99,13 @@ def install(lm, adapters):
 # ---------------------------------------------------------------------------
 # primitives
 # ---------------------------------------------------------------------------
+def _diag(key):
+    """Dev-only ablations (SUFFIX_SFT_DIAG=1 /v1/sft/diag, the dsv41_sft lab tool):
+    dsv4_no_attn / _no_moe / _no_engram / _no_comp / _no_kvqdq."""
+    from suffix_hybrid.sft import model as M
+    return bool(M.DIAG.get(key))
+
+
 def _lin(m, x):
     out = m(x)
     return out[0] if isinstance(out, tuple) else out
@@ -274,6 +281,8 @@ def attention(tm, a, x, pos, segs, carry):
         if a.indexer is not None:                    # index source: new selection
             sel = _select(a, qr, x, pos, segs, KI, r)
     Cl = copy_to_tp(C, g) if r else None
+    if r and _diag("dsv4_no_comp"):
+        Cl = Cl * 0
     sink = a.attn_sink[:a.n_local_heads]
     co = _c_offsets(segs, r) if r else None
     out = []
@@ -294,6 +303,8 @@ def attention(tm, a, x, pos, segs, carry):
     o = o.reshape(T, G, -1)
     z = torch.einsum("tgk,grk->tgr", o, a.wo_a.weight.view(G, a.o_lora_rank, -1))
     y = _lin(a.wo_b, z.flatten(1))
+    if _diag("dsv4_no_attn"):
+        y = y * 0
     return y, (C if r else None, KI if r else None, sel if r else None)
 
 
@@ -326,7 +337,8 @@ def moe(tm, sft, ffn, x):
         if lim:
             gt, up = gt.clamp(max=lim), up.clamp(-lim, lim)
         out = out + _lin(se.down_proj, (F.silu(gt) * up).to(x.dtype))
-    return reduce_from_tp(out, g)
+    out = reduce_from_tp(out, g)
+    return out * 0 if _diag("dsv4_no_moe") else out
 
 
 def engram_kv(inner, eng, hashes):
@@ -388,7 +400,8 @@ def forward(tm, inner, input_ids, positions, **_):
                 if layer.engram is not None:
                     if hashes is None:
                         raise RuntimeError("Engram layer without hashes")
-                    S = engram(layer.engram, S, engram_kv(inner, layer.engram, hashes))
+                    if not _diag("dsv4_no_engram"):
+                        S = engram(layer.engram, S, engram_kv(inner, layer.engram, hashes))
                 post, comb, li, pre_a = _mhc_pre(layer, S, layer.hc_attn_fn, layer.hc_attn_scale,
                                                  layer.hc_attn_base, pre)
             x = _rms(li, layer.attn_norm.weight, layer.attn_norm.variance_epsilon)
