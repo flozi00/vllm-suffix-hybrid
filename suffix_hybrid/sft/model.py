@@ -453,11 +453,17 @@ class _HostCkpt(torch.autograd.Function):
     ``gradient_checkpointing(offload=True)`` does. It also cannot be expressed
     with ``saved_tensors_hooks``: checkpoint installs its own hooks inside the
     region and shadows any outer ones.
+
+    Outputs and gradients stay on the device: nothing saves an output (the
+    next layer parks its own copy of it on the host), so it is freed once the
+    caller rebinds it, and no gradient crosses PCIe (a host round trip per
+    layer of pageable grads cost ~2 s per 2k-token step on DeepSeek-V4.1).
     """
 
     @staticmethod
     def forward(ctx, fn, device, dummy, mod, *args):
         ctx.fn, ctx.device, ctx.mod = fn, device, mod
+        ctx.on_dev = [torch.is_tensor(a) and a.is_cuda for a in args]
         ctx.host = []
         for a in args:
             if torch.is_tensor(a) and a.is_floating_point():
@@ -470,9 +476,7 @@ class _HostCkpt(torch.autograd.Function):
             out = fn(*dev)
         if not isinstance(out, tuple):
             out = (out,)
-        # Return host tensors: the graph then holds host memory between layers,
-        # so no device activation survives the forward.
-        return tuple(_to_host(o, non_blocking=True) if torch.is_tensor(o) else o for o in out)
+        return out
 
     @staticmethod
     def backward(ctx, *grads):
@@ -487,7 +491,7 @@ class _HostCkpt(torch.autograd.Function):
             out = (out,)
         need = [a for a in args if torch.is_tensor(a) and a.is_floating_point()]
         # only differentiable outputs (int carries, no-grad side outputs are skipped)
-        pairs = [(o, x.to(ctx.device, non_blocking=False)) for o, x in zip(out, grads)
+        pairs = [(o, x.to(ctx.device, non_blocking=True)) for o, x in zip(out, grads)
                  if torch.is_tensor(o) and o.requires_grad and torch.is_tensor(x)]
         outs, g = [o for o, _ in pairs], [x for _, x in pairs]
         # ONE backward pass: the recomputed inputs are leaves (requires_grad_
@@ -497,11 +501,12 @@ class _HostCkpt(torch.autograd.Function):
         got = [a.grad for a in need]
         if ctx.mod is not None:
             _swap_out(ctx.mod)   # only after the recompute's gradient is taken
-        # inputs were host tensors, so their gradients must be host tensors too
-        got = [x.to("cpu", non_blocking=False) if torch.is_tensor(x) else x for x in got]
+        # each gradient on its input's device (host inputs: the first layer of a CPU test)
         it = iter(got)
         return (None, None, None, None) + tuple(
-            next(it) if (torch.is_tensor(a) and a.is_floating_point()) else None for a in args)
+            ((lambda x: x if (dev or x is None) else x.cpu())(next(it)))
+            if (torch.is_tensor(a) and a.is_floating_point()) else None
+            for a, dev in zip(args, ctx.on_dev))
 
 
 class TrainMode(contextlib.ContextDecorator):
