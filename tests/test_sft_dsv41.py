@@ -152,14 +152,20 @@ def test_forward_and_grad_reach():
 
 
 def test_segments_independent():
-    """Packed segments never see each other: segment 2 alone == segment 2 packed."""
+    """Packed segments never see each other: changing segment 1's tokens leaves segment 2's
+    rows unchanged (same packing, so the same reductions: any difference is a leak, not
+    rounding; packed-vs-alone comparisons flip fp8 KV / bf16 roundings across platforms)."""
     inner = model()
     ids = torch.randint(3, 100, (30,))
+    ids2 = ids.clone()
+    ids2[:13] = torch.randint(3, 100, (13,))
     pos = torch.cat([torch.arange(13), torch.arange(17)])
+    segs = [(0, 13), (13, 30)]
     with torch.no_grad():
-        both = D.forward(tm_for([(0, 13), (13, 30)]), inner, ids, pos)
-        alone = D.forward(tm_for([(0, 17)]), inner, ids[13:], pos[13:])
-    torch.testing.assert_close(both[13:], alone, atol=1e-4, rtol=1e-3)   # fp32 reduction order only
+        a = D.forward(tm_for(segs), inner, ids, pos)
+        b = D.forward(tm_for(segs), inner, ids2, pos)
+    assert not torch.allclose(a[:13], b[:13])
+    torch.testing.assert_close(a[13:], b[13:], atol=1e-6, rtol=1e-6)
 
 
 def test_indexer_long_matches_select_all_when_topk_covers():
