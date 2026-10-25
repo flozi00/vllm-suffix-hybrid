@@ -414,6 +414,8 @@ def forward(tm, inner, input_ids, positions, **_):
         a, ffn = layer.attn, layer.ffn
 
         def body(y, S, post, comb, pre, C, KI, sel):
+            if sel is not None:          # int carry: host checkpoints only move float inputs
+                sel = sel.to(pos.device, non_blocking=True)
             if idx == 0:
                 S = y.unsqueeze(1).expand(-1, layer.hc_mult, -1).contiguous()
                 post, comb, li, pre_a = _mhc_pre(layer, S, layer.hc_attn_fn_broadcast, layer.hc_attn_scale,
