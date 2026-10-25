@@ -215,3 +215,30 @@ def test_clamped_experts_backward():
     rx, rt = torch.autograd.grad(ref, (x2, tw2), gy)
     torch.testing.assert_close(gx, rx, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(gt, rt, atol=1e-4, rtol=1e-4)
+
+
+def test_host_ckpt_grads_match_plain():
+    """_HostCkpt (inputs/outputs parked on the host, one backward pass) gives the same input and
+    leaf gradients as no checkpointing, with an int carry and a None among the outputs."""
+    from suffix_hybrid.sft.model import _HostCkpt
+    torch.manual_seed(3)
+    w = torch.randn(6, 6, requires_grad=True)          # stands in for the LoRA flat param
+    x0 = torch.randn(4, 6, requires_grad=True)
+
+    def fn(x, c):
+        y = torch.tanh(x @ w) + c
+        return y, (y.sum(-1) > 0).long(), None, y * 2
+
+    def run(ckpt):
+        w.grad = None
+        x = x0 * 1.5
+        c = x0[:, :1] * 0.5
+        dummy = torch.zeros(1, requires_grad=True)
+        out = _HostCkpt.apply(fn, "cpu", dummy, None, x, c) if ckpt else fn(x, c)
+        (out[0].square().sum() + out[3].sum()).backward()
+        return w.grad.clone(), x0.grad.clone()
+    a = run(False)
+    x0.grad = None
+    b = run(True)
+    for p, q in zip(a, b):
+        torch.testing.assert_close(p, q)

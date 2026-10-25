@@ -476,8 +476,8 @@ class _HostCkpt(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
-        args = [h.to(ctx.device, non_blocking=True) if torch.is_tensor(h) else h
-                for h in ctx.host]
+        args = [h.to(ctx.device, non_blocking=True).detach() if torch.is_tensor(h) else h
+                for h in ctx.host]   # detach: fresh leaves even when .to() is a no-op
         for a in args:
             if torch.is_tensor(a) and a.is_floating_point():
                 a.requires_grad_(True)
@@ -490,10 +490,11 @@ class _HostCkpt(torch.autograd.Function):
         pairs = [(o, x.to(ctx.device, non_blocking=False)) for o, x in zip(out, grads)
                  if torch.is_tensor(o) and o.requires_grad and torch.is_tensor(x)]
         outs, g = [o for o, _ in pairs], [x for _, x in pairs]
-        # autograd.grad only fills the *input* grads; the LoRA leaves need
-        # autograd.backward to accumulate into .grad, so do both.
-        torch.autograd.backward(outs, g, retain_graph=True)
-        got = torch.autograd.grad(outs, need, g, allow_unused=True)
+        # ONE backward pass: the recomputed inputs are leaves (requires_grad_
+        # above), so backward accumulates their .grad next to the LoRA leaves'
+        # (autograd.backward + autograd.grad would traverse the layer twice)
+        torch.autograd.backward(outs, g)
+        got = [a.grad for a in need]
         if ctx.mod is not None:
             _swap_out(ctx.mod)   # only after the recompute's gradient is taken
         # inputs were host tensors, so their gradients must be host tensors too
