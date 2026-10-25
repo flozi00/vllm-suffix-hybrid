@@ -234,30 +234,45 @@ def _select(a, qr, x, pos, segs, KI, r):
         return sel
 
 
-def _attend(q, kvl, C, sel, pos0, n_c_vis_r, sink, scale, window):
-    """One query chunk: q [t, H, D]; kvl [n, D] (segment window keys);
-    C [nc, D] or None; sel [t, K] or None (all visible); pos0 = first row."""
+def _attend(q, kw, lo, C, cmask, r0, sink, scale, window):
+    """One query chunk, no per-row key copies: q [t, H, D] at segment
+    positions r0..r0+t-1; kw [r1 - lo, D] = the segment's window keys at
+    positions lo..r1-1 (contiguous slice, band-masked); C [nc, D] the
+    segment's compressed entries or None, cmask [t, nc] bool = visible and
+    selected. One softmax over window + compressed + the per-head sink."""
     t, h, _ = q.shape
     dev = q.device
-    p = pos0 + torch.arange(t, device=dev)
-    w = p[:, None] - torch.arange(window, device=dev)[None]
-    keys, valid = [kvl[w.clamp_min(0)]], [w >= 0]
+    p = r0 + torch.arange(t, device=dev)
+    d = p[:, None] - (lo + torch.arange(kw.shape[0], device=dev))[None]
+    qf = q.float()
+    kwf = kw.float()
+    s = torch.einsum("thd,kd->thk", qf, kwf) * scale
+    s = s.masked_fill(~((d >= 0) & (d < window))[:, None, :], float("-inf"))
+    parts = [s]
     if C is not None:
-        r = n_c_vis_r
-        if sel is None:
-            j = torch.arange(C.shape[0], device=dev)[None].expand(t, -1)
-            ok = j < ((p[:, None] + 1) // r)
-        else:
-            j, ok = sel.clamp_min(0), sel >= 0
-        keys.append(C[j])
-        valid.append(ok)
-    K = torch.cat(keys, 1).float()                                      # [t, W(+K), D]
-    m = torch.cat(valid, 1)
-    s = torch.einsum("thd,tkd->thk", q.float(), K) * scale
-    s = s.masked_fill(~m[:, None, :], float("-inf"))
-    s = torch.cat([s, sink.float().view(1, h, 1).expand(t, h, 1)], -1)
-    pr = torch.softmax(s, -1)[..., :-1]
-    return torch.einsum("thk,tkd->thd", pr, K).to(q.dtype)
+        Cf = C.float()
+        sc = torch.einsum("thd,jd->thj", qf, Cf) * scale
+        parts.append(sc.masked_fill(~cmask[:, None, :], float("-inf")))
+    parts.append(sink.float().view(1, h, 1).expand(t, h, 1))
+    pr = torch.softmax(torch.cat(parts, -1), -1)
+    nw = kw.shape[0]
+    o = torch.einsum("thk,kd->thd", pr[..., :nw], kwf)
+    if C is not None:
+        o = o + torch.einsum("thj,jd->thd", pr[..., nw:nw + C.shape[0]], Cf)
+    return o.to(q.dtype)
+
+
+def _cmask(p, nc, r, sel):
+    """[t, nc] bool: compressed entry j visible (j < (p + 1) // r) and, with
+    an indexer selection sel [t, K] (-1 padded), selected."""
+    with torch.no_grad():
+        j = torch.arange(nc, device=p.device)
+        m = j[None] < ((p[:, None] + 1) // r)
+        if sel is not None:
+            pick = torch.zeros(p.shape[0], nc + 1, dtype=torch.bool, device=p.device)
+            pick.scatter_(1, torch.where(sel >= 0, sel, nc), True)
+            m &= pick[:, :nc]
+        return m
 
 
 def attention(tm, a, x, pos, segs, carry):
@@ -286,13 +301,21 @@ def attention(tm, a, x, pos, segs, carry):
     sink = a.attn_sink[:a.n_local_heads]
     co = _c_offsets(segs, r) if r else None
     out = []
+    W = a.window_size
     for i, (s, e) in enumerate(segs):
         n = e - s
-        Cs = Cl[co[i]:co[i] + n // r] if r else None
-        for r0 in range(0, n, Q_CHUNK):
-            r1 = min(n, r0 + Q_CHUNK)
-            ss = None if (not r or sel is None) else sel[s + r0:s + r1]
-            args = (q[s + r0:s + r1], kvl[s:e], Cs, ss, r0, r, sink, a.scale, a.window_size)
+        nc = n // r if r else 0
+        Cs = Cl[co[i]:co[i] + nc] if r else None
+        # score rows bounded at ~64M fp32 elements per chunk (quadratic in nc: ponytail,
+        # a gather path for > 64k-token segments if training ever needs them)
+        step = max(16, min(Q_CHUNK, (1 << 26) // max(1, a.n_local_heads * (nc + Q_CHUNK + W))))
+        for r0 in range(0, n, step):
+            r1 = min(n, r0 + step)
+            lo = max(0, r0 - W + 1)
+            cm = None
+            if r:
+                cm = _cmask(pos[s + r0:s + r1], nc, r, None if sel is None else sel[s + r0:s + r1])
+            args = (q[s + r0:s + r1], kvl[s + lo:s + r1], lo, Cs, cm, r0, sink, a.scale, W)
             if torch.is_grad_enabled():
                 out.append(checkpoint(_attend, *args, use_reentrant=False))
             else:
@@ -416,7 +439,7 @@ def forward(tm, inner, input_ids, positions, **_):
 
     y, S, post, comb, pre, C, KI, sel = e, None, None, None, None, None, None, None
     for idx, layer in enumerate(layers):
-        run = tm._checkpointed(make(idx, layer), last=False, mod=layer)
+        run = tm._checkpointed(make(idx, layer), last=idx == len(layers) - 1, mod=layer)
         y, S, post, comb, pre, C, KI, sel = run(y, S, post, comb, pre, C, KI, sel)
     S = _mhc_post(y, S, post, comb)
     h = (pre.unsqueeze(-1) * S.float()).sum(1).to(S.dtype)
