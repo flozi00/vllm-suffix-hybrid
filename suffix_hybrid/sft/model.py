@@ -417,13 +417,16 @@ class _Unpark(torch.autograd.Function):
         return g, None
 
 
-def _to_host(t):
-    """Pinned host copy of a device tensor (pageable if the pinned pool is full)."""
+def _to_host(t, non_blocking=False):
+    """Pinned host copy of a device tensor (pageable if the pinned pool is full).
+    non_blocking only for copies the CPU never reads (they come back to the
+    device on the same stream, so stream order makes them safe)."""
     try:
         h = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
     except RuntimeError:
         h = torch.empty(t.shape, dtype=t.dtype)
-    h.copy_(t.detach(), non_blocking=False)
+        non_blocking = False
+    h.copy_(t.detach(), non_blocking=non_blocking)
     return h
 
 
@@ -458,22 +461,22 @@ class _HostCkpt(torch.autograd.Function):
         ctx.host = []
         for a in args:
             if torch.is_tensor(a) and a.is_floating_point():
-                h = a if not a.is_cuda else _to_host(a)
+                h = a if not a.is_cuda else _to_host(a, non_blocking=True)
                 ctx.host.append(h)
             else:
                 ctx.host.append(a)
-        dev = [h.to(device, non_blocking=False) if torch.is_tensor(h) else h for h in ctx.host]
+        dev = [h.to(device, non_blocking=True) if torch.is_tensor(h) else h for h in ctx.host]
         with torch.no_grad():
             out = fn(*dev)
         if not isinstance(out, tuple):
             out = (out,)
         # Return host tensors: the graph then holds host memory between layers,
         # so no device activation survives the forward.
-        return tuple(_to_host(o) if torch.is_tensor(o) else o for o in out)
+        return tuple(_to_host(o, non_blocking=True) if torch.is_tensor(o) else o for o in out)
 
     @staticmethod
     def backward(ctx, *grads):
-        args = [h.to(ctx.device, non_blocking=False) if torch.is_tensor(h) else h
+        args = [h.to(ctx.device, non_blocking=True) if torch.is_tensor(h) else h
                 for h in ctx.host]
         for a in args:
             if torch.is_tensor(a) and a.is_floating_point():

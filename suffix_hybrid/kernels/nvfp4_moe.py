@@ -132,6 +132,8 @@ CLI (in-pod, SM120 + oxide bundle):
 """
 from __future__ import annotations
 
+import functools
+
 import os
 import sys
 import zlib
@@ -292,6 +294,15 @@ def _bf(t):
     return t.to(torch.bfloat16).to(t.dtype)
 
 
+@functools.lru_cache(maxsize=None)
+def _consts(device):
+    """Per-device constant tensors of the torch reference (built once: a
+    torch.tensor(..., device=cuda) per call is a synchronous H2D copy)."""
+    import torch
+    return (torch.tensor(_MID, device=device), torch.arange(7, device=device) % 2 == 1,
+            torch.tensor(_E2M1 + tuple(-v for v in _E2M1), device=device))
+
+
 def quant_codes(x, g: float):
     """f32 [R, K] -> (packed uint8 [R, K/2] low-nibble-even, sf e4m3 bits
     uint8 [R, K/16]) — vLLM scaled_fp4_quant: sf = e4m3(amax16*g/6),
@@ -299,7 +310,7 @@ def quant_codes(x, g: float):
     import torch
     r, k = x.shape
     blk = x.float().reshape(r, k // 16, 16)
-    g = torch.tensor(g, dtype=torch.float32, device=x.device)
+    g = torch.full((), g, dtype=torch.float32, device=x.device)
     amax = blk.abs().amax(-1)
     # g / 6 as tensor / tensor: IEEE division like the kernel (torch turns
     # tensor / python-scalar into a reciprocal multiply, 1 ulp off for some g)
@@ -307,8 +318,7 @@ def quant_codes(x, g: float):
     sf = sf8.float()
     inv = torch.where(sf == 0, torch.zeros_like(sf), g / torch.where(sf == 0, 1.0, sf))
     s = blk * inv[..., None]
-    mid = torch.tensor(_MID, device=x.device)
-    odd = torch.arange(7, device=x.device) % 2 == 1
+    mid, odd, _ = _consts(x.device)
     a = s.abs().clamp(max=6.0)[..., None]
     mag = (a > mid).sum(-1) + ((a == mid) & odd).sum(-1)
     code = (mag | torch.where(s < 0, 8, 0)).to(torch.uint8).reshape(r, k)
@@ -319,7 +329,7 @@ def quant_codes(x, g: float):
 def dequant(packed, sf):
     """(packed uint8 [R, K/2], sf f32 [R, K/16]) -> f32 [R, K] (no 1/g)."""
     import torch
-    lut = torch.tensor(_E2M1 + tuple(-v for v in _E2M1), device=packed.device)
+    lut = _consts(packed.device)[2]
     r, k = packed.shape[0], packed.shape[1] * 2  # explicit: R may be 0 (all off-rank)
     code = torch.stack([packed & 0xF, packed >> 4], -1).reshape(r, k)
     val = lut[code.long()]
