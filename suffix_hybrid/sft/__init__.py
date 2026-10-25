@@ -44,6 +44,10 @@ Env (all optional)
                                 inputs per micro-step (0 = keep on GPU); the
                                 pod's RAM limit also holds vLLM + the master /
                                 AdamW state (12 B per adapter param)
+  SUFFIX_SFT_HOST_RESERVE_GIB=16 with SUFFIX_SFT_HOST_CKPT=1: a micro-step whose
+                                pinned host checkpoints (all ranks of the pod) would
+                                leave less than this in the container is refused
+                                (fail closed: a cgroup OOM kills the serving pod)
   SUFFIX_SFT_DUTY=0.5           training share of GPU time while serving
   SUFFIX_SFT_MAX_EXAMPLES=256 / _MAX_STEPS=1000
   SUFFIX_SFT_REPO_ID=<org/name> private HF model repo for checkpoints
@@ -100,6 +104,7 @@ class Config:
     offload_saved: bool = False
     mem_trace: bool = False
     host_ckpt: bool = False
+    host_reserve_gib: float = 16.0
     swap_keep: int = 0
     saved_min_mb: int = 1
     free_kv: bool = False
@@ -126,6 +131,7 @@ class Config:
                    offload_saved=bool(int(_env("OFFLOAD_SAVED", 0))),
                    mem_trace=bool(int(_env("MEM_TRACE", 0))),
                    host_ckpt=bool(int(_env("HOST_CKPT", 0))),
+                   host_reserve_gib=float(_env("HOST_RESERVE_GIB", 16)),
                    swap_keep=int(_env("SWAP_KEEP", 0)),
                    saved_min_mb=int(_env("SAVED_MIN_MB", 1)),
                    free_kv=bool(int(_env("FREE_KV", 0))),

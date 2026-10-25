@@ -1190,3 +1190,21 @@ def test_sft_token_guards_mutating_routes(tmp_path, monkeypatch):
     monkeypatch.delenv("SUFFIX_SFT_TOKEN")
     asyncio.run(A.SftEndpointPlugin().init_state(object(), {}, types.SimpleNamespace(api_key=None)))
     assert A._S is None
+
+
+def test_host_vote_refuses_what_the_container_cannot_hold(tmp_path, monkeypatch):
+    """SUFFIX_SFT_HOST_CKPT: a micro-step whose pinned host checkpoints exceed the cgroup
+    headroom (minus the reserve) is refused with MemoryError naming the fitting token count;
+    one that fits passes; no cgroup limit -> no check."""
+    import pytest
+    sft = sft_for(build())
+    sft.cfg.host_ckpt, sft.cfg.host_reserve_gib = True, 1.0
+    per = sft.host_bytes_per_token()
+    assert per > 0
+    monkeypatch.setattr(W, "_pinned_reserved", lambda: 0)
+    monkeypatch.setattr(W, "_cgroup_headroom", lambda: 2**30 + 100 * per)
+    sft._host_vote(100)
+    with pytest.raises(MemoryError, match="at most ~100 tokens"):
+        sft._host_vote(101)
+    monkeypatch.setattr(W, "_cgroup_headroom", lambda: None)
+    sft._host_vote(10**9)
