@@ -712,10 +712,17 @@ class TrainMode(contextlib.ContextDecorator):
                 self.offload_left -= size
                 parked = {k: [] for k in keys}
 
+            # the body is kept by the checkpoint (ctx.fn) until backward: it must not
+            # hold the float inputs themselves (they arrive as `vals`), or every
+            # layer's device input outlives the forward
+            key_set = set(keys)
+            rest = [None if i in key_set else v for i, v in enumerate(args)]
+            rest_kw = {k: (None if k in key_set else v) for k, v in kwargs.items()}
+
             def body(*vals):
                 got = {k: (_Unpark.apply(v, parked[k]) if parked else v) for k, v in zip(keys, vals)}
-                a = [got.get(i, v) for i, v in enumerate(args)]
-                kw = {k: got.get(k, v) for k, v in kwargs.items()}
+                a = [got.get(i, v) for i, v in enumerate(rest)]
+                kw = {k: got.get(k, v) for k, v in rest_kw.items()}
                 if self.mem_trace:
                     self._trace_n += 1
                     free, _ = torch.cuda.mem_get_info()
