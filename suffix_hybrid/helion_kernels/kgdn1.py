@@ -43,14 +43,17 @@ V-tiled bodies (kgdn1_decode_vt / kgdn1_verify_vt): the parallel grid is
 64). The delta-rule update is row-independent (pk, pq: per-row dots over K;
 q/k norms and k.q recomputed per program), so each program reads and writes
 only its V rows of the state (verify: same slot semantics, token loop per
-program). The RMS norm couples all V rows, so the bodies write unnormalized
-f32 o to a per-call ``torch.empty`` scratch (graph-private under capture, no
-module-level buffer) and their host code then launches the gated norm
-(``torch.ops.suffix_kgdn1.vt_norm``: a Helion kernel at NORM_CONFIG, one [V]
-row per program, out = bf16(o * rsqrt(mean(o^2) + eps) * norm_w * gate)).
-Two launches, one body: the tuner tunes and times the composite that serves.
-(A Helion body cannot call another Helion kernel, and top-level loops of one
-body run concurrently, hence the custom op boundary.)
+program). The RMS norm couples all V rows, so the bodies only write
+unnormalized f32 o to a per-call ``torch.empty`` scratch (graph-private under
+capture, no module-level buffer) and return (o, state); nothing runs after
+their device loop. The gated norm is its own Helion kernel
+(kgdn1_vt_norm / kgdn1_vt_norm_seq at NORM_CONFIG, one [V] row per program,
+out = bf16(o * rsqrt(mean(o^2) + eps) * norm_w * gate)), launched by plain
+Python right after the body (``vt_post``). Two launches, no nesting (Helion
+refuses a kernel call inside a body, and a host-side op that compiles a
+Helion kernel fails under the real compiler's host trace). The tuner's
+optional KERNELS ``post`` field makes it check and time body + post while it
+autotunes only the body.
 
 Serving: ``decode_op`` / ``verify_op`` (called by the lane only when
 SUFFIX_HELION_KGDN1 != oxide) route per numtokens / sequence bucket.
@@ -80,7 +83,7 @@ except ImportError:  # CPU / no-Helion host: module stays importable (lab ABI, t
 ENV = "SUFFIX_HELION_KGDN1"
 KERNEL = "kgdn1_decode"
 VERIFY_KERNEL = "kgdn1_verify"
-KERNEL_VT = "kgdn1_decode_vt"          # V-tiled bodies (+ the gated-norm launch)
+KERNEL_VT = "kgdn1_decode_vt"          # V-tiled bodies (+ the gated-norm launch, vt_post)
 VERIFY_KERNEL_VT = "kgdn1_verify_vt"
 # The norm launch's fixed config (never tuned: one [V] row per program).
 # ponytail: fixed num_warps; give it a KERNELS entry if the lab shows it matters.
@@ -244,33 +247,36 @@ def kgdn1_vt_norm_seq(o, z, norm_w, out, cu_lo, cu_hi, eps: float, act: hl.const
 _NORM_KERNELS: dict = {}
 
 
-@torch.library.custom_op("suffix_kgdn1::vt_norm", mutates_args=("out",))
-def vt_norm(o: torch.Tensor, z: torch.Tensor, norm_w: torch.Tensor, out: torch.Tensor,
-            cu_lo: torch.Tensor | None, cu_hi: torch.Tensor | None, eps: float,
-            act: int) -> None:
-    """The V-tiled bodies' second launch (decode: cu_lo None; verify: o 5-D)."""
-    body, extra = ((kgdn1_vt_norm, ()) if cu_lo is None
-                   else (kgdn1_vt_norm_seq, (cu_lo, cu_hi)))
-    from helion.runtime.ref_mode import ref_mode_tls
-    if getattr(ref_mode_tls, "context", None) is not None:
-        body(o, z, norm_w, out, *extra, eps, act)  # interpret mode: inside the caller's context
-        return
+def _norm_kernel(body):
+    """The norm launch at its fixed config (compiled once per process)."""
     kern = _NORM_KERNELS.get(body)
     if kern is None:
         kern = _NORM_KERNELS[body] = helion.kernel(
             body, config=helion.Config(**NORM_CONFIG), static_shapes=False)
-    kern(o, z, norm_w, out, *extra, eps, act)
+    return kern
 
 
-@vt_norm.register_fake
-def _(o, z, norm_w, out, cu_lo, cu_hi, eps, act):
-    return None
+def vt_post(res, q, k, v, b, a, z, a_log, dt_bias, norm_w, state, state_idx, out, scale, eps,
+            act):
+    """kgdn1_decode_vt's second launch: (o, state) -> (out, state)."""
+    o, state = res
+    _norm_kernel(kgdn1_vt_norm)(o, z, norm_w, out, eps, act)
+    return out, state
+
+
+def verify_vt_post(res, q, k, v, b, a, z, a_log, dt_bias, norm_w, state, state_idx, cu_lo,
+                   cu_hi, acc, out, scale, eps, act):
+    """kgdn1_verify_vt's second launch: (o, state) -> (out, state)."""
+    o, state = res
+    _norm_kernel(kgdn1_vt_norm_seq)(o, z, norm_w, out, cu_lo, cu_hi, eps, act)
+    return out, state
 
 
 def kgdn1_decode_vt(q, k, v, b, a, z, a_log, dt_bias, norm_w, state, state_idx, out,
-                    scale: float, eps: hl.constexpr, act: hl.constexpr):
-    """kgdn1_decode, V-tiled (same args, same results): grid (t, h, g, V tile).
-    eps is constexpr here: the host-side norm call needs a concrete float."""
+                    scale: float, eps: float, act: hl.constexpr):
+    """kgdn1_decode's args, V-tiled: grid (t, h, g, V tile). Updates the state
+    in place and returns (o f32 [T, H, G, V] unnormalized, state); z, norm_w,
+    out, eps, act are vt_post's (unused here). NULL slot: o row 0 (-> out 0)."""
     T, H, K = q.shape
     G, V = v.shape[2], v.shape[3]
     K = hl.specialize(K)
@@ -298,14 +304,14 @@ def kgdn1_decode_vt(q, k, v, b, a, z, a_log, dt_bias, norm_w, state, state_idx, 
             o[t, h, g, tv] = pq + dv * kq
         else:
             o[t, h, g, tv] = hl.zeros([tv], dtype=torch.float32)  # norm(0) = 0: zero row
-    torch.ops.suffix_kgdn1.vt_norm(o, z, norm_w, out, None, None, eps, act)
-    return out, state
+    return o, state
 
 
 def kgdn1_verify_vt(q, k, v, b, a, z, a_log, dt_bias, norm_w, state, state_idx, cu_lo, cu_hi,
-                    acc, out, scale: float, eps: hl.constexpr, act: hl.constexpr):
-    """kgdn1_verify, V-tiled (same args, same results): grid (n, h, g, V tile);
-    each program runs the W-token recurrence on its V rows of the state."""
+                    acc, out, scale: float, eps: float, act: hl.constexpr):
+    """kgdn1_verify's args, V-tiled: grid (n, h, g, V tile); each program runs
+    the W-token recurrence on its V rows of the state. Returns (o f32
+    [N, W, H, G, V] unnormalized, sequence-major; state); verify_vt_post norms."""
     T, H, K = q.shape
     G, V = v.shape[2], v.shape[3]
     N, W = state_idx.shape
@@ -343,11 +349,12 @@ def kgdn1_verify_vt(q, k, v, b, a, z, a_log, dt_bias, norm_w, state, state_idx, 
                     if dst > 0:
                         state[dst, h, g, tv, :] = s
                     o[n, i, h, g, tv] = pq + dv * kq
+                else:  # never read by the norm; written so no output stays torch.empty
+                    o[n, i, h, g, tv] = hl.zeros([tv], dtype=torch.float32)
         else:
             for i in hl.static_range(W):
                 o[n, i, h, g, tv] = hl.zeros([tv], dtype=torch.float32)
-    torch.ops.suffix_kgdn1.vt_norm(o, z, norm_w, out, cu_lo, cu_hi, eps, act)
-    return out, state
+    return o, state
 
 
 def body_args(mixed_qkv, z, ba, a_log, dt_bias, norm_w, state, state_idx, out, num_k_heads):
@@ -396,12 +403,8 @@ def _check_pool(state):
                            f"(S={S}, page {state.stride(0)}); run {ENV}=oxide")
 
 
-def _ignore() -> list:
-    """The V-tiled bodies' host-side norm launch is intended (not fused)."""
-    return [helion.exc.TensorOperationInWrapper] if helion is not None else []
-
-
 DECODE_BODIES = ((KERNEL, kgdn1_decode), (KERNEL_VT, kgdn1_decode_vt))  # pick order
+POSTS = {KERNEL_VT: vt_post, VERIFY_KERNEL_VT: verify_vt_post}
 VERIFY_BODIES = ((VERIFY_KERNEL, kgdn1_verify), (VERIFY_KERNEL_VT, kgdn1_verify_vt))
 
 
@@ -416,8 +419,9 @@ def _compiled(bodies, c):
     if name is None:
         raise KeyError(f"{hk.MARKER} no tuned {' / '.join(n for n, _ in bodies)} config for "
                        f"{hk.case_key(c)} on {hk.platform()}")
-    vt = {"ignore_warnings": _ignore()} if name in (KERNEL_VT, VERIFY_KERNEL_VT) else {}
-    return hk.compiled(dict(bodies)[name], name, c, **vt)
+    kern = hk.compiled(dict(bodies)[name], name, c)
+    post = POSTS.get(name)
+    return kern if post is None else (lambda *args: post(kern(*args), *args))
 
 
 def gdn_decode_fused_helion(mixed_qkv, z, ba, a_log, dt_bias, norm_w, state, state_idx,
@@ -722,8 +726,7 @@ KERNELS = [
                   r"fused_sigmoid_gating_delta_rule_update_kernel", r"^layer_norm_fwd_kernel"]},
 ]
 # V-tiled bodies: same cases, reference, baseline and check; tuned and timed
-# next to the full-tile ones (the composite incl. the norm launch).
-KERNELS += [dict(KERNELS[0], name=KERNEL_VT, body=kgdn1_decode_vt,
-                 settings={"ignore_warnings": _ignore()}),
-            dict(KERNELS[1], name=VERIFY_KERNEL_VT, body=kgdn1_verify_vt,
-                 settings={"ignore_warnings": _ignore()})]
+# next to the full-tile ones; `post` (helion_tune: checked and timed as body +
+# post, only the body autotuned) adds the norm launch.
+KERNELS += [dict(KERNELS[0], name=KERNEL_VT, body=kgdn1_decode_vt, post=vt_post),
+            dict(KERNELS[1], name=VERIFY_KERNEL_VT, body=kgdn1_verify_vt, post=verify_vt_post)]

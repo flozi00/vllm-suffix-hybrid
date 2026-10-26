@@ -40,8 +40,9 @@ def _args(T, H, HV, K, seed=0, idx=None, act=0):
 def test_kernels_abi():
     dec, ver, dec_vt, ver_vt = kgdn1.KERNELS
     for vt, full in ((dec_vt, dec), (ver_vt, ver)):  # same cases / reference / baseline / check
-        assert {k: v for k, v in vt.items() if k not in ("name", "body", "settings")} == {
+        assert {k: v for k, v in vt.items() if k not in ("name", "body", "post")} == {
             k: v for k, v in full.items() if k not in ("name", "body")}
+        assert callable(vt["post"]) and "post" not in full
     for ent, name, body in ((dec, kgdn1.KERNEL, "kgdn1_decode"),
                             (ver, kgdn1.VERIFY_KERNEL, "kgdn1_verify"),
                             (dec_vt, kgdn1.KERNEL_VT, "kgdn1_decode_vt"),
@@ -518,9 +519,11 @@ V_BLOCKS = (16, 32, 64)
 
 
 def _vt(body, v_block):
+    """The serving composite at a V tile: the V-tiled body, then its post (norm launch)."""
     helion = pytest.importorskip("helion")
-    return helion.kernel(body, config=helion.Config(v_block=v_block),
-                         ignore_warnings=kgdn1._ignore())
+    kern = helion.kernel(body, config=helion.Config(v_block=v_block))
+    post = {kgdn1.kgdn1_decode_vt: kgdn1.vt_post, kgdn1.kgdn1_verify_vt: kgdn1.verify_vt_post}[body]
+    return lambda *args: post(kern(*args), *args)
 
 
 def _clone(args):
@@ -612,37 +615,116 @@ def test_verify_vt_random_accepted_qwen4exp_tp2(v_block):
         assert ok, (seed, msg)
 
 
-@pytest.mark.parametrize("static", [True, False])
-def test_vt_bodies_lower_to_triton(static):
+def _host_run(body, args, config, static):
+    """Helion's real (non-interpret) path minus Triton: bind (type propagation +
+    the host trace), Triton codegen at `config`, then exec the generated module
+    with triton stubbed and call its HOST function with a recording launcher.
+    The kernel never runs; everything the host code does runs on CPU, so a host
+    call that compiles or launches anything besides the one kernel shows up."""
+    import types
     helion = pytest.importorskip("helion")
     from helion.runtime.ref_mode import RefMode
+    bound = helion.kernel(body, static_shapes=static, ref_mode=RefMode.OFF).bind(tuple(args))
+    src = bound.to_triton_code(helion.Config(**{**bound.config_spec.default_config().config,
+                                                **config}))
+    tl = types.SimpleNamespace(constexpr=lambda v=None: v)
+    ns = {"triton": types.SimpleNamespace(jit=lambda f: f, language=tl), "tl": tl,
+          "libdevice": None, "__name__": "kgdn1_host_run"}
+    exec(compile("\n".join(ln for ln in src.splitlines() if not ln.startswith(
+        ("import triton", "from torch._inductor.runtime.triton_compat"))), body.__name__, "exec"),
+        ns)
+    launches = []
+    res = ns[body.__name__](*args, _launcher=lambda k, grid, *a, **kw: launches.append(
+        (k.__name__, grid)))
+    return src, res, launches
 
-    def code(body, args, v_block=32):
-        bound = helion.kernel(body, static_shapes=static, ref_mode=RefMode.OFF,
-                              ignore_warnings=kgdn1._ignore()).bind(tuple(args))
-        cfg = bound.config_spec.default_config()
-        assert cfg["v_block"] == 32
-        return bound.to_triton_code(helion.Config(**{**cfg.config, "v_block": v_block}))
 
-    src = code(kgdn1.kgdn1_decode_vt, _args(3, 8, 24, 128))
+@pytest.mark.parametrize("static", [True, False])
+def test_vt_host_code_launches_one_kernel(static):
+    """Codegen proof for both launches of the V-tiled composite: each body's host
+    code launches exactly its own kernel and calls nothing else."""
+    args = _args(3, 8, 24, 128)
+    src, (o, state), launches = _host_run(kgdn1.kgdn1_decode_vt, args, {"v_block": 32}, static)
+    assert launches == [("_helion_kgdn1_decode_vt", (3 * 8 * 3 * 4,))]   # 4 V tiles of 32
+    assert o.shape == (3, 8, 3, 128) and o.dtype == torch.float32 and state is args[9]
     assert src.count("tl.load(state +") == 1 and src.count("tl.store(state +") == 1
-    assert "(128 + _BLOCK_SIZE_3 - 1) // _BLOCK_SIZE_3" in src       # V tiles in the grid
-    assert "torch.ops.suffix_kgdn1.vt_norm(o, z, norm_w, out, None, None" in src
+    assert "torch.ops" not in src
     lane = _verify_inputs(3, 5, 8, 24, 128, seed=1, lens=[5, 5, 5])
-    src = code(kgdn1.kgdn1_verify_vt, [*kgdn1.verify_body_args(*lane, 8), 128 ** -0.5, 1e-6, 0],
-               v_block=16)
+    vargs = [*kgdn1.verify_body_args(*lane, 8), 128 ** -0.5, 1e-6, 0]
+    src, (vo, _), launches = _host_run(kgdn1.kgdn1_verify_vt, vargs, {"v_block": 16}, static)
+    assert launches == [("_helion_kgdn1_verify_vt", (3 * 8 * 3 * 8,))]
+    assert vo.shape == (3, 5, 8, 3, 128)
     assert src.count("tl.load(state +") == 1 and src.count("tl.store(state +") == 5
-    assert "torch.ops.suffix_kgdn1.vt_norm(o, z, norm_w, out, cu_lo, cu_hi" in src
-    # the norm launches lower at their fixed config
-    o = torch.zeros(3, 8, 3, 128)
-    z = torch.zeros(3, 8, 3, 128, dtype=torch.bfloat16)
-    for body, extra, o_ in ((kgdn1.kgdn1_vt_norm, (), o),
-                            (kgdn1.kgdn1_vt_norm_seq, (lane[8][:-1], lane[8][1:]),
-                             o.view(3, 1, 8, 3, 128).expand(3, 5, 8, 3, 128).contiguous())):
-        b = helion.kernel(body, config=helion.Config(**kgdn1.NORM_CONFIG), static_shapes=static,
-                          ref_mode=RefMode.OFF).bind((o_, z, torch.ones(128), z.clone(), *extra,
-                                                      1e-6, 0))
-        assert "tl.store(out +" in b.to_triton_code(helion.Config(**kgdn1.NORM_CONFIG))
+    # the norm launches, at their fixed config, on the bodies' o
+    z, w = args[5], args[8]
+    for body, nargs, grid in (
+            (kgdn1.kgdn1_vt_norm, (o, z, w, args[11], 1e-6, 0), 3 * 8 * 3),
+            (kgdn1.kgdn1_vt_norm_seq, (vo, vargs[5], w, vargs[14], vargs[11], vargs[12], 1e-6, 0),
+             3 * 5 * 8 * 3)):
+        src, _, launches = _host_run(body, nargs, kgdn1.NORM_CONFIG, static)
+        assert launches == [(f"_helion_{body.__name__}", (grid,))]
+        assert "tl.store(out +" in src and "torch.ops" not in src
+
+
+def test_vt_serving_composite_is_two_launches(table, tmp_path, monkeypatch):
+    """gdn_*_fused_helion on a V-tiled bucket: body, then exactly the norm kernel."""
+    monkeypatch.setenv(kgdn1.ENV, "auto")
+    _ship(tmp_path, kgdn1.KERNEL_VT, [kgdn1.case(1, 2, 6, 16, 16)])
+    calls = []
+    monkeypatch.setattr(hk, "compiled", lambda body, name, c, **kw: (
+        lambda *a: calls.append(body.__name__) or ("o", a[9])))
+    monkeypatch.setattr(kgdn1, "_norm_kernel", lambda body: (
+        lambda *a: calls.append((body.__name__, a[0]))))
+    lane = kgdn1.problem(kgdn1.case(1, 2, 6, 16, 16), 0, device="cpu")
+    kgdn1.gdn_decode_fused_helion(*lane)
+    assert calls == ["kgdn1_decode_vt", ("kgdn1_vt_norm", "o")]
+
+
+def _tune_entry(name):
+    ent = next(e for e in kgdn1.KERNELS if e["name"] == name)
+    cpu = lambda c, s: kgdn1.make(c, s, device="cpu")  # noqa: E731
+    return dict(ent, make=cpu, make_baseline=cpu, baseline=lambda *a: None)
+
+
+@pytest.mark.parametrize("name,post", [(kgdn1.KERNEL_VT, True), (kgdn1.KERNEL_VT, False),
+                                       (kgdn1.KERNEL, False)])
+def test_tuner_post_path(name, post, monkeypatch):
+    """helion_tune.run_case on CPU (interpret-mode kernels, autotune and timing
+    stubbed): only the body is autotuned; correctness and every timed arm are
+    body + post; an entry without post takes the unchanged path."""
+    helion = pytest.importorskip("helion")
+    from suffix_hybrid.tools import helion_tune as ht
+    tuned, timed = [], []
+
+    class Tuner:
+        def __init__(self, body):
+            self.body = body
+
+        def autotune(self, args, force):
+            tuned.append(self.body.__name__)
+            return helion.Config(v_block=16) if "_vt" in self.body.__name__ else helion.Config()
+
+    real = helion.kernel
+    monkeypatch.setattr(helion, "kernel", lambda body, autotune_effort=None, **kw: (
+        Tuner(body) if autotune_effort else real(body, **{k: v for k, v in kw.items()
+                                                           if k != "static_shapes"})))
+    monkeypatch.setattr(ht, "_time_arms", lambda arms: (
+        [timed.append(fn(*sets[0])) or 1.0 for fn, sets in arms], "graph"))
+    monkeypatch.setattr(hk, "platform", lambda device=0: "testgpu")
+    monkeypatch.setattr(hk, "_TABLES", {})
+    ent = _tune_entry(name)
+    if not post:
+        ent.pop("post", None)
+    assert (ht._with_post(ent, len) is len) == (not ent.get("post"))
+    rec = ht.run_case(ent, kgdn1.case(3, 2, 6, 16, 16), "quick", 1 << 20)
+    assert tuned == [ent["body"].__name__]
+    if name == kgdn1.KERNEL_VT and not post:     # the bare body's (o, state) is not the answer
+        assert rec["status"] == "incorrect" and timed == []
+        return
+    assert rec["status"] == "ok" and rec["correct"], rec
+    assert rec["config"].get("v_block") == (16 if post else None)
+    out = timed[0][0]                            # the timed Helion arm returned post's output
+    assert out.dtype == torch.bfloat16 and out.shape == (3, 2, 3, 16)
 
 
 def _ship(tmp_path, kernel, cases):
@@ -665,6 +747,7 @@ def test_pick_rule(table, tmp_path, monkeypatch):
         lambda *a: calls.append((body.__name__, name, c["numtokens"]))))
     monkeypatch.setattr(kgdn1, "body_args", lambda *a: ())
     monkeypatch.setattr(kgdn1, "verify_body_args", lambda *a: ())
+    monkeypatch.setattr(kgdn1, "POSTS", {})  # body routing only (composite: its own test)
     native = _Native()
     op, buckets = qwen_gdn.decode_op(native, 8, 24, 128)
     assert buckets == (1, 8, 32)

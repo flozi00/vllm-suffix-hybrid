@@ -17,7 +17,9 @@ at tp > 1, off otherwise. A checkpoint with MTP layers adds one draft dict per l
 <Arch>MTP, the MTP experts' quant format, no GDN, no dense linears). Cases are deduplicated per
 kernel across layouts and run smallest numtokens first.
 
-Per case (one child process per family, so a poisoned CUDA context costs only its family):
+Per case (one child process per family, so a poisoned CUDA context costs only its family;
+a KERNELS entry's optional `post(body_result, *args)` runs after the body wherever it is
+checked or timed, never inside the autotune):
 autotune (HELION_AUTOTUNER = LFBOTreeSearch when scikit-learn imports, else PatternSearch; an
 explicit env value wins; HELION_AUTOTUNE_BUDGET_SECONDS = --budget-s; SIGALRM kill at
 budget + max(300, budget // 2)), correctness on fresh inputs vs the kernel's `reference` (its
@@ -452,6 +454,16 @@ def _check(kernel, out, ref):
     return True, f"max abs err {worst:.3g}"
 
 
+def _with_post(kernel: dict, fn):
+    """fn, or fn followed by the kernel's optional `post(body_result, *args) -> outputs`
+    (a second launch the body cannot hold): what is checked and timed; only the body is
+    autotuned."""
+    post = kernel.get("post")
+    if post is None:
+        return fn
+    return lambda *args: post(fn(*args), *args)
+
+
 def run_case(kernel: dict, case: dict, effort: str, l2_bytes: int) -> dict:
     import helion
     import torch
@@ -463,7 +475,7 @@ def run_case(kernel: dict, case: dict, effort: str, l2_bytes: int) -> dict:
     config = tuner.autotune(args, force=True)
     rec["autotune_s"] = round(time.time() - t0, 1)
     rec["config"] = json.loads(config.to_json())
-    best = helion.kernel(kernel["body"], config=config, **settings)
+    best = _with_post(kernel, helion.kernel(kernel["body"], config=config, **settings))
     fresh = kernel["make"](case, 0)  # autotune runs may have mutated `args` in place
     ref = kernel["reference"](*fresh)
     ok, msg = _check(kernel, best(*fresh), ref)
@@ -482,7 +494,8 @@ def run_case(kernel: dict, case: dict, effort: str, l2_bytes: int) -> dict:
     old = hk.config(kernel["name"], case)
     if old is not None:
         try:
-            shipped = helion.kernel(kernel["body"], config=helion.Config(**old), **settings)
+            shipped = _with_post(kernel, helion.kernel(kernel["body"], config=helion.Config(**old),
+                                                       **settings))
             shipped(*sets[0])
             arms.append((shipped, sets))
         except Exception as exc:  # noqa: BLE001 - e.g. a knob this Helion does not know
