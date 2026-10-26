@@ -603,6 +603,18 @@ def _csv(text, cast=str):
     return [cast(x) for x in str(text).split(",") if x.strip()] if text else None
 
 
+def raise_nofile() -> tuple:
+    """Soft RLIMIT_NOFILE -> hard. Helion's autotuner leaks descriptors when
+    candidate benchmark subprocesses crash (illegal-address configs); at the
+    container default 1024 a family died mid-run with EMFILE (2026-10-26)."""
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = hard if hard != resource.RLIM_INFINITY else max(soft, 1 << 20)
+    if want > soft:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    return resource.getrlimit(resource.RLIMIT_NOFILE)
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--child", help=argparse.SUPPRESS)
@@ -623,6 +635,7 @@ def main(argv=None) -> int:
     p.add_argument("--spec-k", type=int, default=0,
                    help="serving MTP k (kgdn1_verify cases need it; 0 = no verify cases)")
     a = p.parse_args(argv)
+    raise_nofile()
     if a.child:
         with open(a.child) as f:
             return child(json.load(f))

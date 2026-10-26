@@ -273,3 +273,10 @@ def test_gpu_streams_split():
     assert gpu_streams("--tp 2 --families kgdn1") == [(None, ["--tp", "2", "--families", "kgdn1"])]
     two = gpu_streams("--families kgdn1,nvfp4_moe ;; --families fp8_moe")
     assert two == [(0, ["--families", "kgdn1,nvfp4_moe"]), (1, ["--families", "fp8_moe"])]
+
+
+def test_raise_nofile_reaches_hard_limit():
+    import resource
+    from suffix_hybrid.tools.helion_tune import raise_nofile
+    soft, hard = raise_nofile()
+    assert soft == hard or hard == resource.RLIM_INFINITY
