@@ -256,3 +256,13 @@ def test_sitecustomize_gate_runs_once_then_holds(tmp_path):
     text = "".join(lines)
     assert text.count(f"{ht.PREFIX} DONE") == 1
     assert "exit 0; holding the pod" in text and "vllm would start" not in text
+
+
+def test_spec_k_reaches_kgdn1_verify_cases(capsys):
+    from suffix_hybrid.tools import helion_tune as ht
+    cfg = json.dumps(CONFIG)
+    assert ht.main(["--config", cfg, "--tp", "2", "--families", "kgdn1", "--cases-only",
+                    "--spec-k", "4"]) in (0, None)
+    out = capsys.readouterr().out
+    verify = [l for l in out.splitlines() if '"kernel": "kgdn1_verify"' in l and '"kind": "count"' in l]
+    assert verify and '"cases": 0' not in verify[0], out[-2000:]

@@ -609,6 +609,8 @@ def main(argv=None) -> int:
     p.add_argument("--name", help="checkpoint name (default: from --config)")
     p.add_argument("--mtp-quant", default="auto", choices=("auto", "fp8_block", "nvfp4", "off"))
     p.add_argument("--cases-only", action="store_true", help="list the cases, no GPU")
+    p.add_argument("--spec-k", type=int, default=0,
+                   help="serving MTP k (kgdn1_verify cases need it; 0 = no verify cases)")
     a = p.parse_args(argv)
     if a.child:
         with open(a.child) as f:
@@ -624,6 +626,7 @@ def main(argv=None) -> int:
     models = layouts(config, _csv(a.tp, int), a.ep, a.name or model_name(a.config, config),
                      a.mtp_quant)
     for label, m in models:
+        m["spec_k"] = a.spec_k
         emit("model", layout=label, model=m)
     kernels, numtokens = _csv(a.kernels), _csv(a.numtokens, int)
     recs = []
