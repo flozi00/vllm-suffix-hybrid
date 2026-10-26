@@ -188,6 +188,49 @@ def test_layer_contract():
     assert any("tp_size" in w for w in why) and any("state dtype" in w for w in why)
 
 
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_layer_contract_tp_and_interleaved(tp, interleaved):
+    lay = _Layer()
+    lay.tp_size, lay.gqa_interleaved_layout = tp, interleaved
+    for backend in ("helion", "auto"):
+        assert qwen_gdn.layer_contract_violations(lay, backend) == []
+    why = qwen_gdn.layer_contract_violations(lay, "oxide")  # the cubin is TP1 / flat only
+    assert any("tp_size" in w for w in why)
+    assert any("interleaved" in w for w in why) == interleaved
+    assert qwen_gdn.layer_contract_violations(lay) == why   # default = oxide
+
+
+def test_layer_contract_helion_refusals():
+    lay = _Layer()
+    lay.tp_size = 3                                     # 16 / 48 heads do not split in 3
+    assert any("do not divide" in w for w in qwen_gdn.layer_contract_violations(lay, "auto"))
+    lay = _Layer()
+    lay.tp_size, lay.disable_tp_for_ba_proj = 2, True   # replicated Marlin ba
+    assert any("in_proj_ba" in w for w in qwen_gdn.layer_contract_violations(lay, "helion"))
+    lay = _Layer()
+    lay.head_v_dim = 64                                 # K != V: Helion yes, oxide no
+    assert qwen_gdn.layer_contract_violations(lay, "helion") == []
+    assert any("K=128 != V=64" in w for w in qwen_gdn.layer_contract_violations(lay))
+    lay.head_v_dim = 96
+    assert any("V=96" in w for w in qwen_gdn.layer_contract_violations(lay, "helion"))
+
+
+def test_make_inputs_k_ne_v_and_interleaved_reference():
+    a = qwen_gdn.make_inputs(2, 2, 4, 16, 4, seed=1, V=8)
+    assert a["state"].shape == (4, 4, 8, 16) and a["z"].shape == (2, 4, 8)
+    assert a["mixed_qkv"].shape == (2, 2 * 2 * 16 + 4 * 8)
+    out = qwen_gdn.gdn_decode_fused_torch(a["mixed_qkv"], a["z"], a["ba"], a["a_log"],
+                                          a["dt_bias"], a["norm_w"], a["state"].clone(),
+                                          a["state_idx"], 2, 0.25, 1e-6, 0)
+    assert out.shape == (2, 4, 8) and torch.isfinite(out).all()
+    b = qwen_gdn.make_inputs(3, 2, 6, 16, 5, seed=2, interleaved=True)
+    assert b["z"].shape == (3, 2, 3, 16) and b["mixed_qkv"].is_contiguous()
+    qwen_gdn.gdn_decode_fused_torch(b["mixed_qkv"], b["z"], b["ba"], b["a_log"], b["dt_bias"],
+                                    b["norm_w"], b["state"].clone(), b["state_idx"], 2, 0.25,
+                                    1e-6, 0)
+
+
 def test_entry_point_dist_info():
     cfg = configparser.ConfigParser()
     cfg.read(ROOT / "suffix_qwen_gdn_ep-1.0.dist-info" / "entry_points.txt")
