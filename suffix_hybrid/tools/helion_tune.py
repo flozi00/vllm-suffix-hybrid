@@ -55,7 +55,7 @@ import traceback
 from suffix_hybrid import helion_kernels as hk
 
 PREFIX = "[suffix helion-tune]"
-FAMILIES = ("kgdn1", "nvfp4_moe", "fp8_moe", "nvfp4_gemm", "nvfp4_gemm_fp4mma")
+FAMILIES = ("kgdn1", "nvfp4_moe", "fp8_moe", "nvfp4_gemm", "nvfp4_gemm_fp4mma", "bf16_skinny")
 _NAME_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 _PLATFORM_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$")
 # Rotating input copies (the lab's): spill L2 so both arms read cold weights, bounded.
@@ -234,6 +234,8 @@ def model_dict(config: dict, tp: int, ep: bool, name: str = "") -> dict:
         "experts": _div(experts, ep_size, "num_experts") if experts else None,
         # experts_total: the deleted console's key (nvfp4_moe's DeepSeek branch reads it)
         "experts_global": experts, "experts_total": experts, "topk": topk,
+        # whole size (not per rank): a Qwen shared expert has a BF16 N=1 shared_expert_gate
+        "shared_expert_intermediate": shared,
         "heads": r_heads, "kv_heads": r_kv, "head_dim": head_dim,
         "vocab": math.ceil(vocab / tp) if vocab else None,
         "rms_eps": text.get("rms_norm_eps") or 1e-6,

@@ -6,6 +6,7 @@ suffix_fp8_moe = suffix_hybrid.kernels.fp8_moe:register
 suffix_nvfp4_lm_head = suffix_hybrid.kernels.nvfp4_lm_head:register
 suffix_mxfp4_lm_head = suffix_hybrid.kernels.mxfp4_lm_head:register
 suffix_mxfp8_gemm = suffix_hybrid.kernels.mxfp8_linear:register
+suffix_bf16_skinny = suffix_hybrid.kernels.bf16_skinny:register
 
 [vllm.endpoint_plugins]
 suffix_sft = suffix_hybrid.sft.api:register
