@@ -591,6 +591,8 @@ def main(argv=None) -> int:
     if a.cmd == "selftest":
         return selftest()
     if a.cmd == "dense":
+        from suffix_hybrid import helion_kernels as hk
+        hk.ensure_vendor()  # standalone (in-pod tune stream): no serving lane put _vendor on sys.path
         return run_dense(a)
     if a.cmd == "report":
         recs = [json.loads(ln) for ln in open(os.path.join(a.dir, "dense.jsonl"))]
