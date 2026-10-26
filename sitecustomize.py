@@ -156,8 +156,15 @@ if _helion_tune and not os.environ.get("SUFFIX_HELION_TUNE_ACTIVE"):
     import sys
     import time
     os.environ["SUFFIX_HELION_TUNE_ACTIVE"] = "1"
-    _rc = subprocess.run([sys.executable, "-m", "suffix_hybrid.tools.helion_tune",
-                          *shlex.split(_helion_tune)]).returncode
+    from suffix_hybrid.tools.helion_tune import gpu_streams as _tune_streams
+    _procs = []
+    for _gpu, _argv in _tune_streams(_helion_tune):
+        _env = dict(os.environ)
+        if _gpu is not None:  # one stream per GPU of the pod (' ;; '-separated arg sets)
+            _env["CUDA_VISIBLE_DEVICES"] = str(_gpu)
+        _procs.append(subprocess.Popen([sys.executable, "-m", "suffix_hybrid.tools.helion_tune",
+                                        *_argv], env=_env))
+    _rc = ",".join(str(p.wait()) for p in _procs)
     print(f"[suffix helion-tune] exit {_rc}; holding the pod (vLLM not started)", flush=True)
     while True:
         time.sleep(600)

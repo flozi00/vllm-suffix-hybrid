@@ -588,6 +588,17 @@ def _run_family(task: dict) -> list:
     return recs
 
 
+def gpu_streams(value: str) -> list:
+    """SUFFIX_HELION_TUNE value -> [(gpu index or None, argv)]. ' ;; ' separates
+    independent arg sets, one per GPU: stream i runs with CUDA_VISIBLE_DEVICES=i
+    (a 2-GPU pool tunes two families at once). One set = no pinning."""
+    import shlex
+    sets = [shlex.split(part) for part in value.split(";;") if part.strip()]
+    if len(sets) == 1:
+        return [(None, sets[0])]
+    return [(i, argv) for i, argv in enumerate(sets)]
+
+
 def _csv(text, cast=str):
     return [cast(x) for x in str(text).split(",") if x.strip()] if text else None
 

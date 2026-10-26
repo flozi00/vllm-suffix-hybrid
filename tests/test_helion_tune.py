@@ -266,3 +266,10 @@ def test_spec_k_reaches_kgdn1_verify_cases(capsys):
     out = capsys.readouterr().out
     verify = [l for l in out.splitlines() if '"kernel": "kgdn1_verify"' in l and '"kind": "count"' in l]
     assert verify and '"cases": 0' not in verify[0], out[-2000:]
+
+
+def test_gpu_streams_split():
+    from suffix_hybrid.tools.helion_tune import gpu_streams
+    assert gpu_streams("--tp 2 --families kgdn1") == [(None, ["--tp", "2", "--families", "kgdn1"])]
+    two = gpu_streams("--families kgdn1,nvfp4_moe ;; --families fp8_moe")
+    assert two == [(0, ["--families", "kgdn1,nvfp4_moe"]), (1, ["--families", "fp8_moe"])]
