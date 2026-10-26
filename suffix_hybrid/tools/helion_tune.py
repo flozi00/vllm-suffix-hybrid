@@ -589,14 +589,22 @@ def _run_family(task: dict) -> list:
 
 
 def gpu_streams(value: str) -> list:
-    """SUFFIX_HELION_TUNE value -> [(gpu index or None, argv)]. ' ;; ' separates
+    """SUFFIX_HELION_TUNE value -> [(gpu index or None, module, argv)]. ' ;; ' separates
     independent arg sets, one per GPU: stream i runs with CUDA_VISIBLE_DEVICES=i
-    (a 2-GPU pool tunes two families at once). One set = no pinning."""
+    (a 2-GPU pool tunes two families at once). One set = no pinning. A set starting
+    with `--module <suffix_hybrid module>` runs that module (e.g. the fp4mma bake-off,
+    suffix_hybrid.kernels.fp4mma_bench) instead of this tool."""
     import shlex
     sets = [shlex.split(part) for part in value.split(";;") if part.strip()]
-    if len(sets) == 1:
-        return [(None, sets[0])]
-    return [(i, argv) for i, argv in enumerate(sets)]
+    out = []
+    for i, argv in enumerate(sets):
+        module = "suffix_hybrid.tools.helion_tune"
+        if argv[:1] == ["--module"]:
+            module, argv = argv[1], argv[2:]
+            if not module.startswith("suffix_hybrid."):
+                raise ValueError(f"--module {module!r}: only suffix_hybrid modules")
+        out.append((None if len(sets) == 1 else i, module, argv))
+    return out
 
 
 def _csv(text, cast=str):

@@ -77,9 +77,15 @@ def screen_cases(name: str) -> list:
         return [(f"v41_lm_head.m{m}", *V41_LM_HEAD, m) for m in DSV41_MS]
     if name == "gemma":
         return [(f"{lab}.m{m}", n, k, m) for lab, (n, k) in ng.GEMMA_SHAPES.items() for m in SCREEN_MS]
+    if name == "qwen-flash":
+        # Qwen4Exp (qwen3.8-flash-next) per-rank TP2 dense shapes + the 0.32 QSA qkv (indexer rows
+        # fused: 7296) + the TP2 lm_head; serving M with MTP k=4 at c1/c8/c32 ~ 5/40/160 -> 8/64/192
+        rows = list(ng.QWEN_FLASH_SHAPES.items()) + [("flash_qsa_qkv_v032", (7296, 2560)),
+                                                     ("flash_lm_head_tp2", (124160, 2560))]
+        return [(f"{lab}.m{m}", n, k, m) for lab, (n, k) in rows for m in (1, 8, 64, 192)]
     if name == "all":
         return screen_cases("21") + screen_cases("dsv41") + screen_cases("gemma")
-    raise ValueError(f"unknown screen {name!r}: want 21 | dsv41 | gemma | all")
+    raise ValueError(f"unknown screen {name!r}: want 21 | dsv41 | gemma | qwen-flash | all")
 
 
 def case_dict(n: int, k: int, m: int) -> dict:
@@ -528,6 +534,8 @@ def finish_dense(recs, out_dir, plat, margin) -> int:
     shipped = shipping_rows(recs, margin)
     for p in write_configs(out_dir, plat, shipped):
         print(f"{MARKER} wrote {p}")
+        with open(p) as f:  # in-pod runs: the log is the only way out
+            print(f"{MARKER} CONFIG {os.path.relpath(p, out_dir)} {json.dumps(json.load(f))}", flush=True)
     with open(os.path.join(out_dir, "dense-winners.json"), "w") as f:
         json.dump(rows, f, indent=1)
     return 0
@@ -563,7 +571,7 @@ def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="fp4mma_bench", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd")
     d = sub.add_parser("dense")
-    d.add_argument("--screen", default="21", help="21 | dsv41 | gemma | all")
+    d.add_argument("--screen", default="21", help="21 | dsv41 | gemma | qwen-flash | all")
     d.add_argument("--arms", default="", help="comma list (default all): " + ",".join(ARMS))
     d.add_argument("--m", default="", help="restrict to these Ms")
     d.add_argument("--tune", default="none", choices=("none", "quick", "full"))

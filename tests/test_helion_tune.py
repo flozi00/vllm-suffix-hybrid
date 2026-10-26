@@ -270,9 +270,13 @@ def test_spec_k_reaches_kgdn1_verify_cases(capsys):
 
 def test_gpu_streams_split():
     from suffix_hybrid.tools.helion_tune import gpu_streams
-    assert gpu_streams("--tp 2 --families kgdn1") == [(None, ["--tp", "2", "--families", "kgdn1"])]
-    two = gpu_streams("--families kgdn1,nvfp4_moe ;; --families fp8_moe")
-    assert two == [(0, ["--families", "kgdn1,nvfp4_moe"]), (1, ["--families", "fp8_moe"])]
+    T = "suffix_hybrid.tools.helion_tune"
+    assert gpu_streams("--tp 2 --families kgdn1") == [(None, T, ["--tp", "2", "--families", "kgdn1"])]
+    two = gpu_streams("--families kgdn1,nvfp4_moe ;; --module suffix_hybrid.kernels.fp4mma_bench dense --tune quick")
+    assert two == [(0, T, ["--families", "kgdn1,nvfp4_moe"]),
+                   (1, "suffix_hybrid.kernels.fp4mma_bench", ["dense", "--tune", "quick"])]
+    with pytest.raises(ValueError):
+        gpu_streams("--module os x ;; --tp 2")
 
 
 def test_raise_nofile_reaches_hard_limit():
@@ -280,3 +284,11 @@ def test_raise_nofile_reaches_hard_limit():
     from suffix_hybrid.tools.helion_tune import raise_nofile
     soft, hard = raise_nofile()
     assert soft == hard or hard == resource.RLIM_INFINITY
+
+
+def test_fp4mma_bench_qwen_flash_screen():
+    from suffix_hybrid.kernels import fp4mma_bench as fb
+    cases = fb.screen_cases("qwen-flash")
+    shapes = {(n, k) for _, n, k, _ in cases}
+    assert (7296, 2560) in shapes and (124160, 2560) in shapes and (8192, 2560) in shapes
+    assert {m for *_, m in cases} == {1, 8, 64, 192}
