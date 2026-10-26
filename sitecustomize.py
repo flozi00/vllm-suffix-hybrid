@@ -72,6 +72,8 @@ PYTHONPATH. Each section is independently gated:
                               (suffix_hybrid/kernels/topk_gating_rocm.py)
   SUFFIX_SILU_GRID_CLAMP=1 -> NVIDIA DeepGEMM MoE: the fused SiLU*mul+FP8-quant launch grid
                               clamped to live tokens (persistent loop; bit-identical)
+  SUFFIX_HELION_TUNE=<args> -> in-pod Helion autotune (suffix_hybrid/tools/helion_tune.py)
+                              instead of serving, then hold the pod for log harvest
 Prod sets none of them, so all five are inert there. The kernels gate lives
 OUTSIDE the wrap's fail-closed try: a kernel registration failure must degrade
 to vllm_c/native with a logged refusal, never kill an otherwise healthy pool.
@@ -140,6 +142,27 @@ if _preset:
         raise SystemExit(f"[suffix] SUFFIX_PRESET={_preset!r}: unknown (known: {sorted(_PRESETS)})")
     for _k, _v in _PRESETS[_preset].items():
         os.environ.setdefault(_k, _v)
+
+# SUFFIX_HELION_TUNE="<helion_tune args>": an in-pod Helion autotune run INSTEAD of serving
+# (suffix_hybrid/tools/helion_tune.py; "[suffix helion-tune]" log lines). The tool runs in a child
+# so this process never holds a CUDA context, then the pod is held (vLLM never starts) for log
+# harvest. Once per process tree: the marker reaches every child (the tool's family children,
+# Helion/Triton spawn workers); multiprocessing.parent_process() cannot tell, sitecustomize runs
+# before spawn_main. Unset: nothing here runs.
+_helion_tune = os.environ.get("SUFFIX_HELION_TUNE", "").strip()
+if _helion_tune and not os.environ.get("SUFFIX_HELION_TUNE_ACTIVE"):
+    import shlex
+    import subprocess
+    import sys
+    import time
+    os.environ["SUFFIX_HELION_TUNE_ACTIVE"] = "1"
+    _rc = subprocess.run([sys.executable, "-m", "suffix_hybrid.tools.helion_tune",
+                          *shlex.split(_helion_tune)]).returncode
+    print(f"[suffix helion-tune] exit {_rc}; holding the pod (vLLM not started)", flush=True)
+    while True:
+        time.sleep(600)
+        print(f"[suffix helion-tune] heartbeat {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+              flush=True)
 
 # Kernel provider registration (independent gate). Inert until
 # --kernel-config ir_op_priority names the provider; a registration failure

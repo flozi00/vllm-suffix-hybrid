@@ -687,8 +687,13 @@ def _layouts(model: dict) -> list:
         return out
     if e > 256 or i % 64:  # the oxide baseline's limits (only DS layers are Helion-only)
         return []
-    return [{"experts": e, "hidden": h, "moe_intermediate": i, "topk": k,
-             "act": "gelu_tanh" if "gemma" in arch else "silu"}]
+    d = {"experts": e, "hidden": h, "moe_intermediate": i, "topk": k,
+         "act": "gelu_tanh" if "gemma" in arch else "silu"}
+    # EP rank (experts = this rank's of experts_global): the serving lane_case keys on it
+    eg = int(model.get("experts_global") or model.get("experts_total") or e)
+    if int(model.get("ep") or 1) > 1 and eg != e:
+        d["experts_global"] = eg
+    return [d]
 
 
 def cases(model: dict, kernel: str | None = None) -> list:
@@ -979,7 +984,7 @@ def _oxide_args(case, seed, mode: int, keep: int):
     out = torch.empty(m, hd, dtype=torch.bfloat16, device=x.device)
     tune = nm.tune_for(m, baseline_tune(case)[0])[1]
     head = (x, ids, tw, p["w13"], p["w13_sf"], p["g1"], p["w2"], p["w2_sf"], p["g2"], *ws, out,
-            float(p["a1g"]), float(p["a2g"]), int(p["act"]), 0, mode)
+            float(p["a1g"]), float(p["a2g"]), int(p["act"]), ep_base(case), mode)
     native.nvfp4_moe_cuda(*head, tune, torch.cuda.current_stream().cuda_stream)
     launches = 3 if mode == 2 else 4
     skip = ((1 << launches) - 1) & ~(1 << keep)
