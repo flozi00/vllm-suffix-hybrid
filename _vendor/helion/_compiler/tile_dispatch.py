@@ -1,0 +1,1224 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import sympy
+import torch
+
+from .._compat import shape_env_size_hint
+from .compile_environment import CompileEnvironment
+from .compile_environment import _symint_sympy_expr
+from .cute.layout import CuTeGridExecutionPlan
+from .device_function import DeviceFunction
+from .device_ir import ForLoopGraphInfo
+from .device_ir import ReductionLoopGraphInfo
+from .device_ir import RootGraphInfo
+from .host_function import HostFunction
+from .reduction_strategy import ReductionStrategy
+from .reduction_strategy import cute_looped_reduction_block_size
+from .tile_strategy import CompactedShape
+from .tile_strategy import DeviceLoopState
+from .tile_strategy import PerThreadNDTileStrategy
+from .tile_strategy import TileStrategy
+
+if TYPE_CHECKING:
+    from collections.abc import ItemsView
+    from collections.abc import Sequence
+
+    from .. import Config
+    from .cute.loop_nesting import TileLoopPath
+    from .inductor_lowering import CodegenState
+
+    SymIntLike = torch.SymInt | int
+    ShapeLike = Sequence[SymIntLike]
+
+
+class BlockIDStrategyMapping:
+    def __init__(self) -> None:
+        self._block_id_to_strategy: dict[tuple[int, ...], TileStrategy] = {}
+        self._block_id_to_any_strategy: dict[int, TileStrategy] = {}
+
+    def __setitem__(self, block_ids: tuple[int, ...], strategy: TileStrategy) -> None:
+        self._block_id_to_strategy[block_ids] = strategy
+        for block_id in block_ids:
+            self._block_id_to_any_strategy.setdefault(block_id, strategy)
+
+    def __getitem__(self, block_ids: tuple[int, ...]) -> TileStrategy:
+        return self._block_id_to_strategy[block_ids]
+
+    def get(
+        self, block_ids: tuple[int, ...], default: TileStrategy | None = None
+    ) -> TileStrategy | None:
+        return self._block_id_to_strategy.get(block_ids, default)
+
+    def get_any(self, block_id: int) -> TileStrategy | None:
+        strategy = self._block_id_to_strategy.get((block_id,))
+        if strategy is None:
+            strategy = self._block_id_to_any_strategy.get(block_id)
+        return strategy
+
+    def items(self) -> ItemsView[tuple[int, ...], TileStrategy]:
+        return self._block_id_to_strategy.items()
+
+    def clear(self) -> None:
+        self._block_id_to_strategy.clear()
+        self._block_id_to_any_strategy.clear()
+
+
+class TileStrategyDispatch:
+    def __init__(
+        self,
+        fn: DeviceFunction,
+        config: Config,
+    ) -> None:
+        super().__init__()
+        self._device_function = fn
+        self.strategies: list[TileStrategy] = []
+        self.block_id_to_strategy = BlockIDStrategyMapping()
+        self._cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
+        self._constexpr_live_graph_ids: frozenset[int] | None = None
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.loop_nesting import constexpr_live_graph_ids
+            from .cute.loop_nesting import tile_loop_paths
+
+            device_ir = HostFunction.current().device_ir
+            self._cute_tile_loop_paths = tile_loop_paths(
+                device_ir, fn.codegen.codegen_graphs
+            )
+            self._constexpr_live_graph_ids = constexpr_live_graph_ids(
+                device_ir, fn.codegen.codegen_graphs, fn
+            )
+        self._add_loop_strategies(fn, config)
+        if CompileEnvironment.current().backend.name == "cute":
+            self._normalize_shared_tile_thread_extents()
+        self._add_reduction_strategies(fn, config)
+        if CompileEnvironment.current().backend.name == "cute":
+            self._normalize_shared_reduction_thread_extents()
+
+    def _normalize_shared_reduction_thread_extents(self) -> None:
+        """Spread a reduction over a wider sibling's share of its axis.
+
+        Reductions in mutually exclusive pid branches share a thread axis
+        (``_branch_by_control_flow``) and the launch takes the widest, so a
+        narrower reduction runs surplus threads: they would read past its
+        extent, combine among themselves and race its result to the same
+        address.  As ``_normalize_shared_tile_thread_extents`` does for
+        tiles, the reduction is widened to the launch instead, masking the
+        surplus threads to its identity.  Several root loops or
+        ``hl.barrier()`` phases refuse the surplus at launch instead
+        (``_reject_multi_root_reduction_surplus``, ``_multi_phase_block_dims``),
+        and a sibling branch's free ``hl.arange`` may not widen the axis later
+        (``GenerateAST.allocate_cute_synthetic_arange_axis``).
+        """
+        device_ir = HostFunction.current().device_ir
+        if len(device_ir.grid_block_ids) != 1 or len(device_ir.phases) > 1:
+            return
+        dims = self.thread_block_dims()
+        for strategy in self.strategies:
+            if not isinstance(strategy, ReductionStrategy):
+                continue
+            count = strategy._reduction_thread_count()
+            axis = self.thread_axis_for_strategy(strategy)
+            if (
+                count > 1
+                and axis is not None
+                and axis < len(dims)
+                and dims[axis] > count
+            ):
+                strategy.use_shared_thread_extent(dims[axis])
+
+    def _normalize_shared_tile_thread_extents(self) -> None:
+        """Repartition sibling tile loops over their common physical launch.
+
+        Separate loop paths reuse CUDA axes. Their launch takes each axis's
+        maximum extent, so using a narrower sibling's original thread count
+        in a lane loop overlaps its neighboring lane iterations. Resolve the
+        maximum before creating reductions or emitting any lane coordinates.
+        Only existing SIMT tile axes are widened; scalar and MMA axes keep
+        their ownership model.
+        """
+        if CompileEnvironment.current().config_spec.matmul_facts:
+            # Matrix layouts own additional physical-thread contracts beyond
+            # the scalar tile coordinates normalized here.
+            return
+        dims = self.thread_block_dims()
+        updates: list[tuple[PerThreadNDTileStrategy, dict[int, int]]] = []
+        for strategy in self.strategies:
+            if not isinstance(strategy, PerThreadNDTileStrategy) or strategy.mma_mode:
+                continue
+            base_axis = self.thread_axis_for_strategy(strategy)
+            if base_axis is None:
+                continue
+            extents = {
+                block_id: dims[base_axis + local_axis]
+                for block_id, local_axis, size, _expr in self._iter_strategy_thread_axes(
+                    strategy
+                )
+                if size is not None
+                and base_axis + local_axis < len(dims)
+                and dims[base_axis + local_axis] > size
+            }
+            if extents:
+                updates.append((strategy, extents))
+        for strategy, extents in updates:
+            strategy.use_shared_thread_extents(extents)
+
+    def _add_loop_strategies(self, fn: DeviceFunction, config: Config) -> None:
+        device_ir = HostFunction.current().device_ir
+        for block_ids in device_ir.grid_block_ids:
+            self._add_loop_strategy(block_ids, fn, config)
+        for graph in fn.codegen.codegen_graphs:
+            if (
+                isinstance(graph, ForLoopGraphInfo)
+                and not isinstance(graph, ReductionLoopGraphInfo)
+                and graph.block_ids
+                and (
+                    self._constexpr_live_graph_ids is None
+                    or graph.graph_id in self._constexpr_live_graph_ids
+                )
+            ):
+                block_ids = [*graph.block_ids]
+                self._add_loop_strategy(block_ids, fn, config)
+
+    def _add_loop_strategy(
+        self, block_ids: list[int], fn: DeviceFunction, config: Config
+    ) -> None:
+        env = CompileEnvironment.current()
+        strategy = env.backend.create_loop_strategy(fn, block_ids, config)
+        self._register_strategy(block_ids, strategy)
+
+    def _register_strategy(self, block_ids: list[int], strategy: TileStrategy) -> None:
+        self.strategies.append(strategy)
+        self.block_id_to_strategy[tuple(block_ids)] = strategy
+
+    def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
+        # Make the dispatcher (with tile strategies already registered)
+        # visible to reduction-strategy __init__ via ``fn.tile_strategy``
+        # so reductions can shrink their thread count if total launch
+        # threads would otherwise exceed the per-block limit.
+        fn.tile_strategy = self
+        env = CompileEnvironment.current()
+        max_threads = env.backend.max_reduction_threads()
+        active_block_ids = HostFunction.current().device_ir.codegen_active_block_ids
+        inactive_aliases = self._inactive_cute_broadcast_aliases(fn)
+
+        if self._constexpr_live_graph_ids is not None:
+            from .cute.active_blocks import active_block_ids as live_block_ids
+
+            # A reduction dim used only on the untaken side of a constant
+            # branch is never emitted; its strategy would only claim an axis.
+            live = live_block_ids(
+                [
+                    graph
+                    for graph in fn.codegen.codegen_graphs
+                    if graph.graph_id in self._constexpr_live_graph_ids
+                ],
+                (
+                    block_id
+                    for ids in HostFunction.current().device_ir.grid_block_ids
+                    for block_id in ids
+                ),
+                env,
+            )
+            active_block_ids = (
+                live if active_block_ids is None else active_block_ids & live
+            )
+        rdims = [
+            bs.block_id
+            for bs in env.block_sizes
+            if bs.reduction
+            and bs.block_id not in inactive_aliases
+            and (active_block_ids is None or bs.block_id in active_block_ids)
+        ]
+        reduction_loop_block_ids = set(
+            env.config_spec.reduction_loops.valid_block_ids()
+        )
+        for block_id in rdims:
+            reduction_loop = env.config_spec.reduction_loops.config_get(
+                config.reduction_loops, block_id, None
+            )
+            # Only rolled reduction dimensions can use LoopedReductionStrategy.
+            # Non-rolled dimensions must stay persistent so graph selection and
+            # strategy selection remain consistent.
+            if max_threads is not None and block_id in reduction_loop_block_ids:
+                numel = env.block_sizes[block_id].numel
+                if isinstance(numel, sympy.Integer):
+                    size_hint = int(numel)
+                elif isinstance(numel, sympy.Expr):
+                    size_hint = shape_env_size_hint(env.shape_env, numel)
+                else:
+                    size_hint = env.size_hint(numel)
+                if reduction_loop is None:
+                    if size_hint > max_threads:
+                        # Too many elements for a single warp; force a looped
+                        # reduction. CuTe can cover a wider chunk with either
+                        # more live lanes or per-thread scalar lanes.
+                        reduction_loop = (
+                            cute_looped_reduction_block_size(size_hint, max_threads)
+                            if env.backend.name == "cute"
+                            else max_threads
+                        )
+            strategy = env.backend.create_reduction_strategy(
+                fn, block_id, reduction_loop
+            )
+            self._register_strategy([block_id], strategy)
+
+    def _inactive_cute_broadcast_aliases(self, fn: DeviceFunction) -> set[int]:
+        """Drop duplicate output-range reservations before physical allocation.
+
+        Register broadcasting can allocate a reduction block whose variable is
+        exactly an existing tile variable. The canonical tile already owns
+        those coordinates. Nested tile loops may reuse an outer root's tile,
+        but cannot establish ownership for sibling or child-only tile axes.
+        Never elide executable reductions, free-iota or matrix dimensions.
+        """
+        env = CompileEnvironment.current()
+        spec = env.config_spec
+        graphs = fn.codegen.codegen_graphs
+        if (
+            env.backend_name != "cute"
+            or spec.matmul_facts
+            or any(
+                isinstance(node.target, torch._ops.OpOverload)
+                and node.target.overloadpacket is torch.ops.aten.arange
+                for graph in graphs
+                for node in graph.graph.nodes
+            )
+        ):
+            return set()
+        tile_blocks = {
+            block_id for strategy in self.strategies for block_id in strategy.block_ids
+        }
+        if not (
+            spec.pointwise_facts
+            and all(isinstance(graph, RootGraphInfo) for graph in graphs)
+        ):
+            # One root's grid tiles dominate its tiled child graphs. Restrict
+            # the extension to those outer coordinates: a child loop's tile
+            # may be inactive in a sibling, even with an identical extent.
+            grid_blocks = HostFunction.current().device_ir.grid_block_ids
+            if (
+                len(grid_blocks) != 1
+                or sum(isinstance(graph, RootGraphInfo) for graph in graphs) != 1
+                or not any(type(graph) is ForLoopGraphInfo for graph in graphs)
+                or any(
+                    not isinstance(graph, RootGraphInfo)
+                    and not (type(graph) is ForLoopGraphInfo and graph.block_ids)
+                    for graph in graphs
+                )
+            ):
+                return set()
+            tile_blocks &= set(grid_blocks[0])
+        executable = set(spec.reduction_loops.valid_block_ids())
+        if spec.reduction_kernel_fact is not None:
+            executable.update(
+                reduction.block_id
+                for reduction in spec.reduction_kernel_fact.reductions
+            )
+        if spec.kernel_matmul_fact is not None:
+            executable.update(
+                matmul.fact.k_block_id
+                for matmul in spec.kernel_matmul_fact.matmuls
+                if matmul.fact.k_block_id is not None
+            )
+        return {
+            block.block_id
+            for block in env.block_sizes
+            if block.reduction
+            and block.block_id not in executable
+            and (canonical := env.canonical_block_id(block.block_id)) != block.block_id
+            and canonical in tile_blocks
+            and not env.block_sizes[canonical].reduction
+            and block.symbol() == env.block_sizes[canonical].symbol()
+            and block.numel == env.block_sizes[canonical].symbol()
+        }
+
+    def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
+        strategy = self.block_id_to_strategy[tuple(block_ids)]
+        state.codegen.active_device_loops.clear()
+        grid_state = strategy.codegen_grid(state)
+        state.codegen.set_active_loops(grid_state)
+        for other_strategy in self.strategies:
+            if other_strategy is not strategy:
+                other_strategy.codegen_preamble(state)
+
+    def codegen_device_loop(
+        self, state: CodegenState, block_ids: list[int]
+    ) -> DeviceLoopState:
+        strategy = self.block_id_to_strategy[tuple(block_ids)]
+        return strategy.codegen_device_loop(state)
+
+    def compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
+        """Return physical dimensions with their logical axis and block mappings."""
+        compacted_shapes = []
+        for idx, shape in enumerate(shapes):
+            block_idx = CompileEnvironment.current().resolve_block_id(shape)
+            if block_idx is None:
+                # Check if this is a symbolic expression with block sizes
+                shape_str = self._get_shape_string(shape)
+                compacted_shapes.append(CompactedShape(shape_str, [idx], []))
+            else:
+                strategy = self.block_id_to_strategy.get((block_idx,))
+                if strategy is None:
+                    strategy = self.block_id_to_strategy.get_any(block_idx)
+                if strategy is not None:
+                    block_size = strategy.block_size_var(block_idx)
+                else:
+                    block_size = DeviceFunction.current().block_size_var(block_idx)
+                if block_size is None:
+                    block_size = "1"
+                compacted_shapes.append(CompactedShape(block_size, [idx], [block_idx]))
+        for strategy in self.strategies:
+            compacted_shapes = strategy.compact_shape(compacted_shapes)
+        return compacted_shapes
+
+    def _get_shape_string(self, shape: SymIntLike) -> str:
+        """Get string representation of a shape"""
+        # Extract sympy expression
+        if isinstance(shape, torch.SymInt):
+            expr = _symint_sympy_expr(shape)
+        elif isinstance(shape, sympy.Expr):
+            expr = shape
+        else:
+            return self.strategies[0].fn.literal_expr(shape)
+
+        # Try to map block symbols to their variable names
+        mapped_expr = DeviceFunction.current().try_map_block_symbols_to_vars(expr)
+        if mapped_expr is not None:
+            # Use a dedicated tl.constexpr argument for any mapped shape expression.
+            # This avoids emitting helper calls (e.g., triton_helpers.div_floor_integer)
+            # in contexts that require compile-time constants such as tl.reshape shapes.
+            df = DeviceFunction.current()
+            const_name = df.new_var("_SHAPE_DIM")
+            # Define on host using the original expression so origins are known.
+            df.constexpr_arg_with_host_def(const_name, expr)
+            return const_name
+
+        # Fallback: use literal expression if mapping failed
+        return self.strategies[0].fn.literal_expr(shape)
+
+    def shape_str(self, shape: ShapeLike) -> str:
+        return f"[{', '.join(self.shape_dims(shape))}]"
+
+    def shape_dims(self, shape: ShapeLike) -> list[str]:
+        compacted_shapes = self.compact_shape(shape)
+        return [s.size_str for s in compacted_shapes]
+
+    def supports_index_rank_expansion(self) -> bool:
+        return all(
+            strategy.supports_index_rank_expansion() for strategy in self.strategies
+        )
+
+    def current_cute_grid_execution_plans(self) -> tuple[CuTeGridExecutionPlan, ...]:
+        if not self.strategies:
+            return ()
+        codegen = self.strategies[0].fn.codegen
+        graph_info = getattr(codegen, "current_root_graph_info", None)
+        if isinstance(graph_info, RootGraphInfo):
+            return graph_info.cute_grid_execution_plans
+        # Outside root codegen (launch-shape recovery after the body is
+        # generated) every root's plans stay visible so the launch block dims
+        # follow the same thread-axis order as the generated body.  Lookups
+        # are scoped by block id, so the roots of a ForEach kernel never mix.
+        return tuple(
+            plan
+            for graph in codegen.codegen_graphs
+            if isinstance(graph, RootGraphInfo)
+            for plan in graph.cute_grid_execution_plans
+        )
+
+    def current_cute_grid_execution_plan(
+        self,
+        *,
+        block_ids: tuple[int, ...] | list[int] | None = None,
+    ) -> CuTeGridExecutionPlan | None:
+        plans = self.current_cute_grid_execution_plans()
+        if not plans:
+            return None
+        if block_ids is not None:
+            plans = tuple(
+                plan for plan in plans if plan.applies_to_any_block(tuple(block_ids))
+            )
+        if not plans:
+            return None
+        block_axis_priority: dict[int, int] = {}
+        disable_reduction_axis_reservation_for: set[int] = set()
+        scoped_block_ids: set[int] = set()
+        for plan in plans:
+            scoped_block_ids.update(plan.scoped_block_ids)
+            disable_reduction_axis_reservation_for.update(
+                plan.disable_reduction_axis_reservation_for
+            )
+            for block_id, priority in plan.block_axis_priority.items():
+                previous = block_axis_priority.get(block_id)
+                if previous is None or priority < previous:
+                    block_axis_priority[block_id] = priority
+        return CuTeGridExecutionPlan(
+            scoped_block_ids=frozenset(scoped_block_ids),
+            block_axis_priority=block_axis_priority,
+            disable_reduction_axis_reservation_for=frozenset(
+                disable_reduction_axis_reservation_for
+            ),
+        )
+
+    def _ordered_strategies_for_branch(
+        self, branch: list[TileStrategy]
+    ) -> list[TileStrategy]:
+        """Order strategies for thread axis assignment.
+
+        For CuTe, reduction strategies must come first (axis 0) so that
+        reduction threads are within the same warp for warp-level reductions.
+        """
+        branch_block_ids = tuple(
+            block_id for strategy in branch for block_id in strategy.block_ids
+        )
+        plan = self.current_cute_grid_execution_plan(block_ids=branch_block_ids)
+        priorities = [
+            min(
+                (
+                    priority
+                    for block_id in strategy.block_ids
+                    if (priority := plan.priority_for_block(block_id)) is not None
+                ),
+                default=None,
+            )
+            if plan is not None
+            else None
+            for strategy in branch
+        ]
+        if any(isinstance(priority, int) for priority in priorities):
+            return sorted(
+                branch,
+                key=lambda strategy: (
+                    min(
+                        (
+                            priority
+                            for block_id in strategy.block_ids
+                            if plan is not None
+                            and (priority := plan.priority_for_block(block_id))
+                            is not None
+                        ),
+                        default=1 << 30,
+                    )
+                    if plan is not None
+                    else 1 << 30,
+                    self.strategies.index(strategy),
+                ),
+            )
+        env = CompileEnvironment.current()
+        if not env.backend.reduction_axis_first():
+            return branch
+        reductions = [s for s in branch if isinstance(s, ReductionStrategy)]
+        non_reductions = [s for s in branch if not isinstance(s, ReductionStrategy)]
+        return reductions + non_reductions
+
+    def _strategy_branches(self) -> list[list[TileStrategy]]:
+        """Return strategy branches that execute mutually exclusively."""
+        device_ir = HostFunction.current().device_ir
+        num_grids = len(device_ir.grid_block_ids)
+        grid_strategies = self.strategies[:num_grids]
+
+        if num_grids <= 1:
+            branched = self._branch_by_control_flow()
+            branches = branched if branched is not None else [self.strategies]
+            return self._branch_by_tile_loops(branches)
+
+        loop_strategies = self.strategies[num_grids:]
+        branches: list[list[TileStrategy]] = []
+        for i, grid_strat in enumerate(grid_strategies):
+            branch: list[TileStrategy] = [grid_strat]
+            grid_max = max(grid_strat.block_ids)
+            next_min = (
+                min(grid_strategies[i + 1].block_ids)
+                if i + 1 < num_grids
+                else float("inf")
+            )
+            for ls in loop_strategies:
+                if all(grid_max < bid < next_min for bid in ls.block_ids):
+                    branch.append(ls)
+            branches.append(branch)
+        return self._branch_by_tile_loops(branches)
+
+    def _branch_by_tile_loops(
+        self, branches: list[list[TileStrategy]]
+    ) -> list[list[TileStrategy]]:
+        """Let sibling CuTe tile passes reuse their nesting-level axes."""
+        paths = self._cute_tile_loop_paths
+        if not paths:
+            return branches
+        result: list[list[TileStrategy]] = []
+        for branch in branches:
+            shared = [s for s in branch if isinstance(s, ReductionStrategy)]
+            for path in paths:
+                nested = [
+                    strategy
+                    for block_ids in path
+                    for strategy in branch
+                    if tuple(strategy.block_ids) == block_ids
+                ]
+                if not nested:
+                    continue
+                candidate = [*nested, *shared]
+                if candidate not in result:
+                    result.append(candidate)
+        return result
+
+    def _branch_by_control_flow(self) -> list[list[TileStrategy]] | None:
+        """Split strategies into mutually-exclusive control-flow branches.
+
+        Handles the single-grid branch-by-pid pattern: a kernel whose body is
+        ``if pid == 0: ... elif pid == 1: ...`` where each branch carries its own
+        reduction (and free ``hl.arange``) over a distinct dimension. Such
+        reductions never co-execute, so they may share a CUDA thread axis instead
+        of each claiming a fresh one and blowing the per-block thread budget.
+
+        Returns ``None`` (caller falls back to the single-branch default) unless
+        at least one pair of reductions lives in mutually-exclusive branches.
+        """
+        from .device_ir import DeviceIR
+
+        if CompileEnvironment.current().backend.name != "cute":
+            return None
+        red_paths = self.reduction_branch_paths()
+        if len(red_paths) < 2:
+            return None
+
+        def block_path(strategy: TileStrategy) -> list[tuple[int, int]] | None:
+            for block_id in strategy.block_ids:
+                paths = red_paths.get(block_id)
+                if paths:
+                    return paths[0]
+            return None
+
+        # Collect reduction strategies that carry a branch path.
+        branched_strategies = [s for s in self.strategies if block_path(s) is not None]
+        if len(branched_strategies) < 2:
+            return None
+        # Require at least one mutually-exclusive pair, else nothing is shared.
+        if not any(
+            DeviceIR.branch_paths_mutually_exclusive(block_path(a), block_path(b))
+            for i, a in enumerate(branched_strategies)
+            for b in branched_strategies[i + 1 :]
+        ):
+            return None
+
+        shared = [s for s in self.strategies if block_path(s) is None]
+        # Group branched strategies so that every pair within a group can
+        # co-execute (paths not mutually exclusive); distinct groups are
+        # mutually exclusive and become separate branches that share axes.
+        groups: list[list[TileStrategy]] = []
+        for candidate in branched_strategies:
+            placed = False
+            for group in groups:
+                if all(
+                    not DeviceIR.branch_paths_mutually_exclusive(
+                        block_path(candidate), block_path(member)
+                    )
+                    for member in group
+                ):
+                    group.append(candidate)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([candidate])
+        return [[*shared, *group] for group in groups]
+
+    def reduction_branch_paths(self) -> dict[int, list[list[tuple[int, int]]]]:
+        """``DeviceIR.reduction_block_id_branch_paths`` for this config."""
+        return HostFunction.current().device_ir.reduction_block_id_branch_paths(
+            self._device_function
+        )
+
+    def thread_axis_for_strategy(self, target: TileStrategy) -> int | None:
+        """Return the starting thread-axis index for a strategy in its branch.
+
+        Strategies that share their entire ``block_ids`` set with an
+        earlier strategy in the branch (e.g. two sibling ``hl.tile`` loops
+        over the same N-axis in a softmax kernel) reuse the earlier
+        strategy's thread axis — they are mutually exclusive in time, so
+        they map to the same hardware lane.  Without this dedup the
+        warp-per-row layout would assign one axis per inner tile loop
+        and bury M on axis 2 or 3.
+
+        This is the launch-side copy of the layout the kernel body emits
+        (``BlockSizeTileStrategy._compute_thread_axis_offset``): a reduction
+        claims an axis only when it spreads across threads, and tiles start
+        above the kernel-wide reduction reservation
+        (:meth:`reserved_reduction_axes`).
+
+        A reduction that claims no axis (a single live thread on CuTe,
+        ``ReductionStrategy._claims_thread_axis``) is parked on the lowest
+        axis no threaded reduction of the branch (or of the kernel-wide
+        reservation) holds.  It indexes with the constant 0 and records no
+        thread coordinate, so sharing that axis with a tile is harmless,
+        whereas sharing a threaded reduction's axis would let a lookup of the
+        block's axis extent read the other reduction's threads.
+        """
+        reserved_axes = self.reserved_reduction_axes()
+        reduction_axis_first = (
+            CompileEnvironment.current().backend.reduction_axis_first()
+        )
+        for branch in self._strategy_branches():
+            if target not in branch:
+                continue
+            axis = 0
+            target_axis: int | None = None
+            threaded_reduction_axes: set[int] = set(range(reserved_axes))
+            seen_block_id_sets: dict[tuple[int, ...], int] = {}
+            plan = (
+                self.current_cute_grid_execution_plan(
+                    block_ids=tuple(b for s in branch for b in s.block_ids)
+                )
+                if reserved_axes
+                else None
+            )
+            for strategy in self._ordered_strategies_for_branch(branch):
+                if (
+                    reserved_axes
+                    and not isinstance(strategy, ReductionStrategy)
+                    and not (
+                        plan is not None
+                        and any(
+                            plan.disables_reduction_axis_reservation(block_id)
+                            for block_id in strategy.block_ids
+                        )
+                    )
+                ):
+                    # Mirror ``BlockSizeTileStrategy._compute_thread_axis_offset``:
+                    # the body keeps the kernel-wide reduction axes reserved in
+                    # every branch (another root loop, an ``hl.barrier()``
+                    # phase, a pid branch), so a branch with fewer reductions
+                    # must place its tiles above them too or the launch block
+                    # dims would disagree with the body's axes.
+                    axis = max(axis, reserved_axes)
+                key = tuple(sorted(strategy.block_ids))
+                cached = seen_block_id_sets.get(key)
+                if cached is not None:
+                    # Same block-id footprint as an earlier sibling —
+                    # they're mutually exclusive in time so they share
+                    # the axis.
+                    if strategy is target:
+                        target_axis = cached
+                    continue
+                if strategy is target:
+                    target_axis = axis
+                seen_block_id_sets[key] = axis
+                used = strategy.thread_axes_used()
+                if isinstance(strategy, ReductionStrategy):
+                    threaded_reduction_axes.update(range(axis, axis + used))
+                axis += used
+            if (
+                reduction_axis_first
+                and isinstance(target, ReductionStrategy)
+                and target.thread_axes_used() == 0
+            ):
+                free_axis = 0
+                while free_axis in threaded_reduction_axes:
+                    free_axis += 1
+                return free_axis
+            return target_axis
+        return None
+
+    def reserved_reduction_axes(self) -> int:
+        """Leading thread axes the kernel body reserves for reductions.
+
+        One axis per reduction that spreads across threads, at least one when
+        any reduction claims an axis, counted over the whole kernel (every root
+        loop, ``hl.barrier()`` phase and branch).  Tiles start above them both
+        in the body (``BlockSizeTileStrategy._compute_thread_axis_offset``) and
+        in the launch layout (:meth:`thread_axis_for_strategy`).  ``0`` when
+        the backend does not place reductions first.
+        """
+        if not CompileEnvironment.current().backend.reduction_axis_first():
+            return 0
+        reductions = [s for s in self.strategies if isinstance(s, ReductionStrategy)]
+        return max(
+            sum(1 for s in reductions if s._reduction_thread_count() > 1),
+            1 if any(s.thread_axes_used() > 0 for s in reductions) else 0,
+        )
+
+    def strategies_can_coexecute(
+        self, first: TileStrategy, second: TileStrategy
+    ) -> bool:
+        """Whether two strategies occur in at least one common execution branch."""
+        return any(
+            first in branch and second in branch for branch in self._strategy_branches()
+        )
+
+    def strategies_cover_branches(
+        self, target: TileStrategy, candidates: Sequence[TileStrategy]
+    ) -> bool:
+        """Every branch containing target also contains a candidate strategy."""
+        branches = [branch for branch in self._strategy_branches() if target in branch]
+        return bool(branches) and all(
+            any(candidate in branch for candidate in candidates) for branch in branches
+        )
+
+    def thread_axis_for_block_id(self, target_block_id: int) -> int | None:
+        """Return the launch thread axis assigned to a specific logical block id."""
+        for strategy in self.strategies:
+            if target_block_id not in strategy.block_ids:
+                continue
+            base_axis = self.thread_axis_for_strategy(strategy)
+            if base_axis is None:
+                return None
+            local_axis_map = getattr(strategy, "_thread_axis_map", None)
+            if callable(local_axis_map):
+                axis_map = local_axis_map()
+                if isinstance(axis_map, dict):
+                    local_axis = axis_map.get(target_block_id)
+                    if local_axis is not None:
+                        return base_axis + local_axis
+            if strategy.thread_axes_used() > 0:
+                return base_axis
+        return None
+
+    def _iter_strategy_thread_axes(
+        self, strategy: TileStrategy
+    ) -> list[tuple[int, int, int | None, str | None]]:
+        ordered_block_ids = getattr(strategy, "loop_order", None)
+        if ordered_block_ids is None:
+            block_id_order = list(strategy.block_ids)
+        else:
+            block_id_order = [strategy.block_ids[i] for i in ordered_block_ids]
+        axis_map_fn = getattr(strategy, "_thread_axis_map", None)
+        axis_map = axis_map_fn() if callable(axis_map_fn) else None
+        total_axes = strategy.thread_axes_used()
+        size_iter = iter(strategy.thread_block_sizes())
+        expr_iter = iter(strategy.thread_block_size_exprs())
+        result: list[tuple[int, int, int | None, str | None]] = []
+        for idx, block_id in enumerate(block_id_order):
+            local_axis = (
+                axis_map.get(block_id, idx) if isinstance(axis_map, dict) else idx
+            )
+            if idx + 1 < len(block_id_order):
+                next_axis = (
+                    axis_map.get(block_id_order[idx + 1], local_axis + 1)
+                    if isinstance(axis_map, dict)
+                    else idx + 1
+                )
+            else:
+                next_axis = total_axes
+            if local_axis >= next_axis:
+                continue
+            expr = next(expr_iter, None)
+            # ``thread_block_sizes`` lists the static extents only, while
+            # ``thread_block_size_exprs`` has an entry for every thread axis
+            # (an argument-sized block's is its ``_BLOCK_SIZE_n`` constant),
+            # so a static size pairs with the next digit expression and a
+            # symbolic expression ahead of it takes none.
+            if expr is not None and not expr.isdigit():
+                size = None
+            else:
+                size = next(size_iter, None)
+            result.append((block_id, local_axis, size, expr))
+        return result
+
+    def thread_extent_for_block_id(self, target_block_id: int) -> int | None:
+        """Return the live thread extent for a specific logical block id."""
+        for strategy in self.strategies:
+            if target_block_id not in strategy.block_ids:
+                continue
+            if isinstance(strategy, ReductionStrategy):
+                count = strategy._reduction_thread_count()
+                return count if count > 0 else None
+            for block_id, _local_axis, size, _expr in self._iter_strategy_thread_axes(
+                strategy
+            ):
+                if block_id == target_block_id:
+                    return size
+        return None
+
+    def has_surplus_threads_for_strategy(self, strategy: TileStrategy) -> bool:
+        """Whether the launch may run any of a strategy's thread axes wider
+        than the strategy requested.
+
+        Mutually exclusive kernel sections (e.g. two persistent stages around
+        an ``hl.barrier()``) share one launch whose block dims are the
+        elementwise max across sections, so a section can execute with more
+        threads on an axis than its own tile is wide.  Those surplus threads
+        index past the tile, so bounds masks for the axis must not be elided.
+        """
+        base_axis = self.thread_axis_for_strategy(strategy)
+        if base_axis is None:
+            return False
+        dims = self.thread_block_dims()
+        for block_id, local_axis, size, _expr in self._iter_strategy_thread_axes(
+            strategy
+        ):
+            if isinstance(strategy, PerThreadNDTileStrategy) and size is not None:
+                size = strategy.thread_extent_for_masking(block_id, size)
+            axis = base_axis + local_axis
+            # ``size is None`` means the extent is dynamic; the static launch
+            # dims cannot prove the launch matches, so keep the mask.
+            if (
+                size is None
+                or axis >= len(dims)
+                or dims[axis] > size
+                or self._may_have_multigrid_surplus(size)
+            ):
+                return True
+        return False
+
+    def _may_have_multigrid_surplus(self, extent: int) -> bool:
+        """Bound surplus without assuming branch-local axes agree globally.
+
+        CuTe root execution plans may reserve different synthetic/reduction
+        axes. The final launch follows the emitted indices, while dispatch's
+        axis map is scoped to the current root. Until all emitted mappings are
+        available, a grid mask can be elided only if *every* potential physical
+        axis fits its extent. Equal-width roots retain mask elision.
+        """
+        if (
+            CompileEnvironment.current().backend_name != "cute"
+            or len(HostFunction.current().device_ir.grid_block_ids) <= 1
+        ):
+            return False
+        return any(
+            size is None or size > extent
+            for strategy in self.strategies
+            for _block_id, _axis, size, _expr in self._iter_strategy_thread_axes(
+                strategy
+            )
+        )
+
+    def has_surplus_threads_for_block_id(self, target_block_id: int) -> bool:
+        """Per-block variant of :meth:`has_surplus_threads_for_strategy`.
+
+        ``False`` for blocks that do not claim a thread axis: their index is
+        uniform across the CTA, so extra launched threads only duplicate the
+        owning thread's in-bounds work.
+        """
+        for strategy in self.strategies:
+            if target_block_id not in strategy.block_ids or isinstance(
+                strategy, ReductionStrategy
+            ):
+                continue
+            base_axis = self.thread_axis_for_strategy(strategy)
+            if base_axis is None:
+                return False
+            dims = self.thread_block_dims()
+            for (
+                block_id,
+                local_axis,
+                size,
+                _expr,
+            ) in self._iter_strategy_thread_axes(strategy):
+                if block_id != target_block_id:
+                    continue
+                if isinstance(strategy, PerThreadNDTileStrategy) and size is not None:
+                    size = strategy.thread_extent_for_masking(block_id, size)
+                axis = base_axis + local_axis
+                if size is None or axis >= len(dims):
+                    return True
+                return dims[axis] > size or self._may_have_multigrid_surplus(size)
+            return False
+        return False
+
+    def thread_axis_sizes(self) -> dict[int, int]:
+        dims = self.thread_block_dims()
+        return {axis: size for axis, size in enumerate(dims) if size > 1}
+
+    def _thread_extent_expr_for_block_id(self, target_block_id: int) -> str | None:
+        """Return the launch-time thread extent expression for a specific block id."""
+        for strategy in self.strategies:
+            if target_block_id not in strategy.block_ids:
+                continue
+            for block_id, _local_axis, _size, expr in self._iter_strategy_thread_axes(
+                strategy
+            ):
+                if block_id == target_block_id:
+                    return expr
+        return None
+
+    def symbolic_thread_extent_expr(self, target_block_id: int) -> str | None:
+        """The thread extent of a block that is only known at launch.
+
+        ``hl.tile(n, block_size=bsz)`` with ``bsz`` an int argument of a kernel
+        bound with ``static_shapes=False`` holds one element per thread on the
+        host constant ``_BLOCK_SIZE_n``, which is the expression returned here;
+        the static shape (:meth:`thread_block_dims`) has a one for its axis.
+        ``None`` for a static extent and for a block without a thread axis.
+        """
+        if self.thread_extent_for_block_id(target_block_id) is not None:
+            return None
+        expr = self._thread_extent_expr_for_block_id(target_block_id)
+        if expr is None or expr.isdigit():
+            return None
+        return expr
+
+    def symbolic_thread_axes(self) -> dict[int, str]:
+        """The launch axes whose thread extent is only known at launch, by axis.
+
+        Each value is the extent's expression (see
+        :meth:`symbolic_thread_extent_expr`); the first block claiming an axis
+        names it.
+        """
+        axes: dict[int, str] = {}
+        for strategy in self.strategies:
+            base_axis = self.thread_axis_for_strategy(strategy)
+            if base_axis is None:
+                continue
+            for block_id, local_axis, _size, expr in self._iter_strategy_thread_axes(
+                strategy
+            ):
+                if (
+                    expr is None
+                    or expr.isdigit()
+                    or self.thread_extent_for_block_id(block_id) is not None
+                ):
+                    continue
+                axes.setdefault(base_axis + local_axis, expr)
+        return axes
+
+    def thread_block_dims(self) -> tuple[int, int, int]:
+        """Compute the CUDA thread block dims from all strategies.
+
+        When there are multiple grid entries (ForEach pattern), each branch
+        is mutually exclusive and shares the same thread axes.  We compute
+        per-branch dims and take the elementwise max.
+        """
+        branches = self._strategy_branches()
+        dims = [1, 1, 1]
+        for branch in branches:
+            branch_dims = [1, 1, 1]
+            ordered = self._ordered_strategies_for_branch(branch)
+            for strategy in ordered:
+                for block_id in strategy.block_ids:
+                    axis = self.thread_axis_for_block_id(block_id)
+                    size = self.thread_extent_for_block_id(block_id)
+                    if axis is None or size is None or size <= 1 or axis >= len(dims):
+                        continue
+                    branch_dims[axis] = max(branch_dims[axis], size)
+            for axis, size in enumerate(branch_dims):
+                dims[axis] = max(dims[axis], size)
+        return dims[0], dims[1], dims[2]
+
+    def thread_block_dim_exprs(self) -> tuple[str, str, str] | None:
+        """Compute launch block dims as expressions for single-branch kernels.
+
+        For kernels with dynamic block-size constexprs, this provides symbolic
+        launch dims (e.g. ``_BLOCK_SIZE_0``) when static tracking cannot infer
+        thread extents.
+        """
+        branches = self._strategy_branches()
+        if len(branches) != 1:
+            return None
+        dims = ["1", "1", "1"]
+        for strategy in self._ordered_strategies_for_branch(branches[0]):
+            for block_id in strategy.block_ids:
+                axis = self.thread_axis_for_block_id(block_id)
+                size_expr = self._thread_extent_expr_for_block_id(block_id)
+                if axis is None or size_expr is None:
+                    continue
+                if axis >= len(dims):
+                    return None
+                current = dims[axis]
+                if current == "1":
+                    dims[axis] = size_expr
+                elif current != size_expr:
+                    if current.isdigit() and size_expr.isdigit():
+                        dims[axis] = str(max(int(current), int(size_expr)))
+                    else:
+                        return None
+        return dims[0], dims[1], dims[2]
+
+    def expand_str(self, shape: ShapeLike, i: int) -> str:
+        if not self.supports_index_rank_expansion():
+            return ""
+        if len(shape) == 0 and i == 0:
+            return ""
+        assert 0 <= i < len(shape), f"Invalid index {i} for shape {shape}"
+        compacted_shapes = self.compact_shape(shape)
+        result = []
+        for dim in compacted_shapes:
+            if i in dim.user_indices:
+                result.append(":")
+            else:
+                result.append("None")
+        if result == [":"]:
+            return ""
+        return f"[{', '.join(result)}]"
+
+    def jagged_tile_expand_str(self, src_shape: ShapeLike, dst_shape: ShapeLike) -> str:
+        """Return suffix to transform src to dst using permute + None indexing.
+
+        Examples:
+            (u0, u2) -> (u0, u2, u1) => "[:, :, None]"
+            (u2, u0) -> (u0, u2, u1) => ".permute(1, 0)[:, :, None]"
+            (u0, u2) -> (1, u2)      => ""   (u0 absorbed by dst size-1 via
+                                              broadcast; no transform needed)
+        """
+        if not self.supports_index_rank_expansion():
+            return ""
+        if len(src_shape) == 0:
+            return ""
+        assert len(src_shape) <= len(dst_shape), (src_shape, dst_shape)
+
+        env = CompileEnvironment.current()
+
+        # Map each source dim to a unique destination dim with equal symbolic size.
+        src_to_dst: list[int] = []
+        used_dst: set[int] = set()
+        for src_dim in src_shape:
+            match: int | None = None
+            for dst_i, dst_dim in enumerate(dst_shape):
+                if dst_i in used_dst:
+                    continue
+                if env.known_equal(src_dim, dst_dim):
+                    match = dst_i
+                    break
+            if match is None:
+                # Fallback: absorb unmatched src dim into a dst size-1 slot
+                # (Triton will broadcast the size-1 dim at load time).
+                for dst_i, dst_dim in enumerate(dst_shape):
+                    if dst_i in used_dst:
+                        continue
+                    if env.known_equal(dst_dim, 1):
+                        match = dst_i
+                        break
+            assert match is not None, (
+                f"Cannot map src dim {src_dim} into dst shape {dst_shape} "
+                f"from src shape {src_shape}"
+            )
+            src_to_dst.append(match)
+            used_dst.add(match)
+
+        # Reorder source axes so they match destination axis order.
+        perm = sorted(range(len(src_shape)), key=lambda src_i: src_to_dst[src_i])
+
+        parts: list[str] = []
+        if perm != list(range(len(src_shape))):
+            parts.append(f".permute({', '.join(str(i) for i in perm)})")
+
+        # Add singleton dimensions where destination has extra axes.
+        keep = set(src_to_dst)
+        index_parts = [":" if i in keep else "None" for i in range(len(dst_shape))]
+        if not all(x == ":" for x in index_parts):
+            parts.append(f"[{', '.join(index_parts)}]")
+
+        return "".join(parts)
+
+    def broadcast_expand_dims(
+        self,
+        input_shape: ShapeLike,
+        output_shape: ShapeLike,
+    ) -> list[str]:
+        """Return subscript list to broadcast input_shape into output_shape.
+
+        Examples:
+            (bid=0,)    -> (bid=0, bid=1)    => [":", "None"]
+            (bid=1,)    -> (bid=0, bid=1)    => ["None", ":"]
+            (bid=0, K)  -> (bid=0, bid=1, K) => [":", "None", ":"]
+        """
+        if not self.supports_index_rank_expansion():
+            return []
+        if len(input_shape) == 0 or len(input_shape) == len(output_shape):
+            return []
+
+        env = CompileEnvironment.current()
+        src_compacted = self.compact_shape(input_shape)
+        dst_compacted = self.compact_shape(output_shape)
+
+        # Map each source compacted dim to a destination compacted dim.
+        src_to_dst: list[int] = []
+        used_dst: set[int] = set()
+        for src_dim in src_compacted:
+            match: int | None = None
+            src_bids = [env.canonical_block_id(bid) for bid in src_dim.block_ids]
+            if src_bids:
+                # Tile dim: match by canonical block_id
+                for dst_i, dst_dim in enumerate(dst_compacted):
+                    if dst_i in used_dst:
+                        continue
+                    dst_bids = [
+                        env.canonical_block_id(bid) for bid in dst_dim.block_ids
+                    ]
+                    if src_bids == dst_bids:
+                        match = dst_i
+                        break
+            else:
+                # Non-tile dim: match by size using known_equal on the
+                # original (non-compacted) shape elements.
+                for dst_i, dst_dim in enumerate(dst_compacted):
+                    if dst_i in used_dst:
+                        continue
+                    if dst_dim.block_ids:
+                        continue
+                    if len(src_dim.user_indices) == len(dst_dim.user_indices):
+                        if all(
+                            env.known_equal(input_shape[si], output_shape[di])
+                            for si, di in zip(
+                                src_dim.user_indices,
+                                dst_dim.user_indices,
+                                strict=True,
+                            )
+                        ):
+                            match = dst_i
+                            break
+            if match is None:
+                # Fallback: right-align unmatched non-tile dims
+                for dst_i in range(len(dst_compacted) - 1, -1, -1):
+                    if dst_i not in used_dst:
+                        match = dst_i
+                        break
+            assert match is not None, (
+                f"Cannot map input dim (block_ids={src_dim.block_ids}, "
+                f"size={src_dim.size_str}) into output shape {output_shape} "
+                f"from input shape {input_shape}"
+            )
+            src_to_dst.append(match)
+            used_dst.add(match)
+
+        keep = set(src_to_dst)
+        result = [":" if i in keep else "None" for i in range(len(dst_compacted))]
+        if all(r == ":" for r in result):
+            return []
+        return result
+
+    def expand_dims_str(self, shape: ShapeLike, start_idx: int, num_dims: int) -> str:
+        """Generate expansion string for multi-dimensional tensor indexers.
+
+        For a tensor with `num_dims` dimensions starting at `start_idx` in the output
+        shape, generates an indexing string that preserves those dimensions and adds
+        None for all other positions.
+
+        For example, with shape=[1, 8, 16], start_idx=0, num_dims=2:
+            Returns "[:, :, None]" - preserves positions 0,1 and adds None for position 2
+        """
+        if not self.supports_index_rank_expansion():
+            return ""
+        if len(shape) == 0:
+            return ""
+        end_idx = start_idx + num_dims
+        assert 0 <= start_idx < len(shape), (
+            f"Invalid start_idx {start_idx} for shape {shape}"
+        )
+        assert end_idx <= len(shape), f"Invalid end_idx {end_idx} for shape {shape}"
+
+        compacted_shapes = self.compact_shape(shape)
+        result = []
+        for dim in compacted_shapes:
+            # Check if any of this dim's user_indices fall in our range [start_idx, end_idx)
+            in_range = any(start_idx <= idx < end_idx for idx in dim.user_indices)
+            if in_range:
+                result.append(":")
+            else:
+                result.append("None")
+        # If result is all colons, no expansion needed
+        if all(r == ":" for r in result):
+            return ""
+        return f"[{', '.join(result)}]"
+
+    def get_reduction_strategy(self, block_idx: int) -> ReductionStrategy:
+        strategy = self.block_id_to_strategy[(block_idx,)]
+        assert isinstance(strategy, ReductionStrategy)
+        return strategy
+
+    def user_size(self, block_index: int) -> sympy.Expr:
+        """The user-visible size of the block index."""
+        # This only does something special for reduction loops, only need to check for 1D loop
+        strategy = self.block_id_to_strategy.get((block_index,))
+        if strategy is None:
+            return CompileEnvironment.current().block_sizes[block_index].symbol()
+        return strategy.user_size(block_index)
