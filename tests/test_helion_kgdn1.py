@@ -38,9 +38,14 @@ def _args(T, H, HV, K, seed=0, idx=None, act=0):
 # lab ABI + cases
 # ---------------------------------------------------------------------------
 def test_kernels_abi():
-    dec, ver = kgdn1.KERNELS
+    dec, ver, dec_vt, ver_vt = kgdn1.KERNELS
+    for vt, full in ((dec_vt, dec), (ver_vt, ver)):  # same cases / reference / baseline / check
+        assert {k: v for k, v in vt.items() if k not in ("name", "body", "settings")} == {
+            k: v for k, v in full.items() if k not in ("name", "body")}
     for ent, name, body in ((dec, kgdn1.KERNEL, "kgdn1_decode"),
-                            (ver, kgdn1.VERIFY_KERNEL, "kgdn1_verify")):
+                            (ver, kgdn1.VERIFY_KERNEL, "kgdn1_verify"),
+                            (dec_vt, kgdn1.KERNEL_VT, "kgdn1_decode_vt"),
+                            (ver_vt, kgdn1.VERIFY_KERNEL_VT, "kgdn1_verify_vt")):
         assert re.fullmatch(r"[a-z0-9_]{1,40}", ent["name"]) and ent["name"] == name
         assert ent["body"].__qualname__ == body  # module-level, undecorated
         for key in ("cases", "make", "make_baseline", "reference", "baseline", "check"):
@@ -504,3 +509,208 @@ def test_verify_oracle_cpu(interleaved):
     with pytest.raises(RuntimeError, match="verify oracle FAIL|K-GDN1 oracle FAIL"):
         qwen_gdn.run_gpu_verify_oracle(broken, 2, 4, 16, 16, 3, 0, 1e-6, (8,), interleaved,
                                        device=torch.device("cpu"))
+
+
+# ---------------------------------------------------------------------------
+# V-tiled bodies (kgdn1_decode_vt / kgdn1_verify_vt + the vt_norm launch)
+# ---------------------------------------------------------------------------
+V_BLOCKS = (16, 32, 64)
+
+
+def _vt(body, v_block):
+    helion = pytest.importorskip("helion")
+    return helion.kernel(body, config=helion.Config(v_block=v_block),
+                         ignore_warnings=kgdn1._ignore())
+
+
+def _clone(args):
+    return [a.clone() if isinstance(a, torch.Tensor) else a for a in args]
+
+
+@pytest.mark.parametrize("v_block", V_BLOCKS)
+@pytest.mark.parametrize("H,HV,tp", RANKS[:4])            # (16, 48, 128) at tp 1/2/4/8
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_decode_vt_interpret_tp_rank_shapes(H, HV, tp, interleaved, v_block):
+    lane, args = _lane_decode(3, H, HV, 128, seed=tp, idx=[2, 0, 1], interleaved=interleaved)
+    ref = kgdn1.reference(*args)
+    full = pytest.importorskip("helion").kernel(kgdn1.kgdn1_decode)(*_clone(args))
+    got = _vt(kgdn1.kgdn1_decode_vt, v_block)(*args)
+    ok, msg = kgdn1.check(got, ref)
+    assert ok, msg
+    assert torch.count_nonzero(got[0][1]) == 0                    # NULL slot: zero row
+    torch.testing.assert_close(got[0], full[0], rtol=0, atol=8e-3)  # ~1 bf16 ulp of the body
+    torch.testing.assert_close(got[1], full[1], rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("act", [0, 1])
+@pytest.mark.parametrize("v_block", V_BLOCKS)
+def test_decode_vt_interpret_small(v_block, act):
+    """V < v_block (masked partial tile), K != V, sigmoid gate."""
+    args = list(kgdn1.make(kgdn1.case(5, 2, 6, 16, 16), 3, device="cpu"))
+    args[10].copy_(torch.tensor([3, 0, -1, 1, 5], dtype=torch.int32))
+    args[-1] = act
+    ok, msg = kgdn1.check(_vt(kgdn1.kgdn1_decode_vt, v_block)(*_clone(args)), kgdn1.reference(*args))
+    assert ok, msg
+    lane, kv = _lane_decode(2, 2, 4, 32, seed=1, idx=[1, 2])
+    inp = qwen_gdn.make_inputs(2, 2, 4, 32, slots=4, seed=2, idx=[2, 1], page_pad=8, V=64)
+    out = torch.zeros(2, 4, 64, dtype=torch.bfloat16)
+    kv = [*kgdn1.body_args(inp["mixed_qkv"], inp["z"], inp["ba"], inp["a_log"], inp["dt_bias"],
+                           inp["norm_w"], inp["state"], inp["state_idx"], out, 2),
+          32 ** -0.5, 1e-6, act]
+    ok, msg = kgdn1.check(_vt(kgdn1.kgdn1_decode_vt, v_block)(*_clone(kv)), kgdn1.reference(*kv))
+    assert ok, msg
+
+
+def _rand_verify(N, W, H, HV, K, seed, interleaved=False, pad=0):
+    gen = torch.Generator().manual_seed(seed)
+    lens = torch.randint(0, W + 1, (N,), generator=gen).tolist()
+    acc = torch.randint(1, W + 2, (N,), generator=gen).tolist()  # W + 1: out of range
+    lane = _verify_inputs(N, W, H, HV, K, seed=seed, lens=lens, accepted=acc,
+                          interleaved=interleaved, pad_tokens=pad)
+    lane[10].fill_(0.5)  # rows no sequence covers must keep their values
+    return lane
+
+
+@pytest.mark.parametrize("v_block", V_BLOCKS)
+@pytest.mark.parametrize("H,HV,tp", RANKS[:4])
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_verify_vt_interpret_tp_rank_shapes(H, HV, tp, interleaved, v_block):
+    lane = _rand_verify(3, 5, H, HV, 128, seed=10 * tp + v_block, interleaved=interleaved, pad=2)
+    lane[7][2, 0] = 0  # a NULL destination
+    args = [*kgdn1.verify_body_args(*lane, H), 128 ** -0.5, 1e-6, 0]
+    ref = kgdn1.verify_reference(*args)
+    full = pytest.importorskip("helion").kernel(kgdn1.kgdn1_verify)(*_clone(args))
+    got = _vt(kgdn1.kgdn1_verify_vt, v_block)(*args)
+    ok, msg = kgdn1.check(got, ref)
+    assert ok, msg
+    torch.testing.assert_close(got[0], full[0], rtol=0, atol=8e-3)
+    torch.testing.assert_close(got[1], full[1], rtol=1e-6, atol=1e-7)
+    assert torch.all(got[0][-2:] == 0.5)                         # pad rows untouched
+
+
+@pytest.mark.parametrize("act", [0, 1])
+@pytest.mark.parametrize("N,W,H,HV,K,lens,acc,pad", VERIFY_CASES)
+def test_verify_vt_interpret_edge_cases(N, W, H, HV, K, lens, acc, pad, act):
+    lane = _verify_inputs(N, W, H, HV, K, seed=N + 7, lens=lens, accepted=acc, pad_tokens=pad)
+    lane[7][N - 1, 0] = 0
+    lane[10].fill_(-1.0)
+    args = [*kgdn1.verify_body_args(*lane, H), K ** -0.5, 1e-6, act]
+    for v_block in V_BLOCKS:
+        ok, msg = kgdn1.check(_vt(kgdn1.kgdn1_verify_vt, v_block)(*_clone(args)),
+                              kgdn1.verify_reference(*args))
+        assert ok, (v_block, msg)
+
+
+@pytest.mark.parametrize("v_block", V_BLOCKS)
+def test_verify_vt_random_accepted_qwen4exp_tp2(v_block):
+    """Today's measured case: per-rank H=8, HV=24, K=V=128, w=5; random lens/accepted."""
+    for seed in range(3):
+        lane = _rand_verify(4, 5, 8, 24, 128, seed=seed)
+        args = [*kgdn1.verify_body_args(*lane, 8), 128 ** -0.5, 1e-6, 0]
+        ok, msg = kgdn1.check(_vt(kgdn1.kgdn1_verify_vt, v_block)(*_clone(args)),
+                              kgdn1.verify_reference(*args))
+        assert ok, (seed, msg)
+
+
+@pytest.mark.parametrize("static", [True, False])
+def test_vt_bodies_lower_to_triton(static):
+    helion = pytest.importorskip("helion")
+    from helion.runtime.ref_mode import RefMode
+
+    def code(body, args, v_block=32):
+        bound = helion.kernel(body, static_shapes=static, ref_mode=RefMode.OFF,
+                              ignore_warnings=kgdn1._ignore()).bind(tuple(args))
+        cfg = bound.config_spec.default_config()
+        assert cfg["v_block"] == 32
+        return bound.to_triton_code(helion.Config(**{**cfg.config, "v_block": v_block}))
+
+    src = code(kgdn1.kgdn1_decode_vt, _args(3, 8, 24, 128))
+    assert src.count("tl.load(state +") == 1 and src.count("tl.store(state +") == 1
+    assert "(128 + _BLOCK_SIZE_3 - 1) // _BLOCK_SIZE_3" in src       # V tiles in the grid
+    assert "torch.ops.suffix_kgdn1.vt_norm(o, z, norm_w, out, None, None" in src
+    lane = _verify_inputs(3, 5, 8, 24, 128, seed=1, lens=[5, 5, 5])
+    src = code(kgdn1.kgdn1_verify_vt, [*kgdn1.verify_body_args(*lane, 8), 128 ** -0.5, 1e-6, 0],
+               v_block=16)
+    assert src.count("tl.load(state +") == 1 and src.count("tl.store(state +") == 5
+    assert "torch.ops.suffix_kgdn1.vt_norm(o, z, norm_w, out, cu_lo, cu_hi" in src
+    # the norm launches lower at their fixed config
+    o = torch.zeros(3, 8, 3, 128)
+    z = torch.zeros(3, 8, 3, 128, dtype=torch.bfloat16)
+    for body, extra, o_ in ((kgdn1.kgdn1_vt_norm, (), o),
+                            (kgdn1.kgdn1_vt_norm_seq, (lane[8][:-1], lane[8][1:]),
+                             o.view(3, 1, 8, 3, 128).expand(3, 5, 8, 3, 128).contiguous())):
+        b = helion.kernel(body, config=helion.Config(**kgdn1.NORM_CONFIG), static_shapes=static,
+                          ref_mode=RefMode.OFF).bind((o_, z, torch.ones(128), z.clone(), *extra,
+                                                      1e-6, 0))
+        assert "tl.store(out +" in b.to_triton_code(helion.Config(**kgdn1.NORM_CONFIG))
+
+
+def _ship(tmp_path, kernel, cases):
+    (tmp_path / kernel).mkdir(exist_ok=True)
+    rows = [{"key": c, "config": {"num_warps": 4}} for c in cases]
+    (tmp_path / kernel / "testgpu.json").write_text(json.dumps(rows))
+    hk._TABLES.clear()
+
+
+def test_pick_rule(table, tmp_path, monkeypatch):
+    """Full tile where shipped, else V-tiled, else the baseline (per bucket)."""
+    monkeypatch.setenv(kgdn1.ENV, "auto")
+    dec = lambda m: kgdn1.case(m, 8, 24, 128, 128)  # noqa: E731
+    _ship(tmp_path, kgdn1.KERNEL, [dec(8), dec(32)])
+    _ship(tmp_path, kgdn1.KERNEL_VT, [dec(1), dec(8)])
+    assert kgdn1.served(8, 24, 128, 128) == {1: kgdn1.KERNEL_VT, 8: kgdn1.KERNEL,
+                                              32: kgdn1.KERNEL}
+    calls = []
+    monkeypatch.setattr(hk, "compiled", lambda body, name, c, **kw: (
+        lambda *a: calls.append((body.__name__, name, c["numtokens"]))))
+    monkeypatch.setattr(kgdn1, "body_args", lambda *a: ())
+    monkeypatch.setattr(kgdn1, "verify_body_args", lambda *a: ())
+    native = _Native()
+    op, buckets = qwen_gdn.decode_op(native, 8, 24, 128)
+    assert buckets == (1, 8, 32)
+    for T in (1, 7, 20):
+        op(torch.empty(T, 1), *([None] * 5), torch.empty(4, 24, 128, 128, device="meta"),
+           None, None, 8, 0.1, 1e-6, 0, 0)
+    assert calls == [("kgdn1_decode_vt", kgdn1.KERNEL_VT, 1), ("kgdn1_decode", kgdn1.KERNEL, 8),
+                     ("kgdn1_decode", kgdn1.KERNEL, 32)]
+    # helion mode: the V-tiled row satisfies the bucket; 128 is still missing
+    monkeypatch.setenv(kgdn1.ENV, "helion")
+    with pytest.raises(RuntimeError, match="no tuned kgdn1_decode config"):
+        qwen_gdn.decode_op(native, 8, 24, 128)
+    _ship(tmp_path, kgdn1.KERNEL_VT, [dec(1), dec(8), dec(128)])
+    assert qwen_gdn.decode_op(native, 8, 24, 128)[1] == (1, 8, 32, 128)
+    # verify: V-tiled rows alone route the buckets they cover
+    monkeypatch.setenv(kgdn1.ENV, "auto")
+    ver = lambda m: kgdn1.verify_case(m, 8, 24, 128, 128, 5)  # noqa: E731
+    _ship(tmp_path, kgdn1.VERIFY_KERNEL_VT, [ver(1), ver(8)])
+    op, vb = kgdn1.verify_op(8, 24, 128, 128, 5)
+    assert op is kgdn1.gdn_verify_fused_helion and vb == (1, 8)
+    assert kgdn1.served(8, 24, 128, 128, 5) == {1: kgdn1.VERIFY_KERNEL_VT,
+                                                 8: kgdn1.VERIFY_KERNEL_VT}
+    calls.clear()
+    kgdn1.gdn_verify_fused_helion(None, *([None] * 5), torch.empty(4, 24, 128, 128, device="meta"),
+                                  torch.zeros(1, 5, dtype=torch.int32), None, None, None, 8,
+                                  0.1, 1e-6, 0)
+    assert calls == [("kgdn1_verify_vt", kgdn1.VERIFY_KERNEL_VT, 5)]
+
+
+def test_no_vt_rows_is_todays_routing(table, monkeypatch):
+    """Only full-tile rows shipped: the same buckets, bodies and configs as before."""
+    monkeypatch.setenv(kgdn1.ENV, "auto")
+    table(1, 32)
+    assert kgdn1.served(16, 48, 128, 128) == {1: kgdn1.KERNEL, 32: kgdn1.KERNEL}
+    assert qwen_gdn.decode_op(_Native(), 16, 48, 128)[1] == (1, 32)
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_verify_oracle_cpu_vt(interleaved):
+    """The boot verify oracle with the V-tiled body as the op (CPU, no graph round)."""
+    kern = _vt(kgdn1.kgdn1_verify_vt, 16)
+
+    def op(*a):
+        *lane, H, scale, eps, act = a
+        kern(*kgdn1.verify_body_args(*lane, H), scale, eps, act)
+
+    worst = qwen_gdn.run_gpu_verify_oracle(op, 2, 4, 32, 32, 5, 0, 1e-6, (1, 8), interleaved,
+                                           device=torch.device("cpu"))
+    assert worst["out"] < 0.1 and worst["state"] < 1e-4

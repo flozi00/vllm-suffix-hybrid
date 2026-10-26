@@ -72,9 +72,12 @@ lane restores 0.30's routing, whose stock non-K-GDN1 batches run
 _forward_core + _rms_norm_gated_cuda as before). Routing by batch shape:
   * non-spec decode -> stock causal_conv1d_update + K-GDN1 decode;
   * MTP verify, sequence bucket with a Helion verify config -> stock conv +
-    kgdn1_verify (helion | auto only);
+    kgdn1_verify or kgdn1_verify_vt (helion | auto only);
   * everything else (prefill, mixed, unshipped verify buckets) -> vLLM's own
     method (interleaved: de-interleave, then vLLM's _forward_core_fused_norm).
+Per Helion bucket the full-tile body serves where its config is shipped,
+else the V-tiled one (kgdn1.pick); the layer log names the body per bucket
+and the boot oracles replay a CUDA graph per Helion bucket.
 
 Startup kernel-path assertion (K5, log markers, see the dossier §6 protocol):
   ``suffix qwen-gdn K-GDN1 armed``            register() succeeded
@@ -306,32 +309,35 @@ def run_gpu_oracle(native, H, HV, K, act, norm_eps, row_stride=None, op=None, ex
         _check(out.float(), ref, inp["state"], ref_state, worst, f"T={T}")
 
     # CUDA-graph capture/replay: the kernel must be capturable (no sync, no
-    # alloc on the launch path) and replay must match an eager launch.
-    T = 4
-    inp = make_inputs(T, H, HV, K, slots=24, device=dev, seed=99, page_pad=4096, V=V,
-                      interleaved=interleaved)
-    s_eager = inp["state"].clone()
-    out_eager = torch.empty(T, HV, V, dtype=torch.bfloat16, device=dev)
-    out_graph = torch.empty_like(out_eager)
-    args = [inp["mixed_qkv"], inp["z"], inp["ba"], inp["a_log"], inp["dt_bias"],
-            inp["norm_w"]]
-    op(*args, s_eager, inp["state_idx"], out_eager, H, K ** -0.5, norm_eps, act,
-       torch.cuda.current_stream(dev).cuda_stream)
-    s_graph = inp["state"].clone()
-    s_graph0 = s_graph.clone()
-    graph = torch.cuda.CUDAGraph()
-    side = torch.cuda.Stream(dev)
-    side.wait_stream(torch.cuda.current_stream(dev))
-    with torch.cuda.stream(side):
-        with torch.cuda.graph(graph, stream=side):
-            op(*args, s_graph, inp["state_idx"], out_graph, H, K ** -0.5, norm_eps, act,
-               side.cuda_stream)
-    torch.cuda.current_stream(dev).wait_stream(side)
-    s_graph.copy_(s_graph0)  # capture may or may not have executed the kernel
-    graph.replay()
-    torch.cuda.synchronize(dev)
-    if not torch.equal(out_graph, out_eager) or not torch.equal(s_graph, s_eager):
-        raise RuntimeError("K-GDN1 oracle FAIL: CUDA-graph replay != eager launch")
+    # alloc on the launch path) and replay must match an eager launch. Once
+    # per Helion bucket (each may serve on another body: full tile / V-tiled
+    # + norm launch), plus T=4 (the fallback when no bucket is Helion).
+    for T in sorted({4, *extra_T}):
+        idx = [t + 1 if t < 23 else 0 for t in range(T)]
+        inp = make_inputs(T, H, HV, K, slots=24, device=dev, seed=99, idx=idx, page_pad=4096,
+                          V=V, interleaved=interleaved)
+        s_eager = inp["state"].clone()
+        out_eager = torch.empty(T, HV, V, dtype=torch.bfloat16, device=dev)
+        out_graph = torch.empty_like(out_eager)
+        args = [inp["mixed_qkv"], inp["z"], inp["ba"], inp["a_log"], inp["dt_bias"],
+                inp["norm_w"]]
+        op(*args, s_eager, inp["state_idx"], out_eager, H, K ** -0.5, norm_eps, act,
+           torch.cuda.current_stream(dev).cuda_stream)
+        s_graph = inp["state"].clone()
+        s_graph0 = s_graph.clone()
+        graph = torch.cuda.CUDAGraph()
+        side = torch.cuda.Stream(dev)
+        side.wait_stream(torch.cuda.current_stream(dev))
+        with torch.cuda.stream(side):
+            with torch.cuda.graph(graph, stream=side):
+                op(*args, s_graph, inp["state_idx"], out_graph, H, K ** -0.5, norm_eps, act,
+                   side.cuda_stream)
+        torch.cuda.current_stream(dev).wait_stream(side)
+        s_graph.copy_(s_graph0)  # capture may or may not have executed the kernel
+        graph.replay()
+        torch.cuda.synchronize(dev)
+        if not torch.equal(out_graph, out_eager) or not torch.equal(s_graph, s_eager):
+            raise RuntimeError(f"K-GDN1 oracle FAIL: CUDA-graph replay != eager launch (T={T})")
     return worst
 
 
@@ -385,25 +391,27 @@ def run_gpu_verify_oracle(op, H, HV, K, V, W, act, norm_eps, buckets, interleave
     if not cuda:
         return worst
 
-    args = inputs(sizes[-1], 99)
-    s0 = args[6].clone()
-    op(*args, H, scale, norm_eps, act)
-    out_eager, s_eager = args[10].clone(), args[6].clone()
-    args[6].copy_(s0)
-    args[10].zero_()
-    graph = torch.cuda.CUDAGraph()
-    side = torch.cuda.Stream(dev)
-    side.wait_stream(torch.cuda.current_stream(dev))
-    with torch.cuda.stream(side):
-        with torch.cuda.graph(graph, stream=side):
-            op(*args, H, scale, norm_eps, act)
-    torch.cuda.current_stream(dev).wait_stream(side)
-    args[6].copy_(s0)
-    args[10].zero_()
-    graph.replay()
-    torch.cuda.synchronize(dev)
-    if not torch.equal(args[10], out_eager) or not torch.equal(args[6], s_eager):
-        raise RuntimeError("K-GDN1 verify oracle FAIL: CUDA-graph replay != eager launch")
+    for N in sorted(set(buckets)):  # one graph round per bucket: each may serve on its own body
+        args = inputs(N, 99)
+        s0 = args[6].clone()
+        op(*args, H, scale, norm_eps, act)
+        out_eager, s_eager = args[10].clone(), args[6].clone()
+        args[6].copy_(s0)
+        args[10].zero_()
+        graph = torch.cuda.CUDAGraph()
+        side = torch.cuda.Stream(dev)
+        side.wait_stream(torch.cuda.current_stream(dev))
+        with torch.cuda.stream(side):
+            with torch.cuda.graph(graph, stream=side):
+                op(*args, H, scale, norm_eps, act)
+        torch.cuda.current_stream(dev).wait_stream(side)
+        args[6].copy_(s0)
+        args[10].zero_()
+        graph.replay()
+        torch.cuda.synchronize(dev)
+        if not torch.equal(args[10], out_eager) or not torch.equal(args[6], s_eager):
+            raise RuntimeError(f"K-GDN1 verify oracle FAIL: CUDA-graph replay != eager launch "
+                               f"(N={N})")
     return worst
 
 
@@ -688,12 +696,14 @@ def _make_layer_cls(native):
             self._kgdn_sass = ""
             if mode == "oxide":
                 fallback, self._kgdn_vop, self._kgdn_vbuckets = "oxide", None, ()
+                served = ({}, {})
             else:
                 from suffix_hybrid.helion_kernels import kgdn1
                 fits = kgdn1.oxide_fits(H, HV, K, V, layout)
                 fallback = "oxide" if fits else "vLLM stock FLA chain"
                 self._kgdn_vop, self._kgdn_vbuckets = kgdn1.verify_op(H, HV, K, V, W)
                 self._kgdn_buckets = kgdn1.BUCKETS
+                served = (kgdn1.served(H, HV, K, V), kgdn1.served(H, HV, K, V, W))
             self._kgdn_op, self._kgdn_helion = decode_op(native, H, HV, K, V, layout)
             self._kgdn_fallback = fallback
             if fallback == "oxide" and (mode == "oxide"
@@ -709,10 +719,10 @@ def _make_layer_cls(native):
                      f"act={self.norm.activation}; helion buckets "
                      f"{list(self._kgdn_helion) or 'none'})")
             verify = ("n/a (no spec decode)" if not W else
-                      f"helion@{list(self._kgdn_vbuckets)} seqs (w={W}), else vLLM stock"
+                      f"helion@{served[1]} seqs (w={W}), else vLLM stock"
                       if self._kgdn_vbuckets else f"vLLM stock (w={W})")
             _log(f"K-GDN1 layer {self.prefix}: {HELION_ENV}={mode} tp={tp} H={H} HV={HV} "
-                 f"K={K} V={V} {layout}; decode helion@{list(self._kgdn_helion)} else "
+                 f"K={K} V={V} {layout}; decode helion@{served[0] or '[]'} else "
                  f"{fallback}; verify {verify}; route flag {route_flag}")
 
         def _kgdn_f32(self):
