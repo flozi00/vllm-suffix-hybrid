@@ -55,7 +55,8 @@ from types import SimpleNamespace
 
 import torch
 
-from . import NVFP4_LAYERS_ENV, PATCH_REVISION, nvfp4_layer_patterns, selected
+from . import (NVFP4_LAYERS_ENV, PATCH_REVISION, check_fused_scope, nvfp4_layer_patterns,
+               selected)
 
 MARK = "[suffix nvfp4-dense]"
 ACT_ENV = "SUFFIX_NVFP4_DENSE_ACT_AMAX"
@@ -245,6 +246,7 @@ def convert_model(model, patterns=None) -> list:
             continue
         if not isinstance(mod, LinearBase) or type(mod.quant_method) is not UnquantizedLinearMethod:
             continue
+        check_fused_scope(name, modules)
         w = mod.weight
         n, k = w.shape if w.dim() == 2 else (0, 0)
         if w.dtype != torch.bfloat16 or w.device != dev or n % 16 or k % 16 or n == 0:

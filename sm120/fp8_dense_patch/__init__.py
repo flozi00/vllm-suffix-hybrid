@@ -55,8 +55,11 @@ from pathlib import Path
 PATCH_NAME = "fp8-dense"
 PATCH_REVISION = "2026-09-28.1"
 PINNED_VLLM = "0.30.0"
-# + vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18): same anchors.
-SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1")
+# + vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18) and 0.32.0
+# (fixtures/vllm_0.32.0/model_loader_utils.py, byte-identical to the 0.31.1 nightly):
+# same anchor. 0.32.0 Qwen4Exp adds two model-side seams handled at conversion:
+# check_fused_scope (QSA indexer packed into qkv_proj) and route_converted_hc.
+SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1", "0.32.0")
 GATE_ENV = "SUFFIX_FP8_DENSE"
 LAYERS_ENV = "SUFFIX_FP8_DENSE_LAYERS"
 NVFP4_GATE_ENV = "SUFFIX_NVFP4_DENSE"
@@ -190,6 +193,45 @@ def patch_source(src: str) -> tuple[str, list[str]]:
     return out, [n for n, *_ in EDITS]
 
 
+QSA_INDEXER_ENV = "SUFFIX_DENSE_QSA_INDEXER"
+
+
+def check_fused_scope(name: str, modules: dict) -> None:
+    """vLLM 0.32 Qwen4Exp QSA packs the indexer Q/K projection (separate,
+    BF16 ``self_attn.indexer.index_qk_proj`` on 0.30) into ``self_attn.qkv_proj``
+    (Qwen4ExpQSAQKVIndexerLinear, ``fuse_indexer_projection``). Converting that
+    module would also quantize the indexer: the same glob silently covering more
+    weights. Refuse unless ``SUFFIX_DENSE_QSA_INDEXER=1`` accepts it."""
+    parent, _, leaf = name.rpartition(".")
+    if (leaf == "qkv_proj" and getattr(modules.get(parent), "fuse_indexer_projection", False)
+            and os.environ.get(QSA_INDEXER_ENV, "").strip() != "1"):
+        raise PatchDriftError(
+            f"{name} also holds the QSA indexer Q/K rows on this vLLM (indexer stayed BF16 "
+            f"on 0.30); converting it quantizes the indexer too. Set {QSA_INDEXER_ENV}=1 to "
+            "accept (quality gate first) or drop the glob.")
+
+
+def route_converted_hc(model) -> list:
+    """vLLM 0.32 Qwen4Exp HyperConnection decides ``_use_hc_down_silu`` at
+    __init__ from the BF16 weight and then feeds
+    ``input_mix_weight_down_block_inject.weight`` straight into a CuTe-DSL BF16
+    kernel for M <= 48, bypassing quant_method. A converted (packed) weight there
+    is garbage: route those modules through their quant method, as on 0.30."""
+    import torch
+
+    hits = []
+    for name, mod in model.named_modules():
+        lin = getattr(mod, "input_mix_weight_down_block_inject", None)
+        if getattr(mod, "_use_hc_down_silu", False) and lin.weight.dtype != torch.bfloat16:
+            mod._use_hc_down_silu = False
+            hits.append(name)
+    if hits:
+        print(f"[suffix {PATCH_NAME}] {len(hits)} HyperConnection down+inject projections "
+              "converted: vLLM's BF16 hc_down_silu fast path off for them (quant method serves "
+              f"every M), e.g. {hits[0]}", file=sys.stderr, flush=True)
+    return hits
+
+
 def _suffix_fp8_dense_convert(model) -> None:
     if nvfp4_enabled():  # first: FP8 then skips what became NVFP4
         from . import nvfp4  # torch/vllm: worker side only
@@ -199,6 +241,8 @@ def _suffix_fp8_dense_convert(model) -> None:
         from . import runtime
 
         runtime.convert_model(model)
+    if nvfp4_enabled() or fp8_enabled():
+        route_converted_hc(model)
     if amax_record_enabled():  # last: records what stayed BF16
         from . import amax_record
 

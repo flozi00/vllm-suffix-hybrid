@@ -8,7 +8,7 @@ import sys
 import torch
 from torch import nn
 
-from . import PATCH_NAME, PATCH_REVISION, layer_patterns, selected
+from . import PATCH_NAME, PATCH_REVISION, check_fused_scope, layer_patterns, selected
 
 FP8_MAX = 448.0  # float8_e4m3fn
 FP4_MAX = 6.0    # e2m1
@@ -286,12 +286,14 @@ def convert_model(model, patterns=None) -> list:
         register_op()  # here, not inside the traced forward
     method = method_cls()()
     done, skipped, bf16_bytes, kept_bytes = [], [], 0, 0
-    for name, mod in list(model.named_modules()):
+    modules = dict(model.named_modules())
+    for name, mod in modules.items():
         if not selected(name, patterns):
             continue
         if isinstance(mod, LinearBase):
             if type(mod.quant_method) is not UnquantizedLinearMethod:
                 continue
+            check_fused_scope(name, modules)
             kind = "linear"
         elif type(mod) is nn.Linear:
             kind = "nn"

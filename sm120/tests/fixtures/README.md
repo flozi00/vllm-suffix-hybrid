@@ -37,3 +37,13 @@ fixture + anchor set is required.
   flashinfer_mla_sparse{,_sm120}.py, model_loader utils.py, cuda_communicator.py.
   `test_vllm_nightly_anchors.py` replays every GLM-5.3 patch on them (glm pool's
   "always latest vLLM" lane; other pools stay on 0.30.0).
+
+- `vllm_0.32.0/` — verbatim from tag `v0.32.0`: `model_loader_utils.py`
+  (`vllm/model_executor/model_loader/utils.py`, byte-identical to the 0.31.1
+  nightly copy: fp8_dense_patch anchor unchanged), `qwen4_exp_hyperconnection.py`
+  and `qwen4_exp_qsa.py` (`vllm/models/qwen4_exp/nvidia/{hyperconnection,qsa}.py`);
+  `vllm_0.30.0/qwen4_exp_{hyperconnection,qsa}.py` are the v0.30.0 copies.
+  `test_nvfp4_dense.py` pins their hashes and the two 0.32 seams the dense patch
+  guards: the BF16 `hc_down_silu` fast path (`_use_hc_down_silu`) that reads
+  `input_mix_weight_down_block_inject.weight` directly, and the QSA indexer Q/K
+  projection packed into `self_attn.qkv_proj` (`fuse_indexer_projection`).

@@ -443,12 +443,13 @@ def test_nvfp4_runs_before_fp8_and_fp8_skips_its_layers(fake_vllm, monkeypatch):
     order = []
     monkeypatch.setattr(N, "convert_model", lambda m: order.append("nvfp4"))
     monkeypatch.setattr(R, "convert_model", lambda m: order.append("fp8"))
+    monkeypatch.setattr(P, "route_converted_hc", lambda m: order.append("hc"))
     monkeypatch.setenv(P.NVFP4_GATE_ENV, "1")
     P._suffix_fp8_dense_convert(None)
-    assert order == ["nvfp4"]
+    assert order == ["nvfp4", "hc"]
     monkeypatch.setenv(P.GATE_ENV, "1")
     P._suffix_fp8_dense_convert(None)
-    assert order == ["nvfp4", "nvfp4", "fp8"]
+    assert order == ["nvfp4", "hc", "nvfp4", "fp8", "hc"]
 
 
 # --- gate / hook / drift --------------------------------------------------------------------
@@ -508,3 +509,120 @@ def test_oracle_layer_stub_goes_through_convert_layer(fake_vllm):
     assert N.rel_frob(out, N.reference(x, q, sf, ws2, N.layer_act_amax(m))) < N.KERNEL_BOUND
     assert N.rel_frob(out, nn.functional.linear(x, w).float()) < N.QUANT_BOUND
     assert O._wq_mismatch(w, q, sf) == 0.0  # fake ops = the same torch quantizer
+
+
+# --- vLLM 0.32.0 Qwen4Exp seams (fixtures: verbatim v0.30.0 / v0.32.0 sources) ---------------
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+V032_SHA = {
+    "model_loader_utils.py": "3091a9f64cbe42ad0e7fc0907fbbcb9197d2d56d5da4008779c5a16d9b8649a6",
+    "qwen4_exp_hyperconnection.py": "3cf42672bbf21b97a070fc8901ddb4eacfa66db4e05913187e5431f9ee905601",
+    "qwen4_exp_qsa.py": "1eee006d61000de48aa783037dc2474202413310f9368fcd41c2713e1a41d95c",
+}
+V030_SHA = {
+    "qwen4_exp_hyperconnection.py": "2a15d6b22fbe1def4d2bcd85568269d1157c5e1c298f0c6af43c1fb9797489ba",
+    "qwen4_exp_qsa.py": "9ac72b0e5f02341704a2f5a49bf2f4a6f141d2e241e9db07ea5918592bac90ea",
+}
+
+
+def _fix(version, name):
+    return (FIXTURES / f"vllm_{version}" / name).read_text()
+
+
+def test_v032_fixtures_are_pinned_upstream_copies():
+    import hashlib
+    for version, pins in (("0.32.0", V032_SHA), ("0.30.0", V030_SHA)):
+        for name, sha in pins.items():
+            assert hashlib.sha256(_fix(version, name).encode()).hexdigest() == sha, (version, name)
+
+
+@pytest.mark.parametrize("version", ["0.30.0", "0.32.0"])
+def test_anchor_replays_on_both_pins(version):
+    new, applied = P.patch_source(_fix(version, P.FIXTURE))
+    assert applied == ["convert_after_post_load"] and "_suffix_fp8_dense_convert(model)" in new
+    assert version.startswith(P.SUPPORTED_VLLM) and "0.32.0rc1.dev329+g39983a5e7".startswith(
+        P.SUPPORTED_VLLM)
+    assert not "0.33.0".startswith(P.SUPPORTED_VLLM)
+
+
+def test_upstream_seams_the_guards_key_on():
+    """0.32 HC: _use_hc_down_silu (set at __init__ from the BF16 weight dtype)
+    gates a direct read of input_mix_weight_down_block_inject.weight; 0.32 QSA:
+    fuse_indexer_projection swaps qkv_proj for the packed QKV+indexer linear.
+    0.30 has neither (both guards are no-ops there)."""
+    hc32, qsa32 = _fix("0.32.0", "qwen4_exp_hyperconnection.py"), _fix("0.32.0", "qwen4_exp_qsa.py")
+    assert "self._use_hc_down_silu = (" in hc32 and "weight.dtype == torch.bfloat16" in hc32
+    assert ("self._use_hc_down_silu\n" in hc32 and "hc_down_silu(\n                xn,\n"
+            "                self.input_mix_weight_down_block_inject.weight," in hc32)
+    assert "self.fuse_indexer_projection = vllm_config.lora_config is None" in qsa32
+    assert "self.qkv_proj = Qwen4ExpQSAQKVIndexerLinear(" in qsa32
+    assert "del self.indexer.index_qk_proj" in qsa32
+    hc30, qsa30 = _fix("0.30.0", "qwen4_exp_hyperconnection.py"), _fix("0.30.0", "qwen4_exp_qsa.py")
+    assert "hc_down_silu" not in hc30 and "fuse_indexer_projection" not in qsa30
+    for src in (hc30, hc32):  # the glob leaf names the pool env lists are unchanged
+        for leaf in ("input_mix_weight_down_block_inject", "input_mix_weight_down",
+                     "input_mix_weight_up"):
+            assert f'maybe_prefix(prefix, "{leaf}")' in src
+
+
+def _qsa_like():
+    torch.manual_seed(0)
+    root = nn.Module()
+    lm = root.language_model = nn.Module()
+    lm.model = nn.Module()
+    layer = _decoder()
+    layer.self_attn.fuse_indexer_projection = True  # vLLM 0.32 QSA, no LoRA
+    lm.model.layers = nn.ModuleDict({"0": layer})
+    return root
+
+
+def test_fused_qsa_indexer_qkv_is_refused_unless_accepted(fake_vllm, monkeypatch):
+    monkeypatch.setenv(P.NVFP4_LAYERS_ENV, "*language_model*self_attn.qkv_proj")
+    with pytest.raises(P.PatchDriftError, match="indexer"):
+        N.convert_model(_qsa_like())
+    root = _qsa_like()
+    root.language_model.model.layers["0"].self_attn.fuse_indexer_projection = False  # 0.30 / LoRA
+    assert [d[0] for d in N.convert_model(root)] == [f"{L0}.self_attn.qkv_proj"]
+    monkeypatch.setenv(P.QSA_INDEXER_ENV, "1")
+    assert [d[0] for d in N.convert_model(_qsa_like())] == [f"{L0}.self_attn.qkv_proj"]
+
+
+def test_fp8_mode_refuses_the_fused_qsa_indexer_too(monkeypatch):
+    lin = types.ModuleType("vllm.model_executor.layers.linear")
+    lin.LinearBase, lin.UnquantizedLinearMethod = LinearBase, UnquantizedLinearMethod
+    lin.LinearMethodBase = object
+    monkeypatch.setitem(sys.modules, lin.__name__, lin)
+    monkeypatch.setattr(R, "_capability", lambda dev: (12, 0))
+    monkeypatch.setattr(R, "_OPS", object())
+    monkeypatch.setattr(R, "_METHOD_CLS", None)
+    with pytest.raises(P.PatchDriftError, match="indexer"):
+        R.convert_model(_qsa_like(), patterns=("*self_attn.qkv_proj",))
+
+
+class _HC(nn.Module):
+    """vLLM 0.32 GatedResidual (use_combine=True) attributes the guard reads."""
+
+    def __init__(self):
+        super().__init__()
+        self.input_mix_weight_down_block_inject = LinearBase(336, 64)
+        self.input_mix_weight_up = LinearBase(64, 32)
+        self._use_hc_down_silu = True
+
+
+def test_converted_hc_down_inject_leaves_the_bf16_fast_path(fake_vllm, monkeypatch, capsys):
+    monkeypatch.setenv(P.NVFP4_GATE_ENV, "1")
+    monkeypatch.setenv(P.NVFP4_LAYERS_ENV, "*attn_hyper_connection.input_mix_weight_down_block_inject")
+    monkeypatch.setenv(N.ACT_ENV, "*input_mix_weight_down_block_inject=8.0")
+    root = nn.Module()
+    root.layers = nn.ModuleDict({"0": nn.Module(), "1": nn.Module()})
+    root.layers["0"].attn_hyper_connection = _HC()
+    root.layers["0"].mlp_hyper_connection = _HC()  # not allowlisted: stays BF16 + fast path
+    root.layers["1"].attn_hyper_connection = _HC()
+    root.layers["1"].attn_hyper_connection._use_hc_down_silu = False  # vLLM said no already
+    P._suffix_fp8_dense_convert(root)
+    hc0 = root.layers["0"].attn_hyper_connection
+    assert hc0.input_mix_weight_down_block_inject.weight.dtype == torch.uint8
+    assert hc0._use_hc_down_silu is False
+    assert root.layers["0"].mlp_hyper_connection._use_hc_down_silu is True
+    assert root.layers["1"].attn_hyper_connection._use_hc_down_silu is False
+    assert "1 HyperConnection down+inject projections converted" in capsys.readouterr().err
+    assert P.route_converted_hc(root) == []  # idempotent
