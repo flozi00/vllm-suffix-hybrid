@@ -97,6 +97,9 @@ def nvfp4_gemm_q_body(xq: torch.Tensor, xsf: torch.Tensor, w: torch.Tensor, wsf:
     kb_pad = (nkb + 3) // 4 * 4
     cap = hl.specialize(partial.size(0))
     split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, cap, 1))
+    # measure re-runs configs tuned for other shapes: split_k > cap would write
+    # partial[] out of bounds (device fault). A host assert fails that config, loudly.
+    assert split_k <= cap
     k_split = helion.next_power_of_2(helion.cdiv(kh, split_k * 16)) * 16  # whole 16-k blocks
     bm = hl.register_block_size(16, 64)
     bn = hl.register_block_size(16, 128)
@@ -156,6 +159,9 @@ def nvfp4_gemm_body(x: torch.Tensor, w: torch.Tensor, wsf: torch.Tensor, out: to
     kb_pad = (nkb + 3) // 4 * 4
     cap = hl.specialize(partial.size(0))
     split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, cap, 1))
+    # measure re-runs configs tuned for other shapes: split_k > cap would write
+    # partial[] out of bounds (device fault). A host assert fails that config, loudly.
+    assert split_k <= cap
     k_split = helion.next_power_of_2(helion.cdiv(kh, split_k * 16)) * 16
     bm = hl.register_block_size(16, 64)
     bn = hl.register_block_size(16, 128)
@@ -500,7 +506,7 @@ def problem(case: dict, seed: int, device="cuda", prequant: bool = False) -> dic
     if n:
         p.update(w=codes(n), wsf=scales(n),
                  out=torch.empty(m, n, dtype=torch.bfloat16, device=device),
-                 partial=torch.empty(max_splits(n), m, n, dtype=torch.float32, device=device),
+                 partial=torch.zeros(max_splits(n), m, n, dtype=torch.float32, device=device),
                  counters=torch.zeros(counter_elems(n), dtype=torch.int32, device=device))
     if prequant:
         p.update(xq=codes(m), xsf=scales(m), alpha=float(np.float32(1.0 / FP4_RANGE ** 2)))
@@ -687,6 +693,18 @@ def _pf_name() -> str:
             f"pf {'|'.join(map(str, PF_AUTO))}: the faster per case, like the lane's autoroute")
 
 
+def _tune_check(actual, expected):
+    """Autotuner accuracy check of the GEMMs (raises AssertionError): only the bf16 `out` is
+    compared. The default check also compares every mutated argument, i.e. the split-K scratch
+    `partial` (written only by split_k > 1 configs, untouched by the split_k = 1 reference),
+    which rejected every split-K config as an "accuracy mismatch"."""
+    from torch.utils._pytree import tree_flatten
+    for a, e in zip(tree_flatten(actual)[0], tree_flatten(expected)[0], strict=True):
+        if isinstance(e, torch.Tensor) and e.dtype == torch.bfloat16:
+            rms = float(e.float().square().mean().sqrt())
+            torch.testing.assert_close(a, e, rtol=1e-2, atol=1e-3 * max(rms, 1e-6))
+
+
 def _kernel(name):
     q = name == GEMM_Q
     base = {
@@ -699,7 +717,8 @@ def _kernel(name):
                 "baseline": _quant_baseline, "check": check_quant, "replaces": [],
                 "baseline_name": "vllm scaled_fp4_quant (swizzled; oxide's quant is fused "
                                  "into nvfp4_gemm_cuda)"}
-    return {**base, "make_baseline": lambda case, seed: _baseline_args(case, seed, q),
+    return {**base, "settings": {"autotune_baseline_accuracy_check_fn": _tune_check},
+            "make_baseline": lambda case, seed: _baseline_args(case, seed, q),
             "reference": reference_q if q else reference,
             "baseline": _baseline_q if q else _baseline, "check": check,
             "baseline_name": f"oxide {name} prod launch, {_pf_name()}",

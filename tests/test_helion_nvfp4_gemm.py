@@ -213,3 +213,14 @@ def test_body_interpret_vs_reference(name, case, monkeypatch):
             ok, msg = hx.check(kern(*args), ref)
             assert ok, f"split_k={split}: {msg}"
             assert not p["counters"].any(), "split-K counters not reset"
+
+
+def test_tune_check_compares_only_bf16_out():
+    out = torch.randn(4, 8).bfloat16()
+    scratch = torch.zeros(2, 4, 8)
+    hx._tune_check((out, scratch), (out.clone(), scratch + 5.0))  # fp32 scratch mismatch ignored
+    with pytest.raises(AssertionError):
+        hx._tune_check((out + 1, scratch), (out, scratch))
+    for e in hx.KERNELS:
+        assert (e.get("settings", {}).get("autotune_baseline_accuracy_check_fn") is hx._tune_check) \
+            == (e["name"] != hx.QUANT)
