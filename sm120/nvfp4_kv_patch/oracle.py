@@ -14,7 +14,10 @@ What it exercises is exactly the production byte path, nothing re-implemented:
            the V-SF de-swizzle define (patch ensure_deswizzle_flag()).
 The reference dequantizes the cache BYTES in torch (e2m1 LUT x e4m3 SF x
 global scale; K SF linear, V SF 4-token swizzled per the store kernel) and runs
-fp32 attention — independent of the kernel under test. Gates:
+fp32 attention — independent of the kernel under test. On the vLLM 0.31.1
+nightly the store is FlashInfer's nvfp4_quantize_append_paged_kv_cache_with_
+slot_mapping (the nightly's own nvfp4_fa2 writer, V SF linear) into the
+backend's _nvfp4_kv_views, with no de-swizzle define. Gates:
   * decoder sanity: dequant(cache) vs the bf16 input  (store/decoder bug)
   * kernel vs dequant reference, tight                 (kernel/SF/layout bug)
   * kernel vs bf16-input attention, loose               (end-to-end sanity)
@@ -47,7 +50,8 @@ import json
 import math
 import sys
 
-from . import SF_VEC_SIZE, ensure_deswizzle_flag, is_sm120, mm_helper_namespace
+from . import (NIGHTLY_VLLM, SF_VEC_SIZE, ensure_deswizzle_flag, is_sm120,
+               mm_helper_namespace)
 
 PAGE = 64
 # e2m1 code -> value (bit 3 = sign).
@@ -62,6 +66,14 @@ COS_DECODE_MIN = 0.98     # nvfp4 round-trip of gaussian data is ~0.99
 COS_E2E_MIN = 0.95        # attention output vs un-quantized inputs
 REL_MM_VS_CAUSAL_MIN = 0.05  # mm reference must differ from causal
 COS_VS_FA2_MIN = 0.999    # ours vs FA2 on identical bytes (both ~exact)
+
+
+def _nightly() -> bool:
+    """vLLM 0.31.1 nightly: FlashInfer's slot-mapping writer, LINEAR V scales,
+    views from the backend's own _nvfp4_kv_views (no de-swizzle define)."""
+    import vllm
+
+    return getattr(vllm, "__version__", "").startswith(NIGHTLY_VLLM)
 
 
 def _cos(a, b):
@@ -179,21 +191,33 @@ def run_case(shape, pattern, kv_lens, q_len, scales, wrapper_kind, seed=0,
         indptr.append(indptr[-1] + p)
         last.append(n - (p - 1) * page)
 
-    # --- production store (FlashInferImpl.do_kv_cache_update, nvfp4 branch)
-    k_cache, v_cache = cache.transpose(1, 2).split(hkv, dim=-2)
     ks = torch.tensor([k_scale], dtype=torch.float32, device="cuda")
     vs = torch.tensor([v_scale], dtype=torch.float32, device="cuda")
-    torch.ops._C_cache_ops.reshape_and_cache_flash(
-        torch.cat(keys), torch.cat(vals), k_cache, v_cache,
-        torch.cat(slots).to(torch.int64), "nvfp4", ks, vs)
+    nightly = _nightly()
+    if nightly:
+        # --- nightly production store + views (FlashInferImpl nvfp4_fa2
+        # branch: FlashInfer's writer, the backend's own page views)
+        from vllm.v1.attention.backends.flashinfer import _nvfp4_kv_views
 
-    # --- production read views (FlashInferImpl.forward, HND identity order)
-    k_side, v_side = cache.split(hkv, dim=1)
-    k_data, k_sf = nvfp4_split_data_scale(k_side)
-    v_data, v_sf = nvfp4_split_data_scale(v_side)
+        data, sfs, layout = _nvfp4_kv_views(cache, hkv)
+        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+            torch.cat(keys), torch.cat(vals), torch.cat(slots).to(torch.int64),
+            data, sfs, ks, vs, kv_layout=layout)
+        (k_data, v_data), (k_sf, v_sf) = data, sfs
+    else:
+        # --- production store (FlashInferImpl.do_kv_cache_update, nvfp4 branch)
+        k_cache, v_cache = cache.transpose(1, 2).split(hkv, dim=-2)
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
+            torch.cat(keys), torch.cat(vals), k_cache, v_cache,
+            torch.cat(slots).to(torch.int64), "nvfp4", ks, vs)
+
+        # --- production read views (FlashInferImpl.forward, HND identity order)
+        k_side, v_side = cache.split(hkv, dim=1)
+        k_data, k_sf = nvfp4_split_data_scale(k_side)
+        v_data, v_sf = nvfp4_split_data_scale(v_side)
 
     k_deq = dequant_side(k_data, k_sf, False, k_scale)  # (B,H,N,D)
-    v_deq = dequant_side(v_data, v_sf, True, v_scale)
+    v_deq = dequant_side(v_data, v_sf, not nightly, v_scale)
 
     sm_scale = 1.0 / math.sqrt(d)
     # q_len: int (uniform) or per-request lengths (ragged: suffix drafts)
@@ -562,12 +586,18 @@ def main(argv=None) -> int:
         print("oracle: not an SM120 (cc 12.x) device; nothing to verify",
               file=sys.stderr)
         return 2
-    ensure_deswizzle_flag()  # before flashinfer JITs anything
     try:
+        nightly = _nightly()
+        if not nightly:
+            ensure_deswizzle_flag()  # before flashinfer JITs anything
         import flashinfer  # noqa: F401
         import vllm._custom_ops  # noqa: F401  (registers _C_cache_ops)
     except Exception as exc:
         print(f"oracle: import failed: {exc}", file=sys.stderr)
+        return 2
+    if nightly and args.own:
+        print("oracle: K2-NVFP4 reads swizzled V scales; the nightly writes "
+              "them linear (own cases not applicable)", file=sys.stderr)
         return 2
 
     shapes = [tuple(int(x) for x in spec.split(":"))
