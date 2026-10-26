@@ -1090,18 +1090,24 @@ def _make_layer_cls(native=None):
             stream = torch.cuda.current_stream(dev).cuda_stream
             warm_key = (local, info["H"], info["I"], cfg["topk"], cfg["act"], cfg["limit"],
                         base)
+            judge_all = False
             if hm and warm_key not in _state["helion_warm"]:
                 # every served M once (Triton specializes on sizes): no compile
                 # can happen later, inside CUDA-graph capture
                 _state["helion_warm"].add(warm_key)
+                judge_all = True
                 for m in sorted(hm):
                     xw = torch.zeros(m, info["H"], dtype=torch.bfloat16, device=dev)
                     idw, tww = rand_routing(m, cfg["E_global"], cfg["topk"], dev, m, base, local)
                     run_ours(native, cfg, xw, idw, tww, _state["ws"][dev], stream)
-            # one judged M per tuned (bucket, plan): the largest M it serves
+            # one judged M per tuned (bucket, plan): the largest M it serves; the first layer of a
+            # shape judges EVERY Helion-served M (a tuned config serves its whole bucket, and a
+            # tile/mask bug can hit an unaligned M inside it: route_quant at bucket 48 tuned to a
+            # config whose xq differed in 96% of elements, 2026-10-26)
             reps = {key: max(m for m in hm if hm[m] == key) for key in set(hm.values())}
+            judged = set(hm) if judge_all else set(reps.values())
             cases = [(m, None, 1.0, "balanced")
-                     for m in sorted({1, min(8, mm), mm} | set(reps.values()))]
+                     for m in sorted({1, min(8, mm), mm} | judged)]
             if local < cfg["E_global"]:
                 cases.append((min(8, mm), True, 1.0, "balanced"))
             if cfg["limit"] is not None:  # hot activations: the clamp must engage
