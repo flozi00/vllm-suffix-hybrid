@@ -636,6 +636,10 @@ def main(argv=None) -> int:
                    help="serving MTP k (kgdn1_verify cases need it; 0 = no verify cases)")
     a = p.parse_args(argv)
     raise_nofile()
+    # A candidate whose generated Triton fails (e.g. Helion 1.5.0 epilogue_subtile=2 + split_k
+    # store shape mismatch in nvfp4_gemm_q_fp4mma, 2026-10-26) must be skipped, not abort the
+    # case's search; the winner still passes the exact-reference gate below.
+    os.environ.setdefault("HELION_AUTOTUNE_IGNORE_ERRORS", "1")
     if a.child:
         with open(a.child) as f:
             return child(json.load(f))
