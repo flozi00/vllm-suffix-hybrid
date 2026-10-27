@@ -1208,3 +1208,66 @@ def test_host_vote_refuses_what_the_container_cannot_hold(tmp_path, monkeypatch)
         sft._host_vote(101)
     monkeypatch.setattr(W, "_cgroup_headroom", lambda: None)
     sft._host_vote(10**9)
+
+
+# ---------------------------------------------------------------- QSA fused indexer
+def test_qsa_drops_the_fused_indexer_tail_before_projecting():
+    """vLLM merges the indexer QK projection into qkv_proj, so the fused width is
+    2*q_size + 2*kv_size + index_qk_size. Its own QSA forward splits that tail off
+    before _project_qkv_gate; doing it the other way round makes the split sizes
+    miss the tensor width (4224 vs [3072, 256, 256] on Qwen3.8-Flash-Next)."""
+    from suffix_hybrid.sft.model import TrainMode
+
+    q_size, kv_size, index_qk_size, hd = 4, 2, 3, 2
+    nh, nkv = 2, 1
+    fused = 2 * q_size + 2 * kv_size + index_qk_size
+    seen = {}
+
+    def project_qkv_gate(qkv, positions):
+        seen["width"] = qkv.shape[-1]
+        t = qkv.shape[0]
+        q = qkv[:, :q_size].reshape(t, nh, hd)
+        k = qkv[:, q_size:q_size + kv_size].reshape(t, nkv, hd)
+        v = qkv[:, q_size + kv_size:q_size + 2 * kv_size].reshape(t, nkv, hd)
+        gate = qkv[:, q_size + 2 * kv_size:].reshape(t, nh * hd)
+        return q, k, v, gate
+
+    m = SimpleNamespace(
+        qkv_proj=lambda x: (torch.randn(x.shape[0], fused), None),
+        fuse_indexer_projection=True,
+        q_size=q_size, kv_size=kv_size, index_qk_size=index_qk_size,
+        _project_qkv_gate=project_qkv_gate,
+        num_heads=nh, num_kv_heads=nkv, head_dim=hd, scaling=hd ** -0.5,
+        o_proj=lambda o: (o, None),
+    )
+    me = SimpleNamespace(segments=[(0, 3)])
+    out = TrainMode.qsa(me, m, None, torch.randn(3, 8))
+    assert seen["width"] == 2 * q_size + 2 * kv_size, "indexer tail must be split off first"
+    assert out.shape == (3, nh * hd)
+
+
+def test_qsa_leaves_an_unfused_projection_alone():
+    from suffix_hybrid.sft.model import TrainMode
+
+    q_size, kv_size, hd, nh, nkv = 4, 2, 2, 2, 1
+    seen = {}
+
+    def project_qkv_gate(qkv, positions):
+        seen["width"] = qkv.shape[-1]
+        t = qkv.shape[0]
+        return (qkv[:, :q_size].reshape(t, nh, hd),
+                qkv[:, q_size:q_size + kv_size].reshape(t, nkv, hd),
+                qkv[:, q_size + kv_size:q_size + 2 * kv_size].reshape(t, nkv, hd),
+                torch.ones(t, nh * hd))
+
+    m = SimpleNamespace(
+        qkv_proj=lambda x: (torch.randn(x.shape[0], 2 * q_size + 2 * kv_size), None),
+        fuse_indexer_projection=False,
+        q_size=q_size, kv_size=kv_size, index_qk_size=3,
+        _project_qkv_gate=project_qkv_gate,
+        num_heads=nh, num_kv_heads=nkv, head_dim=hd, scaling=hd ** -0.5,
+        o_proj=lambda o: (o, None),
+    )
+    out = TrainMode.qsa(SimpleNamespace(segments=[(0, 3)]), m, None, torch.randn(3, 8))
+    assert seen["width"] == 2 * q_size + 2 * kv_size
+    assert out.shape == (3, nh * hd)
