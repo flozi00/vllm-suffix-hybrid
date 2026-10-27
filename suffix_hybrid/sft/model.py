@@ -894,6 +894,14 @@ class TrainMode(contextlib.ContextDecorator):
         """Qwen4Exp QSA as dense causal attention: exact while every segment
         fits the indexer budget (every key selected); sigma(gate) in f32."""
         qkv, _ = m.qkv_proj(hidden_states)
+        # vLLM merges the indexer QK projection into qkv_proj
+        # (`output_sizes=[*qkv_proj.output_sizes, index_size * tp_size]`), and its
+        # own QSA forward splits that tail off BEFORE _project_qkv_gate. Dense
+        # attention here selects every key, so the indexer projection is unused
+        # and only has to be dropped: passing the merged tensor straight to
+        # _project_qkv_gate makes it split 4224 into [3072, 256, 256].
+        if getattr(m, "fuse_indexer_projection", False):
+            qkv, _ = qkv.split([2 * m.q_size + 2 * m.kv_size, m.index_qk_size], dim=-1)
         q, k, v, gate = m._project_qkv_gate(qkv, positions)
         t = hidden_states.shape[0]
         nh, nkv, hd = m.num_heads, m.num_kv_heads, m.head_dim
