@@ -43,6 +43,7 @@ implemented yet: ``build_functional`` raises and tuning stays off.
 from __future__ import annotations
 
 import math
+import os
 import time
 
 import contextlib
@@ -201,8 +202,20 @@ def expert_weights(handle, e):
     return handle["w13"][e].float(), handle["w2"][e].float()
 
 
+# Serving quantizes the MoE activations (x, h) to NVFP4 before the expert
+# GEMMs. Emulating that in the twin is a fidelity nicety, not a requirement:
+# ``quant_codes`` casts to uint8, so the graph is CUT at x -- the expert path
+# contributes no gradient to its input -- and the torch reference is where the
+# expert backward dies with a device-side assert past ~370 tokens. Training on
+# the unquantized activation is both differentiable and stable; serving keeps
+# its quantizer. Default 1 = previous behaviour.
+_ACT_QDQ = bool(int(os.environ.get("SUFFIX_SFT_ACT_QDQ", "1")))
+
+
 def _qdq(x, handle, stage):
     if handle["kind"] == "nvfp4":   # serving quantizes x and h to NVFP4
+        if not _ACT_QDQ:
+            return x
         from suffix_hybrid.kernels.nvfp4_moe import qdq
         g = handle["a1g"] if stage == "x" else handle["a2g"]
         return qdq(x, g) / g

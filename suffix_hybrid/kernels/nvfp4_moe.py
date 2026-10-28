@@ -331,7 +331,9 @@ def dequant(packed, sf):
     import torch
     lut = _consts(packed.device)[2]
     r, k = packed.shape[0], packed.shape[1] * 2  # explicit: R may be 0 (all off-rank)
-    code = torch.stack([packed & 0xF, packed >> 4], -1).reshape(r, k)
+    # Mask after the shift: an int8 `packed` shifts arithmetically, so a high
+    # byte yields a negative index and the gather asserts on the device.
+    code = torch.stack([packed & 0xF, (packed >> 4) & 0xF], -1).reshape(r, k)
     val = lut[code.long()]
     return (val.reshape(r, k // 16, 16) * sf[..., None]).reshape(r, k)
 
