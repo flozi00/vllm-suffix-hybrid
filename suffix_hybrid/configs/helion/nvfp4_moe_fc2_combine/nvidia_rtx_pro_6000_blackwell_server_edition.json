@@ -1,0 +1,164 @@
+[
+  {
+    "key": {
+      "experts": 256,
+      "hidden": 2560,
+      "moe_intermediate": 640,
+      "topk": 10,
+      "act": "silu",
+      "experts_global": 512,
+      "numtokens": 32
+    },
+    "config": {
+      "block_sizes": [
+        16,
+        8
+      ],
+      "loop_orders": [
+        [
+          0,
+          1
+        ]
+      ],
+      "l2_groupings": [
+        1
+      ],
+      "range_unroll_factors": [
+        0,
+        0,
+        0
+      ],
+      "range_warp_specializes": [
+        null,
+        null,
+        null
+      ],
+      "range_num_stages": [
+        0,
+        0,
+        0
+      ],
+      "range_multi_buffers": [
+        null,
+        null,
+        null
+      ],
+      "range_flattens": [
+        null,
+        null,
+        null
+      ],
+      "load_eviction_policies": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "num_warps": 4,
+      "num_stages": 1,
+      "indexing": [
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer"
+      ],
+      "atomic_indexing": [],
+      "pid_type": "flat",
+      "host_tensor_descriptors": false
+    }
+  },
+  {
+    "key": {
+      "experts": 256,
+      "hidden": 2560,
+      "moe_intermediate": 640,
+      "topk": 10,
+      "act": "silu",
+      "experts_global": 512,
+      "numtokens": 48
+    },
+    "config": {
+      "block_sizes": [
+        16,
+        8
+      ],
+      "loop_orders": [
+        [
+          0,
+          1
+        ]
+      ],
+      "l2_groupings": [
+        1
+      ],
+      "range_unroll_factors": [
+        0,
+        0,
+        0
+      ],
+      "range_warp_specializes": [
+        null,
+        null,
+        null
+      ],
+      "range_num_stages": [
+        0,
+        0,
+        0
+      ],
+      "range_multi_buffers": [
+        null,
+        null,
+        null
+      ],
+      "range_flattens": [
+        null,
+        null,
+        null
+      ],
+      "load_eviction_policies": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "num_warps": 4,
+      "num_stages": 1,
+      "indexing": [
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer"
+      ],
+      "atomic_indexing": [],
+      "pid_type": "flat",
+      "host_tensor_descriptors": false
+    }
+  }
+]

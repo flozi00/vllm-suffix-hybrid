@@ -1,0 +1,1136 @@
+from __future__ import annotations
+
+from bisect import bisect_right
+import contextlib
+from contextvars import ContextVar
+import csv
+import datetime
+import hashlib
+import io
+import itertools
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from types import TracebackType
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Callable
+from typing import Iterator
+from typing import Literal
+from typing import NamedTuple
+from typing import TypeAlias
+from typing import TypeVar
+from typing import cast
+from typing_extensions import Self
+from uuid import uuid4
+
+from torch._inductor.runtime.triton_compat import OutOfResources
+from torch._inductor.runtime.triton_compat import PTXASError
+from torch.cuda import OutOfMemoryError as CudaOOMError
+
+from .search_space_logger import canonical_config_id
+from helion._dist_utils import is_master_rank
+
+if TYPE_CHECKING:
+    from _csv import Writer as CsvWriter
+
+    from ..runtime.config import Config
+    from ..runtime.settings import Settings
+    from .base_search import _AutotunableKernel
+    from .handoff import HandoffMeasurement
+    from .handoff import HandoffPoint
+    from .metrics import KernelMetadata
+
+else:
+    CsvWriter = Any  # type: ignore[assignment]
+
+SinkSelf = TypeVar("SinkSelf", bound="AutotuneLogSink")
+ExcInfoParam: TypeAlias = (
+    bool
+    | BaseException
+    | tuple[type[BaseException], BaseException, TracebackType | None]
+    | None
+)
+
+_AUTOTUNE_CSV_FIELDS = (
+    "run_id",
+    "timestamp_s",
+    "config_id",
+    "generation",
+    "status",
+    "perf_ms",
+    "compile_time_s",
+    "config",
+)
+_AUTOTUNE_SOURCE_CSV_FIELDS = (
+    "run_id",
+    "timestamp_s",
+    "config_id",
+    "generation",
+    "status",
+    "source_hash",
+)
+
+_active_trace: ContextVar[_AutotuneTrace | None] = ContextVar(
+    "helion_autotune_trace", default=None
+)
+
+
+@contextlib.contextmanager
+def _logging_errors() -> Iterator[None]:
+    """Keep logging failures out of the search, including during cleanup."""
+    try:
+        yield
+    except Exception:
+        # Reporting the error must also tolerate a broken logging handler.
+        with contextlib.suppress(Exception):
+            logging.getLogger(__name__).exception(
+                "Autotune logging failed; continuing tuning"
+            )
+
+
+def _json_safe(value: object) -> object:
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+class _ElapsedFormatter(logging.Formatter):
+    def __init__(self, elapsed_fn: Callable[[], int]) -> None:
+        super().__init__()
+        self._elapsed_fn = elapsed_fn
+
+    def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
+        elapsed = self._elapsed_fn()
+        return f"[{elapsed}s] {record.getMessage()}"
+
+
+class AutotuningLogger:
+    """
+    A self-contained logger that does not propagate to the root logger and
+    prints each record to stderr in the form:
+
+        [<elapsed>s] <message>
+
+    where *elapsed* is the whole-second wall-clock time since the logger
+    instance was created.
+
+    Takes lambdas as arguments, which are called when the log is emitted.
+    """
+
+    _count: itertools.count[int] = itertools.count()
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        level = settings.autotune_log_level
+        self.level = level
+        self._logger: logging.Logger = logging.getLogger(
+            f"{__name__}.{next(self._count)}"
+        )
+        self._logger.setLevel(level)
+        self._logger.propagate = False
+        self._start_time: float = time.perf_counter()
+        self._extra_handlers: list[logging.Handler] = []
+        self._active_handlers: list[logging.Handler] = []
+        self._log_sink: AutotuneLogSink | None = None
+        self._trace_sink: _AutotuneTrace | None = None
+        self._trace_algorithm = ""
+        self.reset()
+
+    @_logging_errors()
+    def reset(self) -> None:
+        self._start_time = time.perf_counter()
+        for handler in list(self._active_handlers):
+            self._logger.removeHandler(handler)
+        self._active_handlers = []
+        self._register_handler(self._make_stream_handler())
+        for handler in self._extra_handlers:
+            self._register_handler(handler)
+
+    def add_handler(self, handler: logging.Handler) -> None:
+        if handler in self._extra_handlers:
+            return
+        self._extra_handlers.append(handler)
+        self._register_handler(handler)
+
+    def remove_handler(self, handler: logging.Handler) -> None:
+        if handler in self._extra_handlers:
+            self._extra_handlers.remove(handler)
+        if handler in self._active_handlers:
+            self._active_handlers.remove(handler)
+            self._logger.removeHandler(handler)
+
+    @contextlib.contextmanager
+    def autotune_logging(
+        self,
+        base_path: str | None = None,
+        metadata: KernelMetadata | None = None,
+        collect_dataset: bool = False,
+    ) -> Iterator[AutotuneLogSink | None]:
+        """Attach an :class:`AutotuneLogSink` for the duration of a tuning run.
+
+        ``<base>.csv``/``.log`` are written whenever a log path is set. With
+        ``collect_dataset`` and ``metadata``, a ``<base>.meta.jsonl`` record
+        (identity + configs) is also written at run end, joined via ``run_id``.
+        """
+
+        path = base_path or self._settings.autotune_log
+        if not path:
+            yield None
+            return
+        sink = None
+        with _logging_errors():
+            sink = AutotuneLogSink(path, metadata, collect_dataset)
+            sink.open()
+            self._attach_sink(sink)
+            sink.start_run()
+        try:
+            yield self._log_sink
+        finally:
+            with _logging_errors():
+                self._detach_sink()
+            if sink is not None:
+                with _logging_errors():
+                    sink.end_run()
+                with _logging_errors():
+                    sink.close()
+
+    def record_autotune_entry(self, entry: AutotuneLogEntry) -> None:
+        """Write a structured autotune log entry when a sink is active."""
+
+        if self._log_sink is not None:
+            with _logging_errors():
+                self._log_sink.record(entry)
+        self.record_trace_entry(entry)
+
+    @_logging_errors()
+    def record_trace_entry(
+        self, entry: AutotuneLogEntry, *, event: str | None = None
+    ) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record_entry(self._trace_algorithm, entry, event=event)
+
+    @property
+    def trace_enabled(self) -> bool:
+        return self._trace_sink is not None
+
+    @_logging_errors()
+    def record_selected_config(self, config: Config) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "selected",
+                self._trace_algorithm,
+                config_id=canonical_config_id(config),
+                config=config.config,
+            )
+
+    @_logging_errors()
+    def record_handoff(self, point: HandoffPoint) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "handoff",
+                self._trace_algorithm,
+                reason=point.reason,
+                config_id=canonical_config_id(point.config),
+                config=point.config.config,
+                source_hash=point.finalists[0].source_hash,
+                objective_unit=point.objective_unit,
+                objective=point.finalists[0].perf,
+                perf_ms=point.finalists[0].perf
+                if point.objective_unit == "ms"
+                else None,
+                trials=point.progress.trials,
+                unique_sources=point.progress.unique_sources,
+                samples=point.finalists[0].samples,
+            )
+
+    @_logging_errors()
+    def record_handoff_event(self, event: str, **fields: object) -> None:
+        """Record native-source progress separately from configuration timings."""
+        if self._trace_sink is not None:
+            self._trace_sink.record(event, "native_source", **fields)
+
+    @_logging_errors()
+    def record_handoff_chat(self, transcript: Path, session_id: str) -> Path | None:
+        """Save each full agent conversation beside the autotune log files."""
+        filename = self._settings.autotune_log
+        if not filename:
+            return None
+        path = (
+            Path(filename).with_suffix(f".handoff.{session_id}.chat.jsonl").absolute()
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(transcript, path)
+        return path
+
+    @_logging_errors()
+    def record_handoff_measurement(
+        self,
+        measurement: HandoffMeasurement,
+        objective_unit: str,
+        *,
+        completed_at: float | None = None,
+    ) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "handoff_confirmation",
+                measurement.algorithm,
+                completed_at=completed_at,
+                config_id=canonical_config_id(measurement.config),
+                config=measurement.config.config,
+                source_hash=measurement.source_hash,
+                status=measurement.status,
+                objective=measurement.perf,
+                objective_unit=objective_unit,
+                per_shape_ms=[
+                    value if math.isfinite(value) else None
+                    for value in measurement.per_shape
+                ],
+                per_shape_statuses=measurement.per_shape_statuses,
+            )
+
+    @_logging_errors()
+    def record_llm_request(self, **fields: object) -> _LLMTraceRequest | None:
+        trace = self._trace_sink
+        if trace is None:
+            return None
+        request = _LLMTraceRequest(trace, self._trace_algorithm, uuid4().hex)
+        trace.record(
+            "llm_request", request.algorithm, request_id=request.request_id, **fields
+        )
+        return request
+
+    @_logging_errors()
+    def record_llm_response(
+        self, request: _LLMTraceRequest | None, **fields: object
+    ) -> None:
+        if request is not None:
+            request.trace.record(
+                "llm_response",
+                request.algorithm,
+                request_id=request.request_id,
+                **fields,
+            )
+
+    @contextlib.contextmanager
+    def autotune_tracing(self, algorithm: str) -> Iterator[None]:
+        """Trace an entire search, sharing the clock across nested search stages."""
+        from .handoff import _HandoffStop
+
+        filename = self._settings.autotune_log
+        if (
+            not self._settings.autotune_log_details
+            or not filename
+            or not is_master_rank()
+        ):
+            yield
+            return
+        stack = contextlib.ExitStack()
+        active = None
+        owns_trace = False
+        previous = self._trace_sink, self._trace_algorithm
+        try:
+            with _logging_errors():
+                path = Path(filename).with_suffix(".trace.jsonl").absolute()
+                trace = _active_trace.get()
+                owns_trace = trace is None or trace.path != path
+                if owns_trace:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    file = stack.enter_context(path.open("a", encoding="utf-8"))
+                    trace = _AutotuneTrace(path, file)
+                    token = _active_trace.set(trace)
+                    stack.callback(_active_trace.reset, token)
+                    stack.callback(trace.close)
+                active = trace
+                self._trace_sink, self._trace_algorithm = active, algorithm
+            with _logging_errors():
+                if active is not None:
+                    if owns_trace:
+                        active.record("run_start", algorithm)
+                    active.record("stage_start", algorithm)
+            status = "error"
+            try:
+                yield
+                status = "ok"
+            except _HandoffStop:
+                status = "handoff"
+                raise
+            finally:
+                if active is not None:
+                    with _logging_errors():
+                        active.record("stage_end", algorithm, status=status)
+                    if owns_trace:
+                        with _logging_errors():
+                            active.record("run_end", algorithm, status=status)
+        finally:
+            self._trace_sink, self._trace_algorithm = previous
+            with _logging_errors():
+                stack.close()
+
+    def register_config(self, config: Config) -> str | None:
+        """Return the content-addressed ``config_id`` (registering it on the sink
+        for the ``.meta.jsonl`` record), or ``None`` when no sink is active."""
+
+        if self._log_sink is None and self._trace_sink is None:
+            return None
+        with _logging_errors():
+            if self._log_sink is not None:
+                return self._log_sink.register_config(config)
+            return canonical_config_id(config)
+        return ""
+
+    def _attach_sink(self, sink: AutotuneLogSink) -> None:
+        self.add_handler(sink.handler)
+        self._log_sink = sink
+
+    def _detach_sink(self) -> None:
+        sink = self._log_sink
+        if sink is None:
+            return
+        self.remove_handler(sink.handler)
+        self._log_sink = None
+
+    def _elapsed_seconds(self) -> int:
+        return int(time.perf_counter() - self._start_time)
+
+    def _configure_handler(self, handler: logging.Handler) -> None:
+        handler.setFormatter(_ElapsedFormatter(self._elapsed_seconds))
+
+    def _register_handler(self, handler: logging.Handler) -> None:
+        self._configure_handler(handler)
+        self._logger.addHandler(handler)
+        self._active_handlers.append(handler)
+
+    def _make_stream_handler(self) -> logging.Handler:
+        return logging.StreamHandler(sys.stderr)
+
+    @_logging_errors()
+    def __call__(
+        self,
+        *msg: str | Callable[[], str],
+        level: int = logging.INFO,
+        exc_info: ExcInfoParam = None,
+        stacklevel: int | None = None,
+    ) -> None:
+        """
+        Log a message at a specified log level.
+
+        Args:
+            msg: The message(s) to log. Can be strings or callables that return strings.
+            level: The log level for the message.
+            exc_info: Optional exception info forwarded to ``logging.Logger``.
+            stacklevel: Optional stack level forwarded to ``logging.Logger``.
+        """
+        if level >= self.level and is_master_rank():
+            message = " ".join(map(_maybe_call, msg))
+            if stacklevel is not None:
+                if exc_info is not None:
+                    self._logger.log(
+                        level,
+                        message,
+                        exc_info=exc_info,
+                        stacklevel=stacklevel,
+                    )
+                else:
+                    self._logger.log(
+                        level,
+                        message,
+                        stacklevel=stacklevel,
+                    )
+            else:
+                if exc_info is not None:
+                    self._logger.log(level, message, exc_info=exc_info)
+                else:
+                    self._logger.log(level, message)
+
+    def error(
+        self,
+        *msg: str | Callable[[], str],
+        exc_info: ExcInfoParam = None,
+        stacklevel: int | None = None,
+    ) -> None:
+        return self(
+            *msg,
+            level=logging.ERROR,
+            exc_info=exc_info,
+            stacklevel=stacklevel,
+        )
+
+    def warning(
+        self,
+        *msg: str | Callable[[], str],
+        exc_info: ExcInfoParam = None,
+        stacklevel: int | None = None,
+    ) -> None:
+        return self(
+            *msg,
+            level=logging.WARNING,
+            exc_info=exc_info,
+            stacklevel=stacklevel,
+        )
+
+    def debug(
+        self,
+        *msg: str | Callable[[], str],
+        exc_info: ExcInfoParam = None,
+        stacklevel: int | None = None,
+    ) -> None:
+        return self(
+            *msg,
+            level=logging.DEBUG,
+            exc_info=exc_info,
+            stacklevel=stacklevel,
+        )
+
+
+def _maybe_call(fn: Callable[[], str] | str) -> str:
+    """
+    Call a callable or return the string directly.
+
+    Args:
+        fn: A callable that returns a string or a string.
+
+    Returns:
+        The resulting string.
+    """
+    if callable(fn):
+        return fn()
+    return fn
+
+
+class AutotuneLogEntry(NamedTuple):
+    generation: int
+    status: str
+    perf_ms: float | None
+    compile_time: float | None
+    config_id: str
+    config: Config
+    source_hash: str | None = None
+    objective: float | None = None
+    objective_unit: str = "ms"
+    completed_at: float | None = None
+
+
+class _LLMTraceRequest(NamedTuple):
+    trace: _AutotuneTrace
+    algorithm: str
+    request_id: str
+
+
+class _TraceMinimum:
+    """Chronological improvement frontier for measurements already recorded."""
+
+    def __init__(self) -> None:
+        self.points: list[tuple[float, float]] = []
+
+    def best_at(self, timestamp: float) -> float | None:
+        index = bisect_right(self.points, (timestamp, math.inf))
+        return self.points[index - 1][1] if index else None
+
+    def record(self, timestamp: float, value: float | None) -> None:
+        if value is None:
+            return
+        index = bisect_right(self.points, (timestamp, math.inf))
+        if index and self.points[index - 1][1] <= value:
+            return
+        start = index
+        if index and self.points[index - 1][0] == timestamp:
+            start -= 1
+        end = index
+        while end < len(self.points) and self.points[end][1] >= value:
+            end += 1
+        self.points[start:end] = [(timestamp, value)]
+
+
+class _AutotuneTrace:
+    """Append JSON-safe events at observation time, flushing every record.
+
+    ``trial`` rows are terminal candidate outcomes; ``trial_start`` marks actual
+    timing attempts. ``rebenchmark`` rows are subsequent timings used by search.
+    The running best excludes recorded observations completed after the row's
+    timestamp; it is not a claim about the final noise-corrected selection.
+    Failed timings are represented by JSON null.
+    """
+
+    def __init__(self, path: Path, file: io.TextIOWrapper) -> None:
+        self.path = path
+        self.file = file
+        self.run_id = uuid4().hex
+        self.start = time.perf_counter()
+        self.wall_start = time.time()
+        self._best_perf_ms = _TraceMinimum()
+        self._best_objective = _TraceMinimum()
+        self.trial_index = 0
+        # Round zero overlaps the LLM request with seed benchmarking.
+        self._lock = threading.RLock()
+        self._closed = False
+
+    def close(self) -> None:
+        # Stop accepting late LLM callbacks before ExitStack closes the file.
+        with self._lock:
+            self._closed = True
+
+    def record(self, event: str, algorithm: str, **fields: object) -> None:
+        with self._lock:
+            if not self._closed:
+                self._record(event, algorithm, **fields)
+                if event == "run_end":
+                    self._closed = True
+
+    def _record(self, event: str, algorithm: str, **fields: object) -> None:
+        completed_at = cast("float | None", fields.pop("completed_at", None))
+        observed_at = completed_at if completed_at is not None else time.perf_counter()
+        elapsed = observed_at - self.start
+        timestamp = (
+            self.wall_start + elapsed if completed_at is not None else time.time()
+        )
+        if fields.pop("_update_best", False):
+            self._best_perf_ms.record(
+                observed_at, cast("float | None", fields["perf_ms"])
+            )
+            self._best_objective.record(
+                observed_at, cast("float | None", fields["objective"])
+            )
+        row = {
+            "schema_version": 1,
+            "run_id": self.run_id,
+            "event": event,
+            "algorithm": algorithm,
+            "timestamp": datetime.datetime.fromtimestamp(
+                timestamp, datetime.timezone.utc
+            ).isoformat(),
+            "timestamp_s": timestamp,
+            "elapsed_s": elapsed,
+            "best_perf_ms": self._best_perf_ms.best_at(observed_at),
+            "best_objective": self._best_objective.best_at(observed_at),
+            **fields,
+        }
+        self.file.write(
+            json.dumps(_json_safe(row), default=str, allow_nan=False) + "\n"
+        )
+        self.file.flush()
+
+    def record_entry(
+        self, algorithm: str, entry: AutotuneLogEntry, *, event: str | None
+    ) -> None:
+        with self._lock:
+            if not self._closed:
+                self._record_entry(algorithm, entry, event=event)
+
+    def _record_entry(
+        self, algorithm: str, entry: AutotuneLogEntry, *, event: str | None
+    ) -> None:
+        event = event or ("trial_start" if entry.status == "started" else "trial")
+        perf_ms = entry.perf_ms
+        if perf_ms is not None and not math.isfinite(perf_ms):
+            perf_ms = None
+        objective = (
+            entry.objective
+            if entry.objective is not None
+            else perf_ms
+            if entry.objective_unit == "ms"
+            else None
+        )
+        if objective is not None and not math.isfinite(objective):
+            objective = None
+        if event == "trial":
+            self.trial_index += 1
+        self.record(
+            event,
+            algorithm,
+            _update_best=entry.status in ("ok", "deduplicated"),
+            completed_at=entry.completed_at,
+            trial_index=self.trial_index if event == "trial" else None,
+            config_id=entry.config_id,
+            config=entry.config.config,
+            generation=entry.generation,
+            status=entry.status,
+            perf_ms=perf_ms,
+            objective=objective,
+            objective_unit=entry.objective_unit,
+            compile_time_s=entry.compile_time,
+            source_hash=entry.source_hash,
+        )
+
+
+class AutotuneLogSink:
+    """
+    Writes autotune results to CSV and connects autotune logs to a file handler.
+
+    Entries carrying generated-source identity also populate a lazy
+    ``.sources.csv`` sidecar, leaving the established main CSV schema unchanged.
+    """
+
+    def __init__(
+        self,
+        base_path: str,
+        metadata: KernelMetadata | None = None,
+        collect_dataset: bool = False,
+    ) -> None:
+        self._base_path = Path(base_path)
+        self.csv_path = self._base_path.with_suffix(".csv")
+        self.source_path = self._base_path.with_suffix(".sources.csv")
+        self.log_path = self._base_path.with_suffix(".log")
+        self.meta_path = self._base_path.with_suffix(".meta.jsonl")
+        self._metadata = metadata
+        self._collect_dataset = collect_dataset
+        self._csv_file: io.TextIOWrapper | None = None
+        self._csv_writer: CsvWriter | None = None
+        self._source_csv_file: io.TextIOWrapper | None = None
+        self._source_csv_writer: CsvWriter | None = None
+        self._log_handler: logging.FileHandler | None = None
+        self._run_start_time: float | None = None
+        # config_id -> full config; flushed to the .meta.jsonl record at end_run.
+        # Populated only when collecting the dataset; identical configs collapse.
+        self._configs: dict[str, dict[str, object]] = {}
+
+    def __enter__(self) -> Self:
+        self.open()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    @property
+    def handler(self) -> logging.Handler:
+        assert self._log_handler is not None, "Log sink not opened"
+        return self._log_handler
+
+    def open(self) -> None:
+        if self._csv_writer is not None:
+            return
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Append so runs sharing one base path accumulate; header only for a new
+        # or empty file. The .meta.jsonl record is written at end_run.
+        write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
+        self._csv_file = self.csv_path.open("a", encoding="utf-8", newline="")
+        self._csv_writer = csv.writer(self._csv_file)
+        if write_header:
+            self._csv_writer.writerow(_AUTOTUNE_CSV_FIELDS)
+            self._csv_file.flush()
+        handler = logging.FileHandler(self.log_path, mode="a", encoding="utf-8")
+        handler.setLevel(logging.DEBUG)
+        self._log_handler = handler
+
+    def close(self) -> None:
+        for stream in (self._csv_file, self._source_csv_file, self._log_handler):
+            if stream is not None:
+                with _logging_errors():
+                    stream.close()
+        self._csv_file = None
+        self._csv_writer = None
+        self._source_csv_file = None
+        self._source_csv_writer = None
+        self._log_handler = None
+        self._run_start_time = None
+        self._configs = {}
+
+    def start_run(self) -> None:
+        self._run_start_time = time.perf_counter()
+        self._configs = {}
+
+    def end_run(self) -> None:
+        # Append the per-run record (identity + configs map) once every config is
+        # known. default=str keeps it JSON-safe for non-serializable settings
+        # (torch.dtype, enums, callables). CSV rows join via run_id + config_id.
+        if self._collect_dataset and self._metadata is not None:
+            record = {**self._metadata.to_dict(), "configs": self._configs}
+            with self.meta_path.open("a", encoding="utf-8") as meta_file:
+                meta_file.write(
+                    json.dumps(_json_safe(record), default=str, allow_nan=False) + "\n"
+                )
+        self._run_start_time = None
+        self._configs = {}
+
+    def register_config(self, config: Config) -> str | None:
+        """Return a stable ``config_id`` for ``config``: ``sha256`` of the
+        canonical config JSON (sorted keys, compact), 16 hex chars -- the same
+        config always maps to the same id (the CSV<->record join key). Returns
+        ``None`` when the sink is not open. When collecting the dataset, the config
+        is stored under its id for the .meta.jsonl record (identical ids collapse).
+        """
+        if self._csv_writer is None:
+            return None
+        config_id = canonical_config_id(config)
+        if self._collect_dataset:
+            self._configs[config_id] = config.config
+        return config_id
+
+    def record(self, entry: AutotuneLogEntry) -> None:
+        if self._csv_writer is None:
+            return
+        timestamp_field = ""
+        if self._run_start_time is not None:
+            timestamp = (
+                entry.completed_at
+                if entry.completed_at is not None
+                else time.perf_counter()
+            ) - self._run_start_time
+            timestamp_field = f"{timestamp:.2f}"
+        perf_field = ""
+        if entry.perf_ms is not None and math.isfinite(entry.perf_ms):
+            perf_field = f"{entry.perf_ms:.6f}"
+        compile_field = ""
+        if entry.compile_time is not None:
+            compile_field = f"{entry.compile_time:.2f}"
+        # run_id joins the row to its .meta.jsonl record; config_id to its config.
+        run_id = self._metadata.run_id if self._metadata is not None else ""
+        self._csv_writer.writerow(
+            [
+                run_id,
+                timestamp_field,
+                entry.config_id,
+                entry.generation,
+                entry.status,
+                perf_field,
+                compile_field,
+                str(entry.config),
+            ]
+        )
+        if self._csv_file is not None:
+            self._csv_file.flush()
+        if entry.source_hash is not None:
+            self._record_source_hash(entry, run_id, timestamp_field)
+
+    def _record_source_hash(
+        self, entry: AutotuneLogEntry, run_id: str, timestamp_field: str
+    ) -> None:
+        if self._source_csv_writer is None:
+            write_header = (
+                not self.source_path.exists() or self.source_path.stat().st_size == 0
+            )
+            self._source_csv_file = self.source_path.open(
+                "a", encoding="utf-8", newline=""
+            )
+            self._source_csv_writer = csv.writer(self._source_csv_file)
+            if write_header:
+                self._source_csv_writer.writerow(_AUTOTUNE_SOURCE_CSV_FIELDS)
+        self._source_csv_writer.writerow(
+            [
+                run_id,
+                timestamp_field,
+                entry.config_id,
+                entry.generation,
+                entry.status,
+                entry.source_hash,
+            ]
+        )
+        assert self._source_csv_file is not None
+        self._source_csv_file.flush()
+
+
+SUPPRESSED_TRITON_CODE_MSG = (
+    "Set HELION_AUTOTUNE_LOG_LEVEL=DEBUG to log the generated Triton code, "
+    "or HELION_AUTOTUNER_TRITON_FAILURE_DUMP_DIR=<dir> to write per-failure dumps "
+    "(source code + traceback) to <dir>."
+)
+
+
+def log_generated_triton_code_debug(
+    logger: AutotuningLogger,
+    kernel: _AutotunableKernel,
+    config: Config,
+    *,
+    prefix: str | None = None,
+) -> None:
+    """
+    Emit the generated Triton code at debug level if the logger allows it.
+
+    Args:
+        logger: Logger that should receive the message.
+        kernel: Kernel whose Triton code should be logged.
+        config: Config used to generate the Triton code.
+        prefix: Optional prefix for the log message.
+    """
+    logger.debug(
+        lambda: _format_triton_code(kernel, config, prefix or "Generated Triton code:")
+    )
+
+
+def _format_triton_code(kernel: _AutotunableKernel, config: Config, prefix: str) -> str:
+    code = kernel.to_triton_code(config)
+    if code is None:
+        return f"{prefix}\n<no source code available>"
+    return f"{prefix}\n{code}"
+
+
+_FAILURE_DUMP_ENV = "HELION_AUTOTUNER_TRITON_FAILURE_DUMP_DIR"
+
+
+def _get_failure_dump_dir() -> str | None:
+    value = os.environ.get(_FAILURE_DUMP_ENV)
+    if value is None or (value := value.strip()) == "":
+        return None
+    return value
+
+
+def maybe_dump_triton_failure(
+    bound_kernel: _AutotunableKernel,
+    config: Config,
+    err: BaseException,
+    *,
+    remote_traceback: str | None = None,
+    captured_output: str | None = None,
+) -> None:
+    """Dump a Triton failure report if HELION_AUTOTUNER_TRITON_FAILURE_DUMP_DIR is set."""
+    dump_dir = _get_failure_dump_dir()
+    if not dump_dir:
+        return
+    try:
+        triton_code = bound_kernel.to_triton_code(config) or "# (no Triton code)"
+    except Exception:
+        triton_code = "# (failed to regenerate Triton code)"
+    dump_triton_failure(
+        dump_dir,
+        triton_code,
+        err,
+        remote_traceback=remote_traceback,
+        captured_output=captured_output,
+    )
+
+
+def format_triton_compile_failure(
+    config: Config, err: BaseException, kernel: _AutotunableKernel
+) -> str:
+    return (
+        "Triton compile failed. This likely indicates a bug in Triton. "
+        "Skipping failing config.\n"
+        f"Config: {kernel.format_kernel_decorator(config, kernel.settings)}\n"
+        f"Error: {type(err).__name__}: {err}\n"
+        f"{SUPPRESSED_TRITON_CODE_MSG}"
+    )
+
+
+# Common logic to decide how to surface Triton errors
+_EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
+    "|".join(
+        map(
+            re.escape,
+            [
+                "[CUDA]: invalid argument",  # CUDA Error
+                "PassManager::run failed",  # Triton Error
+                "TServiceRouterException",  # Remote compile failed
+                "triton.compiler.errors.CompilationError",  # Triton CompilationError
+                "out of resource: shared memory",  # Triton shared memory OOM
+                "ZE_RESULT_ERROR_INVALID_KERNEL_NAME",  # Level Zero compile failed
+                "ZE_RESULT_ERROR_MODULE_BUILD_FAILURE",  # Level Zero module build failed
+                "exceeds triton maximum tensor numel",  # needs smaller config
+                "failed to translate module to LLVM IR",  # Triton LLVM lowering failure
+                "Resource temporarily unavailable",  # LLVM Error
+                "too many blocks in cooperative launch",  # CUDA cooperative launch limit
+                "too many resources requested for launch",  # Triton resource error
+                "CUDA error: out of memory",  # CUDA runtime OOM during kernel execution
+                "CUDA out of memory",  # PyTorch torch.cuda.OutOfMemoryError
+                "[CUDA]: out of memory",  # Triton CUDA OOM
+                "Ran out of memory in memory space vmem",  # TPU VMEM OOM (caught by Helion or XLA)
+            ],
+        )
+    )
+)
+
+_UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
+    "|".join(
+        map(
+            re.escape,
+            [
+                "illegal memory access",
+                "misaligned address",
+                "unspecified launch failure",
+                "illegal instruction",
+            ],
+        )
+    ),
+    re.IGNORECASE,
+)
+
+
+def match_unrecoverable_runtime_error(err: BaseException) -> bool:
+    return bool(_UNRECOVERABLE_RUNTIME_ERROR_RE.search(str(err)))
+
+
+def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "debug"]:
+    """
+    Classify a Triton compile/runtime exception during autotuning.
+
+    Returns one of:
+      - "raise": unexpected error, caller should raise
+      - "warn": notable expected error (e.g., PassManager pipeline failure)
+      - "debug": benign/expected error; caller can log at debug level
+    """
+    # Known exception types first
+    if isinstance(err, (OutOfResources, CudaOOMError)):
+        return "debug"
+    # Different PTXASError classes may be raised from different modules; match by name as well
+    if isinstance(err, PTXASError) or err.__class__.__name__ == "PTXASError":
+        return "warn"
+
+    msg = str(err)
+    if "PassManager::run failed" in msg:
+        return "warn"
+    if _EXPECTED_TRITON_ERRORS_RE.search(msg) or match_unrecoverable_runtime_error(err):
+        return "debug"
+    return "raise"
+
+
+# Regex to strip filesystem paths and timestamps from dump content before hashing,
+# so that equivalent failures on different machines or at different times deduplicate.
+# Matches absolute paths with at least two components (e.g. /tmp/foo, /home/user/bar.py).
+_PATH_RE = re.compile(r"(?:/[\w][\w.-]*){2,}")
+_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\s]*")
+
+
+def _stable_hash(content: str) -> str:
+    """Hash *content* after stripping filesystem paths and timestamps."""
+    normalized = _PATH_RE.sub("PATH", content)
+    normalized = _TIMESTAMP_RE.sub("TIME", normalized)
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+@contextlib.contextmanager
+def capture_output() -> Iterator[list[str]]:
+    """
+    Context manager that captures stdout and stderr written during its scope.
+
+    Yields a single-element list; after the block exits ``result[0]`` contains
+    the captured text.  The original file descriptors are restored on exit even
+    if an exception is raised.
+
+    Captures at the file-descriptor level (via a temporary file) so that C/C++
+    output from Triton's LLVM/MLIR compiler passes is captured in addition to
+    Python-level ``print()`` calls.  A temporary file is used instead of a pipe
+    to avoid deadlocks when the captured output exceeds the pipe buffer size.
+
+    Falls back to Python-level capture when running in environments like pytest
+    where sys.stdout/sys.stderr don't have file descriptors.
+    """
+    result: list[str] = [""]
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    # Check if we can use file descriptor level capture
+    stdout_fd: int | None = None
+    stderr_fd: int | None = None
+    try:
+        stdout_fd = sys.stdout.fileno()
+        stderr_fd = sys.stderr.fileno()
+        use_fd_capture = True
+    except (AttributeError, io.UnsupportedOperation):
+        # Fall back to Python-level capture (e.g., in pytest or other test frameworks)
+        use_fd_capture = False
+
+    if use_fd_capture:
+        # File descriptor level capture (captures C/C++ output from Triton)
+        assert stdout_fd is not None and stderr_fd is not None
+        saved_stdout_fd = os.dup(stdout_fd)
+        saved_stderr_fd = os.dup(stderr_fd)
+        tmp_fd, tmp_path = tempfile.mkstemp()
+        try:
+            os.dup2(tmp_fd, stdout_fd)
+            os.dup2(tmp_fd, stderr_fd)
+            os.close(tmp_fd)
+            yield result
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(saved_stdout_fd, stdout_fd)
+            os.dup2(saved_stderr_fd, stderr_fd)
+            os.close(saved_stdout_fd)
+            os.close(saved_stderr_fd)
+            try:
+                result[0] = Path(tmp_path).read_text(encoding="utf-8", errors="replace")
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+    else:
+        # Python-level capture (fallback for pytest and similar environments)
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+
+        try:
+            sys.stdout = captured_stdout
+            sys.stderr = captured_stderr
+            yield result
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            result[0] = captured_stdout.getvalue() + captured_stderr.getvalue()
+
+
+def dump_triton_failure(
+    dump_dir: str,
+    triton_code: str,
+    err: BaseException,
+    *,
+    remote_traceback: str | None = None,
+    captured_output: str | None = None,
+) -> str | None:
+    """
+    Write a self-contained Triton failure report to *dump_dir*.
+
+    The file contains the full Triton source code, the Triton version, and the
+    error message / traceback.  The filename is derived from a content hash
+    (with filesystem paths and timestamps stripped) so that identical failures
+    naturally deduplicate across runs.
+
+    Returns the path of the written file, or ``None`` if writing failed.
+    """
+    import triton
+
+    triton_version = getattr(triton, "__version__", "unknown")
+
+    error_type = type(err).__qualname__
+    error_msg = str(err)
+    if remote_traceback:
+        tb_text = remote_traceback
+    else:
+        tb_text = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+
+    parts: list[str] = [
+        (
+            f"# Triton failure report\n"
+            f"# triton version: {triton_version}\n"
+            f"# error: {error_type}: {error_msg}\n"
+            f"\n"
+            f"# --- Triton source code ---\n"
+            f"{triton_code}\n"
+            f"\n"
+            f"# --- Error ---\n"
+            f"# {error_type}: {error_msg}\n"
+            f"#\n"
+            f"# --- Traceback ---\n"
+        ),
+    ]
+    parts.extend(f"# {line}\n" for line in tb_text.splitlines())
+
+    if captured_output:
+        parts.append("#\n# --- Captured stdout/stderr ---\n")
+        parts.extend(f"# {line}\n" for line in captured_output.splitlines())
+
+    report = "".join(parts)
+    file_hash = _stable_hash(report)
+    filename = f"{file_hash}.py"
+    dump_path = Path(dump_dir)
+    try:
+        dump_path.mkdir(parents=True, exist_ok=True)
+        dest = dump_path / filename
+        if not dest.exists():
+            dest.write_text(report, encoding="utf-8")
+        return str(dest)
+    except Exception:
+        return None
