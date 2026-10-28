@@ -1,0 +1,16477 @@
+"""CuTe MMA (tensor core) codegen for matmul operations.
+
+Generates cute.gemm calls using MmaUniversalOp for warp-level MMA.
+Follows the reduction strategy pattern: initialization in outer_prefix,
+per-K-tile MMA in the loop body, fragment→scalar conversion in outer_suffix.
+
+The MMA always accumulates in float32 for precision.  Input data (float16
+or bfloat16) is cast to float32 during the register load.  After the
+K-loop the fragment is written to shared memory via partition_C and each
+thread reads back its own scalar element, re-entering the normal
+scalar-per-thread model so epilogue ops (bias, activation, cast) work.
+
+Features:
+- Works through both aten lowering (addmm/mm) and hl.dot API paths
+- Shared memory staging for A and B operands with sync_threads
+- Multi-warp tiling via atom_layout_mnk for larger tile sizes
+- Masking for non-divisible tile boundaries
+"""
+
+from __future__ import annotations
+
+import ast
+from collections.abc import Mapping
+import contextlib
+from dataclasses import dataclass
+from dataclasses import replace
+import os
+import textwrap
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Literal
+from typing import NamedTuple
+from typing import cast
+
+import torch
+from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.fx.node import Node
+
+from ... import exc
+from ..ast_extension import expr_from_string
+from ..ast_extension import statement_from_string
+from ..dtype_utils import cast_ast
+from ..host_function import HostFunction
+from ..indexing_strategy import exact_tile_block_ids
+from ..indexing_strategy import subscript_tile_info
+from ..tile_strategy import DeviceLoopState
+from .aux_tensor import analyze_tcgen05_matmul_store_chains
+from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
+from .aux_tensor import tcgen05_promoted_rowvec_epilogue
+from .cute_epilogue import _ZERO_ARG_TARGETS
+from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
+from .cute_epilogue import find_tcgen05_grouped_tail_epilogue_for_mma
+from .cutedsl_compat import CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION
+from .cutedsl_compat import emit_pipeline_advance
+from .cutedsl_compat import tcgen05_runtime_n_ptx_compatible
+from .cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
+from .device_state import CuteDeviceFunctionState
+from .device_state import CuteTcgen05GroupedPlan
+from .device_state import CuteTcgen05MatmulPlan
+from .device_state import CuteTcgen05StoreValue
+from .device_state import Tcgen05AbStartupPrefill
+from .device_state import Tcgen05GroupedDMode
+from .device_state import Tcgen05GroupedSchedulerMode
+from .device_state import Tcgen05Orientation
+from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
+from .fragment_epilogue import _tcgen05_fragment_dtype_supported
+from .fragment_epilogue import _tcgen05_fragment_source_layout_reachable
+from .fragment_epilogue import _tcgen05_fragment_source_layout_supported
+from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_candidate
+from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_plan
+from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
+from .grouped_full_coverage import full_allocation_b_two_cta_profile_supported
+from .grouped_full_coverage import full_allocation_b_two_cta_smem_upper_bound
+from .grouped_full_coverage import full_coverage_index_domain
+from .grouped_full_coverage import full_coverage_pipeline_supported
+from .grouped_full_coverage import full_coverage_smem_upper_bound
+from .grouped_full_coverage import full_row_union_predicate
+from .grouped_full_coverage import full_row_union_statements
+from .grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
+from .grouped_row_union import PAIRED_CLC
+from .grouped_row_union import RESIDENT_CTAS_KEY as GROUPED_RESIDENT_CTAS_KEY
+from .grouped_row_union import STARTUP_PREFILL_KEY
+from .grouped_row_union import TRANSPOSED
+from .grouped_row_union import GroupedRowUnionPlan
+from .grouped_row_union import RowUnionSchedule
+from .grouped_row_union import index_domain as row_union_index_domain
+from .grouped_row_union import physical_schedule
+from .grouped_row_union import resident_ctas_supported
+from .grouped_row_union import schedule_supported as row_union_schedule_supported
+from .layout import MatmulExecutionKind
+from .layout import MatmulExecutionPlan
+from .matmul_utils import _cute_matmul_reread_unsafe
+from .matmul_utils import analyze_direct_grouped_n_loads
+from .matmul_utils import cute_f32_mma_matches_dot
+from .matmul_utils import loop_carries
+from .matmul_utils import reads_loop_carry
+from .matmul_utils import strip_new_vars
+from .mma_support import cute_fp32_dot_uses_tf32
+from .mma_support import get_cute_mma_support
+from .mma_support import tcgen05_supports_input_dtype
+from .pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
+from .strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
+from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
+from .strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from .strategies import Tcgen05LayoutStrategy
+from .strategies import Tcgen05PersistenceModel
+from .strategies import is_pure_matmul_role_lifecycle_config
+from .strategies import l2_swizzle_size_from_config
+from .strategies import layout_overrides_from_config
+from .strategies import smem_swizzle_min_major_mode_bytes
+from .strategies import tcgen05_explicit_epilogue_tile_expr
+from .strategies import tcgen05_explicit_epilogue_tile_supported
+from .strategies import tcgen05_resolve_epilogue_tile
+from .strategies import tcgen05_smem_layout_expr
+from .strategies import warp_spec_from_config
+from .tcgen05_config import CuteTcgen05Config
+from .tcgen05_config import parse_tcgen05_grouped_static_problem_signature
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
+from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
+from .tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
+from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
+from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE
+from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
+from .tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_MODE_DIRECT
+from .tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
+from .tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
+from .tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from .tcgen05_constants import TCGEN05_GROUPED_MODES
+from .tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_STATIC_BLOCK_K_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
+from .tcgen05_constants import TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_N_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
+from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
+from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from .tcgen05_lifecycle import Tcgen05LifecycleContext
+from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ...autotuner.config_spec import ConfigSpec
+    from ...autotuner.config_spec import MatmulFact
+    from ...language.matmul_ops import CuteTcgen05SearchPlan
+    from ...runtime.config import Config
+    from ..aten_lowering import LoweringContext
+    from ..compile_environment import CompileEnvironment
+    from ..device_function import DeviceFunction
+    from ..device_ir import DeviceIR
+    from ..device_ir import GraphInfo
+    from ..generate_ast import GenerateAST
+    from ..inductor_lowering import CodegenState
+    from .strategies import Tcgen05WarpSpec
+
+
+def _register_tensor_arg_by_host_name(df: DeviceFunction, arg_name: str) -> None:
+    for fake_value, origin in HostFunction.current().tensor_to_origin.items():
+        try:
+            host_name = origin.host_str()
+        except NotImplementedError:
+            continue
+        if host_name == arg_name:
+            df.tensor_arg(fake_value, prefer_name=arg_name)
+            return
+    raise exc.BackendUnsupported(
+        "cute",
+        f"external grouped direct pointer metadata argument {arg_name!r} "
+        "is not a tensor argument",
+    )
+
+
+_TRACE_THROUGH_TARGETS = {
+    torch.ops.prims.convert_element_type.default,
+    # NOTE: permute is NOT included because the MMA pipeline reads
+    # raw tensor data — tracing through permute would bypass the
+    # data shuffle.  Permuted operands fall back to scalar codegen.
+}
+
+# Extra forward-trace targets used only for output store/dtype/lifetime
+# analysis. Operand tracing remains restricted to _TRACE_THROUGH_TARGETS.
+# These are the fused epilogue unary and auxiliary-binary operations. The
+# store's epilogue classifier separately validates complete renderability.
+_DTYPE_TRACE_EXTRA_TARGETS = {
+    *_ZERO_ARG_TARGETS,
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.sub.Tensor,
+    torch.ops.aten.div.Tensor,
+}
+_MMA_OUTPUT_STORE_ANALYSIS_META_KEY = "cute_mma_output_store_analysis"
+_MMA_REQUIRES_ACCUMULATOR_SEED_META_KEY = "cute_mma_requires_accumulator_seed"
+_MMA_ACCUMULATES_LOOP_CARRY_META_KEY = "cute_mma_accumulates_loop_carry"
+
+# Register reallocation budget for tcgen05 warp-specialized kernels.
+# Producer warps (TMA loads, scheduler) only do address arithmetic and
+# barrier ops, so they can give back registers; consumer warps (MMA
+# exec, epilogue) need the extra budget for register-resident
+# accumulators and TMEM↔RMEM staging. Values match Quack's sm100
+# reference (`gemm_sm100.py`). The consumer-side ceiling is autotune-
+# searchable via ``TCGEN05_CONSUMER_REGS_CONFIG_KEY`` (cycle 15 H2);
+# the default 256 lives in ``tcgen05_constants.py`` so the codegen
+# call site reads the per-config value and emission stays byte-
+# identical at the default.
+_TCGEN05_PRODUCER_REGS = 120
+# 128x32 bf16 gives the validated 64 Ki-bit D-store TMA box and x32 TMEM
+# drain for the current Target1 CtaGroup.TWO diagnostic path.
+_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE = (
+    TCGEN05_TWO_CTA_BLOCK_M // 2,
+    32,
+    32,
+)
+
+
+# Cluster-leader (cta_rank == 0) form. Used only when V-leader semantics
+# degenerate to cluster-leader -- i.e. cluster_size == V (no V-non-leader
+# CTAs), today's cluster_m=2 cluster_n=1 use_2cta=True path. Preserves the
+# cluster_n=1 leader predicate form.
+_TCGEN05_CLUSTER_LEADER_PREDICATE = (
+    "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)"
+)
+# V-leader form: ``cta_rank % V == 0``. Required for cluster_m=2 cluster_n=2
+# use_2cta=True (V=2) where V-leaders are ranks {0, 2} but the cluster-leader
+# is only {0}. The V-non-leaders {1, 3} hold their V-pair's TMEM allocation
+# and *do not* commit on the AB consumer-release barrier — only V-leaders
+# {0, 2} do. See cute_plan.md §6.12.3 for the full diagnosis: cycle 26's hang
+# at cluster_n=2 was caused by Helion using the cluster-leader form here,
+# which only fires from rank 0 and races ranks {2, 3}.
+_TCGEN05_V_LEADER_PREDICATE = (
+    "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+    "% cutlass.Int32(2) == cutlass.Int32(0)"
+)
+
+# Named-barrier ids reserved by Helion's tcgen05 codegen. Kept as module
+# constants so the codegen sites read symbolically instead of hardcoding
+# magic numbers, and so the next free id is obvious if a third role-local
+# barrier is added.
+_TCGEN05_TMEM_ALLOC_BARRIER_ID = 1
+_TCGEN05_EPILOG_SYNC_BARRIER_ID = 2
+_TCGEN05_PIPELINE_INIT_BARRIER_ID = 3
+
+
+@dataclass(frozen=True)
+class _Tcgen05LayoutPlan:
+    """Generated CuTe variable names for the tcgen05 layout setup.
+
+    Pure name container: every field is the textual identifier of a value
+    materialized in the kernel prefix. Compile-time integer constants
+    (stage counts, arrive counts, barrier ids) are not stored here; they
+    live as Python ints alongside ``CuteTcgen05MatmulPlan`` and get
+    inlined at the codegen call site.
+    """
+
+    exec_active: str
+    smem_a_layout: str
+    smem_b_layout: str
+    c_layout: str
+    epi_tile: str
+    tmem_load_atom: str
+    acc_tmem_cols: str
+    tmem_holding_buf: str
+    tmem_dealloc_mbar_ptr: str
+    tmem_alloc_barrier: str
+    tmem_allocator: str
+    acc_pipeline_barriers: str
+    acc_pipeline_producer_group: str
+    acc_pipeline_consumer_group: str
+    acc_pipeline: str
+    acc_producer_state: str
+    acc_consumer_state: str
+    epilogue_rest_mode: str
+    # Second acc producer state for M-paired tiles (m_subtile_count == 2):
+    # offset by one stage so the two subtiles own the two acc stages, each
+    # advancing by two per work tile (phase flips per tile as usual).
+    acc_producer_state2: str = ""
+
+
+@dataclass(frozen=True)
+class _MmaOperandInfo:
+    load: Node
+    terminal: Node
+    source_fake: torch.Tensor
+    logical_fake: torch.Tensor
+    block_ids: tuple[int, ...] = ()
+    collective_dependency_nodes: tuple[Node, ...] = ()
+    grouped_k_mask: _Rank3RhsGroupedKMaskInfo | None = None
+    rhs_group_index: Node | None = None
+    rhs_safe_group: _Rank3RhsSafeGroupInfo | None = None
+    rhs_n_block_id: int | None = None
+    rhs_k_block_id: int | None = None
+    rhs_rank3_grouped_nt: bool = False
+    rhs_shared_group_count: int | None = None
+    rhs_segment_group: _Rank3RhsSegmentGroupInfo | None = None
+    rhs_packed_group: _Rank3RhsPackedGroupInfo | None = None
+    source_to_logical_order: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_to_logical_order is None:
+            return
+        expected = self.source_fake.permute(self.source_to_logical_order)
+
+        def mismatch(field: str, actual: object, expected_value: object) -> str:
+            return (
+                f"Invalid MMA operand analysis: logical_fake {field} does not "
+                "match source_fake.permute(source_to_logical_order). The recorded "
+                "logical order is likely incorrect. Please report a bug to the "
+                "Helion maintainers with this context: "
+                f"source_to_logical_order={self.source_to_logical_order}, "
+                f"source_shape={self.source_fake.shape}, "
+                f"source_stride={self.source_fake.stride()}, "
+                f"logical_shape={self.logical_fake.shape}, "
+                f"logical_stride={self.logical_fake.stride()}, "
+                f"field={field}, actual={actual}, expected={expected_value}"
+            )
+
+        assert self.logical_fake.dtype == expected.dtype, mismatch(
+            "dtype", self.logical_fake.dtype, expected.dtype
+        )
+        assert self.logical_fake.device == expected.device, mismatch(
+            "device", self.logical_fake.device, expected.device
+        )
+        assert self.logical_fake.shape == expected.shape, mismatch(
+            "shape", self.logical_fake.shape, expected.shape
+        )
+        assert self.logical_fake.stride() == expected.stride(), mismatch(
+            "stride", self.logical_fake.stride(), expected.stride()
+        )
+        assert self.logical_fake.storage_offset() == expected.storage_offset(), (
+            mismatch(
+                "storage_offset",
+                self.logical_fake.storage_offset(),
+                expected.storage_offset(),
+            )
+        )
+
+    @property
+    def matrix_major(self) -> str | None:
+        return _tcgen05_tma_matrix_major(self.logical_fake)
+
+    @property
+    def matrix_rows(self) -> int | torch.SymInt:
+        return self.logical_fake.size(-2)
+
+    @property
+    def matrix_cols(self) -> int | torch.SymInt:
+        return self.logical_fake.size(-1)
+
+    @property
+    def matrix_row_block_id(self) -> int:
+        return self.block_ids[-2]
+
+    @property
+    def matrix_col_block_id(self) -> int:
+        return self.block_ids[-1]
+
+    @property
+    def leading_passthrough_block_id(self) -> int | None:
+        leading_block_ids = self.block_ids[:-2]
+        return leading_block_ids[0] if leading_block_ids else None
+
+    @property
+    def is_leading_passthrough(self) -> bool:
+        return self.leading_passthrough_block_id is not None
+
+    @property
+    def rhs_grouped_leading_block_id(self) -> int | None:
+        if self.rhs_segment_group is not None:
+            return self.rhs_segment_group.segment_block_id
+        if self.rhs_packed_group is not None:
+            return self.rhs_packed_group.group_block_id
+        return None
+
+    @property
+    def rhs_is_grouped(self) -> bool:
+        return self.rhs_rank3_grouped_nt or self.rhs_shared_group_count is not None
+
+    @property
+    def rhs_group_count(self) -> int:
+        if self.rhs_shared_group_count is not None:
+            return self.rhs_shared_group_count
+        assert self.rhs_rank3_grouped_nt
+        return int(self.source_fake.shape[0])
+
+
+@dataclass(frozen=True)
+class _Rank3RhsGroupedKMaskInfo:
+    k_sizes_tensor: torch.Tensor
+    k_sizes_load: Node
+    k_sizes_value_nodes: tuple[Node, ...]
+    k_sizes_allowed_loop_users: tuple[Node, ...]
+    safe_group: Node
+    valid_k: Node
+    condition: Node
+    zero: Node
+    where: Node
+
+
+@dataclass(frozen=True)
+class _Rank3RhsSafeGroupInfo:
+    group_load: Node
+    condition: Node
+    safe_group: Node
+
+
+@dataclass(frozen=True)
+class _Rank3RhsSegmentGroupInfo:
+    metadata_tensor: torch.Tensor
+    segment_id: Node
+    segment_block_id: int
+    group_load: Node
+
+
+@dataclass(frozen=True)
+class _Rank3RhsPackedGroupInfo:
+    """Canonical scalar group id carried by a leading block-size-one axis."""
+
+    group_index: Node
+    group_block_id: int
+
+
+@dataclass(frozen=True)
+class _Rank3RhsPackedSplitInfo:
+    """Proof that compact A rows are partitioned by a device segment layout.
+
+    Both ``split_sizes[G]`` and ``offsets[G + 1]`` are normalized to the same
+    kernel-local scheduler table before the persistent loop starts.
+    """
+
+    layout_tensor: torch.Tensor
+    layout_kind: Literal["split_sizes", "offsets"]
+    clipped_negative_start: bool = False
+
+
+@dataclass(frozen=True)
+class _Rank3RhsLhsScaffold:
+    """Shared row-address and validity structure for packed grouped LHS loads."""
+
+    row_index: Node
+    row_offset: Node
+    valid_m: Node
+    valid_extent: Node
+
+
+@dataclass(frozen=True)
+class _Rank3RhsWorklistLhsInfo:
+    row_start: Node
+    group_m: Node
+    row_index: Node
+    valid_m: Node
+    dependency_nodes: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class _Rank3RhsWorklistStoreInfo:
+    store_node: Node
+    row_index: Node
+    valid_m: Node
+    extent_load: Node
+    uses_scheduler_store_extent: bool = False
+
+
+@dataclass(frozen=True)
+class _GroupedMmaAxes:
+    m_block_id: int
+    n_block_id: int
+    k_block_id: int
+    segment_block_id: int | None = None
+
+
+@dataclass(frozen=True)
+class _Rank3RhsGroupedProof:
+    """Graph-local semantic proof for a rank-3 RHS grouped MMA."""
+
+    lhs: _MmaOperandInfo
+    rhs: _MmaOperandInfo
+    layout_tensor: torch.Tensor
+    k_mask: _Rank3RhsGroupedKMaskInfo | None
+    tail_epilogue: Tcgen05GroupedTailEpilogueMatch | None
+    worklist_lhs: _Rank3RhsWorklistLhsInfo | None
+    worklist_store: _Rank3RhsWorklistStoreInfo | None
+    packed_split: _Rank3RhsPackedSplitInfo | None = None
+
+    @property
+    def is_worklist(self) -> bool:
+        return self.worklist_lhs is not None
+
+    @property
+    def requires_explicit_grouped_mode(self) -> bool:
+        """Whether lowering must explicitly enable grouped semantics."""
+        return self.k_mask is not None or self.tail_epilogue is not None
+
+    @property
+    def requires_worklist_nm_schedule(self) -> bool:
+        """Whether lowering needs the N,M-oriented worklist schedule."""
+        return (
+            self.rhs.matrix_major == "row"
+            or self.packed_split is not None
+            or (
+                self.worklist_store is not None
+                and self.worklist_store.uses_scheduler_store_extent
+            )
+        )
+
+
+class Tcgen05GroupedWorklistSeedFacts(NamedTuple):
+    """Structural proof plus first-binding hints for worklist seed ranking.
+
+    The integer fields are deliberately named ``*_hint``: they are not static
+    compiler facts and must not escape the grouped-worklist heuristic.
+    """
+
+    groups_hint: int
+    packed_m_hint: int
+    n_hint: int
+    k_hint: int
+    b_major: Literal["k", "n"]
+    device_split_sizes: bool
+
+
+@dataclass(frozen=True)
+class Tcgen05GroupedWorklistAnalysis:
+    """Schedule-independent compiler facts for a grouped worklist input.
+
+    ``metadata_tensor`` is the traced fake tensor for either a compact device
+    segment layout or the external ``[segments, 4]`` worklist described by
+    ``input_kind``. ``packed_tensor`` and ``grouped_tensor`` provide replayable
+    runtime sources for the dimensions that define that layout.
+    """
+
+    seed_facts: Tcgen05GroupedWorklistSeedFacts
+    metadata_tensor: torch.Tensor
+    packed_tensor: torch.Tensor
+    grouped_tensor: torch.Tensor
+    device_layout_kind: Literal["split_sizes", "offsets"] | None = None
+    full_coverage_supported: bool = False
+    dense_row_union_supported: bool = False
+    dense_row_union_cluster4_supported: bool = False
+    dense_row_union_paired_clc_supported: bool = False
+
+    @property
+    def input_kind(self) -> Literal["device_split_sizes", "external_worklist"]:
+        """Return the semantic form of the traced scheduling input."""
+        return (
+            "device_split_sizes"
+            if self.seed_facts.device_split_sizes
+            else "external_worklist"
+        )
+
+
+@dataclass(frozen=True)
+class _Tcgen05AuxPerDescriptorRingNames:
+    """Generated CuTe variable names for one auxiliary-tensor SMEM ring.
+
+    One instance per :class:`Tcgen05AuxTensorDescriptor` registered on
+    the matmul plan when the productive-body gate fires
+    (``c_input_warp_count > 0`` AND non-empty
+    ``aux_tensor_descriptors``). Each ring has its own
+    ``make_smem_layout_epi``-based SMEM layout, ``alloc_smem`` ptr,
+    and ``make_tensor`` view; the producer body in
+    ``program_id._build_c_input_warp_role_local_while`` indexes the
+    ring by descriptor position, and the consumer-side flip
+    in ``memory_ops._aux_subtile_load_source`` reads from the same
+    SMEM tensor by looking up each
+    ``_AuxStepRecord.load_node`` in the matmul plan's
+    descriptor list to find its ring position.
+    """
+
+    smem_layout: str
+    smem_ptr: str
+    smem: str
+    tma_atom: str | None
+    tma_tensor: str | None
+
+
+@dataclass(frozen=True)
+class _Tcgen05AuxPipelinePlan:
+    """Generated CuTe variable names for the C-input warp's
+    auxiliary-tensor SMEM-ring pipeline (``cute_plan.md`` §7.5.3.2).
+
+    Pure name container, mirroring ``_Tcgen05SchedPipelinePlan``.
+    Each field is the textual identifier of a value materialized in
+    the kernel prefix when ``_emit_tcgen05_aux_pipeline_setup``
+    runs. The pipeline is allocated only when the productive-body
+    gate fires (``c_input_warp_count > 0`` AND non-empty
+    ``aux_tensor_descriptors``).
+
+    ``rings`` carries the per-descriptor SMEM ring names in
+    descriptor-list order — the same order
+    ``CuteTcgen05MatmulPlan.aux_tensor_descriptors`` exposes them.
+    The producer body indexes by position; the consumer side
+    looks up by ``load_node`` identity (see
+    ``memory_ops._codegen_cute_store_tcgen05_tile``'s
+    ``aux_ring_index_by_step``) so multi-step chains within one
+    store map cleanly onto the descriptor order.
+
+    Consumer cooperative group: TMA uses ``epi_warp_count`` elected
+    warp arrivals; SIMT uses ``epi_warp_count * 32`` reader arrivals.
+    The matching release in ``memory_ops._aux_subtile_load_source``
+    must keep the same distinction so SIMT stage reuse waits for every
+    reader, not just one lane of each warp.
+    """
+
+    barriers: str
+    producer_group: str
+    consumer_group: str
+    pipeline: str
+    producer_state: str
+    # The consumer-side flip in
+    # ``memory_ops._aux_subtile_load_source`` issues
+    # ``c_pipeline_aux.consumer_wait`` / ``consumer_release`` keyed
+    # off this state per subtile of the per-output-tile aux region.
+    consumer_state: str
+    rings: tuple[_Tcgen05AuxPerDescriptorRingNames, ...]
+    use_tma_load: bool
+    stage_count: int
+    # ``epi_tile_var`` is the matmul-plan ``epi_tile`` variable
+    # name. The producer body in
+    # ``program_id._build_c_input_warp_role_local_while`` uses it
+    # to compute the per-subtile GMEM slice that gets cooperative-
+    # copied into a SMEM ring stage. Each stage holds one
+    # ``epi_tile`` worth of aux data so per-subtile staging keeps
+    # the SMEM footprint small (one stage = one subtile). The
+    # producer-body codegen reads ``(bm, bn)`` directly from the
+    # matmul plan so no block-shape fields are plumbed through
+    # this dataclass.
+    epi_tile_var: str
+
+
+@dataclass(frozen=True)
+class _Tcgen05SchedPipelinePlan:
+    """Generated CuTe variable names for the scheduler-broadcast pipeline.
+
+    Pure name container, mirroring ``_Tcgen05LayoutPlan``: each field
+    is the textual identifier of a value materialized in the kernel
+    prefix when ``_emit_sched_pipeline_setup`` runs.
+
+    The ``clc_*`` fields are populated only under
+    ``Tcgen05PersistenceModel.CLC_PERSISTENT`` (G2-H, cute_plan.md);
+    empty strings on the static path. They name SMEM storage
+    + an mbarrier that the scheduler-warp loop body uses to issue
+    ``nvvm.clusterlaunchcontrol_try_cancel`` and read back the next
+    cluster's CTA id (or a "canceled" sentinel) per persistent-loop
+    iteration.
+    """
+
+    barriers: str
+    producer_group: str
+    consumer_group: str
+    pipeline: str
+    producer_state: str
+    consumer_state: str
+    # CLC SMEM/mbarrier handles. Only emitted/used on the CLC path.
+    clc_response_smem_ptr: str = ""
+    clc_response_tensor: str = ""
+    clc_mbar_smem_ptr: str = ""
+    clc_mbar_tensor: str = ""
+    clc_mbar_phase: str = ""
+
+
+_ConfigLike = Mapping[str, object]
+
+
+def _tcgen05_grouped_mode(config: _ConfigLike) -> str | None:
+    mode = config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+    return cast("str", mode) if mode in TCGEN05_GROUPED_MODES else None
+
+
+def _iter_node_inputs(arg: object) -> list[Node]:
+    nodes: list[Node] = []
+    if isinstance(arg, Node):
+        nodes.append(arg)
+    elif isinstance(arg, (list, tuple)):
+        for item in arg:
+            nodes.extend(_iter_node_inputs(item))
+    elif isinstance(arg, dict):
+        for item in arg.values():
+            nodes.extend(_iter_node_inputs(item))
+    return nodes
+
+
+def _node_input_use_count(arg: object, needle: Node) -> int:
+    if arg is needle:
+        return 1
+    if isinstance(arg, (list, tuple)):
+        return sum(_node_input_use_count(item, needle) for item in arg)
+    if isinstance(arg, dict):
+        return sum(_node_input_use_count(item, needle) for item in arg.values())
+    return 0
+
+
+def _collect_node_dependencies(node: Node) -> set[Node]:
+    required: set[Node] = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current in required:
+            continue
+        required.add(current)
+        for arg in current.args:
+            stack.extend(_iter_node_inputs(arg))
+        for arg in current.kwargs.values():
+            stack.extend(_iter_node_inputs(arg))
+    return required
+
+
+def _collective_load_dependency_nodes(
+    load_node: Node,
+    collective_dependency_nodes: set[Node],
+    terminal_load_nodes: set[Node],
+) -> tuple[Node, ...]:
+    """Return exclusive FX dependency nodes for a tcgen05 collective load."""
+    dependencies = _collect_node_dependencies(load_node)
+    exclusive_nodes = set(collective_dependency_nodes)
+    terminal_load_nodes = terminal_load_nodes & exclusive_nodes
+    changed = True
+    while changed:
+        changed = False
+        for dependency in tuple(exclusive_nodes):
+            if dependency in terminal_load_nodes:
+                continue
+            if any(user not in exclusive_nodes for user in dependency.users):
+                exclusive_nodes.remove(dependency)
+                changed = True
+    return tuple(
+        sorted(dependencies & exclusive_nodes, key=lambda dependency: dependency.name)
+    )
+
+
+def _register_collective_handled_loads(
+    cute_state: CuteDeviceFunctionState,
+    *load_nodes: Node,
+    extra_dependency_nodes: tuple[Node, ...] = (),
+) -> None:
+    # This is called both by the early lane-loop-suppression probe and by MMA
+    # emission. Registration is set-based, so repeating it is idempotent and
+    # keeps both call sites local to the decision they support.
+    collective_dependency_nodes: set[Node] = set()
+    for load_node in load_nodes:
+        collective_dependency_nodes.update(_collect_node_dependencies(load_node))
+    collective_dependency_nodes.update(extra_dependency_nodes)
+    terminal_load_nodes = set(load_nodes)
+    for load_node in load_nodes:
+        dependency_nodes = _collective_load_dependency_nodes(
+            load_node, collective_dependency_nodes, terminal_load_nodes
+        )
+        cute_state.register_collective_handled_load(
+            load_node,
+            dependency_nodes=dependency_nodes,
+        )
+
+
+def _sole_user_is(node: Node, expected_user: Node) -> bool:
+    return len(node.users) == 1 and next(iter(node.users)) is expected_user
+
+
+def _operand_load_path_exclusive(info: _MmaOperandInfo, fx_node: Node) -> bool:
+    if info.collective_dependency_nodes:
+        return False
+    if info.terminal is info.load:
+        return _sole_user_is(info.load, fx_node)
+    return _sole_user_is(info.load, info.terminal) and _sole_user_is(
+        info.terminal,
+        fx_node,
+    )
+
+
+def _is_tracing_for_loop_node(node: Node) -> bool:
+    from ...language import _tracing_ops
+
+    return node.op == "call_function" and node.target is _tracing_ops._for_loop
+
+
+def _grouped_k_allowed_loop_users(
+    cg: GenerateAST,
+    *,
+    k_sizes_load: Node,
+    k_sizes_value_nodes: tuple[Node, ...],
+) -> tuple[Node, ...]:
+    """Return the exact loop node that carried ``k_sizes_load`` into the mask."""
+    from ..device_ir import NodeArgsGraphInfo
+
+    def graph_info_for(graph: torch.fx.Graph) -> NodeArgsGraphInfo | None:
+        for graph_info in cg.codegen_graphs:
+            if graph_info.graph is graph and isinstance(graph_info, NodeArgsGraphInfo):
+                return graph_info
+        return None
+
+    allowed_loop_users: list[Node] = []
+    for value_node in k_sizes_value_nodes:
+        if value_node.op != "placeholder":
+            continue
+        graph_info = graph_info_for(value_node.graph)
+        if graph_info is None:
+            continue
+        placeholders = tuple(value_node.graph.find_nodes(op="placeholder"))
+        try:
+            placeholder_index = placeholders.index(value_node)
+        except ValueError:
+            continue
+        for user in k_sizes_load.users:
+            if (
+                not _is_tracing_for_loop_node(user)
+                or len(user.args) < 4
+                or user.args[0] != graph_info.graph_id
+            ):
+                continue
+            loop_args = user.args[3]
+            if not (
+                isinstance(loop_args, list | tuple)
+                and placeholder_index < len(loop_args)
+            ):
+                continue
+            loop_arg = loop_args[placeholder_index]
+            if (
+                isinstance(loop_arg, Node)
+                and _codegen_graph_node_for(cg, loop_arg) is k_sizes_load
+            ):
+                allowed_loop_users.append(user)
+    return tuple(dict.fromkeys(allowed_loop_users))
+
+
+def _operand_infos_exclusive_for_mma(
+    lhs_info: _MmaOperandInfo,
+    rhs_info: _MmaOperandInfo,
+    fx_node: Node,
+) -> bool:
+    if not (
+        lhs_info.collective_dependency_nodes or rhs_info.collective_dependency_nodes
+    ):
+        return _operand_load_path_exclusive(
+            lhs_info, fx_node
+        ) and _operand_load_path_exclusive(rhs_info, fx_node)
+
+    nodes: set[Node] = {
+        lhs_info.load,
+        lhs_info.terminal,
+        rhs_info.load,
+        rhs_info.terminal,
+        *lhs_info.collective_dependency_nodes,
+        *rhs_info.collective_dependency_nodes,
+    }
+    allowed_k_size_loop_users = {
+        (mask.k_sizes_load, loop_user)
+        for mask in (lhs_info.grouped_k_mask, rhs_info.grouped_k_mask)
+        if mask is not None
+        for loop_user in mask.k_sizes_allowed_loop_users
+    }
+    for node in nodes:
+        for user in node.users:
+            if user in nodes or user is fx_node:
+                continue
+            if (node, user) in allowed_k_size_loop_users:
+                continue
+            return False
+    return True
+
+
+def _same_grouped_k_mask(
+    lhs_info: _MmaOperandInfo,
+    rhs_info: _MmaOperandInfo,
+) -> _Rank3RhsGroupedKMaskInfo | None:
+    lhs_mask = lhs_info.grouped_k_mask
+    rhs_mask = rhs_info.grouped_k_mask
+    if lhs_mask is None or rhs_mask is None:
+        return None
+    if (
+        lhs_mask.k_sizes_tensor is rhs_mask.k_sizes_tensor
+        and lhs_mask.k_sizes_load is rhs_mask.k_sizes_load
+        and lhs_mask.safe_group is rhs_mask.safe_group
+        and lhs_mask.valid_k is rhs_mask.valid_k
+    ):
+        if (
+            not rhs_info.rhs_rank3_grouped_nt
+            or rhs_info.rhs_safe_group is None
+            or rhs_mask.safe_group is not rhs_info.rhs_safe_group.safe_group
+        ):
+            return None
+        return rhs_mask
+    return None
+
+
+def _rank3_rhs_safe_group_consumed_nodes_exclusive(
+    cg: GenerateAST,
+    info: _MmaOperandInfo,
+    *,
+    allowed_safe_group_users: tuple[Node, ...] = (),
+) -> bool:
+    if info.rhs_group_index is None or info.rhs_safe_group is None:
+        return False
+    group_load = info.rhs_safe_group.group_load
+    condition = info.rhs_safe_group.condition
+    safe_group = info.rhs_safe_group.safe_group
+    if _trace_to_outer_graph_arg(cg, info.rhs_group_index) is not safe_group:
+        return False
+    if set(group_load.users) != {condition, safe_group}:
+        return False
+    if set(condition.users) != {safe_group}:
+        return False
+    if not _sole_user_is(info.rhs_group_index, info.load):
+        return False
+    safe_group_users = set(safe_group.users)
+    safe_group_users.difference_update(allowed_safe_group_users)
+    if len(safe_group_users) != 1:
+        return False
+    (safe_group_user,) = tuple(safe_group_users)
+    return (
+        _node_input_use_count(safe_group_user.args, safe_group)
+        + _node_input_use_count(safe_group_user.kwargs, safe_group)
+        == 1
+    )
+
+
+def _mma_loop_is_exclusive(node: Node) -> bool:
+    """Require the loop body to contain only the candidate MMA dataflow."""
+    required = _collect_node_dependencies(node)
+    for graph_node in node.graph.nodes:
+        if graph_node in required or graph_node.op in {
+            "placeholder",
+            "output",
+            "get_attr",
+        }:
+            continue
+        if graph_node.op == "call_function":
+            return False
+    return True
+
+
+def _shared_rhs_region_is_exclusive(cg: GenerateAST, mma: Node, store: Node) -> bool:
+    """Keep rescheduling confined to one pure contraction and its fresh store.
+
+    Operand/scaffold use counts do not prove effect ordering: an unrelated
+    store or atomic can modify an input before this region reads it. Require
+    the complete active root and its sole K loop to have no other effects.
+    Unknown calls and other control flow fail closed.
+    """
+    from ...language import _tracing_ops
+    from ...language import creation_ops
+    from ..device_ir import ForLoopGraphInfo
+    from ..device_ir import RootGraphInfo
+    from .fold_noop_stores import _is_read_only
+
+    if len(cg.codegen_graphs) != 2:
+        return False
+    reduction = next(
+        (graph for graph in cg.codegen_graphs if graph.graph is mma.graph), None
+    )
+    root = next(
+        (graph for graph in cg.codegen_graphs if graph.graph is store.graph), None
+    )
+    if not isinstance(reduction, ForLoopGraphInfo) or not isinstance(
+        root, RootGraphInfo
+    ):
+        return False
+    loops = [node for node in root.graph.nodes if _is_tracing_for_loop_node(node)]
+    if len(loops) != 1 or loops[0].args[0] != reduction.graph_id:
+        return False
+    for graph in cg.codegen_graphs:
+        for node in graph.graph.nodes:
+            if node is store or node is loops[0] or node.op == "output":
+                continue
+            if node.op == "call_function" and node.target in (
+                creation_ops.full,
+                _tracing_ops._new_var,
+                _tracing_ops._phi,
+            ):
+                continue
+            if not _is_read_only(node):
+                return False
+    return True
+
+
+def _trace_to_load(node: Node) -> Node | None:
+    """Trace through dtype casts to the underlying load node."""
+    from ...language import memory_ops
+
+    cur = node
+    while cur.op == "call_function" and cur.target is not memory_ops.load:
+        if cur.target not in _TRACE_THROUGH_TARGETS:
+            return None
+        input_nodes = [arg for arg in cur.args if isinstance(arg, Node)]
+        if len(input_nodes) != 1:
+            return None
+        cur = input_nodes[0]
+    if cur.op != "call_function" or cur.target is not memory_ops.load:
+        return None
+    return cur
+
+
+def _is_unmasked_load(node: Node) -> bool:
+    """Return whether ``node`` is an ``hl.load`` without an extra mask."""
+    from ...language import memory_ops
+
+    return (
+        node.op == "call_function"
+        and node.target is memory_ops.load
+        and (len(node.args) < 3 or node.args[2] is None)
+        and node.kwargs.get("extra_mask") is None
+    )
+
+
+def _trace_to_load_tensor(node: Node) -> tuple[Node, str, torch.Tensor] | None:
+    """Trace through dtype casts to find the underlying load tensor."""
+    load_node = _trace_to_load(node)
+    if load_node is None:
+        return None
+    tensor_node = load_node.args[0]
+    if not isinstance(tensor_node, Node):
+        return None
+    fake = tensor_node.meta.get("val")
+    if not isinstance(fake, torch.Tensor):
+        return None
+    return load_node, tensor_node.name, fake
+
+
+def _direct_load_tensor(node: Node) -> tuple[Node, str, torch.Tensor] | None:
+    """Return a direct load and its backing tensor for collective codegen."""
+    load_info = _trace_to_load_tensor(node)
+    if load_info is None or load_info[0] is not node:
+        return None
+    return load_info
+
+
+_MMA_SUPPORTED_DTYPES = {
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float8_e4m3fn,
+}
+
+
+def _tcgen05_tma_matrix_major(tensor: torch.Tensor) -> str | None:
+    """Return the contiguous trailing matrix axis understood by tcgen05 TMA."""
+    if tensor.ndim not in (2, 3):
+        return None
+    if tensor.stride(-1) == 1:
+        return "row"
+    if tensor.stride(-2) == 1:
+        return "col"
+    return None
+
+
+def _tcgen05_tma_operand_is_aligned(
+    env: CompileEnvironment, operand: _MmaOperandInfo
+) -> bool:
+    """Prove the base and noncontiguous strides satisfy TensorMap alignment.
+
+    A contiguous axis alone is insufficient: an unaligned outer byte stride
+    can produce a TensorMap whose TMA loads silently address the wrong rows.
+    Runtime input alignment is already classified in the bound kernel cache
+    key, including every stride's byte residue. Unproved layouts retain the
+    scalar shared-memory producer while keeping native MMA.
+    """
+    if operand.matrix_major is None:
+        return False
+    return _tcgen05_tma_tensor_is_aligned(env, operand.source_fake)
+
+
+def _tcgen05_tma_tensor_is_aligned(
+    env: CompileEnvironment, tensor: torch.Tensor
+) -> bool:
+    """Prove a TensorMap over ``tensor``: 16-byte base and outer strides.
+
+    Kernel arguments carry the bound kernel's pointer/stride residue
+    specialization (the dispatch cache re-checks it before reusing the code
+    for later tensors), fresh host allocations are allocator-aligned at
+    offset zero, and a static alias view of exactly one input inherits that
+    input's guarded base.  Exactly one unit stride; every other stride a
+    whole 16-byte multiple.  Shared by the TMA-load operands and the
+    TMA-store destination.
+    """
+    from .input_view_layout import input_view_copy_facts
+    from .memory_ops import tensor_has_specialized_tma_alignment
+    from .promote_output_axis import _fresh_tensors
+
+    if tensor in env.cute_proven_tma_inputs:
+        return True
+    if env.tensor_input_source(tensor) is not None:
+        return tensor_has_specialized_tma_alignment(env, tensor)
+    if tensor in _fresh_tensors(HostFunction.current()):
+        storage_offset = tensor.storage_offset()
+        if not isinstance(storage_offset, int) or storage_offset != 0:
+            return False
+        strides = tensor.stride()
+    else:
+        # Pointer-preserving host views inherit their input's guarded base
+        # alignment. Their own outer strides must still satisfy TensorMap.
+        facts = input_view_copy_facts(env, tensor)
+        if facts is None:
+            return False
+        strides = facts.strides
+    unit_strides = 0
+    for stride in strides:
+        if isinstance(stride, torch.SymInt):
+            expression = env.specialize_expr(env.shape_env.replace(stride._sympy_()))
+            if expression.free_symbols:
+                return False
+            stride = int(expression)
+        if stride == 1:
+            unit_strides += 1
+        elif stride * tensor.element_size() % 16:
+            return False
+    return unit_strides == 1
+
+
+def _tcgen05_tma_destination_is_legal(
+    env: CompileEnvironment, store: Node, *, output_column_major: bool
+) -> bool:
+    """Whether the TMA store may address ``store``'s destination.
+
+    The epilogue stages the D tile in the layout the store analysis chose
+    (row-major for the plain MN epilogue, column-major when the analysis
+    saw a column-major destination); the destination's contiguous axis has
+    to be that one, and its base and outer strides have to satisfy the
+    TensorMap proof above.
+    """
+    tensor_node = store.args[0] if store.args else None
+    tensor = tensor_node.meta.get("val") if isinstance(tensor_node, Node) else None
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    expected_major = "col" if output_column_major else "row"
+    return _tcgen05_tma_matrix_major(
+        tensor
+    ) == expected_major and _tcgen05_tma_tensor_is_aligned(env, tensor)
+
+
+def _tcgen05_grouped_rhs_keeps_store_protocol(rhs_info: _MmaOperandInfo) -> bool:
+    """Whether a grouped RHS form is exempt from the TMA-store destination proof.
+
+    Shared by codegen's ``tcgen05_output_tma_store_proven`` and its bind-time
+    form so the two cannot disagree. The rank-3 N,K-major grouped RHS (its
+    group expression selects the per-group destination) and the
+    segment-metadata form store through their own protocols; the shared
+    rank-2 RHS and a packed group without segment metadata store through the
+    plain epilogue and keep the proof.
+    """
+    return rhs_info.rhs_rank3_grouped_nt or rhs_info.rhs_segment_group is not None
+
+
+def _tcgen05_mma_output_tma_store_provable(
+    env: CompileEnvironment,
+    mma_node: Node,
+    candidate: _CuteMmaNode,
+    graphs: list[GraphInfo],
+) -> bool:
+    """Bind-time form of codegen's ``tcgen05_output_tma_store_proven``.
+
+    The flat-role / TVM-FFI direct-entry path also hard-requires the TMA
+    store epilogue, which ``_emit_mma_pipeline`` enables only when every
+    store the accumulator reaches has a TensorMap-legal destination
+    (``_tcgen05_tma_destination_is_legal``: 16-byte base and outer strides,
+    contiguous axis matching the staged D layout). The grouped RHS forms
+    exempt here are exactly codegen's structural ones
+    (``_tcgen05_grouped_rhs_keeps_store_protocol``); codegen's remaining
+    exemptions (N,M orientation, row union, a grouped mode) are config
+    requests the direct-entry seed never makes. An untraced fan-out is left
+    to the store lowering, as in codegen.
+
+    ``candidate`` was analyzed with the DeviceIR, which also analyzes the
+    output stores; codegen analyzes the MMA from the graphs alone and stages
+    D row-major unless that view carries a store analysis (leading
+    passthrough or permuted operands), so the expected destination layout is
+    taken from the same graph-only view.
+    """
+    if _tcgen05_grouped_rhs_keeps_store_protocol(candidate.operands.rhs):
+        return True
+    stores = _trace_mma_to_stores(mma_node, graphs)
+    if stores is None:
+        return True
+    codegen_candidate = analyze_cute_mma_node(mma_node, graphs=graphs)
+    output_column_major = (
+        codegen_candidate is not None and codegen_candidate.output_column_major
+    )
+    return all(
+        _tcgen05_tma_destination_is_legal(
+            env, store, output_column_major=output_column_major
+        )
+        for store in stores
+    )
+
+
+def host_function_matmul_operands_tma_provable(
+    env: CompileEnvironment, host_function: HostFunction
+) -> bool:
+    """Return False when an MMA candidate operand or output fails the TMA proof.
+
+    The tcgen05 flat-role / TVM-FFI direct-entry seed hard-requires the TMA
+    A/B pipeline and the TMA store epilogue, which ``_emit_mma_pipeline`` only
+    enables when both operands pass ``_tcgen05_tma_operand_is_aligned`` and
+    every traced output store passes ``_tcgen05_tma_destination_is_legal``.
+    The matmul plan facts alone cannot see this: an input whose base pointer
+    or outer byte stride is not a 16-byte multiple keeps the scalar SMEM
+    producers, and an under-aligned or N-major output destination takes the
+    SIMT store body, so the seed config would be rejected at codegen.
+    ``CuteTcgen05ClusterM2FfiHeuristic.register_facts`` evaluates the same
+    proofs at bind time so the seed stays ineligible for such kernels.
+
+    The proof reads the immutable bound alignment facts, which the runtime
+    records only after seed registration. While the bound kernel's runtime
+    argument values are active, classify them into a temporary snapshot and
+    restore the prior one afterwards (the cache-managed binding records its
+    facts on the first call and must find them empty); a later regeneration
+    without active values reads the recorded facts. Pointer-preserving host
+    views are thereby proven exactly as codegen proves them, through their
+    input's recorded base alignment.
+
+    The facts hooks run both under the binding's active environment and
+    outside any (``compiler_seed_configs`` called directly), while the MMA
+    analysis reads the current one, so ``env`` is entered when none is active.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    device_ir = host_function.device_ir
+    saved = env.bound_runtime_input_specialization_results
+    with contextlib.ExitStack() as stack:
+        if CompileEnvironment.has_current():
+            assert CompileEnvironment.current() is env
+        else:
+            stack.enter_context(env)
+        try:
+            if env.runtime_arg_values_by_name:
+                env.snapshot_runtime_input_specialization_results(
+                    env.runtime_arg_values_by_name
+                )
+            with host_function:
+                for graph_info in device_ir.graphs:
+                    for node in graph_info.graph.nodes:
+                        candidate = analyze_cute_mma_node(node, device_ir=device_ir)
+                        if candidate is None:
+                            continue
+                        for operand in (candidate.operands.lhs, candidate.operands.rhs):
+                            if not _tcgen05_tma_operand_is_aligned(env, operand):
+                                return False
+                        if not _tcgen05_mma_output_tma_store_provable(
+                            env, node, candidate, device_ir.graphs
+                        ):
+                            return False
+        finally:
+            env.bound_runtime_input_specialization_results = saved
+        return True
+
+
+def _compose_axis_orders(
+    source_to_logical: tuple[int, ...],
+    logical_to_target: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Map source axes directly into a target ordered from logical axes."""
+    assert len(source_to_logical) == len(logical_to_target)
+    return tuple(source_to_logical[logical_dim] for logical_dim in logical_to_target)
+
+
+def _rank3_rhs_index_block_id(index: Node, *, reduction: bool | None) -> int | None:
+    from ..compile_environment import CompileEnvironment
+    from ..compile_environment import _symint_expr
+    from ..host_function import HostFunction
+    from ..variable_origin import BlockSizeOrigin
+
+    val = index.meta.get("val")
+    if not isinstance(val, torch.SymInt):
+        return None
+    expr = _symint_expr(val)
+    if expr is None:
+        return None
+    env = CompileEnvironment.current()
+    origin_info = HostFunction.current().expr_to_origin.get(expr)
+    block_id = (
+        origin_info.origin.block_id
+        if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin)
+        else env.resolve_block_id(val)
+    )
+    if block_id is None:
+        return None
+    canonical_block_id = env.canonical_block_id(block_id)
+    if (
+        reduction is not None
+        and bool(env.block_sizes[canonical_block_id].reduction) is not reduction
+    ):
+        return None
+    return canonical_block_id
+
+
+def _rank3_rhs_exact_index_block_id(
+    index: Node, *, reduction: bool | None
+) -> int | None:
+    """Return the canonical block axis only for an unshifted tile subscript."""
+    from ..compile_environment import CompileEnvironment
+
+    block_id = _rank3_rhs_index_block_id(index, reduction=reduction)
+    if block_id is None:
+        return None
+    env = CompileEnvironment.current()
+    tile_info = subscript_tile_info(env, index)
+    if (
+        tile_info is None
+        or not env.known_equal(tile_info.offset, 0)
+        or env.canonical_block_id(tile_info.block_id) != block_id
+    ):
+        return None
+    return block_id
+
+
+def _rank3_rhs_safe_group_load(
+    cg: GenerateAST,
+    group_index: Node,
+    *,
+    m_block_id: int | None = None,
+) -> _Rank3RhsSafeGroupInfo | None:
+    """Return the admitted ``where(load(tile_m.begin) >= 0, load, 0)`` chain."""
+    import operator
+
+    root = _trace_to_outer_graph_arg(cg, group_index)
+    if (
+        root.op != "call_function"
+        or root.target is not torch.ops.aten.where.self
+        or len(root.args) < 3
+    ):
+        return None
+    condition, true_value, false_value = root.args[:3]
+    if (
+        not isinstance(condition, Node)
+        or not isinstance(true_value, Node)
+        or not _is_zero_scalar_node(false_value)
+    ):
+        return None
+    if (
+        condition.op != "call_function"
+        or condition.target not in (operator.ge, torch.ops.aten.ge.Scalar)
+        or len(condition.args) < 2
+        or condition.args[0] is not true_value
+        or not _is_zero_scalar_node(condition.args[1])
+    ):
+        return None
+    if not _is_unmasked_load(true_value) or len(true_value.args) < 2:
+        return None
+    tensor_node = true_value.args[0]
+    index = true_value.args[1]
+    if (
+        not isinstance(tensor_node, Node)
+        or not isinstance(index, list)
+        or len(index) != 1
+        or not isinstance(index[0], Node)
+        or not _is_tile_begin(index[0], m_block_id=m_block_id)
+    ):
+        return None
+    tensor = tensor_node.meta.get("val")
+    loaded = true_value.meta.get("val")
+    if (
+        not isinstance(tensor, torch.Tensor)
+        or tensor.ndim != 1
+        or not isinstance(loaded, torch.Tensor)
+        or loaded.ndim != 0
+    ):
+        return None
+    return _Rank3RhsSafeGroupInfo(
+        group_load=true_value,
+        condition=condition,
+        safe_group=root,
+    )
+
+
+def _tile_begin_block_id(node: Node) -> int | None:
+    from ..compile_environment import _symint_expr
+    from ..host_function import HostFunction
+    from ..variable_origin import TileBeginOrigin
+
+    val = node.meta.get("val")
+    if not isinstance(val, torch.SymInt):
+        return None
+    expr = _symint_expr(val)
+    if expr is None:
+        return None
+    origin_info = HostFunction.current().expr_to_origin.get(expr)
+    if origin_info is None or not isinstance(origin_info.origin, TileBeginOrigin):
+        return None
+    return origin_info.origin.block_id
+
+
+def _is_tile_index_for_block(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    block_id: int,
+) -> bool:
+    from ...language import tile_ops
+    from ..compile_environment import CompileEnvironment
+
+    root = _trace_to_outer_graph_arg(cg, node)
+    if (
+        root.op != "call_function"
+        or root.target is not tile_ops.tile_index
+        or len(root.args) != 1
+        or not isinstance(root.args[0], Node)
+    ):
+        return False
+    root_block_id = _rank3_rhs_index_block_id(root.args[0], reduction=False)
+    if root_block_id is None:
+        return False
+    env = CompileEnvironment.current()
+    canonical_block_id = env.canonical_block_id
+    return canonical_block_id(root_block_id) == canonical_block_id(block_id)
+
+
+def _rank3_rhs_segment_metadata_load(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    column: int,
+    expected_tensor: torch.Tensor | None = None,
+    expected_segment_id: Node | None = None,
+) -> tuple[torch.Tensor, Node, Node] | None:
+    root = _trace_to_outer_graph_arg(cg, node)
+    if not _is_unmasked_load(root) or len(root.args) < 2:
+        return None
+    tensor_node = root.args[0]
+    index = root.args[1]
+    if (
+        not isinstance(tensor_node, Node)
+        or not isinstance(index, list | tuple)
+        or len(index) != 2
+        or not isinstance(index[0], Node)
+        or index[1] != column
+    ):
+        return None
+    segment_id = _trace_to_outer_graph_arg(cg, index[0])
+    if expected_segment_id is not None and segment_id is not expected_segment_id:
+        return None
+    metadata = tensor_node.meta.get("val")
+    loaded = root.meta.get("val")
+    if (
+        not isinstance(metadata, torch.Tensor)
+        or metadata.ndim != 2
+        or metadata.dtype not in (torch.int32, torch.int64)
+        or metadata.shape[1] != 4
+        or (expected_tensor is not None and metadata is not expected_tensor)
+        or not isinstance(loaded, torch.Tensor)
+        or loaded.ndim != 0
+    ):
+        return None
+    return metadata, segment_id, root
+
+
+def _rank3_rhs_segment_group_load(
+    cg: GenerateAST,
+    group_index: Node,
+) -> _Rank3RhsSegmentGroupInfo | None:
+    loaded = _rank3_rhs_segment_metadata_load(cg, group_index, column=0)
+    if loaded is None:
+        return None
+    metadata, segment_id, group_load = loaded
+    segment_block_id = _tile_begin_block_id(segment_id)
+    if segment_block_id is None:
+        return None
+    return _Rank3RhsSegmentGroupInfo(
+        metadata_tensor=metadata,
+        segment_id=segment_id,
+        segment_block_id=segment_block_id,
+        group_load=group_load,
+    )
+
+
+def _rank3_rhs_packed_group_index(
+    cg: GenerateAST,
+    group_index: Node,
+) -> _Rank3RhsPackedGroupInfo | None:
+    """Recognize ``group_tile.index.sum()`` for a block-size-one group axis."""
+    from ...language import tile_ops
+    from ..compile_environment import CompileEnvironment
+    from ..compile_environment import FixedBlockSizeSource
+
+    root = _trace_to_outer_graph_arg(cg, group_index)
+    if (
+        root.op != "call_function"
+        or root.target is not torch.ops.aten.sum.default
+        or len(root.args) != 1
+        or not isinstance(root.args[0], Node)
+    ):
+        return None
+    tile_index, mask_to = _unwrap_zero_mask_to(root.args[0])
+    if (
+        mask_to is None
+        or tile_index.op != "call_function"
+        or tile_index.target is not tile_ops.tile_index
+        or len(tile_index.args) != 1
+        or not isinstance(tile_index.args[0], Node)
+    ):
+        return None
+    group_block_id = _rank3_rhs_index_block_id(
+        tile_index.args[0],
+        reduction=False,
+    )
+    root_value = root.meta.get("val")
+    tile_value = tile_index.meta.get("val")
+    block_size_source = (
+        CompileEnvironment.current().block_sizes[group_block_id].block_size_source
+        if group_block_id is not None
+        else None
+    )
+    if (
+        group_block_id is None
+        or not isinstance(block_size_source, FixedBlockSizeSource)
+        or block_size_source.value != 1
+        or not isinstance(root_value, torch.Tensor)
+        or root_value.ndim != 0
+        or not isinstance(tile_value, torch.Tensor)
+        or tile_value.ndim != 1
+    ):
+        return None
+    return _Rank3RhsPackedGroupInfo(
+        group_index=root,
+        group_block_id=group_block_id,
+    )
+
+
+def _rank3_rhs_packed_split_load(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    expected_tensor: torch.Tensor | None = None,
+    literal_index: int | None = None,
+    expected_index: Node | None = None,
+) -> tuple[torch.Tensor, Node] | None:
+    root = _trace_to_outer_graph_arg(cg, node)
+    if not _is_unmasked_load(root) or len(root.args) < 2:
+        return None
+    tensor_node = root.args[0]
+    index = root.args[1]
+    if (
+        not isinstance(tensor_node, Node)
+        or not isinstance(index, list | tuple)
+        or len(index) != 1
+    ):
+        return None
+    index_value = index[0]
+    if literal_index is not None and index_value != literal_index:
+        return None
+    if expected_index is not None and (
+        not isinstance(index_value, Node)
+        or _trace_to_outer_graph_arg(cg, index_value) is not expected_index
+    ):
+        return None
+    tensor = tensor_node.meta.get("val")
+    loaded = root.meta.get("val")
+    if (
+        not isinstance(tensor, torch.Tensor)
+        or tensor.ndim != 1
+        or tensor.dtype not in (torch.int32, torch.int64)
+        or (expected_tensor is not None and tensor is not expected_tensor)
+        or not isinstance(loaded, torch.Tensor)
+        or loaded.ndim != 0
+    ):
+        return None
+    return tensor, root
+
+
+def _rank3_rhs_flatten_add_tree(cg: GenerateAST, node: Node) -> tuple[Node, ...]:
+    import operator
+
+    root = _trace_to_outer_graph_arg(cg, node)
+    if (
+        root.op == "call_function"
+        and root.target in (operator.add, torch.ops.aten.add.Tensor)
+        and len(root.args) == 2
+        and not root.kwargs
+        and all(isinstance(arg, Node) for arg in root.args)
+    ):
+        lhs, rhs = cast("tuple[Node, Node]", root.args)
+        return (
+            *_rank3_rhs_flatten_add_tree(cg, lhs),
+            *_rank3_rhs_flatten_add_tree(cg, rhs),
+        )
+    return (root,)
+
+
+def _rank3_rhs_lhs_scaffold(
+    cg: GenerateAST,
+    lhs_info: _MmaOperandInfo,
+    *,
+    m_block_id: int,
+    k_block_id: int,
+) -> _Rank3RhsLhsScaffold | None:
+    """Match ``row_offset + local_m`` guarded by ``local_m < valid_extent``."""
+    import operator
+
+    from ..compile_environment import CompileEnvironment
+
+    indices = lhs_info.load.args[1] if len(lhs_info.load.args) >= 2 else None
+    extra_mask = lhs_info.load.args[2] if len(lhs_info.load.args) >= 3 else None
+    if (
+        not isinstance(indices, list | tuple)
+        or len(indices) != 2
+        or not isinstance(indices[0], Node)
+        or not isinstance(indices[1], Node)
+        or not isinstance(extra_mask, Node)
+    ):
+        return None
+    env = CompileEnvironment.current()
+    lhs_k_block_id = _rank3_rhs_exact_index_block_id(indices[1], reduction=None)
+    if lhs_k_block_id is None or env.canonical_block_id(
+        lhs_k_block_id
+    ) != env.canonical_block_id(k_block_id):
+        return None
+
+    row_index = _trace_to_outer_graph_arg(cg, indices[0])
+    if (
+        row_index.op != "call_function"
+        or row_index.target not in (operator.add, torch.ops.aten.add.Tensor)
+        or len(row_index.args) != 2
+        or row_index.kwargs
+        or not all(isinstance(arg, Node) for arg in row_index.args)
+    ):
+        return None
+    row_args = cast("tuple[Node, Node]", row_index.args)
+    local_m_positions = [
+        index
+        for index, arg in enumerate(row_args)
+        if _is_tile_index_for_block(cg, arg, block_id=m_block_id)
+    ]
+    if len(local_m_positions) != 1:
+        return None
+    row_offset = _trace_to_outer_graph_arg(cg, row_args[1 - local_m_positions[0]])
+
+    mask = _trace_to_outer_graph_arg(cg, extra_mask)
+    valid_m = _rank3_rhs_broadcast_mask_base(mask, broadcast_dim=1)
+    if valid_m is None:
+        return None
+    valid_m = _trace_to_outer_graph_arg(cg, valid_m)
+    if (
+        valid_m.op != "call_function"
+        or valid_m.target not in (operator.lt, torch.ops.aten.lt.Tensor)
+        or len(valid_m.args) != 2
+        or valid_m.kwargs
+        or not all(isinstance(arg, Node) for arg in valid_m.args)
+    ):
+        return None
+    valid_lhs, valid_extent = cast("tuple[Node, Node]", valid_m.args)
+    if not _is_tile_index_for_block(cg, valid_lhs, block_id=m_block_id):
+        return None
+    return _Rank3RhsLhsScaffold(
+        row_index=row_index,
+        row_offset=row_offset,
+        valid_m=valid_m,
+        valid_extent=_trace_to_outer_graph_arg(cg, valid_extent),
+    )
+
+
+def _rank3_rhs_is_group_plus_one(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    group_index: Node,
+) -> bool:
+    import operator
+
+    root = _trace_to_outer_graph_arg(cg, node)
+    if (
+        root.op != "call_function"
+        or root.target not in (operator.add, torch.ops.aten.add.Tensor)
+        or len(root.args) != 2
+        or root.kwargs
+    ):
+        return False
+    lhs, rhs = root.args
+    return (
+        isinstance(lhs, Node)
+        and _trace_to_outer_graph_arg(cg, lhs) is group_index
+        and type(rhs) is int
+        and rhs == 1
+    ) or (
+        isinstance(rhs, Node)
+        and _trace_to_outer_graph_arg(cg, rhs) is group_index
+        and type(lhs) is int
+        and lhs == 1
+    )
+
+
+def _zero_clamp_input(cg: GenerateAST, node: Node, *, minimum: bool) -> Node | None:
+    root = _trace_to_outer_graph_arg(cg, node)
+    target = (
+        torch.ops.aten.clamp_min.default
+        if minimum
+        else torch.ops.aten.clamp_max.default
+    )
+    if (
+        root.op == "call_function"
+        and root.target is target
+        and len(root.args) == 2
+        and not root.kwargs
+        and isinstance(root.args[0], Node)
+        and type(root.args[1]) is int
+        and root.args[1] == 0
+    ):
+        return _trace_to_outer_graph_arg(cg, root.args[0])
+    return None
+
+
+def _rank3_rhs_packed_offsets_lhs_info(
+    cg: GenerateAST,
+    lhs_scaffold: _Rank3RhsLhsScaffold,
+    *,
+    group_index: Node,
+    group_count: int,
+) -> tuple[_Rank3RhsWorklistLhsInfo, _Rank3RhsPackedSplitInfo] | None:
+    """Match ``offsets[g] + local_m`` with extent ``offsets[g+1]-offsets[g]``."""
+    import operator
+
+    row_offset = lhs_scaffold.row_offset
+    raw_start = _zero_clamp_input(cg, row_offset, minimum=True)
+    clipped_negative_start = raw_start is not None
+    start_loaded = _rank3_rhs_packed_split_load(
+        cg,
+        raw_start if raw_start is not None else row_offset,
+        expected_index=group_index,
+    )
+    if start_loaded is None:
+        return None
+    offsets, start_load = start_loaded
+    if offsets.shape[0] != group_count + 1:
+        return None
+
+    extent = lhs_scaffold.valid_extent
+    if clipped_negative_start:
+        # clamp_min(clamp_min(end-start, 0) + clamp_max(start, 0), 0)
+        # represents the original local-row range after its negative-address
+        # prefix is removed. Unlike truncating that range before clipping,
+        # this preserves valid rows even when end-start exceeds A.size(0).
+        clipped = _zero_clamp_input(cg, extent, minimum=True)
+        if (
+            clipped is None
+            or clipped.op != "call_function"
+            or clipped.target not in (operator.add, torch.ops.aten.add.Tensor)
+            or len(clipped.args) != 2
+            or clipped.kwargs
+            or not all(isinstance(arg, Node) for arg in clipped.args)
+        ):
+            return None
+        positive_extent, negative_start = cast("tuple[Node, Node]", clipped.args)
+        extent_input = _zero_clamp_input(cg, positive_extent, minimum=True)
+        offset_input = _zero_clamp_input(cg, negative_start, minimum=False)
+        if extent_input is None or offset_input is not start_load:
+            return None
+        extent = extent_input
+    if (
+        extent.op != "call_function"
+        or extent.target not in (operator.sub, torch.ops.aten.sub.Tensor)
+        or len(extent.args) != 2
+        or extent.kwargs
+        or not all(isinstance(arg, Node) for arg in extent.args)
+    ):
+        return None
+    end_value, start_value = cast("tuple[Node, Node]", extent.args)
+    if (
+        _trace_to_outer_graph_arg(cg, start_value) is not start_load
+        and _rank3_rhs_packed_split_load(
+            cg,
+            start_value,
+            expected_tensor=offsets,
+            expected_index=group_index,
+        )
+        is None
+    ):
+        return None
+    end_loaded = _rank3_rhs_packed_split_load(
+        cg,
+        end_value,
+        expected_tensor=offsets,
+    )
+    if end_loaded is None:
+        return None
+    _offsets, end_load = end_loaded
+    end_indices = end_load.args[1] if len(end_load.args) >= 2 else None
+    if (
+        not isinstance(end_indices, list | tuple)
+        or len(end_indices) != 1
+        or not isinstance(end_indices[0], Node)
+        or not _rank3_rhs_is_group_plus_one(
+            cg,
+            end_indices[0],
+            group_index=group_index,
+        )
+    ):
+        return None
+
+    dependency_nodes = tuple(
+        dict.fromkeys(
+            (
+                group_index,
+                *(
+                    dependency
+                    for dependency in _collect_node_dependencies(lhs_scaffold.row_index)
+                    if dependency.op == "call_function"
+                    and isinstance(dependency.meta.get("val"), torch.Tensor)
+                    and cast("torch.Tensor", dependency.meta["val"]).ndim == 0
+                ),
+                *(
+                    dependency
+                    for dependency in _collect_node_dependencies(lhs_scaffold.valid_m)
+                    if dependency.op == "call_function"
+                    and isinstance(dependency.meta.get("val"), torch.Tensor)
+                    and cast("torch.Tensor", dependency.meta["val"]).ndim == 0
+                ),
+                lhs_scaffold.row_offset,
+                extent,
+                lhs_scaffold.row_index,
+                lhs_scaffold.valid_m,
+            )
+        )
+    )
+    return (
+        _Rank3RhsWorklistLhsInfo(
+            row_start=row_offset,
+            group_m=lhs_scaffold.valid_extent,
+            row_index=lhs_scaffold.row_index,
+            valid_m=lhs_scaffold.valid_m,
+            dependency_nodes=dependency_nodes,
+        ),
+        _Rank3RhsPackedSplitInfo(
+            layout_tensor=offsets,
+            layout_kind="offsets",
+            clipped_negative_start=clipped_negative_start,
+        ),
+    )
+
+
+def _rank3_rhs_packed_split_lhs_info(
+    cg: GenerateAST,
+    lhs_info: _MmaOperandInfo,
+    rhs_info: _MmaOperandInfo,
+    *,
+    group_count: int,
+    group_block_id: int,
+    m_block_id: int,
+    k_block_id: int,
+) -> tuple[_Rank3RhsWorklistLhsInfo, _Rank3RhsPackedSplitInfo] | None:
+    """Prove compact row addressing from ``split_sizes[group]`` and its prefix."""
+    import operator
+
+    from ..compile_environment import CompileEnvironment
+
+    packed_group = rhs_info.rhs_packed_group
+    if packed_group is None or group_count < 1:
+        return None
+    env = CompileEnvironment.current()
+    canonical_block_id = env.canonical_block_id
+    if canonical_block_id(packed_group.group_block_id) != canonical_block_id(
+        group_block_id
+    ) or canonical_block_id(group_block_id) in (
+        canonical_block_id(m_block_id),
+        canonical_block_id(k_block_id),
+    ):
+        return None
+
+    def block_extent_matches(block_id: int, expected: int | torch.SymInt) -> bool:
+        extent = env.block_sizes[canonical_block_id(block_id)].size
+        return isinstance(extent, int | torch.SymInt) and env.known_equal(
+            extent,
+            expected,
+        )
+
+    rhs_n_block_id = rhs_info.rhs_n_block_id
+    if (
+        lhs_info.source_fake.ndim != 2
+        or not rhs_info.rhs_is_grouped
+        or rhs_n_block_id is None
+        or not block_extent_matches(
+            packed_group.group_block_id,
+            group_count,
+        )
+        or not block_extent_matches(m_block_id, lhs_info.source_fake.shape[0])
+        or not block_extent_matches(rhs_n_block_id, rhs_info.matrix_cols)
+        or not block_extent_matches(k_block_id, lhs_info.source_fake.shape[1])
+        or not block_extent_matches(k_block_id, rhs_info.matrix_rows)
+    ):
+        return None
+    lhs_scaffold = _rank3_rhs_lhs_scaffold(
+        cg,
+        lhs_info,
+        m_block_id=m_block_id,
+        k_block_id=k_block_id,
+    )
+    if lhs_scaffold is None:
+        return None
+    offsets_lhs = _rank3_rhs_packed_offsets_lhs_info(
+        cg,
+        lhs_scaffold,
+        group_index=packed_group.group_index,
+        group_count=group_count,
+    )
+    if offsets_lhs is not None:
+        return offsets_lhs
+    group_m_loaded = _rank3_rhs_packed_split_load(
+        cg,
+        lhs_scaffold.valid_extent,
+        expected_index=packed_group.group_index,
+    )
+    if group_m_loaded is None:
+        return None
+    split_sizes, group_m_load = group_m_loaded
+    if split_sizes.shape[0] != group_count:
+        return None
+
+    prefix_terms = _rank3_rhs_flatten_add_tree(cg, lhs_scaffold.row_offset)
+    if len(prefix_terms) != group_count - 1:
+        return None
+    scaffold_nodes: list[Node] = [packed_group.group_index, group_m_load]
+    prefix_indices: set[int] = set()
+    for term in prefix_terms:
+        if (
+            term.op != "call_function"
+            or term.target is not torch.ops.aten.where.self
+            or len(term.args) != 3
+            or not isinstance(term.args[0], Node)
+            or not isinstance(term.args[1], Node)
+            or not _is_zero_scalar_node(term.args[2])
+        ):
+            return None
+        condition, true_value = cast("tuple[Node, Node]", term.args[:2])
+        prefix_index = condition.args[1] if len(condition.args) == 2 else None
+        if (
+            condition.op != "call_function"
+            or condition.target not in (operator.gt, torch.ops.aten.gt.Scalar)
+            or len(condition.args) != 2
+            or not isinstance(condition.args[0], Node)
+            or _trace_to_outer_graph_arg(cg, condition.args[0])
+            is not packed_group.group_index
+            or type(prefix_index) is not int
+            or prefix_index not in range(group_count - 1)
+            or prefix_index in prefix_indices
+        ):
+            return None
+        prefix_loaded = _rank3_rhs_packed_split_load(
+            cg,
+            true_value,
+            expected_tensor=split_sizes,
+            literal_index=prefix_index,
+        )
+        if prefix_loaded is None:
+            return None
+        _tensor, prefix_load = prefix_loaded
+        scaffold_nodes.extend((prefix_load, condition))
+        zero = term.args[2]
+        if isinstance(zero, Node):
+            scaffold_nodes.append(zero)
+        scaffold_nodes.append(term)
+        prefix_indices.add(prefix_index)
+    if prefix_indices != set(range(group_count - 1)):
+        return None
+    scaffold_nodes.extend(
+        dependency
+        for dependency in _collect_node_dependencies(lhs_scaffold.row_offset)
+        if dependency.op == "call_function"
+        and isinstance(dependency.meta.get("val"), torch.Tensor)
+        and cast("torch.Tensor", dependency.meta["val"]).ndim == 0
+    )
+    scaffold_nodes.extend(
+        (
+            lhs_scaffold.row_offset,
+            lhs_scaffold.row_index,
+            lhs_scaffold.valid_m,
+        )
+    )
+    dependency_nodes = tuple(dict.fromkeys(scaffold_nodes))
+    return (
+        _Rank3RhsWorklistLhsInfo(
+            row_start=lhs_scaffold.row_offset,
+            group_m=group_m_load,
+            row_index=lhs_scaffold.row_index,
+            valid_m=lhs_scaffold.valid_m,
+            dependency_nodes=dependency_nodes,
+        ),
+        _Rank3RhsPackedSplitInfo(
+            layout_tensor=split_sizes,
+            layout_kind="split_sizes",
+        ),
+    )
+
+
+def _rank3_rhs_broadcast_mask_base(
+    condition: Node, *, broadcast_dim: int
+) -> Node | None:
+    from ...language import view_ops
+
+    cond_val = condition.meta.get("val")
+    if (
+        not isinstance(cond_val, torch.Tensor)
+        or cond_val.dtype is not torch.bool
+        or cond_val.ndim != 2
+        or cond_val.shape[broadcast_dim] != 1
+        or condition.op != "call_function"
+        or condition.target is not view_ops.subscript
+        or len(condition.args) != 2
+        or not isinstance(condition.args[0], Node)
+        or not isinstance(condition.args[1], list | tuple)
+    ):
+        return None
+    index = condition.args[1]
+    if len(index) != 2:
+        return None
+    expected_index: list[object] = [slice(None), slice(None)]
+    expected_index[broadcast_dim] = None
+    if tuple(index) != tuple(expected_index):
+        return None
+    return condition.args[0]
+
+
+def _rank3_rhs_segment_lhs_info(
+    cg: GenerateAST,
+    lhs_info: _MmaOperandInfo,
+    rhs_info: _MmaOperandInfo,
+    *,
+    segment_block_id: int,
+    m_block_id: int,
+    k_block_id: int,
+) -> _Rank3RhsWorklistLhsInfo | None:
+    from ..compile_environment import CompileEnvironment
+
+    if rhs_info.rhs_segment_group is None:
+        return None
+    segment_group = rhs_info.rhs_segment_group
+    env = CompileEnvironment.current()
+    canonical_block_id = env.canonical_block_id
+    if canonical_block_id(segment_group.segment_block_id) != canonical_block_id(
+        segment_block_id
+    ) or canonical_block_id(segment_group.segment_block_id) in (
+        canonical_block_id(m_block_id),
+        canonical_block_id(k_block_id),
+    ):
+        return None
+    lhs_scaffold = _rank3_rhs_lhs_scaffold(
+        cg,
+        lhs_info,
+        m_block_id=m_block_id,
+        k_block_id=k_block_id,
+    )
+    if lhs_scaffold is None:
+        return None
+    loaded_start = _rank3_rhs_segment_metadata_load(
+        cg,
+        lhs_scaffold.row_offset,
+        column=1,
+        expected_tensor=segment_group.metadata_tensor,
+        expected_segment_id=segment_group.segment_id,
+    )
+    if loaded_start is None:
+        return None
+    _metadata, _segment_id, segment_start_load = loaded_start
+    loaded_actual_m = _rank3_rhs_segment_metadata_load(
+        cg,
+        lhs_scaffold.valid_extent,
+        column=2,
+        expected_tensor=segment_group.metadata_tensor,
+        expected_segment_id=segment_group.segment_id,
+    )
+    if loaded_actual_m is None:
+        return None
+    _metadata, _segment_id, actual_m_load = loaded_actual_m
+    return _Rank3RhsWorklistLhsInfo(
+        row_start=segment_start_load,
+        group_m=actual_m_load,
+        row_index=lhs_scaffold.row_index,
+        valid_m=lhs_scaffold.valid_m,
+        dependency_nodes=tuple(
+            dict.fromkeys(
+                (
+                    segment_group.group_load,
+                    segment_start_load,
+                    actual_m_load,
+                )
+            )
+        ),
+    )
+
+
+def _unwrap_zero_mask_to(node: Node) -> tuple[Node, Node | None]:
+    from ...language import _tracing_ops
+
+    if (
+        node.op == "call_function"
+        and node.target is _tracing_ops._mask_to
+        and len(node.args) == 2
+        and isinstance(node.args[0], Node)
+        and _is_zero_scalar_node(node.args[1])
+    ):
+        return node.args[0], node
+    return node, None
+
+
+def _is_zero_tensor_node(node: object, *, expected: torch.Tensor) -> bool:
+    if not isinstance(node, Node) or node.op != "call_function":
+        return False
+    val = node.meta.get("val")
+    if (
+        not isinstance(val, torch.Tensor)
+        or val.dtype is not expected.dtype
+        or tuple(val.shape) != tuple(expected.shape)
+    ):
+        return False
+    if node.target is torch.ops.aten.full.default and len(node.args) >= 2:
+        value = node.args[1]
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value == 0
+        )
+    return node.target is torch.ops.aten.zeros_like.default
+
+
+def _rank3_rhs_grouped_k_mask(
+    cg: GenerateAST | None,
+    node: Node,
+    *,
+    load_node: Node,
+    k_index_node: Node,
+    expected_safe_group: Node | None = None,
+) -> _Rank3RhsGroupedKMaskInfo | None:
+    import operator
+
+    from ...language import tile_ops
+
+    if cg is None:
+        return None
+    if (
+        node.op != "call_function"
+        or node.target is not torch.ops.aten.where.self
+        or len(node.args) != 3
+        or not isinstance(node.args[0], Node)
+        or node.args[1] is not load_node
+    ):
+        return None
+    condition = node.args[0]
+    load_fake = load_node.meta.get("val")
+    if not isinstance(load_fake, torch.Tensor):
+        return None
+    if not _is_zero_tensor_node(node.args[2], expected=load_fake):
+        return None
+    zero_node = node.args[2]
+    assert isinstance(zero_node, Node)
+
+    valid_k = _rank3_rhs_broadcast_mask_base(condition, broadcast_dim=0)
+    if (
+        valid_k is None
+        or valid_k.op != "call_function"
+        or valid_k.target not in (operator.lt, torch.ops.aten.lt.Tensor)
+        or len(valid_k.args) != 2
+    ):
+        return None
+    tile_index = valid_k.args[0]
+    group_k = valid_k.args[1]
+    if not isinstance(tile_index, Node) or not isinstance(group_k, Node):
+        return None
+    if (
+        tile_index.op != "call_function"
+        or tile_index.target is not tile_ops.tile_index
+        or len(tile_index.args) != 1
+        or tile_index.args[0] is not k_index_node
+    ):
+        return None
+    group_k_root, group_k_value_nodes = _trace_to_outer_graph_arg_with_path(
+        cg,
+        group_k,
+    )
+    if not _is_unmasked_load(group_k_root) or len(group_k_root.args) < 2:
+        return None
+    tensor_node = group_k_root.args[0]
+    index = group_k_root.args[1]
+    if (
+        not isinstance(tensor_node, Node)
+        or not isinstance(index, list | tuple)
+        or len(index) != 1
+        or not isinstance(index[0], Node)
+    ):
+        return None
+    if expected_safe_group is not None and index[0] is not expected_safe_group:
+        return None
+    k_sizes = tensor_node.meta.get("val")
+    loaded_k = group_k_root.meta.get("val")
+    if (
+        not isinstance(k_sizes, torch.Tensor)
+        or k_sizes.ndim != 1
+        or k_sizes.dtype not in (torch.int32, torch.int64)
+        or not isinstance(loaded_k, torch.Tensor)
+        or loaded_k.ndim != 0
+    ):
+        return None
+    return _Rank3RhsGroupedKMaskInfo(
+        k_sizes_tensor=k_sizes,
+        k_sizes_load=group_k_root,
+        k_sizes_value_nodes=group_k_value_nodes,
+        k_sizes_allowed_loop_users=_grouped_k_allowed_loop_users(
+            cg,
+            k_sizes_load=group_k_root,
+            k_sizes_value_nodes=group_k_value_nodes,
+        ),
+        safe_group=index[0],
+        valid_k=valid_k,
+        condition=condition,
+        zero=zero_node,
+        where=node,
+    )
+
+
+def _trace_rank3_grouped_rhs_nt_operand(
+    cg: GenerateAST | None,
+    node: Node,
+    *,
+    m_block_id: int | None = None,
+    allow_grouped_k_mask: bool = False,
+    allow_mn_major: bool = False,
+) -> _MmaOperandInfo | None:
+    """Recognize ``B_grouped[group, tile_n, tile_k].T`` as logical ``[K, N]``.
+
+    This is intentionally narrower than tracing through arbitrary permutes:
+    the source must be a rank-3 tensor load, the first index must be a proven
+    safe-group, segment-metadata group load, or block-size-one scalar group
+    tile index, and the only data layout transform is the 2-D NT transpose.
+    """
+    if cg is None:
+        return None
+    original_node = node
+    node, mask_to_node = _unwrap_zero_mask_to(node)
+    if (
+        node.op != "call_function"
+        or node.target is not torch.ops.aten.permute.default
+        or len(node.args) < 2
+    ):
+        return None
+    dims = node.args[1]
+    if not isinstance(dims, list | tuple) or list(dims) != [1, 0]:
+        return None
+    permute_input = node.args[0]
+    if not isinstance(permute_input, Node):
+        return None
+    maybe_load_node = permute_input
+    if allow_grouped_k_mask:
+        maybe_load_node, _inner_mask_to = _unwrap_zero_mask_to(maybe_load_node)
+        if _inner_mask_to is not None:
+            return None
+        if (
+            maybe_load_node.op == "call_function"
+            and maybe_load_node.target is torch.ops.aten.where.self
+            and len(maybe_load_node.args) >= 2
+            and isinstance(maybe_load_node.args[1], Node)
+        ):
+            maybe_load_node = maybe_load_node.args[1]
+    load_node = maybe_load_node
+    if (
+        not isinstance(load_node, Node)
+        or not _is_unmasked_load(load_node)
+        or len(load_node.args) < 2
+    ):
+        return None
+    tensor_node = load_node.args[0]
+    indices = load_node.args[1]
+    if (
+        not isinstance(tensor_node, Node)
+        or not isinstance(indices, list)
+        or len(indices) != 3
+        or not isinstance(indices[0], Node)
+        or not isinstance(indices[1], Node)
+        or not isinstance(indices[2], Node)
+    ):
+        return None
+    source_fake = tensor_node.meta.get("val")
+    load_fake = load_node.meta.get("val")
+    node_fake = node.meta.get("val")
+    if (
+        not isinstance(source_fake, torch.Tensor)
+        or not isinstance(load_fake, torch.Tensor)
+        or not isinstance(node_fake, torch.Tensor)
+        or source_fake.ndim != 3
+        or load_fake.ndim != 2
+        or node_fake.ndim != 2
+    ):
+        return None
+    safe_group_info = _rank3_rhs_safe_group_load(
+        cg,
+        indices[0],
+        m_block_id=m_block_id,
+    )
+    segment_group_info = None
+    packed_group_info = None
+    if safe_group_info is None:
+        segment_group_info = _rank3_rhs_segment_group_load(cg, indices[0])
+        if segment_group_info is None:
+            packed_group_info = _rank3_rhs_packed_group_index(cg, indices[0])
+            if packed_group_info is None:
+                return None
+    rhs_n_block_id = _rank3_rhs_exact_index_block_id(indices[1], reduction=False)
+    rhs_k_block_id = _rank3_rhs_exact_index_block_id(indices[2], reduction=None)
+    if rhs_n_block_id is None or rhs_k_block_id is None:
+        return None
+    grouped_k_mask = None
+    collective_dependency_nodes: tuple[Node, ...] = ()
+    if permute_input is not load_node:
+        if safe_group_info is None:
+            return None
+        if not allow_grouped_k_mask:
+            return None
+        grouped_k_mask = _rank3_rhs_grouped_k_mask(
+            cg,
+            permute_input,
+            load_node=load_node,
+            k_index_node=indices[2],
+            expected_safe_group=safe_group_info.safe_group,
+        )
+        if grouped_k_mask is None:
+            return None
+        collective_dependency_nodes = (
+            *grouped_k_mask.k_sizes_value_nodes,
+            grouped_k_mask.k_sizes_load,
+            grouped_k_mask.valid_k,
+            grouped_k_mask.condition,
+            grouped_k_mask.zero,
+            grouped_k_mask.where,
+            node,
+            *(() if mask_to_node is None else (mask_to_node,)),
+        )
+    logical_fake = source_fake.as_strided(
+        (source_fake.shape[2], source_fake.shape[1]),
+        (source_fake.stride(2), source_fake.stride(1)),
+    )
+    matrix_major = _tcgen05_tma_matrix_major(logical_fake)
+    if matrix_major != "col" and not (allow_mn_major and matrix_major == "row"):
+        return None
+    return _MmaOperandInfo(
+        load=load_node,
+        terminal=mask_to_node if mask_to_node is not None else original_node,
+        source_fake=source_fake,
+        logical_fake=logical_fake,
+        collective_dependency_nodes=collective_dependency_nodes,
+        grouped_k_mask=grouped_k_mask,
+        rhs_group_index=indices[0],
+        rhs_safe_group=safe_group_info,
+        rhs_n_block_id=rhs_n_block_id,
+        rhs_k_block_id=rhs_k_block_id,
+        rhs_rank3_grouped_nt=True,
+        rhs_segment_group=segment_group_info,
+        rhs_packed_group=packed_group_info,
+    )
+
+
+def _trace_to_mma_operand(
+    node: Node,
+    *,
+    role: str,
+    allow_rank3_rhs_nt: bool = False,
+    cg: GenerateAST | None = None,
+    rank3_rhs_m_block_id: int | None = None,
+    allow_grouped_k_mask: bool = False,
+    allow_rank3_rhs_mn_major: bool = False,
+) -> _MmaOperandInfo | None:
+    if role == "rhs" and allow_rank3_rhs_nt:
+        rank3_rhs = _trace_rank3_grouped_rhs_nt_operand(
+            cg,
+            node,
+            m_block_id=rank3_rhs_m_block_id,
+            allow_grouped_k_mask=allow_grouped_k_mask,
+            allow_mn_major=allow_rank3_rhs_mn_major,
+        )
+        if rank3_rhs is not None:
+            return rank3_rhs
+
+    original_node = node
+    unwrapped_node, mask_to_node = _unwrap_zero_mask_to(node)
+    grouped_k_mask = None
+    collective_dependency_nodes: tuple[Node, ...] = ()
+    if allow_grouped_k_mask and unwrapped_node is not node:
+        if (
+            unwrapped_node.op == "call_function"
+            and unwrapped_node.target is torch.ops.aten.where.self
+            and len(unwrapped_node.args) >= 2
+            and isinstance(unwrapped_node.args[1], Node)
+        ):
+            load_node = unwrapped_node.args[1]
+            traced = _trace_to_load_tensor(load_node)
+            if traced is not None:
+                load_node, _, source_fake = traced
+                indices = load_node.args[1] if len(load_node.args) >= 2 else None
+                if (
+                    isinstance(indices, list | tuple)
+                    and len(indices) == 2
+                    and isinstance(indices[1], Node)
+                ):
+                    grouped_k_mask = _rank3_rhs_grouped_k_mask(
+                        cg,
+                        unwrapped_node,
+                        load_node=load_node,
+                        k_index_node=indices[1],
+                    )
+                    if grouped_k_mask is not None:
+                        if mask_to_node is None:
+                            return None
+                        collective_dependency_nodes = (
+                            *grouped_k_mask.k_sizes_value_nodes,
+                            grouped_k_mask.k_sizes_load,
+                            grouped_k_mask.valid_k,
+                            grouped_k_mask.condition,
+                            grouped_k_mask.zero,
+                            grouped_k_mask.where,
+                            mask_to_node,
+                        )
+                        return _MmaOperandInfo(
+                            load=load_node,
+                            terminal=original_node,
+                            source_fake=source_fake,
+                            logical_fake=source_fake,
+                            collective_dependency_nodes=collective_dependency_nodes,
+                            grouped_k_mask=grouped_k_mask,
+                        )
+
+    traced = _trace_to_load_tensor(node)
+    if traced is None:
+        return None
+    load_node, _, source_fake = traced
+    if source_fake.ndim != 2:
+        return None
+    return _MmaOperandInfo(
+        load=load_node,
+        terminal=load_node,
+        source_fake=source_fake,
+        logical_fake=source_fake,
+    )
+
+
+def _same_fx_node_identity_in_graph(lhs: Node, rhs: Node) -> bool:
+    return lhs.name == rhs.name and lhs.op == rhs.op and lhs.target == rhs.target
+
+
+def _with_shared_rhs_group(
+    cg: GenerateAST,
+    lhs: _MmaOperandInfo,
+    rhs: _MmaOperandInfo,
+) -> _MmaOperandInfo:
+    """Recover group metadata from offset-indexed A independently of B's rank.
+
+    A shared matrix must be a direct unmasked B[K,N] load. The leading group
+    axis and its extent come from the offset scaffold, never from a synthetic
+    broadcast tensor. Full consumer, output, dtype and schedule proofs remain
+    mandatory at grouped admission.
+    """
+    import operator
+
+    from ...language import tile_ops
+    from ..compile_environment import CompileEnvironment
+
+    if (
+        rhs.rhs_is_grouped
+        or lhs.source_fake.ndim != 2
+        or rhs.source_fake.ndim != 2
+        or not _is_unmasked_load(rhs.load)
+    ):
+        return rhs
+    lhs_indices = lhs.load.args[1] if len(lhs.load.args) > 1 else None
+    rhs_indices = rhs.load.args[1] if len(rhs.load.args) > 1 else None
+    if (
+        not isinstance(lhs_indices, list | tuple)
+        or len(lhs_indices) != 2
+        or not all(isinstance(index, Node) for index in lhs_indices)
+        or not isinstance(rhs_indices, list | tuple)
+        or len(rhs_indices) != 2
+        or not all(isinstance(index, Node) for index in rhs_indices)
+    ):
+        return rhs
+    k_block_id, n_block_id = (
+        _rank3_rhs_exact_index_block_id(cast("Node", index), reduction=None)
+        for index in rhs_indices
+    )
+    if k_block_id is None or n_block_id is None:
+        return rhs
+    row_index = _trace_to_outer_graph_arg(cg, cast("Node", lhs_indices[0]))
+    if (
+        row_index.op != "call_function"
+        or row_index.target not in (operator.add, torch.ops.aten.add.Tensor)
+        or len(row_index.args) != 2
+        or row_index.kwargs
+        or not all(isinstance(arg, Node) for arg in row_index.args)
+    ):
+        return rhs
+    env = CompileEnvironment.current()
+    for row_arg in row_index.args:
+        local_m = _trace_to_outer_graph_arg(cg, cast("Node", row_arg))
+        if (
+            local_m.op != "call_function"
+            or local_m.target is not tile_ops.tile_index
+            or len(local_m.args) != 1
+            or not isinstance(local_m.args[0], Node)
+        ):
+            continue
+        m_block_id = _rank3_rhs_index_block_id(local_m.args[0], reduction=False)
+        if m_block_id is None:
+            continue
+        scaffold = _rank3_rhs_lhs_scaffold(
+            cg, lhs, m_block_id=m_block_id, k_block_id=k_block_id
+        )
+        if scaffold is None:
+            continue
+        raw_start = _zero_clamp_input(cg, scaffold.row_offset, minimum=True)
+        loaded = _rank3_rhs_packed_split_load(
+            cg, raw_start if raw_start is not None else scaffold.row_offset
+        )
+        if loaded is None:
+            continue
+        offsets, start = loaded
+        start_indices = start.args[1]
+        assert isinstance(start_indices, list | tuple)
+        index = start_indices[0]
+        if not isinstance(index, Node):
+            continue
+        group = _rank3_rhs_packed_group_index(cg, index)
+        if group is None:
+            continue
+        groups = int(offsets.shape[0]) - 1
+        group_extent = env.block_sizes[group.group_block_id].size
+        if (
+            groups < 1
+            or not isinstance(group_extent, int | torch.SymInt)
+            or not env.known_equal(group_extent, groups)
+        ):
+            continue
+        if (
+            _rank3_rhs_packed_offsets_lhs_info(
+                cg, scaffold, group_index=group.group_index, group_count=groups
+            )
+            is None
+        ):
+            continue
+        return replace(
+            rhs,
+            rhs_group_index=group.group_index,
+            rhs_packed_group=group,
+            rhs_shared_group_count=groups,
+            rhs_n_block_id=n_block_id,
+            rhs_k_block_id=k_block_id,
+        )
+    return rhs
+
+
+def _codegen_graph_node_for(cg: GenerateAST, node: Node) -> Node:
+    if any(graph_info.graph is node.graph for graph_info in cg.codegen_graphs):
+        return node
+
+    from ..host_function import HostFunction
+
+    graph_id = None
+    for graph_info in HostFunction.current().device_ir.graphs:
+        if graph_info.graph is node.graph:
+            graph_id = graph_info.graph_id
+            break
+    if graph_id is None or graph_id >= len(cg.codegen_graphs):
+        return node
+
+    for candidate in cg.codegen_graphs[graph_id].graph.nodes:
+        if _same_fx_node_identity_in_graph(candidate, node):
+            return candidate
+    return node
+
+
+def _trace_to_outer_graph_arg_with_path(
+    cg: GenerateAST,
+    node: Node,
+) -> tuple[Node, tuple[Node, ...]]:
+    """Follow loop placeholder copies back to the graph that produced *node*."""
+    from ...language import _tracing_ops
+    from ..device_ir import NodeArgsGraphInfo
+
+    def graph_info_for(graph: torch.fx.Graph) -> NodeArgsGraphInfo | None:
+        for graph_info in cg.codegen_graphs:
+            if graph_info.graph is graph and isinstance(graph_info, NodeArgsGraphInfo):
+                return graph_info
+        return None
+
+    current = node
+    seen: set[Node] = set()
+    path: list[Node] = []
+    while current not in seen:
+        seen.add(current)
+        if current.op == "call_function" and current.target is _tracing_ops._new_var:
+            if len(current.args) != 1 or not isinstance(current.args[0], Node):
+                return current, tuple(dict.fromkeys(path))
+            path.append(current)
+            current = current.args[0]
+            continue
+        if current.op == "placeholder":
+            graph_info = graph_info_for(current.graph)
+            if graph_info is None:
+                return current, tuple(dict.fromkeys(path))
+            outer = graph_info.placeholder_to_outer_arg(current)
+            if not isinstance(outer, Node):
+                return current, tuple(dict.fromkeys(path))
+            path.append(current)
+            current = _codegen_graph_node_for(cg, outer)
+            continue
+        return current, tuple(dict.fromkeys(path))
+    return current, tuple(dict.fromkeys(path))
+
+
+def _trace_to_outer_graph_arg(cg: GenerateAST, node: Node) -> Node:
+    return _trace_to_outer_graph_arg_with_path(cg, node)[0]
+
+
+def _is_zero_scalar_node(node: object) -> bool:
+    if isinstance(node, int) and not isinstance(node, bool):
+        return node == 0
+    if (
+        isinstance(node, Node)
+        and node.op == "call_function"
+        and node.target is torch.ops.aten.scalar_tensor.default
+        and len(node.args) >= 1
+    ):
+        value = node.args[0]
+        return isinstance(value, int) and not isinstance(value, bool) and value == 0
+    return False
+
+
+def _is_tile_begin(node: Node, *, m_block_id: int | None = None) -> bool:
+    from ..compile_environment import CompileEnvironment
+
+    block_id = _tile_begin_block_id(node)
+    if block_id is None:
+        return False
+    if m_block_id is None:
+        return True
+    env = CompileEnvironment.current()
+    canonical_block_id = env.canonical_block_id
+    return canonical_block_id(block_id) == canonical_block_id(m_block_id)
+
+
+def _tcgen05_rank3_rhs_group_tma_setup(
+    cg: GenerateAST,
+    group_index: Node,
+    *,
+    m_block_id: int,
+    m_offset_var: str,
+) -> tuple[str, list[str]] | None:
+    """Emit the role-local group-id expression for grouped rank-3 RHS TMA.
+
+    The K-loop RHS operand sees the group index through a placeholder copy.
+    For the TMA producer, recover the root ``where(load(tile_m.begin) >= 0,
+    load, 0)`` expression and materialize the same safe group value next to
+    ``gB_tma`` so extracted role-local code does not depend on shared-loop
+    locals.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    safe_group_info = _rank3_rhs_safe_group_load(cg, group_index, m_block_id=m_block_id)
+    if safe_group_info is None:
+        return None
+    true_value = safe_group_info.group_load
+    tensor_node = true_value.args[0]
+    if not isinstance(tensor_node, Node):
+        return None
+    tensor = tensor_node.meta.get("val")
+    if not isinstance(tensor, torch.Tensor):
+        return None
+
+    df = cg.device_function
+    tensor_name = df.tensor_arg(tensor).name
+    group_var = df.new_var("tcgen05_rhs_group")
+    safe_group_var = df.new_var("tcgen05_rhs_safe_group")
+    index_dtype = CompileEnvironment.current().index_type()
+    load_expr = (
+        f"({tensor_name}.iterator + {index_dtype}({m_offset_var}) "
+        f"* {index_dtype}({tensor_name}.layout.stride[0])).load()"
+    )
+    return safe_group_var, [
+        f"{group_var} = {load_expr}",
+        (
+            f"{safe_group_var} = cutlass.Int32({group_var}) "
+            f"if {group_var} >= cutlass.Int32(0) else cutlass.Int32(0)"
+        ),
+    ]
+
+
+def _assignment_target_name(stmt: ast.AST) -> str | None:
+    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+        return None
+    target = stmt.targets[0]
+    if not isinstance(target, ast.Name):
+        return None
+    return target.id
+
+
+def _rank3_rhs_safe_group_scalar_rewrite_plan(
+    cg: GenerateAST,
+    info: _MmaOperandInfo,
+    *,
+    m_offset_var: str,
+) -> tuple[ast.Assign, ast.expr, tuple[ast.AST, ...]] | None:
+    """Return the group-load assignment and unmasked load expression if safe."""
+    from ..compile_environment import CompileEnvironment
+
+    if info.rhs_group_index is None or info.rhs_safe_group is None:
+        return None
+    group_load = info.rhs_safe_group.group_load
+    condition = info.rhs_safe_group.condition
+    safe_group = info.rhs_safe_group.safe_group
+    entries_by_owner = cg._statements_by_owner_node_id
+    group_entries = list(entries_by_owner.get(id(group_load), ()))
+    condition_entries = list(entries_by_owner.get(id(condition), ()))
+    safe_group_entries = list(entries_by_owner.get(id(safe_group), ()))
+    if len(group_entries) != 1 or not condition_entries or len(safe_group_entries) != 1:
+        return None
+
+    body, group_stmt = group_entries[0]
+    owned_statements = [
+        stmt
+        for _owner_body, stmt in (
+            *group_entries,
+            *condition_entries,
+            *safe_group_entries,
+        )
+    ]
+    if len({id(stmt) for stmt in owned_statements}) != len(owned_statements):
+        return None
+    for owner_body, owned_stmt in (
+        *group_entries,
+        *condition_entries,
+        *safe_group_entries,
+    ):
+        if owner_body is not body or sum(stmt is owned_stmt for stmt in body) != 1:
+            return None
+    group_var = _assignment_target_name(group_stmt)
+    if group_var is None or not isinstance(group_stmt, ast.Assign):
+        return None
+
+    tensor_node = group_load.args[0] if group_load.args else None
+    if not isinstance(tensor_node, Node):
+        return None
+    tensor = tensor_node.meta.get("val")
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim != 1:
+        return None
+
+    df = cg.device_function
+    tensor_name = df.tensor_arg(tensor).name
+    env = CompileEnvironment.current()
+    index_dtype = env.index_type()
+    load_expr = (
+        f"({tensor_name}.iterator + {index_dtype}({m_offset_var}) "
+        f"* {index_dtype}({tensor_name}.layout.stride[0])).load()"
+    )
+    return (
+        group_stmt,
+        cast("ast.expr", expr_from_string(load_expr)),
+        tuple(owned_statements),
+    )
+
+
+def _apply_rank3_rhs_safe_group_scalar_rewrite(
+    plan: tuple[ast.Assign, ast.expr, tuple[ast.AST, ...]],
+) -> None:
+    """Keep the safe-group scalar chain, but drop its tile-mask dependency."""
+    group_stmt, replacement, _owned_statements = plan
+    group_stmt.value = replacement
+    ast.fix_missing_locations(group_stmt)
+
+
+def _owned_scalar_statement_pass_rewrite_plan(
+    cg: GenerateAST,
+    required_nodes: tuple[Node, ...],
+    *,
+    optional_nodes: tuple[Node, ...] = (),
+) -> tuple[tuple[int, list[ast.AST], int, ast.AST], ...] | None:
+    replacement_plan: list[tuple[int, list[ast.AST], int, ast.AST]] = []
+    seen_node_ids: set[int] = set()
+    seen_stmt_ids: set[int] = set()
+    for index, node in enumerate((*required_nodes, *optional_nodes)):
+        required = index < len(required_nodes)
+        node_id = id(node)
+        if node_id in seen_node_ids:
+            return None
+        seen_node_ids.add(node_id)
+        entries = cg._statements_by_owner_node_id.get(node_id, ())
+        if required and len(entries) != 1:
+            return None
+        if not entries:
+            continue
+        for body, stmt in entries:
+            matching_indices = [
+                stmt_index
+                for stmt_index, existing in enumerate(body)
+                if existing is stmt
+            ]
+            if len(matching_indices) != 1 or id(stmt) in seen_stmt_ids:
+                return None
+            seen_stmt_ids.add(id(stmt))
+            replacement_plan.append((node_id, body, matching_indices[0], stmt))
+
+    return tuple(replacement_plan)
+
+
+def _grouped_scaffold_value_escapes(
+    cg: GenerateAST, node: Node, matmul_node: Node
+) -> bool:
+    """Whether ``node`` reaches a statement the grouped matmul does not take over.
+
+    The grouped worklist schedule reads the worklist from its own tables and
+    rewrites the scalar scaffolding the kernel computed from it to constants.
+    That is only sound while the scaffolding feeds nothing but the matmul (its
+    operand loads and their masks) and the store of its result (addressing
+    and mask): a side statement of ``store_m`` would read the constant.
+    """
+    from ...language import _tracing_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+    from ...language.memory_ops import store
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import reach_matmul_anchors
+
+    graphs = {graph.graph_id: graph for graph in cg.codegen_graphs}
+    inner_outputs = build_inner_outputs_index_from_graphs(cg.codegen_graphs)
+    seen: set[Node] = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        for user in current.users:
+            if user is matmul_node or user in seen:
+                continue
+            seen.add(user)
+            if user.target is store or user.target in ATOMIC_OPS:
+                value = user.args[2]
+                if not (
+                    isinstance(value, Node)
+                    and reach_matmul_anchors(
+                        value,
+                        target_fx_nodes={matmul_node},
+                        inner_outputs_by_graph_id=inner_outputs,
+                    )
+                ):
+                    return True
+                continue
+            if user.op == "call_function" and _tracing_ops.is_for_loop_target(
+                user.target
+            ):
+                graph_id, _begin, _end, loop_args = user.args[:4]
+                assert isinstance(graph_id, int) and isinstance(loop_args, list)
+                placeholders = list(graphs[graph_id].graph.find_nodes(op="placeholder"))
+                stack.extend(
+                    placeholder
+                    for arg, placeholder in zip(loop_args, placeholders, strict=False)
+                    if arg is current
+                )
+                continue
+            if (
+                user.op != "call_function"
+                or user.target is _tracing_ops._if
+                or (
+                    isinstance(user.target, torch._ops.OpOverload)
+                    and user.target._schema.is_mutable
+                )
+            ):
+                return True
+            stack.append(user)
+    return False
+
+
+def _apply_owned_scalar_statement_pass_rewrite(
+    cg: GenerateAST,
+    replacement_plan: tuple[tuple[int, list[ast.AST], int, ast.AST], ...],
+) -> None:
+    for node_id, body, index, stmt in replacement_plan:
+        assert body[index] is stmt
+        replacement = ast.Pass()
+        ast.fix_missing_locations(replacement)
+        body[index] = replacement
+        cg._statements_by_owner_node_id.pop(node_id, None)
+
+
+def _owned_scalar_statement_expr_rewrite_plan(
+    cg: GenerateAST,
+    replacements: dict[Node, str],
+    *,
+    cast_then_expr_nodes: tuple[Node, ...] = (),
+) -> tuple[tuple[list[ast.AST], int, ast.Assign, ast.expr | None], ...] | None:
+    import operator
+
+    def name_access_count(
+        statements: list[ast.AST], name: str, context: type[ast.expr_context]
+    ) -> int:
+        return sum(
+            isinstance(candidate, ast.Name)
+            and candidate.id == name
+            and isinstance(candidate.ctx, context)
+            for stmt in statements
+            for candidate in ast.walk(stmt)
+        )
+
+    def is_name(expr: ast.expr, name: str) -> bool:
+        return isinstance(expr, ast.Name) and expr.id == name
+
+    def cast_then_expr_entries(
+        node: Node,
+        entries: list[tuple[list[ast.AST], ast.AST]],
+    ) -> tuple[tuple[list[ast.AST], int, ast.Assign, ast.expr | None], ...] | None:
+        indexed: list[tuple[list[ast.AST], int, ast.Assign]] = []
+        for body, stmt in entries:
+            if not isinstance(stmt, ast.Assign):
+                return None
+            indices = [index for index, existing in enumerate(body) if existing is stmt]
+            if len(indices) != 1:
+                return None
+            indexed.append((body, indices[0], stmt))
+        indexed.sort(key=operator.itemgetter(1))
+        (
+            (cast_body, cast_index, cast_stmt),
+            (
+                result_body,
+                result_index,
+                result_stmt,
+            ),
+        ) = indexed
+        if cast_body is not result_body or result_index != cast_index + 1:
+            return None
+        cast_name = _assignment_target_name(cast_stmt)
+        result_name = _assignment_target_name(result_stmt)
+        cast_call = cast_stmt.value
+        codegen_result = node.meta.get("codegen")
+        is_int32_cast = (
+            isinstance(cast_call, ast.Call)
+            and len(cast_call.args) == 1
+            and not cast_call.keywords
+            and isinstance(cast_call.func, ast.Attribute)
+            and cast_call.func.attr == "Int32"
+            and isinstance(cast_call.func.value, ast.Name)
+            and cast_call.func.value.id == "cutlass"
+        )
+        is_clamp_zero = (
+            node.target is torch.ops.aten.clamp_min.default
+            and isinstance(cast_call, ast.Constant)
+            and type(cast_call.value) is int
+            and cast_call.value == 0
+        )
+        if (
+            cast_name is None
+            or result_name is None
+            or cast_name == result_name
+            or not (is_int32_cast or is_clamp_zero)
+            or name_access_count(cast_body, cast_name, ast.Store) != 1
+            or name_access_count(cast_body, cast_name, ast.Load) != 1
+            or name_access_count([result_stmt], cast_name, ast.Load) != 1
+            or name_access_count(cast_body, result_name, ast.Store) != 1
+            or not isinstance(codegen_result, ast.Name)
+            or not isinstance(codegen_result.ctx, ast.Load)
+            or codegen_result.id != result_name
+        ):
+            return None
+        if node.target in (operator.add, torch.ops.aten.add.Tensor):
+            if not (
+                isinstance(result_stmt.value, ast.BinOp)
+                and isinstance(result_stmt.value.op, ast.Add)
+                and sum(
+                    is_name(operand, cast_name)
+                    for operand in (result_stmt.value.left, result_stmt.value.right)
+                )
+                == 1
+            ):
+                return None
+        elif node.target in (operator.lt, torch.ops.aten.lt.Tensor):
+            call = result_stmt.value
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "lt"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "operator"
+                and len(call.args) == 2
+                and not call.keywords
+                and sum(is_name(arg, cast_name) for arg in call.args) == 1
+            ):
+                return None
+        elif is_clamp_zero:
+            call = result_stmt.value
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "max"
+                and isinstance(call.func.value, ast.Attribute)
+                and call.func.value.attr == "math"
+                and isinstance(call.func.value.value, ast.Name)
+                and call.func.value.value.id == "cute"
+                and len(call.args) == 2
+            ):
+                return None
+        else:
+            return None
+        return (
+            (cast_body, cast_index, cast_stmt, None),
+            (
+                result_body,
+                result_index,
+                result_stmt,
+                cast("ast.expr", expr_from_string(replacements[node])),
+            ),
+        )
+
+    replacement_plan: list[tuple[list[ast.AST], int, ast.Assign, ast.expr | None]] = []
+    seen_stmt_ids: set[int] = set()
+    for node, expr in replacements.items():
+        entries = cg._statements_by_owner_node_id.get(id(node), ())
+        if not entries:
+            continue
+        if len(entries) == 2 and node in cast_then_expr_nodes:
+            cast_plan = cast_then_expr_entries(node, entries)
+            if cast_plan is None or any(
+                id(stmt) in seen_stmt_ids for _body, _index, stmt, _value in cast_plan
+            ):
+                return None
+            seen_stmt_ids.update(id(stmt) for _body, _index, stmt, _value in cast_plan)
+            replacement_plan.extend(cast_plan)
+            continue
+        if len(entries) != 1:
+            return None
+        for body, stmt in entries:
+            matching_indices = [
+                index for index, existing in enumerate(body) if existing is stmt
+            ]
+            if (
+                not isinstance(stmt, ast.Assign)
+                or _assignment_target_name(stmt) is None
+                or len(matching_indices) != 1
+                or id(stmt) in seen_stmt_ids
+            ):
+                return None
+            seen_stmt_ids.add(id(stmt))
+            replacement_plan.append(
+                (
+                    body,
+                    matching_indices[0],
+                    stmt,
+                    cast("ast.expr", expr_from_string(expr)),
+                )
+            )
+    return tuple(replacement_plan)
+
+
+def _apply_owned_scalar_statement_expr_rewrite(
+    replacement_plan: tuple[
+        tuple[list[ast.AST], int, ast.Assign, ast.expr | None], ...
+    ],
+) -> None:
+    for body, index, stmt, value in replacement_plan:
+        assert body[index] is stmt
+        if value is None:
+            replacement = ast.Pass()
+            ast.fix_missing_locations(replacement)
+            body[index] = replacement
+        else:
+            stmt.value = value
+            ast.fix_missing_locations(stmt)
+
+
+def _tcgen05_pid_initializes_epi_role_tile_counter(pid: object) -> bool:
+    from ..program_id import ForEachProgramID
+    from ..program_id import L2GroupingProgramIDs
+    from ..program_id import Tcgen05PersistentProgramIDs
+
+    if isinstance(pid, Tcgen05PersistentProgramIDs):
+        return True
+    if isinstance(pid, L2GroupingProgramIDs):
+        return (
+            pid.parent_strategy is not None
+            and _tcgen05_pid_initializes_epi_role_tile_counter(pid.parent_strategy)
+        )
+    if isinstance(pid, ForEachProgramID):
+        return any(
+            _tcgen05_pid_initializes_epi_role_tile_counter(case) for case in pid.cases
+        )
+    return False
+
+
+def _has_mma_operands(
+    lhs_node: Node,
+    rhs_node: Node,
+    *,
+    allow_rank3_rhs_nt: bool = False,
+    cg: GenerateAST | None = None,
+    rank3_rhs_m_block_id: int | None = None,
+    allow_grouped_k_mask: bool = False,
+    allow_rank3_rhs_mn_major: bool = False,
+) -> bool:
+    """Check if lhs/rhs come from loads with MMA-compatible dtypes."""
+    lhs_info = _trace_to_mma_operand(
+        lhs_node,
+        role="lhs",
+        cg=cg,
+        allow_grouped_k_mask=allow_grouped_k_mask,
+    )
+    rhs_info = _trace_to_mma_operand(
+        rhs_node,
+        role="rhs",
+        allow_rank3_rhs_nt=allow_rank3_rhs_nt,
+        cg=cg,
+        rank3_rhs_m_block_id=rank3_rhs_m_block_id,
+        allow_grouped_k_mask=allow_grouped_k_mask,
+        allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
+    )
+    if lhs_info is None or rhs_info is None:
+        return False
+    if (
+        lhs_info.grouped_k_mask is not None or rhs_info.grouped_k_mask is not None
+    ) and _same_grouped_k_mask(lhs_info, rhs_info) is None:
+        return False
+    lhs_fake = lhs_info.logical_fake
+    rhs_fake = rhs_info.logical_fake
+    return (
+        lhs_fake.dtype in _MMA_SUPPORTED_DTYPES
+        and rhs_fake.dtype in _MMA_SUPPORTED_DTYPES
+        and lhs_fake.dtype == rhs_fake.dtype
+        and lhs_fake.ndim == 2
+        and rhs_fake.ndim == 2
+    )
+
+
+@dataclass(frozen=True)
+class _MmaOperandAnalysis:
+    lhs: _MmaOperandInfo
+    rhs: _MmaOperandInfo
+
+    @property
+    def supports_role_local_n_edge_tma(self) -> bool:
+        """Whether rank-2 layouts support the partial-N role-local TMA path."""
+        return (
+            not self.has_leading_passthrough
+            and self.lhs.matrix_major == "row"
+            # The partial-N role-local TMA path is runtime-validated for a
+            # K-major B. MN-major B remains correct through the scalar edge
+            # fill but produces wrong results with role-local edge TMA.
+            and self.rhs.matrix_major == "col"
+        )
+
+    @property
+    def scalar_loads_use_identity_axis_mapping(self) -> bool:
+        """Whether scalar fallback indices address both source tensors directly."""
+        return (
+            self.lhs.source_to_logical_order is None
+            and self.rhs.source_to_logical_order is None
+        )
+
+    @property
+    def leading_passthrough_block_id(self) -> int | None:
+        return (
+            self.lhs.leading_passthrough_block_id
+            if self.lhs.is_leading_passthrough
+            else self.rhs.leading_passthrough_block_id
+        )
+
+    @property
+    def has_leading_passthrough(self) -> bool:
+        """True when the matmul carries a leading passthrough grid axis."""
+        return self.leading_passthrough_block_id is not None
+
+    @property
+    def m_block_id(self) -> int:
+        return self.lhs.matrix_row_block_id
+
+    @property
+    def n_block_id(self) -> int:
+        return self.rhs.matrix_col_block_id
+
+    @property
+    def k_block_id(self) -> int:
+        return self.lhs.matrix_col_block_id
+
+    @property
+    def output_block_ids(self) -> tuple[int, ...]:
+        matrix_block_ids = (self.m_block_id, self.n_block_id)
+        if self.leading_passthrough_block_id is None:
+            return matrix_block_ids
+        return (self.leading_passthrough_block_id, *matrix_block_ids)
+
+
+@dataclass(frozen=True)
+class _MmaSearchGraphView:
+    codegen_graphs: list[GraphInfo]
+
+
+@dataclass(frozen=True)
+class _MmaOutputStoreAnalysis:
+    explicit_epi_tile_compatible: bool
+    output_column_major: bool
+    requires_fragment_epilogue: bool = False
+
+
+def _mma_tiles_are_static_full(
+    analysis: _MmaOperandAnalysis, *, bm: int, bn: int, bk: int
+) -> bool:
+    """Whether the analyzed matrix extents are divisible by their tile sizes."""
+    return (
+        int(analysis.lhs.matrix_rows) % bm == 0
+        and int(analysis.rhs.matrix_cols) % bn == 0
+        and int(analysis.lhs.matrix_cols) % bk == 0
+    )
+
+
+def _unwrap_mma_operand_permute(
+    node: Node,
+) -> tuple[Node, tuple[int, ...] | None] | None:
+    """Unwrap the trailing-axis swap supported by collective MMA lowering.
+
+    Return ``(node, None)`` when no permutation is present, or the source node
+    and its source-to-logical axis order for a supported swap. Return ``None``
+    when the node is a malformed or unsupported permutation.
+    """
+    if node.op != "call_function" or node.target is not torch.ops.aten.permute.default:
+        return node, None
+    if len(node.args) != 2 or not isinstance(node.args[0], Node):
+        return None
+    value_fake = node.meta.get("val")
+    order = node.args[1]
+    if not isinstance(value_fake, torch.Tensor) or not isinstance(order, (list, tuple)):
+        return None
+    normalized = tuple(int(cast("int", dim)) % value_fake.ndim for dim in order)
+    # The order representation is general, but collective MMA lowering only
+    # supports swapping the two trailing matrix axes. Arbitrary permutations
+    # would also require remapping M/N/K, leading batch/group axes, tile block
+    # ids, and TMA coordinates throughout the rest of the lowering.
+    trailing_axis_swap = (
+        *range(value_fake.ndim - 2),
+        value_fake.ndim - 1,
+        value_fake.ndim - 2,
+    )
+    if normalized != trailing_axis_swap:
+        return None
+    return node.args[0], normalized
+
+
+def _tcgen05_fragment_epilogue_operands_supported(
+    analysis: _MmaOperandAnalysis,
+) -> bool:
+    """Check the config-independent operand envelope for fragment epilogues."""
+    return (
+        analysis.has_leading_passthrough
+        and _tcgen05_fragment_dtype_supported(analysis.lhs.source_fake.dtype)
+        and _tcgen05_tma_matrix_major(analysis.lhs.source_fake) == "row"
+        and _tcgen05_tma_matrix_major(analysis.rhs.source_fake) in ("row", "col")
+    )
+
+
+def _tcgen05_fragment_epilogue_source_global_shape(
+    analysis: _MmaOperandAnalysis,
+) -> tuple[int | torch.SymInt, ...]:
+    leading_operand = (
+        analysis.lhs if analysis.lhs.is_leading_passthrough else analysis.rhs
+    )
+    return (
+        *leading_operand.logical_fake.shape[:-2],
+        analysis.lhs.matrix_rows,
+        analysis.rhs.matrix_cols,
+    )
+
+
+def _tcgen05_fragment_epilogue_plan_output_supported(
+    plan: Tcgen05FragmentEpiloguePlan,
+) -> bool:
+    output_node = plan.store_node.args[0] if plan.store_node.args else None
+    output_fake = output_node.meta.get("val") if isinstance(output_node, Node) else None
+    return isinstance(output_fake, torch.Tensor) and (
+        _tcgen05_tma_matrix_major(output_fake) == "row"
+    )
+
+
+def tcgen05_fragment_epilogue_source_tiles_reachable(
+    candidate: _CuteMmaNode,
+    plan: CuteTcgen05SearchPlan,
+    config_spec: ConfigSpec,
+) -> bool:
+    """Whether the search can reach a fragment source-tile layout.
+
+    Output layout and graph ownership are validated when a concrete fragment
+    plan is committed. This preflight only prevents a fragment-only graph from
+    enabling a search whose block-size fragments cannot produce any supported
+    source tile.
+    """
+    if not candidate.requires_fragment_epilogue:
+        return True
+    static_m = plan.static_m
+    static_n = plan.static_n
+    static_k = plan.static_k
+    if static_m is None or static_n is None or static_k is None:
+        return False
+
+    def reachable_values(block_id: int, low: int, high: int) -> tuple[int, ...]:
+        if block_id not in config_spec.block_sizes.valid_block_ids():
+            from ..compile_environment import CompileEnvironment
+            from ..compile_environment import FixedBlockSizeSource
+
+            source = (
+                CompileEnvironment.current().block_sizes[block_id].block_size_source
+            )
+            if isinstance(source, FixedBlockSizeSource) and isinstance(
+                source.value, int
+            ):
+                return (source.value,) if low <= source.value <= high else ()
+            return ()
+        fragment = config_spec.block_sizes.block_id_lookup(block_id)._fragment(
+            config_spec
+        )
+        values = fragment.search_values()
+        assert values is not None
+        return tuple(
+            value for value in values if isinstance(value, int) and low <= value <= high
+        )
+
+    analysis = candidate.operands
+    if not _tcgen05_fragment_epilogue_operands_supported(analysis):
+        return False
+    block_values = (
+        reachable_values(analysis.m_block_id, plan.min_search_m, plan.max_search_m),
+        reachable_values(analysis.n_block_id, plan.min_search_n, plan.max_search_n),
+        reachable_values(analysis.k_block_id, plan.mma_k, plan.max_search_k),
+    )
+    return any(
+        _tcgen05_fragment_source_layout_supported(
+            bm=bm,
+            bn=bn,
+            input_dtype=analysis.lhs.source_fake.dtype,
+        )
+        and static_m % bm == 0
+        and static_n % bn == 0
+        and static_k % bk == 0
+        for bm in block_values[0]
+        for bn in block_values[1]
+        for bk in block_values[2]
+    )
+
+
+def ensure_tcgen05_fragment_epilogue_plan(
+    fn: DeviceFunction,
+    node: Node,
+    candidate: _CuteMmaNode,
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    config: Config,
+) -> bool:
+    """Commit a validated fragment plan before tcgen05 removes scalar lanes."""
+    if not candidate.requires_fragment_epilogue:
+        return True
+    cute_state = fn.cute_state
+    if cute_state.tcgen05_fragment_epilogue_plan_for_anchor(node) is not None:
+        return True
+    if cute_state.tcgen05_fragment_epilogue_plan_was_rejected(
+        node, bm=bm, bn=bn, bk=bk
+    ):
+        return False
+
+    def reject() -> bool:
+        cute_state.reject_tcgen05_fragment_epilogue_plan(node, bm=bm, bn=bn, bk=bk)
+        return False
+
+    analysis = candidate.operands
+    anchors = [
+        graph_node
+        for graph_info in fn.codegen.codegen_graphs
+        for graph_node in graph_info.graph.nodes
+        if _decode_cute_mma_target(graph_node, graphs=fn.codegen.codegen_graphs)
+        is not None
+    ]
+    if anchors != [node]:
+        return reject()
+    if not (
+        _tcgen05_fragment_epilogue_operands_supported(analysis)
+        and _tcgen05_fragment_source_layout_supported(
+            bm=bm,
+            bn=bn,
+            input_dtype=analysis.lhs.source_fake.dtype,
+        )
+        and _mma_tiles_are_static_full(analysis, bm=bm, bn=bn, bk=bk)
+        and _tcgen05_cluster_m(config) == 1
+        and _tcgen05_cluster_n(config) == 1
+        and config.get(
+            TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY, TCGEN05_EPILOGUE_LAYOUT_NORMAL
+        )
+        == TCGEN05_EPILOGUE_LAYOUT_NORMAL
+        and config.get(
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+            Tcgen05LayoutStrategy.DEFAULT.value,
+        )
+        == Tcgen05LayoutStrategy.DEFAULT.value
+        and warp_spec_from_config(config).store_warps == 0
+        and not is_pure_matmul_role_lifecycle_config(config)
+    ):
+        return reject()
+    plan = analyze_tcgen05_fragment_epilogue_plan(
+        fn.codegen.codegen_graphs,
+        node,
+        expected_output_block_ids=analysis.output_block_ids,
+        config=config,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        input_dtype=analysis.lhs.source_fake.dtype,
+        source_global_shape=_tcgen05_fragment_epilogue_source_global_shape(analysis),
+    )
+    if plan is None:
+        return reject()
+    if not _tcgen05_fragment_epilogue_plan_output_supported(plan) or any(
+        "codegen" in owned.meta for owned in plan.owned_nodes
+    ):
+        return reject()
+    cute_state.register_tcgen05_fragment_epilogue_plan(plan)
+    return True
+
+
+def _unwrap_lossless_mma_upcast(node: Node) -> Node:
+    """Recover only the single half/BF16-to-FP32 conversion MMA can absorb."""
+    if (
+        node.op == "call_function"
+        and node.target is torch.ops.prims.convert_element_type.default
+        and len(node.args) == 2
+        and not node.kwargs
+        and isinstance(node.args[0], Node)
+        and node.args[1] is torch.float32
+    ):
+        source = node.args[0]
+        source_value = source.meta.get("val")
+        if (
+            isinstance(source_value, torch.Tensor)
+            and source_value.ndim == 2
+            and source_value.dtype in (torch.float16, torch.bfloat16)
+        ):
+            # Half/BF16 values are represented exactly in FP32. Collective
+            # MMA can consume their original bits with an FP32 accumulator;
+            # scalar fallback still sees the unchanged conversion node.
+            return source
+    return node
+
+
+def _analyze_mma_operand(
+    node: Node,
+    env: CompileEnvironment,
+) -> _MmaOperandInfo | None:
+    permute = _unwrap_mma_operand_permute(node)
+    if permute is None:
+        return None
+    load_value, source_to_logical_order = permute
+    if source_to_logical_order is None:
+        load_value = _unwrap_lossless_mma_upcast(load_value)
+    info = _direct_load_tensor(load_value)
+    if info is None:
+        return None
+    load_node, _, source_fake = info
+    if not _is_unmasked_load(load_node):
+        return None
+    value_fake = node.meta.get("val")
+    if not isinstance(value_fake, torch.Tensor):
+        return None
+    if source_fake.dtype not in _MMA_SUPPORTED_DTYPES:
+        return None
+    subscript = load_node.args[1] if len(load_node.args) > 1 else None
+    if not isinstance(subscript, (list, tuple)) or len(subscript) != source_fake.ndim:
+        return None
+    block_ids = exact_tile_block_ids(env, subscript)
+    if block_ids is None:
+        return None
+    for dim, block_id in enumerate(block_ids):
+        block_size = env.block_sizes[block_id].size
+        if not isinstance(block_size, int | torch.SymInt) or not env.known_equal(
+            block_size, source_fake.size(dim)
+        ):
+            return None
+    if source_to_logical_order is not None:
+        block_ids = tuple(block_ids[dim] for dim in source_to_logical_order)
+    if source_fake.ndim not in (2, 3):
+        return None
+    if source_to_logical_order is not None and source_fake.ndim == 3:
+        return None
+    if value_fake.ndim not in (2, source_fake.ndim):
+        return None
+    return _MmaOperandInfo(
+        load=load_node,
+        terminal=node,
+        source_fake=source_fake,
+        logical_fake=(
+            source_fake.permute(source_to_logical_order)
+            if source_to_logical_order is not None
+            else source_fake
+        ),
+        block_ids=block_ids,
+        source_to_logical_order=source_to_logical_order,
+    )
+
+
+def _analyze_mma_operands(
+    lhs_node: Node,
+    rhs_node: Node,
+    env: CompileEnvironment,
+) -> _MmaOperandAnalysis | None:
+    lhs = _analyze_mma_operand(lhs_node, env)
+    rhs = _analyze_mma_operand(rhs_node, env)
+    if lhs is None or rhs is None:
+        return None
+    if lhs.source_fake.dtype != rhs.source_fake.dtype:
+        return None
+    if not env.known_equal(lhs.matrix_cols, rhs.matrix_rows):
+        return None
+    if lhs.matrix_col_block_id != rhs.matrix_row_block_id:
+        return None
+    leading_block_ids = {
+        operand.leading_passthrough_block_id
+        for operand in (lhs, rhs)
+        if operand.leading_passthrough_block_id is not None
+    }
+    if len(leading_block_ids) > 1:
+        return None
+    leading_passthrough_block_id = (
+        next(iter(leading_block_ids)) if leading_block_ids else None
+    )
+    # Leading-axis TMA descriptors currently require row-major trailing
+    # matrices. Keep other layouts out of the shared search/planning/codegen
+    # capability until their rank-3 descriptor mapping is supported.
+    if leading_passthrough_block_id is not None and any(
+        operand.matrix_major != "row"
+        for operand in (lhs, rhs)
+        if operand.is_leading_passthrough
+    ):
+        return None
+    return _MmaOperandAnalysis(lhs=lhs, rhs=rhs)
+
+
+def _analyze_rank3_rhs_grouped_search_operands(
+    lhs_node: Node,
+    rhs_node: Node,
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+) -> _MmaOperandAnalysis | None:
+    """Build the block-axis view needed by the early tcgen05 search gate.
+
+    Full grouped admission still runs later with ``GenerateAST`` so it can
+    prove the safe-group, segment metadata, and store chains across graphs.
+    The earlier DeviceIR search pass only needs the matrix axes and source
+    dtype; recover those from the canonical ``B[group, n, k].T`` load.
+    """
+    from ..device_ir import ForLoopGraphInfo
+
+    graph_view = cast("GenerateAST", _MmaSearchGraphView(device_ir.graphs))
+    lhs = _trace_to_mma_operand(
+        lhs_node,
+        role="lhs",
+        cg=graph_view,
+        allow_grouped_k_mask=True,
+    )
+    rhs = _trace_to_mma_operand(
+        rhs_node,
+        role="rhs",
+        allow_rank3_rhs_nt=True,
+        # This early DeviceIR pass only recovers axes. Complete grouped
+        # semantics are proven by ``_analyze_rank3_rhs_grouped_mma``.
+        allow_rank3_rhs_mn_major=True,
+        cg=graph_view,
+        allow_grouped_k_mask=True,
+    )
+    if lhs is not None and rhs is not None:
+        rhs = _with_shared_rhs_group(graph_view, lhs, rhs)
+    if (
+        lhs is None
+        or rhs is None
+        or not rhs.rhs_is_grouped
+        or rhs.rhs_n_block_id is None
+        or rhs.rhs_k_block_id is None
+    ):
+        return None
+
+    canonical_block_id = env.canonical_block_id
+    n_block_id = canonical_block_id(rhs.rhs_n_block_id)
+    k_block_id = canonical_block_id(rhs.rhs_k_block_id)
+    lhs_indices = lhs.load.args[1] if len(lhs.load.args) > 1 else None
+    lhs_k_block_id = (
+        _rank3_rhs_exact_index_block_id(lhs_indices[-1], reduction=None)
+        if isinstance(lhs_indices, list | tuple)
+        and lhs_indices
+        and isinstance(lhs_indices[-1], Node)
+        else None
+    )
+    if lhs_k_block_id is None or canonical_block_id(lhs_k_block_id) != k_block_id:
+        return None
+    if len(device_ir.grid_block_ids) != 1:
+        return None
+    root_grid_ids = device_ir.grid_block_ids[0]
+    leading_group_block_id = rhs.rhs_grouped_leading_block_id
+    segment_block_id = (
+        canonical_block_id(leading_group_block_id)
+        if leading_group_block_id is not None
+        else None
+    )
+    n_root_ids = [
+        block_id
+        for block_id in root_grid_ids
+        if canonical_block_id(block_id) == n_block_id
+    ]
+    m_root_ids = [
+        block_id
+        for block_id in root_grid_ids
+        if canonical_block_id(block_id) != n_block_id
+        and (
+            segment_block_id is None or canonical_block_id(block_id) != segment_block_id
+        )
+    ]
+    if len(n_root_ids) != 1 or len(m_root_ids) != 1:
+        return None
+    m_block_id = m_root_ids[0]
+    n_block_id = n_root_ids[0]
+
+    k_loop_ids = [
+        block_id
+        for graph_info in device_ir.graphs
+        if isinstance(graph_info, ForLoopGraphInfo)
+        and graph_info.graph is rhs_node.graph
+        for block_id in graph_info.block_ids
+        if canonical_block_id(block_id) == k_block_id
+    ]
+    if len(k_loop_ids) != 1:
+        return None
+    k_block_id = k_loop_ids[0]
+    leading_block_ids = (
+        ()
+        if segment_block_id is None
+        else tuple(
+            block_id
+            for block_id in root_grid_ids
+            if canonical_block_id(block_id) == segment_block_id
+        )
+    )
+    if segment_block_id is not None and len(leading_block_ids) != 1:
+        return None
+    lhs = replace(
+        lhs,
+        block_ids=(*leading_block_ids, m_block_id, k_block_id),
+    )
+    rhs = replace(
+        rhs,
+        block_ids=(*leading_block_ids, k_block_id, n_block_id),
+    )
+    if lhs.source_fake.dtype != rhs.source_fake.dtype:
+        return None
+    # Dynamic inputs can carry distinct K symbols. Admission relies on the
+    # proven shared reduction block-id above, never coincidentally equal size
+    # hints; the host K-equality guard and full grouped proof stay authoritative.
+    return _MmaOperandAnalysis(lhs=lhs, rhs=rhs)
+
+
+def _rank3_grouped_root_axes(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    *,
+    m_block_id: int,
+    n_block_id: int,
+    k_block_id: int,
+) -> _GroupedMmaAxes | None:
+    """Resolve grouped matrix axes by identity, independent of root order.
+
+    The persistent grouped scheduler replaces the original three-dimensional
+    root traversal, so source order is not semantic.  It still requires one
+    unique M axis, one unique N axis, and (for a three-axis root) one remaining
+    work/group axis; aliases and a root-carried K axis fail closed.
+    """
+    if len(device_ir.grid_block_ids) != 1:
+        return None
+    root_block_ids = device_ir.grid_block_ids[0]
+    if len(root_block_ids) not in (2, 3):
+        return None
+    canonical_block_id = env.canonical_block_id
+    canonical_m = canonical_block_id(m_block_id)
+    canonical_n = canonical_block_id(n_block_id)
+    canonical_root = tuple(map(canonical_block_id, root_block_ids))
+    if (
+        canonical_m == canonical_n
+        or canonical_block_id(k_block_id) in canonical_root
+        or len(set(canonical_root)) != len(canonical_root)
+    ):
+        return None
+    m_root_ids = [
+        block_id
+        for block_id in root_block_ids
+        if canonical_block_id(block_id) == canonical_m
+    ]
+    n_root_ids = [
+        block_id
+        for block_id in root_block_ids
+        if canonical_block_id(block_id) == canonical_n
+    ]
+    if len(m_root_ids) != 1 or len(n_root_ids) != 1:
+        return None
+    remaining = [
+        block_id
+        for block_id in root_block_ids
+        if block_id not in (m_root_ids[0], n_root_ids[0])
+    ]
+    if len(remaining) != len(root_block_ids) - 2:
+        return None
+    return _GroupedMmaAxes(
+        m_block_id=m_root_ids[0],
+        n_block_id=n_root_ids[0],
+        k_block_id=k_block_id,
+        segment_block_id=remaining[0] if remaining else None,
+    )
+
+
+def is_mma_compatible_aten(
+    node: Node,
+    with_acc: bool,
+    *,
+    allow_rank3_rhs_nt: bool = False,
+    cg: GenerateAST | None = None,
+    rank3_rhs_m_block_id: int | None = None,
+    allow_grouped_k_mask: bool = False,
+    allow_rank3_rhs_mn_major: bool = False,
+) -> bool:
+    """Check if an aten addmm/mm node can use MMA."""
+    args = node.args
+    if with_acc:
+        if len(args) < 3:
+            return False
+        acc_node = args[0]
+        lhs_node, rhs_node = args[1], args[2]
+        if isinstance(acc_node, Node):
+            acc_val = acc_node.meta.get("val")
+            if isinstance(acc_val, torch.Tensor) and acc_val.ndim != 2:
+                return False
+    else:
+        if len(args) < 2:
+            return False
+        lhs_node, rhs_node = args[0], args[1]
+    if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
+        return False
+    return _has_mma_operands(
+        lhs_node,
+        rhs_node,
+        allow_rank3_rhs_nt=allow_rank3_rhs_nt,
+        cg=cg,
+        rank3_rhs_m_block_id=rank3_rhs_m_block_id,
+        allow_grouped_k_mask=allow_grouped_k_mask,
+        allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
+    )
+
+
+def is_mma_compatible_dot(node: Node) -> bool:
+    """Check if an hl.dot FX node can use MMA."""
+    if len(node.args) < 2:
+        return False
+    acc_node = node.args[2] if len(node.args) > 2 else None
+    lhs_node, rhs_node = node.args[0], node.args[1]
+    if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
+        return False
+    if isinstance(acc_node, Node):
+        acc_val = acc_node.meta.get("val")
+        if isinstance(acc_val, torch.Tensor) and acc_val.ndim != 2:
+            return False
+    return _has_mma_operands(lhs_node, rhs_node)
+
+
+def can_codegen_cute_mma_dot(node: Node) -> bool:
+    """Return True when hl.dot supports MMA and matches MMA dtype semantics."""
+    if not is_mma_compatible_dot(node):
+        return False
+    if not _mma_result_can_be_deferred(node) or not _mma_loop_is_exclusive(node):
+        return False
+
+    lhs_node = node.args[0]
+    rhs_node = node.args[1]
+    assert isinstance(lhs_node, Node) and isinstance(rhs_node, Node)
+    lhs_val = lhs_node.meta.get("val")
+    rhs_val = rhs_node.meta.get("val")
+    if not isinstance(lhs_val, torch.Tensor) or not isinstance(rhs_val, torch.Tensor):
+        return False
+    acc_dtype: torch.dtype | None = None
+    if len(node.args) > 2 and isinstance(node.args[2], Node):
+        acc_val = node.args[2].meta.get("val")
+        if isinstance(acc_val, torch.Tensor):
+            acc_dtype = acc_val.dtype
+    out_dtype = node.args[3] if len(node.args) > 3 else None
+    if out_dtype is not None and not isinstance(out_dtype, torch.dtype):
+        return False
+    return cute_f32_mma_matches_dot(lhs_val.dtype, rhs_val.dtype, acc_dtype, out_dtype)
+
+
+@dataclass(frozen=True)
+class _CuteMmaTarget:
+    """An accumulating matmul target and its matrix operands."""
+
+    lhs: Node
+    rhs: Node
+    acc: Node | None
+    out_dtype: object
+    with_acc: bool
+    is_dot: bool
+    requires_accumulator_seed: bool
+
+
+@dataclass(frozen=True)
+class _CuteMmaNode(_CuteMmaTarget):
+    """A CuTe MMA target with its structurally analyzed operands."""
+
+    operands: _MmaOperandAnalysis
+    output_store_analysis: _MmaOutputStoreAnalysis | None
+    explicit_epi_tile_compatible: bool
+    output_column_major: bool
+    requires_fragment_epilogue: bool = False
+
+    @property
+    def requires_scalar_fallback(self) -> bool:
+        """Whether the incoming accumulator cannot seed a collective fragment."""
+        return self.requires_accumulator_seed and self.operands.has_leading_passthrough
+
+    @property
+    def supports_small_n_role_local_tma(self) -> bool:
+        """Whether compiler analysis proved the small-N TMA/store requirements."""
+        return (
+            self.operands.supports_role_local_n_edge_tma
+            and self.output_store_analysis is not None
+        )
+
+    @property
+    def supports_small_n_scalar_fallback(self) -> bool:
+        """Whether non-tcgen05 and nonpersistent small-N candidates stay correct."""
+        return (
+            not self.operands.has_leading_passthrough
+            and self.output_store_analysis is not None
+            and self.operands.scalar_loads_use_identity_axis_mapping
+        )
+
+    def supports_tcgen05_search_plan(self, plan: CuteTcgen05SearchPlan) -> bool:
+        """Whether the search contains a usable tile for this MMA candidate."""
+        if not self.requires_fragment_epilogue:
+            return True
+        return _tcgen05_fragment_epilogue_operands_supported(
+            self.operands
+        ) and _tcgen05_fragment_source_layout_reachable(
+            min_bm=plan.min_search_m,
+            max_bm=plan.max_search_m,
+            min_bn=plan.min_search_n,
+            max_bn=plan.max_search_n,
+            input_dtype=self.operands.lhs.source_fake.dtype,
+        )
+
+
+def _decode_cute_mma_target(
+    node: Node,
+    *,
+    device_ir: DeviceIR | None = None,
+    graphs: Sequence[GraphInfo] | None = None,
+) -> _CuteMmaTarget | None:
+    """Decode a reduction target supported by the collective CuTe MMA path.
+
+    Keeping target dispatch here ensures search shaping, lane-loop suppression,
+    and codegen planning all recognize the same Aten and ``hl.dot`` forms.
+    ``bmm`` and ``hl.dot`` intrinsically reduce the active K tile; explicit
+    accumulators additionally carry a seed into that reduction.
+    """
+    if node.op != "call_function":
+        return None
+
+    if node.target in (
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.baddbmm.default,
+    ):
+        if len(node.args) < 3:
+            return None
+        acc = node.args[0]
+        if not isinstance(acc, Node):
+            return None
+        lhs, rhs = node.args[1], node.args[2]
+        with_acc = True
+        is_dot = False
+    elif node.target in (torch.ops.aten.bmm.default, torch.ops.aten.bmm.dtype):
+        if len(node.args) < 2:
+            return None
+        acc = None
+        lhs, rhs = node.args[0], node.args[1]
+        with_acc = False
+        is_dot = False
+    else:
+        from ...language._decorators import is_api_func
+
+        if not (
+            is_api_func(node.target) and getattr(node.target, "__name__", "") == "dot"
+        ):
+            return None
+        if len(node.args) < 2:
+            return None
+        acc = node.args[2] if len(node.args) > 2 else None
+        lhs, rhs = node.args[0], node.args[1]
+        with_acc = False
+        is_dot = True
+
+    if not isinstance(lhs, Node) or not isinstance(rhs, Node):
+        return None
+    if _mma_result_can_be_deferred(node) and not _mma_accumulates_its_loop_carry(
+        node,
+        acc if isinstance(acc, Node) else None,
+        device_ir=device_ir,
+        graphs=graphs,
+    ):
+        return None
+    requires_accumulator_seed = False
+    if isinstance(acc, Node):
+        cached = node.meta.get(_MMA_REQUIRES_ACCUMULATOR_SEED_META_KEY)
+        if isinstance(cached, bool):
+            requires_accumulator_seed = cached
+        else:
+            requires_accumulator_seed = not _is_zero_init_acc_node(
+                acc, device_ir=device_ir, graphs=graphs
+            )
+            if device_ir is not None:
+                # Codegen deep-copies FX graphs, so graph identity is no longer
+                # available for tracing an accumulator through duplicate loop
+                # bodies. Node metadata survives that copy.
+                node.meta[_MMA_REQUIRES_ACCUMULATOR_SEED_META_KEY] = (
+                    requires_accumulator_seed
+                )
+    return _CuteMmaTarget(
+        lhs=lhs,
+        rhs=rhs,
+        acc=acc if isinstance(acc, Node) else None,
+        out_dtype=node.args[3] if is_dot and len(node.args) > 3 else None,
+        with_acc=with_acc,
+        is_dot=is_dot,
+        requires_accumulator_seed=requires_accumulator_seed,
+    )
+
+
+def tcgen05_fragment_epilogue_has_unique_anchor(
+    graphs: list[GraphInfo],
+    *,
+    device_ir: DeviceIR | None = None,
+) -> bool:
+    """Whether fragment-plan commitment can own the complete MMA function."""
+    return (
+        sum(
+            _decode_cute_mma_target(node, device_ir=device_ir, graphs=graphs)
+            is not None
+            for graph_info in graphs
+            for node in graph_info.graph.nodes
+        )
+        == 1
+    )
+
+
+def tcgen05_fragment_epilogue_present(graphs: list[GraphInfo]) -> bool:
+    """Whether structural analysis found any thread-local epilogue region."""
+    return any(
+        isinstance(
+            output_analysis := node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY),
+            _MmaOutputStoreAnalysis,
+        )
+        and output_analysis.requires_fragment_epilogue
+        for graph_info in graphs
+        for node in graph_info.graph.nodes
+    )
+
+
+def can_codegen_cute_mma_aten(
+    node: Node,
+    with_acc: bool,
+    *,
+    allow_rank3_rhs_nt: bool = False,
+    cg: GenerateAST | None = None,
+    rank3_rhs_m_block_id: int | None = None,
+    allow_grouped_k_mask: bool = False,
+    allow_rank3_rhs_mn_major: bool = False,
+) -> bool:
+    return (
+        is_mma_compatible_aten(
+            node,
+            with_acc,
+            allow_rank3_rhs_nt=allow_rank3_rhs_nt,
+            cg=cg,
+            rank3_rhs_m_block_id=rank3_rhs_m_block_id,
+            allow_grouped_k_mask=allow_grouped_k_mask,
+            allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
+        )
+        and _mma_result_can_be_deferred(node)
+        and _mma_loop_is_exclusive(node)
+    )
+
+
+def analyze_cute_mma_node(
+    node: Node,
+    *,
+    device_ir: DeviceIR | None = None,
+    graphs: Sequence[GraphInfo] | None = None,
+) -> _CuteMmaNode | None:
+    """Match a codegen-able MMA and analyze its matrix operand structure."""
+    target = _decode_cute_mma_target(node, device_ir=device_ir, graphs=graphs)
+    if target is None:
+        return None
+    from ..compile_environment import CompileEnvironment
+
+    operands = _analyze_mma_operands(
+        target.lhs,
+        target.rhs,
+        CompileEnvironment.current(),
+    )
+    if operands is None and device_ir is not None:
+        operands = _analyze_rank3_rhs_grouped_search_operands(
+            target.lhs,
+            target.rhs,
+            CompileEnvironment.current(),
+            device_ir,
+        )
+    if operands is None:
+        return None
+    if not _mma_result_can_be_deferred(node) or not _mma_loop_is_exclusive(node):
+        return None
+    output_store_analysis: _MmaOutputStoreAnalysis | None = None
+    needs_output_store_analysis = operands.has_leading_passthrough or (
+        operands.lhs.source_to_logical_order is not None
+        and operands.rhs.source_to_logical_order is not None
+    )
+    # DeviceIR provides the complete graph set needed to compute and cache the
+    # store analysis for small-N search. Later codegen callers lack DeviceIR;
+    # operand forms that require this proof retrieve the cached result instead.
+    if needs_output_store_analysis or device_ir is not None:
+        cached = node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY)
+        if isinstance(cached, _MmaOutputStoreAnalysis):
+            output_store_analysis = cached
+        if device_ir is not None:
+            if operands.rhs.rhs_packed_group is not None:
+                graph_view = cast(
+                    "GenerateAST",
+                    _MmaSearchGraphView(device_ir.graphs),
+                )
+                packed_lhs = _rank3_rhs_packed_split_lhs_info(
+                    graph_view,
+                    operands.lhs,
+                    operands.rhs,
+                    group_count=operands.rhs.rhs_group_count,
+                    group_block_id=cast(
+                        "int",
+                        operands.leading_passthrough_block_id,
+                    ),
+                    m_block_id=operands.m_block_id,
+                    k_block_id=operands.k_block_id,
+                )
+                if packed_lhs is not None:
+                    worklist_lhs, _packed_split = packed_lhs
+                    worklist_store = _rank3_rhs_worklist_store_info(
+                        graph_view,
+                        node,
+                        worklist_lhs,
+                        n_block_id=operands.n_block_id,
+                    )
+                    if worklist_store is not None:
+                        output_store_analysis = _analyze_packed_split_mma_output_store(
+                            node,
+                            operands,
+                            worklist_store,
+                            graphs=device_ir.graphs,
+                        )
+            elif (segment_group := operands.rhs.rhs_segment_group) is not None:
+                graph_view = cast(
+                    "GenerateAST",
+                    _MmaSearchGraphView(device_ir.graphs),
+                )
+                segment_lhs = _rank3_rhs_segment_lhs_info(
+                    graph_view,
+                    operands.lhs,
+                    operands.rhs,
+                    segment_block_id=segment_group.segment_block_id,
+                    m_block_id=operands.m_block_id,
+                    k_block_id=operands.k_block_id,
+                )
+                if segment_lhs is not None:
+                    worklist_store = _rank3_rhs_worklist_store_info(
+                        graph_view,
+                        node,
+                        segment_lhs,
+                        segment_group,
+                        n_block_id=operands.n_block_id,
+                        allow_store_extent_metadata=True,
+                    )
+                    if worklist_store is not None:
+                        output_store_analysis = _analyze_packed_split_mma_output_store(
+                            node,
+                            operands,
+                            worklist_store,
+                            graphs=device_ir.graphs,
+                        )
+            else:
+                output_store_analysis = _analyze_mma_output_stores(
+                    node,
+                    operands,
+                    graphs=device_ir.graphs,
+                )
+            node.meta[_MMA_OUTPUT_STORE_ANALYSIS_META_KEY] = output_store_analysis
+        if needs_output_store_analysis and output_store_analysis is None:
+            return None
+    acc_dtype: torch.dtype | None = None
+    if target.acc is not None:
+        acc_val = target.acc.meta.get("val")
+        if isinstance(acc_val, torch.Tensor):
+            valid_acc_ranks = (2, 3) if operands.has_leading_passthrough else (2,)
+            if acc_val.ndim not in valid_acc_ranks:
+                return None
+            acc_dtype = acc_val.dtype
+    if target.is_dot and not cute_f32_mma_matches_dot(
+        operands.lhs.source_fake.dtype,
+        operands.rhs.source_fake.dtype,
+        acc_dtype,
+        cast("torch.dtype | None", target.out_dtype),
+    ):
+        return None
+    return _CuteMmaNode(
+        lhs=target.lhs,
+        rhs=target.rhs,
+        acc=target.acc,
+        out_dtype=target.out_dtype,
+        operands=operands,
+        output_store_analysis=output_store_analysis,
+        explicit_epi_tile_compatible=(
+            operands.lhs.matrix_major == "row"
+            and operands.rhs.matrix_major in ("row", "col")
+            and (
+                output_store_analysis.explicit_epi_tile_compatible
+                if output_store_analysis is not None
+                else True
+            )
+        ),
+        output_column_major=(
+            output_store_analysis.output_column_major
+            if output_store_analysis is not None
+            else False
+        ),
+        requires_fragment_epilogue=(
+            output_store_analysis.requires_fragment_epilogue
+            if output_store_analysis is not None
+            else False
+        ),
+        with_acc=target.with_acc,
+        is_dot=target.is_dot,
+        requires_accumulator_seed=target.requires_accumulator_seed,
+    )
+
+
+def _node_has_static_empty_tensor_result(node: Node) -> bool:
+    value = node.meta.get("val")
+    return isinstance(value, torch.Tensor) and any(
+        type(size) is int and size == 0 for size in value.shape
+    )
+
+
+def _analyze_rank3_rhs_grouped_mma(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    axes: _GroupedMmaAxes,
+    allow_missing_empty_store: bool = False,
+) -> _Rank3RhsGroupedProof | None:
+    """Analyze rank-3 RHS grouped semantics independently of a schedule."""
+    from ..compile_environment import CompileEnvironment
+
+    # Grouped semantics are recognized only for the rank-2 addmm form emitted
+    # by Helion's tiled reduction. Other Aten MMA forms remain supported by the
+    # ordinary collective path, but must not enter this analysis through only a
+    # subset of the compiler phases.
+    if node.target is not torch.ops.aten.addmm.default:
+        return None
+    if not can_codegen_cute_mma_aten(
+        node,
+        True,
+        allow_rank3_rhs_nt=True,
+        cg=cg,
+        rank3_rhs_m_block_id=axes.m_block_id,
+        allow_grouped_k_mask=True,
+        allow_rank3_rhs_mn_major=True,
+    ):
+        return None
+    lhs_node = node.args[1]
+    rhs_node = node.args[2]
+    assert isinstance(lhs_node, Node) and isinstance(rhs_node, Node)
+    lhs_info = _trace_to_mma_operand(
+        lhs_node,
+        role="lhs",
+        cg=cg,
+        allow_grouped_k_mask=True,
+    )
+    rhs_info = _trace_to_mma_operand(
+        rhs_node,
+        role="rhs",
+        allow_rank3_rhs_nt=True,
+        cg=cg,
+        rank3_rhs_m_block_id=axes.m_block_id,
+        allow_grouped_k_mask=True,
+        allow_rank3_rhs_mn_major=True,
+    )
+    if lhs_info is not None and rhs_info is not None:
+        rhs_info = _with_shared_rhs_group(cg, lhs_info, rhs_info)
+    if lhs_info is None or rhs_info is None or not rhs_info.rhs_is_grouped:
+        return None
+
+    lhs_fake = lhs_info.logical_fake
+    rhs_fake = rhs_info.logical_fake
+    env = CompileEnvironment.current()
+    canonical_block_id = env.canonical_block_id
+    k_mask = _same_grouped_k_mask(lhs_info, rhs_info)
+    if (
+        lhs_info.grouped_k_mask is not None or rhs_info.grouped_k_mask is not None
+    ) and k_mask is None:
+        return None
+    rhs_major = _tcgen05_tma_matrix_major(rhs_fake)
+    if not (
+        lhs_fake.dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        and _tcgen05_tma_matrix_major(lhs_fake) == "row"
+        and rhs_major in ("row", "col")
+        and rhs_info.rhs_n_block_id == canonical_block_id(axes.n_block_id)
+        and rhs_info.rhs_k_block_id == canonical_block_id(axes.k_block_id)
+        and isinstance(node.args[0], Node)
+        and _is_zero_init_acc_node(node.args[0], graphs=cg.codegen_graphs)
+    ):
+        return None
+
+    tail_epilogue = None
+    if rhs_info.rhs_group_index is not None and rhs_info.rhs_safe_group is not None:
+        tail_epilogue = find_tcgen05_grouped_tail_epilogue_for_mma(
+            node,
+            cg.codegen_graphs,
+            safe_group_node=rhs_info.rhs_safe_group.safe_group,
+            safe_group_layout_load_node=rhs_info.rhs_safe_group.group_load,
+        )
+    allowed_safe_group_users = (
+        tuple(
+            producer
+            for producer in tail_epilogue.producer_nodes
+            if producer in tail_epilogue.safe_group_node.users
+        )
+        if tail_epilogue is not None
+        else ()
+    )
+    allowed_safe_group_users = (
+        *allowed_safe_group_users,
+        *((k_mask.k_sizes_load,) if k_mask is not None else ()),
+    )
+
+    segment_group = rhs_info.rhs_segment_group
+    worklist_lhs = None
+    worklist_store = None
+    packed_split = None
+    if rhs_info.rhs_packed_group is not None:
+        packed_group = rhs_info.rhs_packed_group
+        if axes.segment_block_id is None or canonical_block_id(
+            packed_group.group_block_id
+        ) != canonical_block_id(axes.segment_block_id):
+            return None
+        packed_lhs = _rank3_rhs_packed_split_lhs_info(
+            cg,
+            lhs_info,
+            rhs_info,
+            group_count=rhs_info.rhs_group_count,
+            group_block_id=axes.segment_block_id,
+            m_block_id=axes.m_block_id,
+            k_block_id=axes.k_block_id,
+        )
+        if packed_lhs is None:
+            return None
+        worklist_lhs, packed_split = packed_lhs
+        worklist_store = _rank3_rhs_worklist_store_info(
+            cg,
+            node,
+            worklist_lhs,
+            n_block_id=axes.n_block_id,
+        )
+        if worklist_store is None:
+            return None
+        if rhs_info.rhs_shared_group_count is not None:
+            output_node = worklist_store.store_node.args[0]
+            output = (
+                output_node.meta.get("val") if isinstance(output_node, Node) else None
+            )
+            if not isinstance(output, torch.Tensor) or id(output.untyped_storage()) in {
+                id(tensor.untyped_storage()) for tensor in env.input_sources
+            }:
+                return None
+            if not _shared_rhs_region_is_exclusive(cg, node, worklist_store.store_node):
+                return None
+        if not _rank3_rhs_packed_split_consumers_are_exclusive(
+            cg,
+            rhs_info,
+            worklist_lhs,
+            worklist_store,
+        ):
+            return None
+        # The device scheduler owns the store extent even though it equals the
+        # load extent.  Consume its role-local ``store_m`` value rather than
+        # the scalar source scaffold that is replaced after proof.
+        worklist_store = replace(
+            worklist_store,
+            uses_scheduler_store_extent=True,
+        )
+        layout_tensor = packed_split.layout_tensor
+    elif segment_group is not None:
+        if axes.segment_block_id is None:
+            return None
+        worklist_lhs = _rank3_rhs_segment_lhs_info(
+            cg,
+            lhs_info,
+            rhs_info,
+            segment_block_id=axes.segment_block_id,
+            m_block_id=axes.m_block_id,
+            k_block_id=axes.k_block_id,
+        )
+        if worklist_lhs is None:
+            return None
+        worklist_store = _rank3_rhs_worklist_store_info(
+            cg,
+            node,
+            worklist_lhs,
+            segment_group,
+            n_block_id=axes.n_block_id,
+            allow_store_extent_metadata=True,
+        )
+        if worklist_store is None and not (
+            allow_missing_empty_store and _node_has_static_empty_tensor_result(node)
+        ):
+            return None
+        layout_tensor = segment_group.metadata_tensor
+    else:
+        if axes.segment_block_id is not None or not _is_unmasked_load(lhs_info.load):
+            return None
+        if not _rank3_rhs_safe_group_consumed_nodes_exclusive(
+            cg,
+            rhs_info,
+            allowed_safe_group_users=allowed_safe_group_users,
+        ):
+            return None
+        safe_group = rhs_info.rhs_safe_group
+        if rhs_info.rhs_group_index is None or safe_group is None:
+            return None
+        tensor_node = safe_group.group_load.args[0]
+        if not isinstance(tensor_node, Node):
+            return None
+        layout_tensor = tensor_node.meta.get("val")
+        if not isinstance(layout_tensor, torch.Tensor):
+            return None
+
+    return _Rank3RhsGroupedProof(
+        lhs=lhs_info,
+        rhs=rhs_info,
+        layout_tensor=layout_tensor,
+        k_mask=k_mask,
+        tail_epilogue=tail_epilogue,
+        worklist_lhs=worklist_lhs,
+        worklist_store=worklist_store,
+        packed_split=packed_split,
+    )
+
+
+def _rank3_rhs_grouped_schedule_is_legal(
+    proof: _Rank3RhsGroupedProof,
+    *,
+    grouped_mode: str | None,
+) -> bool:
+    """Return whether a requested grouped schedule can lower a semantic proof."""
+    if grouped_mode is None and proof.requires_explicit_grouped_mode:
+        return False
+    return not (
+        grouped_mode != TCGEN05_GROUPED_MODE_WORKLIST_NM
+        and proof.requires_worklist_nm_schedule
+    )
+
+
+def _prove_rank3_rhs_grouped_mma(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    config: _ConfigLike,
+    axes: _GroupedMmaAxes,
+) -> _Rank3RhsGroupedProof | None:
+    """Compatibility wrapper for config-specific grouped MMA admission."""
+    proof = _analyze_rank3_rhs_grouped_mma(cg, node, axes=axes)
+    if config.get(GROUPED_ROW_UNION_KEY, False) is True:
+        return (
+            proof
+            if proof is not None
+            and _grouped_row_union_metadata(
+                cg, node, proof, schedule=physical_schedule(config)
+            )
+            is not None
+            else None
+        )
+    if proof is None or not _rank3_rhs_grouped_schedule_is_legal(
+        proof,
+        grouped_mode=_tcgen05_grouped_mode(config),
+    ):
+        return None
+    return proof
+
+
+def _grouped_full_coverage_semantics(
+    cg: GenerateAST, node: Node, proof: _Rank3RhsGroupedProof
+) -> bool:
+    """Require group-invariant operands and an identity store of the contraction.
+
+    The existing grouped proof establishes zero initialization, original row
+    addressing and an exclusive fresh-output region. Check the complete store
+    chain as well: group-independent RHS alone does not prove an epilogue can
+    be rescheduled or duplicate stores can be coalesced.
+    """
+    if not (
+        proof.rhs.rhs_shared_group_count is not None
+        and proof.lhs.source_fake.dtype is torch.bfloat16
+        and proof.rhs.source_fake.dtype is torch.bfloat16
+        and proof.layout_tensor.dtype is torch.int32
+        and proof.packed_split is not None
+        and proof.packed_split.layout_kind == "offsets"
+        and proof.packed_split.clipped_negative_start
+        and proof.k_mask is None
+        and proof.tail_epilogue is None
+        and proof.worklist_store is not None
+    ):
+        return False
+    stores = analyze_tcgen05_matmul_store_chains(cg.codegen_graphs, node)
+    if (
+        stores is None
+        or len(stores) != 1
+        or stores[0][0] is not proof.worklist_store.store_node
+        or stores[0][1].steps
+    ):
+        return False
+    output_node = proof.worklist_store.store_node.args[0]
+    output = output_node.meta.get("val") if isinstance(output_node, Node) else None
+    return (
+        isinstance(output, torch.Tensor)
+        and output.ndim == 2
+        and output.dtype is torch.bfloat16
+    )
+
+
+def _grouped_row_union_metadata(
+    cg: GenerateAST,
+    node: Node,
+    proof: _Rank3RhsGroupedProof,
+    *,
+    specialize: bool = True,
+    schedule: RowUnionSchedule | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Retain every grouped purity/alias/offset proof before rescheduling.
+
+    Full-allocation dense loads additionally require contiguous rank-two
+    sources and a fresh contiguous destination. No runtime offset values are
+    inspected: the generated epilogue reloads and normalizes them each call.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    if not _grouped_full_coverage_semantics(cg, node, proof):
+        return None
+    assert proof.worklist_store is not None
+    output_node = proof.worklist_store.store_node.args[0]
+    assert isinstance(output_node, Node)
+    output = output_node.meta["val"]
+    assert isinstance(output, torch.Tensor)
+    lhs, rhs = proof.lhs.source_fake, proof.rhs.source_fake
+    if not (
+        lhs.ndim == rhs.ndim == output.ndim == 2
+        and lhs.is_contiguous()
+        and rhs.is_contiguous()
+        and output.is_contiguous()
+        and output.storage_offset() == 0
+        and proof.layout_tensor.ndim == 1
+        and proof.layout_tensor.stride(0) > 0
+        and tuple(output.shape) == (lhs.shape[0], rhs.shape[1])
+        and lhs.shape[1] == rhs.shape[0]
+    ):
+        return None
+    groups = proof.rhs.rhs_group_count
+    # Proposal discovery uses hints only. The selected codegen path freezes
+    # these dimensions with guards before emitting literal allocation views.
+    size = int if specialize else CompileEnvironment.current().size_hint
+    m, k = map(size, lhs.shape)
+    n = size(rhs.shape[1])
+    if size(proof.layout_tensor.shape[0]) != groups + 1 or not (
+        row_union_index_domain(groups, m, n, k)
+        if schedule is None
+        else schedule.index_domain(groups, m, n, k)
+    ):
+        return None
+    return groups, m, n, k
+
+
+def analyze_tcgen05_grouped_worklist(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    fact: MatmulFact,
+) -> Tcgen05GroupedWorklistAnalysis | None:
+    """Analyze a grouped worklist without assuming a compiler config."""
+    from ..compile_environment import CompileEnvironment
+
+    host_function = device_ir.host_function
+    if (
+        host_function is None
+        or fact.m_block_id is None
+        or fact.k_block_id is None
+        or len(device_ir.root_ids) != 1
+        or len(device_ir.grid_block_ids) != 1
+        or len(device_ir.grid_block_ids[0]) != 3
+    ):
+        return None
+    if fact.n_block_id is None and fact.static_n != 0:
+        return None
+    graph_view = _MmaSearchGraphView(device_ir.graphs)
+    if CompileEnvironment.has_current():
+        assert CompileEnvironment.current() is env, (
+            "grouped worklist analysis must use the provided compile environment"
+        )
+        env_context = contextlib.nullcontext()
+    else:
+        env_context = env
+    with env_context, host_function:
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if (
+                    node.op != "call_function"
+                    or node.target is not torch.ops.aten.addmm.default
+                ):
+                    continue
+                lhs_node = node.args[1] if len(node.args) > 1 else None
+                rhs_node = node.args[2] if len(node.args) > 2 else None
+                if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
+                    continue
+                operands = _analyze_rank3_rhs_grouped_search_operands(
+                    lhs_node,
+                    rhs_node,
+                    env,
+                    device_ir,
+                )
+                if operands is None:
+                    continue
+                axes = _rank3_grouped_root_axes(
+                    env,
+                    device_ir,
+                    m_block_id=operands.m_block_id,
+                    n_block_id=operands.n_block_id,
+                    k_block_id=operands.k_block_id,
+                )
+                segment_block_id = operands.leading_passthrough_block_id
+                if (
+                    axes is None
+                    or axes.segment_block_id is None
+                    or segment_block_id is None
+                    or env.canonical_block_id(axes.segment_block_id)
+                    != env.canonical_block_id(segment_block_id)
+                ):
+                    continue
+                canonical_block_id = env.canonical_block_id
+                if (
+                    canonical_block_id(operands.m_block_id)
+                    != canonical_block_id(fact.m_block_id)
+                    or canonical_block_id(operands.k_block_id)
+                    != canonical_block_id(fact.k_block_id)
+                    or (
+                        fact.n_block_id is not None
+                        and canonical_block_id(operands.n_block_id)
+                        != canonical_block_id(fact.n_block_id)
+                    )
+                ):
+                    continue
+                proof = _analyze_rank3_rhs_grouped_mma(
+                    cast("GenerateAST", graph_view),
+                    node,
+                    axes=axes,
+                    allow_missing_empty_store=True,
+                )
+                if proof is None or not proof.is_worklist:
+                    continue
+                rhs_major = proof.rhs.matrix_major
+                if rhs_major == "col":
+                    b_major: Literal["k", "n"] = "k"
+                elif rhs_major == "row":
+                    b_major = "n"
+                else:
+                    continue
+                groups = proof.rhs.rhs_group_count
+                packed_m = env.size_hint(proof.lhs.source_fake.shape[0])
+                n = env.size_hint(proof.rhs.matrix_cols)
+                k = env.size_hint(proof.rhs.matrix_rows)
+                device_split_sizes = proof.packed_split is not None
+                # Resolve and cache the input path while HostFunction is active.
+                # Seed ranking later replays this path against real bind values.
+                env.tensor_input_source(proof.layout_tensor)
+                env.tensor_input_source(proof.lhs.source_fake)
+                env.tensor_input_source(proof.rhs.source_fake)
+                return Tcgen05GroupedWorklistAnalysis(
+                    seed_facts=Tcgen05GroupedWorklistSeedFacts(
+                        groups,
+                        packed_m,
+                        n,
+                        k,
+                        b_major,
+                        device_split_sizes,
+                    ),
+                    metadata_tensor=proof.layout_tensor,
+                    packed_tensor=proof.lhs.source_fake,
+                    grouped_tensor=proof.rhs.source_fake,
+                    device_layout_kind=(
+                        proof.packed_split.layout_kind
+                        if proof.packed_split is not None
+                        else None
+                    ),
+                    full_coverage_supported=_grouped_full_coverage_semantics(
+                        cast("GenerateAST", graph_view), node, proof
+                    ),
+                    dense_row_union_supported=(
+                        _grouped_row_union_metadata(
+                            cast("GenerateAST", graph_view),
+                            node,
+                            proof,
+                            specialize=False,
+                        )
+                        is not None
+                    ),
+                    dense_row_union_paired_clc_supported=(
+                        _grouped_row_union_metadata(
+                            cast("GenerateAST", graph_view),
+                            node,
+                            proof,
+                            specialize=False,
+                            schedule=PAIRED_CLC,
+                        )
+                        is not None
+                    ),
+                    dense_row_union_cluster4_supported=(
+                        _grouped_row_union_metadata(
+                            cast("GenerateAST", graph_view),
+                            node,
+                            proof,
+                            specialize=False,
+                            schedule=TRANSPOSED,
+                        )
+                        is not None
+                    ),
+                )
+    return None
+
+
+def _tcgen05_grouped_static_seed_has_proof(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    fact: MatmulFact,
+    *,
+    require_exact_k: bool,
+) -> bool:
+    from ..compile_environment import CompileEnvironment
+
+    host_function = device_ir.host_function
+    if (
+        host_function is None
+        or fact.m_block_id is None
+        or fact.n_block_id is None
+        or fact.k_block_id is None
+    ):
+        return False
+    axes = _GroupedMmaAxes(
+        m_block_id=fact.m_block_id,
+        n_block_id=fact.n_block_id,
+        k_block_id=fact.k_block_id,
+    )
+
+    grouped_mode = (
+        TCGEN05_GROUPED_MODE_DYNAMIC if require_exact_k else TCGEN05_GROUPED_MODE_STATIC
+    )
+    graph_view = _MmaSearchGraphView(device_ir.graphs)
+    env_context = contextlib.nullcontext() if CompileEnvironment.has_current() else env
+    with env_context, host_function:
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                if node.target is not torch.ops.aten.addmm.default:
+                    continue
+                proof = _analyze_rank3_rhs_grouped_mma(
+                    cast("GenerateAST", graph_view),
+                    node,
+                    axes=axes,
+                )
+                if proof is None or not _rank3_rhs_grouped_schedule_is_legal(
+                    proof,
+                    grouped_mode=grouped_mode,
+                ):
+                    continue
+                proof_matches = (
+                    proof.k_mask is not None
+                    if require_exact_k
+                    else (
+                        proof.lhs.grouped_k_mask is None
+                        and proof.rhs.grouped_k_mask is None
+                        and not proof.is_worklist
+                    )
+                )
+                if proof_matches:
+                    return True
+    return False
+
+
+def tcgen05_grouped_dynamic_bk64_seed_has_exact_k_proof(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    fact: MatmulFact,
+) -> bool:
+    """Return whether a seed can rely on exact grouped K proof."""
+    return _tcgen05_grouped_static_seed_has_proof(
+        env, device_ir, fact, require_exact_k=True
+    )
+
+
+def tcgen05_grouped_static_seed_has_common_k_proof(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    fact: MatmulFact,
+) -> bool:
+    """Return whether a seed can use grouped-static common-K codegen."""
+    return _tcgen05_grouped_static_seed_has_proof(
+        env, device_ir, fact, require_exact_k=False
+    )
+
+
+def _graph_signature(graph: torch.fx.Graph) -> tuple[tuple[str, str], ...]:
+    signature: list[tuple[str, str]] = []
+    for node in graph.nodes:
+        target = node.op
+        if node.op == "call_function":
+            target = getattr(node.target, "__name__", str(node.target))
+        signature.append((node.op, target))
+    return tuple(signature)
+
+
+def _graph_tensor_output_count(graph: torch.fx.Graph) -> int:
+    output_nodes = list(graph.find_nodes(op="output"))
+    if not output_nodes:
+        return 0
+    (output_node,) = output_nodes
+    outputs: set[Node] = set()
+    for node in _iter_node_inputs(output_node.args):
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            outputs.add(node)
+    return len(outputs)
+
+
+def _trace_acc_init_node(
+    node: Node,
+    *,
+    device_ir: DeviceIR | None = None,
+    graphs: Sequence[GraphInfo] | None = None,
+) -> Node | None:
+    """Trace an accumulator through the exact graphs being analyzed or emitted.
+
+    Codegen copies graphs, so a supplied graph set must match by identity.
+    Structural matching remains only for callers using the legacy DeviceIR
+    context; even there, multiple identical loop bodies are ambiguous.
+    """
+    from ...language import _tracing_ops
+    from ..device_ir import NodeArgsGraphInfo
+    from ..host_function import HostFunction
+
+    active_graphs = (
+        graphs
+        if graphs is not None
+        else (
+            HostFunction.current().device_ir if device_ir is None else device_ir
+        ).graphs
+    )
+    current = node
+    seen: set[Node] = set()
+    while current not in seen:
+        seen.add(current)
+        if current.op == "placeholder":
+            current_placeholders = list(current.graph.find_nodes(op="placeholder"))
+            node_args_graphs = [
+                graph_info
+                for graph_info in active_graphs
+                if isinstance(graph_info, NodeArgsGraphInfo)
+            ]
+            matches = [
+                graph_info
+                for graph_info in node_args_graphs
+                if current.graph is graph_info.graph
+            ]
+            if not matches and graphs is None:
+                current_signature = _graph_signature(current.graph)
+                matches = [
+                    graph_info
+                    for graph_info in node_args_graphs
+                    if _graph_signature(graph_info.graph) == current_signature
+                ]
+            if len(matches) != 1:
+                return current
+            (graph_info,) = matches
+            if (
+                _graph_tensor_output_count(current.graph) > 1
+                or _graph_tensor_output_count(graph_info.graph) > 1
+            ):
+                return current
+            if current.graph is graph_info.graph:
+                current = graph_info.placeholder_to_outer_arg(current)
+                continue
+            for placeholder, outer_node in zip(
+                current_placeholders,
+                graph_info.node_args,
+                strict=True,
+            ):
+                if placeholder is current:
+                    current = outer_node
+                    break
+            else:
+                return current
+            continue
+        if current.op != "call_function":
+            return current
+        if current.target is _tracing_ops._new_var:
+            (arg,) = current.args
+            if not isinstance(arg, Node):
+                return None
+            current = arg
+            continue
+        if current.target is _tracing_ops._phi:
+            lhs = current.args[0]
+            if not isinstance(lhs, Node):
+                return None
+            current = lhs
+            continue
+        return current
+    return None
+
+
+def _mma_accumulates_its_loop_carry(
+    node: Node,
+    acc: Node | None,
+    *,
+    device_ir: DeviceIR | None = None,
+    graphs: Sequence[GraphInfo] | None = None,
+) -> bool:
+    """Whether a deferred MMA may keep its accumulator in one fragment across its loop.
+
+    The MMA lowerings seed one accumulator fragment from ``acc`` in the
+    first iteration and read it out after the loop, which is the program
+    only for ``carry = mma(..., acc=carry)``.  An accumulator computed from
+    a loop carry in the body (``acc * alpha``, another carry) would be read
+    once and dropped in every later iteration; the scalar fallback lowers
+    those recurrences instead.  A bare ``bmm`` or ``hl.dot`` reduces the
+    whole K extent, and a loop-invariant accumulator seeds that reduction
+    (``_decode_cute_mma_target``), as does any MMA outside a loop body or in
+    a body whose loop statement is not among the graphs.  Codegen copies the
+    graphs, so the device-IR answer is cached on the node like
+    ``requires_accumulator_seed``.
+    """
+    cached = node.meta.get(_MMA_ACCUMULATES_LOOP_CARRY_META_KEY)
+    if isinstance(cached, bool):
+        return cached
+    active_graphs = (
+        graphs
+        if graphs is not None
+        else (
+            HostFunction.current().device_ir if device_ir is None else device_ir
+        ).graphs
+    )
+    carries = None if acc is None else loop_carries(node.graph, active_graphs)
+    if acc is None or carries is None or not reads_loop_carry(acc, carries):
+        accumulates = True
+    else:
+        accumulates = carries.get(node) is strip_new_vars(acc)
+    if device_ir is not None:
+        node.meta[_MMA_ACCUMULATES_LOOP_CARRY_META_KEY] = accumulates
+    return accumulates
+
+
+def _is_zero_init_acc_node(
+    node: Node,
+    *,
+    device_ir: DeviceIR | None = None,
+    graphs: Sequence[GraphInfo] | None = None,
+) -> bool:
+    from ...language import creation_ops
+
+    init_node = _trace_acc_init_node(node, device_ir=device_ir, graphs=graphs)
+    if init_node is None or init_node.op != "call_function":
+        return False
+    if init_node.target is creation_ops.full:
+        value = init_node.args[1]
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value == 0
+        )
+    return False
+
+
+def _physical_mma_coord_expr(
+    cg: GenerateAST,
+    block_id: int,
+) -> str:
+    """Return the physical thread coordinate for an MMA output axis."""
+    grid_state = cg.current_grid_state
+    if grid_state is None:
+        return "cutlass.Int32(0)"
+    thread_axis = grid_state.block_thread_axes.get(block_id)
+    if thread_axis is None:
+        return "cutlass.Int32(0)"
+    return f"cutlass.Int32(cute.arch.thread_idx()[{thread_axis}])"
+
+
+def _local_mma_coord_expr(
+    cg: GenerateAST,
+    block_id: int,
+) -> str:
+    """Return the current block-local coordinate for an MMA output axis.
+
+    Same as ``_physical_mma_coord_expr`` plus a lane offset when the grid
+    strategy has registered a per-block lane var (the lane-loop fast path
+    serializes `elements_per_thread` consecutive elements per physical
+    thread).
+    """
+    coord = _physical_mma_coord_expr(cg, block_id)
+    grid_state = cg.current_grid_state
+    if grid_state is None or grid_state.block_thread_axes.get(block_id) is None:
+        return coord
+
+    strategy = grid_state.strategy
+    lane_vars = getattr(strategy, "_lane_var_by_block", None)
+    if not isinstance(lane_vars, dict) or block_id not in lane_vars:
+        return coord
+
+    elements_per_thread_fn = getattr(strategy, "_elements_per_thread_for_block", None)
+    if not callable(elements_per_thread_fn):
+        return coord
+    elements_per_thread = elements_per_thread_fn(block_id)
+    lane_var = lane_vars[block_id]
+    if elements_per_thread == 1:
+        return f"{coord} + cutlass.Int32({lane_var})"
+    return f"{coord} * cutlass.Int32({elements_per_thread}) + cutlass.Int32({lane_var})"
+
+
+def _grid_thread_extent(cg: GenerateAST, block_id: int) -> int:
+    grid_state = cg.current_grid_state
+    if grid_state is None:
+        return 1
+    thread_axis = grid_state.block_thread_axes.get(block_id)
+    if thread_axis is None:
+        return 1
+    return grid_state.thread_axis_sizes.get(thread_axis, 1)
+
+
+@dataclass(frozen=True)
+class _MmaRoleCoordinatePlan:
+    """Logical MMA/role coordinates for the current CUDA launch topology."""
+
+    mma_m_coord: str
+    mma_n_coord: str
+    mma_m_thread_extent: int
+    mma_active_n_threads: int
+
+    def mma_tidx_expr(self) -> str:
+        return (
+            f"{self.mma_m_coord} + "
+            f"({self.mma_n_coord}) * cutlass.Int32({self.mma_m_thread_extent})"
+        )
+
+    def mma_active_expr(self) -> str:
+        return f"({self.mma_n_coord}) < cutlass.Int32({self.mma_active_n_threads})"
+
+
+def _mma_epi_tidx_expr(*, lane_idx: str, warp_idx: str, epi_active: str) -> str:
+    return (
+        f"{lane_idx} + {warp_idx} * cutlass.Int32(32) "
+        f"if {epi_active} else cutlass.Int32(0)"
+    )
+
+
+def _launch_axis_mma_role_coordinate_plan(
+    *,
+    mma_m_thread_extent: int,
+    mma_active_n_threads: int,
+) -> _MmaRoleCoordinatePlan:
+    """Return MMA role coordinates on the tcgen05 role launch.
+
+    The launch is ``(physical_m_threads, launched_warps, 1)``
+    (``CuteTcgen05MatmulPlan.block_shape``): the M row on x and the role warps
+    on y, whichever thread axes the root tile strategy gave the M and N
+    blocks.  A loop order that swaps them (``loop_orders=[[1, 0]]``) launches
+    the same shape, so reading the blocks' own axes would put the M
+    coordinate on the warp index (the edge-tile operand copies then filled
+    shared memory from the wrong threads).
+    """
+    return _MmaRoleCoordinatePlan(
+        mma_m_coord="cutlass.Int32(cute.arch.thread_idx()[0])",
+        mma_n_coord="cutlass.Int32(cute.arch.thread_idx()[1])",
+        mma_m_thread_extent=mma_m_thread_extent,
+        mma_active_n_threads=mma_active_n_threads,
+    )
+
+
+def _flat_mma_role_coordinate_plan(
+    *,
+    lane_idx: str,
+    warp_idx: str,
+    mma_active_n_threads: int,
+) -> _MmaRoleCoordinatePlan:
+    """Return logical MMA coordinates derived from a flat 8-warp launch."""
+    return _MmaRoleCoordinatePlan(
+        mma_m_coord=lane_idx,
+        mma_n_coord=warp_idx,
+        mma_m_thread_extent=32,
+        mma_active_n_threads=mma_active_n_threads,
+    )
+
+
+def _grid_cta_thread_count(cg: GenerateAST) -> int:
+    grid_state = cg.current_grid_state
+    if grid_state is None:
+        return 1
+    cta_threads = 1
+    for size in grid_state.thread_axis_sizes.values():
+        cta_threads *= size
+    return cta_threads
+
+
+def _get_mma_k_loop_info(
+    cg: GenerateAST,
+    env: CompileEnvironment,
+    lhs_fake: torch.Tensor,
+    rhs_fake: torch.Tensor,
+    fx_node: Node | None = None,
+    lhs_k_size: int | torch.SymInt | None = None,
+    rhs_k_size: int | torch.SymInt | None = None,
+) -> tuple[DeviceLoopState, int, str, int] | None:
+    """Return the active reduction loop for the operands' shared K dimension."""
+    lhs_k_size = lhs_fake.size(-1) if lhs_k_size is None else lhs_k_size
+    rhs_k_size = rhs_fake.size(-2) if rhs_k_size is None else rhs_k_size
+    if fx_node is not None:
+        from ..device_ir import ForLoopGraphInfo
+
+        graph_k_block_ids = [
+            graph_info.block_ids
+            for graph_info in cg.codegen_graphs
+            if isinstance(graph_info, ForLoopGraphInfo)
+            and graph_info.graph is fx_node.graph
+        ]
+        if len(graph_k_block_ids) == 1:
+            active_graph_block_ids = [
+                block_id
+                for block_id in graph_k_block_ids[0]
+                if any(
+                    isinstance(loop_state, DeviceLoopState)
+                    for loop_state in cg.active_device_loops.get(block_id, ())
+                )
+            ]
+            if len(active_graph_block_ids) == 1:
+                k_block_id = active_graph_block_ids[0]
+                loops = cg.active_device_loops.get(k_block_id)
+                assert loops is not None
+                device_loop = next(
+                    (
+                        loop_state
+                        for loop_state in reversed(loops)
+                        if isinstance(loop_state, DeviceLoopState)
+                    ),
+                    None,
+                )
+                if device_loop is not None:
+                    block_size = env.block_sizes[k_block_id].from_config(
+                        cg.device_function.config
+                    )
+                    if isinstance(block_size, int):
+                        return (
+                            device_loop,
+                            k_block_id,
+                            device_loop.strategy.offset_var(k_block_id),
+                            block_size,
+                        )
+
+    lhs_k_block_id = env.resolve_block_id(lhs_k_size)
+    rhs_k_block_id = env.resolve_block_id(rhs_k_size)
+    candidate_block_ids: set[int] = set()
+    if (
+        lhs_k_block_id is not None
+        and rhs_k_block_id is not None
+        and lhs_k_block_id == rhs_k_block_id
+    ):
+        candidate_block_ids.add(lhs_k_block_id)
+    else:
+        for block_id, loops in cg.active_device_loops.items():
+            if not any(isinstance(loop_state, DeviceLoopState) for loop_state in loops):
+                continue
+            size = env.block_sizes[block_id].size
+            if not isinstance(size, int | torch.SymInt):
+                continue
+            if env.known_equal(size, lhs_k_size) and env.known_equal(size, rhs_k_size):
+                candidate_block_ids.add(block_id)
+
+    if len(candidate_block_ids) != 1:
+        return None
+
+    (k_block_id,) = tuple(candidate_block_ids)
+    loops = cg.active_device_loops.get(k_block_id)
+    assert loops is not None
+
+    device_loop = next(
+        (
+            loop_state
+            for loop_state in reversed(loops)
+            if isinstance(loop_state, DeviceLoopState)
+        ),
+        None,
+    )
+    if device_loop is None:
+        return None
+
+    block_size = env.block_sizes[k_block_id].from_config(cg.device_function.config)
+    if not isinstance(block_size, int):
+        return None
+
+    return (
+        device_loop,
+        k_block_id,
+        device_loop.strategy.offset_var(k_block_id),
+        block_size,
+    )
+
+
+def _device_loop_begin_expr(device_loop: DeviceLoopState) -> str:
+    loop_iter = device_loop.for_node.iter
+    if not isinstance(loop_iter, ast.Call) or not loop_iter.args:
+        return "cutlass.Int32(0)"
+    if len(loop_iter.args) == 1:
+        return "cutlass.Int32(0)"
+    return ast.unparse(loop_iter.args[0])
+
+
+def _has_non_root_lane_loops(
+    cg: GenerateAST, *, allowed_loop_states: tuple[DeviceLoopState, ...] = ()
+) -> bool:
+    seen: set[int] = set()
+    allowed_ids = {id(loop_state) for loop_state in allowed_loop_states}
+    for loops in cg.active_device_loops.values():
+        for loop_state in loops:
+            key = id(loop_state)
+            if key in seen:
+                continue
+            seen.add(key)
+            if loop_state is cg.current_grid_state or key in allowed_ids:
+                continue
+            strategy = getattr(loop_state, "strategy", None)
+            lane_vars = getattr(strategy, "_lane_var_by_block", None)
+            if lane_vars:
+                return True
+    return False
+
+
+def prepare_cute_collective_lane_loop_suppression(
+    cg: GenerateAST, graph: torch.fx.Graph
+) -> None:
+    from ..compile_environment import CompileEnvironment
+
+    grid_state = cg.current_grid_state
+    if grid_state is None:
+        return
+
+    env = CompileEnvironment.current()
+    if env.backend_name != "cute":
+        return
+    grouped_mode = _tcgen05_grouped_mode(cg.device_function.config)
+    row_union_requested = cg.device_function.config.get(GROUPED_ROW_UNION_KEY, False)
+    allow_grouped_k_mask = grouped_mode is not None
+    allow_rank3_rhs_mn_major = (
+        grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM or row_union_requested is True
+    )
+    cute_state = cg.device_function.cute_state
+    if not tcgen05_fragment_epilogue_has_unique_anchor(
+        cg.codegen_graphs
+    ) and tcgen05_fragment_epilogue_present(cg.codegen_graphs):
+        # Root lane-loop suppression is shared across the device-function
+        # planning state. Fragment-plan commitment is deliberately limited to a
+        # unique MMA anchor, so a mixed function must reject tcgen05 atomically.
+        cute_state.veto_collective_lane_loop_suppression()
+    if cute_state.collective_lane_loop_suppression_is_vetoed():
+        return
+    analyzed_candidates = {
+        node: candidate
+        for node in graph.nodes
+        if (candidate := analyze_cute_mma_node(node, graphs=cg.codegen_graphs))
+        is not None
+    }
+    for node in graph.nodes:
+        candidate = analyzed_candidates.get(node)
+        if candidate is not None:
+            if candidate.requires_accumulator_seed:
+                continue
+            analysis = candidate.operands
+            if tuple(grid_state.block_ids) != analysis.output_block_ids:
+                continue
+            leading_block_id = analysis.leading_passthrough_block_id
+            if leading_block_id is not None and (
+                cg.device_function.resolved_block_size(leading_block_id) != 1
+            ):
+                continue
+            lhs_operand = analysis.lhs
+            rhs_operand = analysis.rhs
+            lhs_load = lhs_operand.load
+            rhs_load = rhs_operand.load
+            lhs_fake = lhs_operand.source_fake
+            rhs_fake = rhs_operand.source_fake
+            k_loop_info = _get_mma_k_loop_info(
+                cg,
+                env,
+                lhs_fake,
+                rhs_fake,
+                fx_node=node,
+                lhs_k_size=lhs_operand.matrix_cols,
+                rhs_k_size=rhs_operand.matrix_rows,
+            )
+            if k_loop_info is None or k_loop_info[1] != analysis.k_block_id:
+                continue
+            bm = cg.device_function.resolved_block_size(analysis.m_block_id)
+            bn = cg.device_function.resolved_block_size(analysis.n_block_id)
+            bk = k_loop_info[3]
+            if not isinstance(bm, int) or not isinstance(bn, int):
+                continue
+            if (
+                _choose_mma_impl(
+                    lhs_fake.dtype,
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                    config=cg.device_function.config,
+                    input_device=lhs_fake.device,
+                )
+                != "tcgen05"
+            ):
+                continue
+            if lhs_fake.dtype == torch.float32 and _tcgen05_fp32_lowering_blocked(
+                cg,
+                node,
+                lhs_operand=lhs_operand,
+                rhs_operand=rhs_operand,
+                config=cg.device_function.config,
+            ):
+                continue
+            if analysis.has_leading_passthrough and not _mma_tiles_are_static_full(
+                analysis, bm=bm, bn=bn, bk=bk
+            ):
+                continue
+            if not _operand_infos_exclusive_for_mma(lhs_operand, rhs_operand, node):
+                continue
+            allowed_k_lane_loops: tuple[DeviceLoopState, ...] = (
+                (k_loop_info[0],)
+                if analysis.leading_passthrough_block_id is not None
+                else ()
+            )
+            if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
+                continue
+            if not ensure_tcgen05_fragment_epilogue_plan(
+                cg.device_function,
+                node,
+                candidate,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                config=cg.device_function.config,
+            ):
+                continue
+            cute_state = cg.device_function.cute_state
+            _register_collective_handled_loads(
+                cute_state,
+                lhs_load,
+                rhs_load,
+                lhs_operand.terminal,
+                rhs_operand.terminal,
+            )
+            if grid_state.has_lane_loops():
+                cute_state.request_root_lane_loop_suppression()
+            continue
+
+        if node.target is torch.ops.aten.addmm.default:
+            with_acc = True
+            lhs_node = node.args[1]
+            rhs_node = node.args[2]
+            if not can_codegen_cute_mma_aten(
+                node,
+                with_acc,
+                allow_rank3_rhs_nt=True,
+                cg=cg,
+                allow_grouped_k_mask=allow_grouped_k_mask,
+                allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
+            ):
+                continue
+        elif node.target is torch.ops.aten.mm.default:
+            with_acc = False
+            lhs_node = node.args[0]
+            rhs_node = node.args[1]
+            if not can_codegen_cute_mma_aten(
+                node,
+                with_acc,
+                allow_rank3_rhs_nt=True,
+                cg=cg,
+                allow_grouped_k_mask=allow_grouped_k_mask,
+                allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
+            ):
+                continue
+        elif can_codegen_cute_mma_dot(node):
+            lhs_node = node.args[0]
+            rhs_node = node.args[1]
+        else:
+            continue
+
+        if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
+            continue
+
+        lhs_info = _trace_to_mma_operand(
+            lhs_node,
+            role="lhs",
+            cg=cg,
+            allow_grouped_k_mask=allow_grouped_k_mask,
+        )
+        rhs_info = _trace_to_mma_operand(
+            rhs_node,
+            role="rhs",
+            allow_rank3_rhs_nt=True,
+            cg=cg,
+            allow_grouped_k_mask=allow_grouped_k_mask,
+            allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
+        )
+        if lhs_info is None or rhs_info is None:
+            continue
+        rhs_info = _with_shared_rhs_group(cg, lhs_info, rhs_info)
+        # The fallback in codegen_cute_mma only admits grouped addmm when
+        # analyze_cute_mma_node declined. Keep ordinary operands and their
+        # scalar lane coordinates live for that same fallback decision.
+        if not rhs_info.rhs_is_grouped:
+            continue
+        lhs_fake = lhs_info.logical_fake
+        rhs_fake = rhs_info.logical_fake
+        if lhs_fake.ndim != 2 or rhs_fake.ndim != 2:
+            continue
+
+        if not (
+            isinstance(lhs_fake.shape[0], int)
+            and isinstance(rhs_fake.shape[1], int)
+            and isinstance(lhs_fake.shape[1], int)
+        ):
+            continue
+        bm = bn = bk = None
+        m_block_id = n_block_id = None
+        candidate_block_ids = [*grid_state.block_ids]
+        if (
+            k_loop_info := _get_mma_k_loop_info(
+                cg, env, lhs_fake, rhs_fake, fx_node=node
+            )
+        ) is not None:
+            device_loop, k_block_id, _, k_block_size = k_loop_info
+            candidate_block_ids.append(k_block_id)
+            bk = int(k_block_size)
+        else:
+            device_loop = None
+            k_block_id = None
+        for bid in dict.fromkeys(candidate_block_ids):
+            size = env.block_sizes[bid].size
+            bs = cg.device_function.resolved_block_size(bid)
+            if not isinstance(bs, int):
+                continue
+            if isinstance(size, (int, torch.SymInt)):
+                if bm is None and env.known_equal(size, lhs_fake.shape[0]):
+                    bm = int(bs)
+                    m_block_id = bid
+                elif bn is None and env.known_equal(size, rhs_fake.shape[1]):
+                    bn = int(bs)
+                    n_block_id = bid
+                elif bk is None and env.known_equal(size, lhs_fake.shape[1]):
+                    bk = int(bs)
+        if rhs_info.rhs_is_grouped and m_block_id is None:
+            canonical_block_id = env.canonical_block_id
+            rhs_n_block_id = rhs_info.rhs_n_block_id
+            grouped_leading_block_id = rhs_info.rhs_grouped_leading_block_id
+            if rhs_n_block_id is not None:
+                m_block_ids = [
+                    bid
+                    for bid in grid_state.block_ids
+                    if canonical_block_id(bid) != canonical_block_id(rhs_n_block_id)
+                    and (
+                        grouped_leading_block_id is None
+                        or canonical_block_id(bid)
+                        != canonical_block_id(grouped_leading_block_id)
+                    )
+                ]
+                if len(m_block_ids) == 1:
+                    candidate_m_block_id = m_block_ids[0]
+                    candidate_bm = cg.device_function.resolved_block_size(
+                        candidate_m_block_id
+                    )
+                    if isinstance(candidate_bm, int):
+                        m_block_id = candidate_m_block_id
+                        bm = candidate_bm
+        if bm is None or bn is None or bk is None:
+            continue
+        rhs_rank3_worklist_lhs_info: _Rank3RhsWorklistLhsInfo | None = None
+        if rhs_info.rhs_is_grouped:
+            if m_block_id is None or n_block_id is None or k_block_id is None:
+                continue
+            if device_loop is None:
+                continue
+            canonical_block_id = env.canonical_block_id
+            segment_block_id = None
+            grouped_leading_block_id = rhs_info.rhs_grouped_leading_block_id
+            if grouped_leading_block_id is not None:
+                segment_block_ids = [
+                    bid
+                    for bid in grid_state.block_ids
+                    if canonical_block_id(bid)
+                    not in (
+                        canonical_block_id(m_block_id),
+                        canonical_block_id(n_block_id),
+                    )
+                ]
+                if len(segment_block_ids) != 1:
+                    continue
+                segment_block_id = segment_block_ids[0]
+                if (
+                    canonical_block_id(segment_block_id)
+                    != canonical_block_id(grouped_leading_block_id)
+                    or cg.device_function.resolved_block_size(segment_block_id) != 1
+                ):
+                    continue
+            proof = _analyze_rank3_rhs_grouped_mma(
+                cg,
+                node,
+                axes=_GroupedMmaAxes(
+                    m_block_id=m_block_id,
+                    n_block_id=n_block_id,
+                    k_block_id=k_block_id,
+                    segment_block_id=segment_block_id,
+                ),
+            )
+            if proof is None:
+                continue
+            if row_union_requested is True:
+                if _grouped_row_union_metadata(
+                    cg,
+                    node,
+                    proof,
+                    schedule=physical_schedule(cg.device_function.config),
+                ) is None or not row_union_schedule_supported(
+                    cg.device_function.config.config, (bm, bn, bk)
+                ):
+                    continue
+            elif not _rank3_rhs_grouped_schedule_is_legal(
+                proof, grouped_mode=grouped_mode
+            ):
+                continue
+            if (
+                not proof.is_worklist
+                and _tcgen05_cluster_m(cg.device_function.config) != 1
+            ):
+                continue
+            lhs_info = proof.lhs
+            rhs_info = proof.rhs
+            lhs_fake = lhs_info.logical_fake
+            rhs_fake = rhs_info.logical_fake
+            rhs_rank3_worklist_lhs_info = proof.worklist_lhs
+            if not proof.is_worklist:
+                if (
+                    lhs_fake.shape[0] % bm != 0
+                    or rhs_fake.shape[1] % bn != 0
+                    or lhs_fake.shape[1] % bk != 0
+                ):
+                    continue
+                m_offset_var = grid_state.strategy.offset_var(m_block_id)
+                if (
+                    _rank3_rhs_safe_group_scalar_rewrite_plan(
+                        cg,
+                        rhs_info,
+                        m_offset_var=m_offset_var,
+                    )
+                    is None
+                ):
+                    continue
+        worklist_lowering = (
+            rhs_rank3_worklist_lhs_info is not None
+            and grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
+        )
+        worklist_profile = (
+            resolve_tcgen05_grouped_worklist_mma_profile(
+                cg.device_function.config,
+                block_k=bk,
+            )
+            if worklist_lowering
+            else None
+        )
+        if worklist_lowering and worklist_profile is None:
+            continue
+        row_profile = physical_schedule(cg.device_function.config)
+        collective_profile = row_profile or worklist_profile
+        collective_bm = (
+            collective_profile.mma_m if collective_profile is not None else bm
+        )
+        collective_bn = (
+            collective_profile.mma_n if collective_profile is not None else bn
+        )
+        if (
+            _choose_mma_impl(
+                lhs_fake.dtype,
+                bm=collective_bm,
+                bn=collective_bn,
+                bk=bk,
+                config=cg.device_function.config,
+                input_device=lhs_fake.device,
+                defer_grouped_worklist_smem_check=(
+                    worklist_profile is not None
+                    or physical_schedule(cg.device_function.config) is not None
+                ),
+            )
+            != "tcgen05"
+        ):
+            continue
+        if lhs_fake.dtype == torch.float32 and _tcgen05_fp32_lowering_blocked(
+            cg,
+            node,
+            lhs_operand=lhs_info,
+            rhs_operand=rhs_info,
+            config=cg.device_function.config,
+        ):
+            continue
+        if not _operand_infos_exclusive_for_mma(lhs_info, rhs_info, node):
+            continue
+
+        # Mirror the real codegen bailout in ``_emit_mma_pipeline`` (it returns
+        # ``None`` and falls back to the scalar matmul path when non-root lane
+        # loops are active, see the ``_has_non_root_lane_loops`` guard there).
+        # If we predicted the collective tcgen05 path here but codegen actually
+        # takes the scalar fallback, requesting root lane-loop suppression would
+        # drop the synthetic-lane index/mask definitions for the grid axis and
+        # produce a ``NameError`` at runtime. Only register the loads / request
+        # suppression when the collective path will truly be taken.
+        allowed_loop_states = () if device_loop is None else (device_loop,)
+        if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_loop_states):
+            continue
+
+        cute_state = cg.device_function.cute_state
+        _register_collective_handled_loads(
+            cute_state,
+            lhs_info.load,
+            rhs_info.load,
+            lhs_info.terminal,
+            rhs_info.terminal,
+            extra_dependency_nodes=(
+                *lhs_info.collective_dependency_nodes,
+                *rhs_info.collective_dependency_nodes,
+                *(
+                    ()
+                    if rhs_rank3_worklist_lhs_info is None
+                    else rhs_rank3_worklist_lhs_info.dependency_nodes
+                ),
+            ),
+        )
+        if grid_state.has_lane_loops():
+            cute_state.request_root_lane_loop_suppression()
+
+
+def _mma_result_can_be_deferred(node: Node) -> bool:
+    """Return True when the node value is only consumed after the K loop finishes."""
+    return all(user.op == "output" for user in node.users)
+
+
+@dataclass(frozen=True)
+class _Tcgen05ScalarSmemSync:
+    """Order generic SMEM stores against the asynchronous UMMA proxy.
+
+    A CTA barrier does not complete earlier UMMA reads. Before scalar staging
+    reuses an AB buffer, drain the issuing warp's earlier MMAs through a
+    separate completion barrier. This also handles the transition from TMA
+    staging, whose empty-barrier acquire the scalar path otherwise bypasses.
+    """
+
+    barrier_ptr: str
+    phase: str
+    exec_active: str
+
+    def setup_stmts(self) -> list[ast.stmt]:
+        return [
+            statement_from_string(
+                f"{self.barrier_ptr} = cute.arch.alloc_smem(cutlass.Int64, 1)"
+            ),
+            statement_from_string(f"{self.phase} = cutlass.Int32(0)"),
+            statement_from_string(
+                f"if {self.exec_active}:\n"
+                "    with cute.arch.elect_one():\n"
+                f"        cute.arch.mbarrier_init({self.barrier_ptr}, 1)"
+            ),
+            statement_from_string("cute.arch.mbarrier_init_fence()"),
+            statement_from_string("cute.arch.sync_threads()"),
+        ]
+
+    def copy_src(self, loads: tuple[ast.stmt, ...]) -> str:
+        return (
+            f"if {self.exec_active}:\n"
+            "    with cute.arch.elect_one():\n"
+            f"        cute.nvgpu.tcgen05.commit({self.barrier_ptr})\n"
+            f"cute.arch.mbarrier_wait({self.barrier_ptr}, {self.phase})\n"
+            f"{self.phase} = {self.phase} ^ cutlass.Int32(1)\n"
+            + "\n".join(ast.unparse(load) for load in loads)
+            # Every scalar writer publishes its generic-proxy stores before
+            # the CTA rendezvous lets the MMA warp read through the async proxy.
+            + "\ncute.arch.fence_view_async_shared()\ncute.arch.sync_threads()"
+        )
+
+
+@dataclass(frozen=True)
+class _PerKiterTmaArgs:
+    """Variable names + flags threaded into the per-K-iter TMA builders.
+
+    All ``str`` fields name a Python identifier in the generated code.
+    Only valid when the tcgen05 TMA path is active, so every name is
+    guaranteed bound at the call site.
+    """
+
+    tma_pipeline: str
+    tma_producer_state: str
+    tma_consumer_state: str
+    tma_producer_try_token: str
+    tma_consumer_try_token: str
+    tma_barrier_ptr: str
+    tma_full_tile: str
+    tma_next_full_tile: str
+    tma_next_consumer_tile: str
+    tma_warp: str
+    tma_atom_a: str
+    tma_atom_b: str
+    tma_gA: str
+    tma_gB: str
+    tma_sA: str
+    tma_sB: str
+    tma_k_tile: str
+    tma_a_mcast_mask: str
+    tma_b_mcast_mask: str
+    ab_stage_count: int
+    is_two_cta: bool
+    use_tma_b_mcast_mask: bool
+    use_tma_a: bool
+    use_tma_b: bool
+    skip_producer_acquire: bool
+    skip_producer_advance: bool
+    skip_consumer_wait: bool
+    exec_active: str
+    scalar_load_a: ast.stmt
+    scalar_load_b: ast.stmt
+    # ``cluster_n`` is only consulted when ``is_two_cta=True`` to pick the
+    # V-leader vs cluster-leader form for the AB consumer-release predicate
+    # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
+    # validated cluster_m=2 cluster_n=1 path.
+    cluster_n: int = 1
+    # Static-full pipelined TMA loops can drop the per-K runtime full-tile
+    # branch and scalar fallback. Non-pipelined/asymmetric paths must keep the
+    # guarded fallback path.
+    static_full_tiles: bool = False
+    tma_desc_ptr_a: str | None = None
+    tma_desc_ptr_b: str | None = None
+    tma_desc_acquire_fence_src: str | None = None
+    # M-paired tiles: second A staging buffer's (gmem, smem) TMA partitions.
+    # Empty strings when m_subtile_count == 1.
+    tma_gA2: str = ""
+    tma_sA2: str = ""
+    a_producer_predicate: str | None = None
+    scalar_smem_sync: _Tcgen05ScalarSmemSync | None = None
+
+
+def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
+    """Per-K-iter TMA copy source for A; ``""`` when A is not TMA-loaded.
+
+    A only multicasts in 2-CTA mode (asymmetric vs. B, which can also
+    multicast across cluster CTAs). With M-paired tiles a second copy fills
+    the paired subtile's A buffer from the adjacent M tile (same barrier /
+    transaction, tx_count covers both).
+    """
+    if not args.use_tma_a:
+        return ""
+    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
+    desc = f", tma_desc_ptr={args.tma_desc_ptr_a}" if args.tma_desc_ptr_a else ""
+    src = (
+        f"    cute.copy({args.tma_atom_a}, "
+        f"{args.tma_gA}[None, {k_offset}], "
+        f"{args.tma_sA}[None, {args.tma_producer_state}.index], "
+        f"tma_bar_ptr={args.tma_barrier_ptr}{mcast}{desc})\n"
+    )
+    if args.tma_gA2:
+        src += (
+            f"    cute.copy({args.tma_atom_a}, "
+            f"{args.tma_gA2}[None, {k_offset}], "
+            f"{args.tma_sA2}[None, {args.tma_producer_state}.index], "
+            f"tma_bar_ptr={args.tma_barrier_ptr}{mcast}{desc})\n"
+        )
+    if args.a_producer_predicate is not None:
+        src = f"    if {args.a_producer_predicate}:\n" + textwrap.indent(src, "    ")
+    return src
+
+
+def _kloop_tma_copy_b_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
+    """Per-K-iter TMA copy source for B; ``""`` when B is not TMA-loaded.
+
+    Callers pass a mask whenever the B TMA atom is multicast. The guarded
+    clustered CtaGroup.ONE bridge uses a self-only mask so each CTA duplicates
+    local-B loads while satisfying CuTe's multicast-atom contract.
+    """
+    if not args.use_tma_b:
+        return ""
+    mcast = f", mcast_mask={args.tma_b_mcast_mask}" if args.use_tma_b_mcast_mask else ""
+    desc = f", tma_desc_ptr={args.tma_desc_ptr_b}" if args.tma_desc_ptr_b else ""
+    return (
+        f"    cute.copy({args.tma_atom_b}, "
+        f"{args.tma_gB}[None, {k_offset}], "
+        f"{args.tma_sB}[None, {args.tma_producer_state}.index], "
+        f"tma_bar_ptr={args.tma_barrier_ptr}{mcast}{desc})\n"
+    )
+
+
+def _tcgen05_two_cta_owner_predicate(
+    exec_active: str,
+    *,
+    is_two_cta: bool,
+    gate_exec_warp: bool,
+    cluster_n: int = 1,
+) -> str | None:
+    """Owner-of-the-V-pair predicate for AB consumer release / MMA issuance.
+
+    At ``is_two_cta=True`` V=2; the predicate must fire only on the V-leader
+    of each V-pair so the AB consumer-release barrier and MMA issuance are
+    *not* duplicated by the V-non-leader CTA. With ``cluster_n=1`` the only
+    V-pair has V-leader rank 0 (cluster-leader), so the cheaper ``rank == 0``
+    spelling keeps the validated cluster_n=1 predicate shape. With
+    ``cluster_n=2`` there are two V-pairs (V-leaders {0, 2}) so the predicate
+    must use ``rank % 2 == 0``; rank 2 must commit on its own V-pair's empty
+    barrier or the cluster races (cycle-26 hang root cause; see cute_plan.md
+    §6.12.3).
+    """
+    predicate_terms = []
+    if gate_exec_warp:
+        predicate_terms.append(exec_active)
+    if is_two_cta:
+        if cluster_n > 1:
+            predicate_terms.append(_TCGEN05_V_LEADER_PREDICATE)
+        else:
+            predicate_terms.append(_TCGEN05_CLUSTER_LEADER_PREDICATE)
+    if not predicate_terms:
+        return None
+    return " and ".join(predicate_terms)
+
+
+def _tcgen05_emit_optional_gate(src: str, predicate: str | None, *, indent: str) -> str:
+    if predicate is None:
+        return textwrap.indent(src, indent)
+    return f"{indent}if {predicate}:\n{textwrap.indent(src, indent + '    ')}"
+
+
+def _build_kloop_pipeline_producer_if(
+    args: _PerKiterTmaArgs,
+    *,
+    gate_tma_warp: bool = True,
+    load_current_tile: bool = False,
+) -> ast.stmt:
+    """Per-K-iter TMA producer ``if`` for the pipelined branch.
+
+    The pipelined branch is only entered when both A and B are TMA-
+    loaded (``tcgen05_use_tma_pipeline = use_tma_a and use_tma_b``), so
+    both ``cute.copy`` emissions must be present; assert that invariant
+    rather than silently dropping a side.
+
+    Role-local grouped producers load the current tile because their loop
+    starts at tile 0; other producers issue lookahead copies after warmup.
+    """
+    assert args.use_tma_a and args.use_tma_b, (
+        "pipelined branch requires both A and B to be TMA-loaded"
+    )
+    k_offset = (
+        args.tma_k_tile
+        if load_current_tile
+        else f"{args.tma_k_tile} + cutlass.Int32({args.ab_stage_count})"
+    )
+    predicate_terms = []
+    if not args.static_full_tiles:
+        predicate_terms.append(args.tma_full_tile)
+    if gate_tma_warp:
+        predicate_terms.append(args.tma_warp)
+    if not load_current_tile:
+        predicate_terms.append(args.tma_next_full_tile)
+    copy_src = _kloop_tma_copy_a_src(args, k_offset=k_offset) + _kloop_tma_copy_b_src(
+        args, k_offset=k_offset
+    )
+    # CtaGroup.TWO uses CTA-rank-specific TMA partitions, so both CTAs issue
+    # these copies; PipelineTmaUmma gates the full-barrier tx setup internally.
+    predicate = " and ".join(predicate_terms) or "True"
+    src = f"if {predicate}:\n"
+    producer_advance_src = (
+        emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        if not args.skip_producer_advance
+        else ""
+    )
+    if not args.skip_producer_acquire:
+        src += (
+            f"    {args.tma_producer_try_token} = "
+            f"{args.tma_pipeline}.producer_try_acquire({args.tma_producer_state})\n"
+            f"    {args.tma_pipeline}.producer_acquire("
+            f"{args.tma_producer_state}, {args.tma_producer_try_token})\n"
+        )
+    if args.tma_desc_acquire_fence_src is not None:
+        assert load_current_tile, (
+            "dynamic TensorMap acquire fences belong to the grouped "
+            "current-tile producer"
+        )
+        src += textwrap.indent(args.tma_desc_acquire_fence_src, "    ") + "\n"
+    src += (
+        f"    {args.tma_barrier_ptr} = "
+        f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
+        + copy_src
+        + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
+        + producer_advance_src
+    )
+    return statement_from_string(src)
+
+
+def _build_kloop_pipeline_consumer_if(
+    args: _PerKiterTmaArgs,
+    *,
+    gate_exec_warp: bool = True,
+    include_scalar_fallback: bool = True,
+    use_existing_try_token: bool = False,
+    sync_before_scalar_fallback: bool = False,
+) -> ast.stmt:
+    """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
+    if args.static_full_tiles:
+        assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
+        assert not include_scalar_fallback, (
+            "static-full fast path has no scalar fallback branch"
+        )
+        assert not sync_before_scalar_fallback, (
+            "static-full fast path has no scalar fallback presync"
+        )
+    if args.skip_consumer_wait:
+        consumer_src = "pass"
+    else:
+        consumer_src = ""
+        if not use_existing_try_token:
+            consumer_src = (
+                f"{args.tma_consumer_try_token} = "
+                f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
+            )
+        consumer_src += (
+            f"{args.tma_pipeline}.consumer_wait("
+            f"{args.tma_consumer_state}, {args.tma_consumer_try_token})"
+        )
+    full_tile_src = _tcgen05_emit_optional_gate(
+        consumer_src,
+        _tcgen05_two_cta_owner_predicate(
+            args.exec_active,
+            is_two_cta=args.is_two_cta,
+            gate_exec_warp=gate_exec_warp,
+            cluster_n=args.cluster_n,
+        ),
+        indent="" if args.static_full_tiles else "    ",
+    )
+    if args.static_full_tiles:
+        return statement_from_string(full_tile_src)
+    fallback_src = ""
+    if include_scalar_fallback:
+        if args.scalar_smem_sync is not None:
+            fallback_body = args.scalar_smem_sync.copy_src(
+                (args.scalar_load_a, args.scalar_load_b)
+            )
+        else:
+            fallback_body = (
+                ("cute.arch.sync_threads()\n" if sync_before_scalar_fallback else "")
+                + ast.unparse(args.scalar_load_a)
+                + "\n"
+                + ast.unparse(args.scalar_load_b)
+                + "\ncute.arch.sync_threads()"
+            )
+        fallback_src = "\nelse:\n" + textwrap.indent(fallback_body, "    ")
+    src = f"if {args.tma_full_tile}:\n{full_tile_src}{fallback_src}"
+    return statement_from_string(src)
+
+
+def _build_kloop_pipeline_consumer_prefetch_stmts(
+    args: _PerKiterTmaArgs,
+    *,
+    gate_exec_warp: bool = True,
+) -> list[ast.stmt]:
+    """Peek the next AB full barrier after advancing the consumer state."""
+    assert args.is_two_cta, "AB consumer prefetch is validated for CtaGroup.TWO"
+    predicate = args.tma_next_consumer_tile
+    owner_predicate = _tcgen05_two_cta_owner_predicate(
+        args.exec_active,
+        is_two_cta=args.is_two_cta,
+        gate_exec_warp=gate_exec_warp,
+        cluster_n=args.cluster_n,
+    )
+    if owner_predicate is not None:
+        predicate = f"{predicate} and {owner_predicate}"
+    return [
+        statement_from_string(f"{args.tma_consumer_try_token} = cutlass.Boolean(1)"),
+        statement_from_string(
+            f"if {predicate}:\n"
+            f"    {args.tma_consumer_try_token} = "
+            f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})"
+        ),
+    ]
+
+
+def _build_kloop_pipeline_release_if(
+    args: _PerKiterTmaArgs,
+    *,
+    gate_exec_warp: bool = True,
+    include_scalar_fallback: bool = True,
+) -> ast.stmt:
+    """Per-K-iter consumer release ``if`` for the pipelined branch.
+
+    Producer-state advance lives in the producer block (one per
+    commit), so only the consumer-state advance is emitted here. In
+    CtaGroup.TWO the empty-barrier release is leader-owned, matching the
+    PipelineTmaUmma multicast-mask semantics, while both CTA exec warps still
+    advance their local consumer state. Peer CTAs participate via the
+    multicast mask; separate peer arrivals over-count the empty barrier.
+    """
+    if args.static_full_tiles:
+        assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
+        assert not include_scalar_fallback, (
+            "static-full fast path has no scalar fallback branch"
+        )
+    release_src = f"{args.tma_pipeline}.consumer_release({args.tma_consumer_state})"
+    release_gate = _tcgen05_two_cta_owner_predicate(
+        args.exec_active,
+        is_two_cta=args.is_two_cta,
+        gate_exec_warp=gate_exec_warp,
+        cluster_n=args.cluster_n,
+    )
+    advance_src = emit_pipeline_advance(args.tma_consumer_state)
+    indent = "" if args.static_full_tiles else "    "
+    if args.is_two_cta:
+        # With gate_exec_warp=False the caller is already inside the
+        # role-local exec loop, so every iteration can advance local state.
+        advance_gate = args.exec_active if gate_exec_warp else None
+        full_tile_src = (
+            _tcgen05_emit_optional_gate(release_src, release_gate, indent=indent)
+            + "\n"
+            + _tcgen05_emit_optional_gate(advance_src, advance_gate, indent=indent)
+        )
+    else:
+        full_tile_src = _tcgen05_emit_optional_gate(
+            release_src + "\n" + advance_src, release_gate, indent=indent
+        )
+    if args.static_full_tiles:
+        if args.is_two_cta and gate_exec_warp:
+            owner_gate = _tcgen05_two_cta_owner_predicate(
+                args.exec_active,
+                is_two_cta=True,
+                gate_exec_warp=False,
+                cluster_n=args.cluster_n,
+            )
+            assert owner_gate is not None
+            full_tile_src = (
+                f"if {args.exec_active}:\n"
+                f"    if {owner_gate}:\n"
+                f"        {release_src}\n" + textwrap.indent(advance_src, "    ")
+            )
+        return statement_from_string(full_tile_src)
+    fallback_src = (
+        "\nelse:\n    cute.arch.sync_threads()" if include_scalar_fallback else ""
+    )
+    src = f"if {args.tma_full_tile}:\n{full_tile_src}{fallback_src}"
+    return statement_from_string(src)
+
+
+_TCGEN05_RUNTIME_MMA_N_GRANULARITY = 16
+# The instruction descriptor stores N in bits [17:23) with its three low bits
+# omitted. Build the static portion with N=0, then insert the runtime field.
+_TCGEN05_INSTR_DESC_N_LOW_BITS = 3
+_TCGEN05_INSTR_DESC_N_FIELD_SHIFT = 17
+
+
+def _tcgen05_runtime_mma_n_expr(valid_m: str, static_mma_n: int) -> str:
+    """Round a worklist tail, mapping zero-valid padding tiles to UMMA-N=16."""
+    assert static_mma_n in TCGEN05_GROUPED_WORKLIST_MMA_N_CHOICES
+    granularity = _TCGEN05_RUNTIME_MMA_N_GRANULARITY
+    # Every scheduler clamps valid_m to static_mma_n, and each admitted static
+    # width is a granularity multiple, so the rounded value cannot exceed it.
+    return (
+        f"((max({valid_m}, cutlass.Int32(1)) + cutlass.Int32({granularity - 1})) "
+        f"// cutlass.Int32({granularity})) * cutlass.Int32({granularity})"
+    )
+
+
+def _build_tcgen05_mma_accumulate_reset_stmt(
+    exec_active: str,
+    *,
+    tiled_mma: str,
+    input_dtype_str: str,
+    acc_dtype_str: str,
+    gate_exec_warp: bool = True,
+    is_two_cta: bool = False,
+    cluster_n: int = 1,
+    runtime_mma_n: str | None = None,
+    runtime_instr_desc: str | None = None,
+    valid_m: str | None = None,
+    static_mma_m: int | None = None,
+    static_mma_n: int | None = None,
+    a_k_major: bool = True,
+    b_k_major: bool = False,
+) -> list[ast.stmt]:
+    runtime_args = (
+        runtime_mma_n,
+        runtime_instr_desc,
+        valid_m,
+        static_mma_m,
+        static_mma_n,
+    )
+    assert all(arg is None for arg in runtime_args) or all(
+        arg is not None for arg in runtime_args
+    )
+    setup_stmts: list[ast.stmt] = []
+    if runtime_mma_n is not None:
+        assert runtime_instr_desc is not None
+        assert valid_m is not None
+        assert static_mma_m is not None and static_mma_m in (128, 256)
+        assert static_mma_n is not None
+        assert static_mma_n in TCGEN05_GROUPED_WORKLIST_MMA_N_CHOICES
+        a_major = 0 if a_k_major else 1
+        b_major = 0 if b_k_major else 1
+        # A legal over-aligned worklist may schedule a trailing tile with
+        # valid_m=0. Its output is fully masked; clamp the instruction width to
+        # UMMA-N=16 so descriptor encoding never sees invalid N=0. SMEM/TMEM
+        # layouts remain at their static maximum; only bits [17:23) (N >> 3) of
+        # the instruction descriptor vary for a tail work tile.
+        setup_stmts.extend(
+            (
+                statement_from_string(
+                    f"{runtime_mma_n} = cutlass.Int32({static_mma_n})"
+                ),
+                statement_from_string(f"{runtime_instr_desc} = cutlass.Int32(0)"),
+                statement_from_string(
+                    f"if {valid_m} <= cutlass.Int32("
+                    f"{static_mma_n - _TCGEN05_RUNTIME_MMA_N_GRANULARITY}):\n"
+                    f"    {runtime_mma_n} = "
+                    f"{_tcgen05_runtime_mma_n_expr(valid_m, static_mma_n)}\n"
+                    f"    {runtime_instr_desc} = (cutlass.Int32("
+                    "cutlass.experimental.primitives.Tcgen05InstrDesc.build("
+                    f"c_dtype={acc_dtype_str}, a_dtype={input_dtype_str}, "
+                    f"b_dtype={input_dtype_str}, a_major={a_major}, "
+                    f"b_major={b_major}, n_dim=0, m_dim={static_mma_m})) | "
+                    f"(({runtime_mma_n} >> "
+                    f"cutlass.Int32({_TCGEN05_INSTR_DESC_N_LOW_BITS})) << "
+                    f"cutlass.Int32({_TCGEN05_INSTR_DESC_N_FIELD_SHIFT})))"
+                ),
+            )
+        )
+    reset_src = f"{tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)"
+    predicate = _tcgen05_two_cta_owner_predicate(
+        exec_active,
+        is_two_cta=is_two_cta,
+        gate_exec_warp=gate_exec_warp,
+        cluster_n=cluster_n,
+    )
+    if predicate is None:
+        reset_stmt = statement_from_string(reset_src)
+    else:
+        reset_stmt = statement_from_string(f"if {predicate}:\n    {reset_src}")
+    setup_stmts.append(reset_stmt)
+    return setup_stmts
+
+
+def _build_tcgen05_mma_issue_stmt(
+    *,
+    exec_active: str,
+    tiled_mma: str,
+    acc_frag: str,
+    tcgen05_frag_a: str,
+    tcgen05_frag_b: str,
+    mma_stage: str,
+    input_dtype_str: str,
+    acc_dtype_str: str,
+    gate_exec_warp: bool = True,
+    is_two_cta: bool = False,
+    cluster_n: int = 1,
+    runtime_mma_n: str | None = None,
+    runtime_instr_desc: str | None = None,
+    static_mma_n: int | None = None,
+) -> ast.stmt:
+    runtime_args = (runtime_mma_n, runtime_instr_desc, static_mma_n)
+    assert all(arg is None for arg in runtime_args) or all(
+        arg is not None for arg in runtime_args
+    )
+    full_issue_src = (
+        f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
+        f"    cute.gemm(\n"
+        f"        {tiled_mma},\n"
+        f"        {acc_frag},\n"
+        f"        [{tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
+        f"        [{tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
+        f"        {acc_frag},\n"
+        "    )\n"
+        f"    {tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)"
+    )
+    issue_src = full_issue_src
+    if runtime_mma_n is not None:
+        assert runtime_instr_desc is not None
+        assert static_mma_n in TCGEN05_GROUPED_WORKLIST_MMA_N_CHOICES
+        if not tcgen05_runtime_n_ptx_compatible():
+            raise exc.BackendUnsupported(
+                "cute",
+                "runtime UMMA-N raw PTX requires exactly "
+                "nvidia-cutlass-dsl=="
+                f"{CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION}; revalidate the "
+                "PTX before enabling it for another CuTe DSL release",
+            )
+        if (input_dtype_str, acc_dtype_str) != (
+            "cutlass.BFloat16",
+            "cutlass.Float32",
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "runtime UMMA-N raw PTX is validated only for BF16/FP32 under the "
+                f"CuTe {CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION} "
+                "compatibility contract",
+            )
+        # This fallback is covered by the central validated CuTe compatibility
+        # generation in ``cutedsl_compat``. Updating that contract explicitly
+        # requires revalidating this PTX because the typed ``tcgen05_mma`` wrapper
+        # currently lowers this runtime-N form to rejected sm_100a IR.
+        # Descriptor construction and operands still use public typed helpers.
+        tail_issue_src = (
+            f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
+            f"    _tcgen05_frag_a_slice = "
+            f"{tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]\n"
+            f"    _tcgen05_frag_b_slice = "
+            f"{tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]\n"
+            "    _tcgen05_smem_desc_a = "
+            "cute.nvgpu.tcgen05.smem_descriptor_to_int("
+            "_tcgen05_frag_a_slice.iterator)\n"
+            "    _tcgen05_smem_desc_b = "
+            "cute.nvgpu.tcgen05.smem_descriptor_to_int("
+            "_tcgen05_frag_b_slice.iterator)\n"
+            "    with cute.arch.elect_one():\n"
+            "        cutlass.experimental.primitives.inline_ptx(\n"
+            '            "{\\n\\t.reg .pred accumulate;\\n\\t"\n'
+            '            "setp.ne.b32 accumulate, {$r4}, 0;\\n\\t"\n'
+            '            "tcgen05.mma.cta_group::'
+            f'{2 if is_two_cta else 1}.kind::f16 "\n'
+            '            "[{$r0}], {$r1}, {$r2}, {$r3}, accumulate;\\n}",\n'
+            "            read_only_args=[\n"
+            f"                cutlass.Int32({acc_frag}.iterator.toint()),\n"
+            "                cutlass.Int64(_tcgen05_smem_desc_a),\n"
+            "                cutlass.Int64(_tcgen05_smem_desc_b),\n"
+            f"                cutlass.Int32({runtime_instr_desc}),\n"
+            "                cutlass.Int32(\n"
+            f"                    {tiled_mma}.get(\n"
+            "                        cute.nvgpu.tcgen05.Field.ACCUMULATE\n"
+            "                    )\n"
+            "                ),\n"
+            "            ],\n"
+            "        )\n"
+            f"    {tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)"
+        )
+        issue_src = (
+            f"if {runtime_mma_n} == cutlass.Int32({static_mma_n}):\n"
+            f"{textwrap.indent(full_issue_src, '    ')}\n"
+            "else:\n"
+            f"{textwrap.indent(tail_issue_src, '    ')}"
+        )
+    predicate = _tcgen05_two_cta_owner_predicate(
+        exec_active,
+        is_two_cta=is_two_cta,
+        gate_exec_warp=gate_exec_warp,
+        cluster_n=cluster_n,
+    )
+    if predicate is not None:
+        issue_src = f"if {predicate}:\n{textwrap.indent(issue_src, '    ')}"
+    return statement_from_string(issue_src)
+
+
+def _build_kloop_non_pipeline_producer_if(
+    args: _PerKiterTmaArgs, *, gate_tma_warp: bool = True
+) -> ast.stmt:
+    """Per-K-iter TMA producer ``if`` for the non-pipelined branch.
+
+    Single AB stage alive at a time: no try-token, no stage-count
+    offset on the cute.copy, and no ``advance`` here (the release block
+    advances both producer and consumer state).
+    """
+    assert not args.static_full_tiles, (
+        "static-full fast path is only valid for pipelined all-TMA K loops"
+    )
+    predicate_terms = [args.tma_full_tile]
+    if gate_tma_warp:
+        predicate_terms.append(args.tma_warp)
+    copy_src = _kloop_tma_copy_a_src(
+        args, k_offset=args.tma_k_tile
+    ) + _kloop_tma_copy_b_src(args, k_offset=args.tma_k_tile)
+    src = f"if {' and '.join(predicate_terms)}:\n"
+    if not args.skip_producer_acquire:
+        src += f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+    src += (
+        f"    {args.tma_barrier_ptr} = "
+        f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
+        + copy_src
+        + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})"
+    )
+    return statement_from_string(src)
+
+
+def _build_kloop_non_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
+    """Per-K-iter consumer / scalar-fallback ``if`` for the non-pipelined branch.
+
+    Interleaves scalar fallback loads for any operand NOT TMA-loaded
+    into the full-tile branch (e.g. A-TMA + B-scalar still loads B
+    here on full tiles).
+    """
+    assert not args.static_full_tiles, (
+        "static-full fast path is only valid for pipelined all-TMA K loops"
+    )
+    scalar_load_a_src = ast.unparse(args.scalar_load_a)
+    scalar_load_b_src = ast.unparse(args.scalar_load_b)
+    scalar_load_a_tma_src = scalar_load_a_src + "\n" if not args.use_tma_a else ""
+    scalar_load_b_tma_src = scalar_load_b_src + "\n" if not args.use_tma_b else ""
+    scalar_tma_src = scalar_load_a_tma_src + scalar_load_b_tma_src
+    if args.scalar_smem_sync is not None and scalar_tma_src:
+        scalar_tma_src = (
+            args.scalar_smem_sync.copy_src(
+                tuple(
+                    load
+                    for use_tma, load in (
+                        (args.use_tma_a, args.scalar_load_a),
+                        (args.use_tma_b, args.scalar_load_b),
+                    )
+                    if not use_tma
+                )
+            )
+            + "\n"
+        )
+    # The try token is only pre-initialised on the pipelined branch, so this
+    # builder must bind it itself (mirroring the pipelined consumer) or the
+    # generated kernel hits a NameError on consumer_wait.
+    full_body = (
+        f"{scalar_tma_src}"
+        f"if {args.exec_active}:\n"
+        "    cute.arch.sync_warp()\n"
+        + (
+            "    pass\n"
+            if args.skip_consumer_wait
+            else (
+                f"    {args.tma_consumer_try_token} = "
+                f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
+                f"    {args.tma_pipeline}.consumer_wait("
+                f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
+            )
+        )
+        + "cute.arch.sync_threads()"
+    )
+    fallback_body = (
+        args.scalar_smem_sync.copy_src((args.scalar_load_a, args.scalar_load_b))
+        if args.scalar_smem_sync is not None
+        else f"{scalar_load_a_src}\n{scalar_load_b_src}\ncute.arch.sync_threads()"
+    )
+    src = (
+        f"if {args.tma_full_tile}:\n"
+        f"{textwrap.indent(full_body, '    ')}\n"
+        "else:\n"
+        f"{textwrap.indent(fallback_body, '    ')}"
+    )
+    return statement_from_string(src)
+
+
+def _build_kloop_non_pipeline_release_if(args: _PerKiterTmaArgs) -> ast.stmt:
+    """Per-K-iter consumer release ``if`` for the non-pipelined branch.
+
+    CTA-wide ``sync_threads()`` runs first so every warp sees the
+    consumer wait completed; single-stage means both producer and
+    consumer state normally advance here. The producer advance is omitted
+    only when config explicitly requests skipping that edge.
+    """
+    assert not args.static_full_tiles, (
+        "static-full fast path is only valid for pipelined all-TMA K loops"
+    )
+    producer_advance_src = (
+        emit_pipeline_advance(args.tma_producer_state, indent="") + "\n"
+        if not args.skip_producer_advance
+        else ""
+    )
+    full_body = (
+        "cute.arch.sync_threads()\n"
+        f"if {args.exec_active}:\n"
+        "    cute.arch.sync_warp()\n"
+        f"    {args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
+        + producer_advance_src
+        + emit_pipeline_advance(args.tma_consumer_state, indent="")
+    )
+    src = (
+        f"if {args.tma_full_tile}:\n"
+        f"{textwrap.indent(full_body, '    ')}\n"
+        "else:\n"
+        "    cute.arch.sync_threads()"
+    )
+    return statement_from_string(src)
+
+
+@dataclass(frozen=True)
+class _InitialPrefetchTmaArgs:
+    """Variable names threaded into the initial-prefetch TMA builder.
+
+    The initial prefetch warms stages ``0..ab_stage_count-1`` of the AB
+    pipeline at the start of each tile. Only valid on the tcgen05 TMA
+    path, which requires both A and B to be TMA-loaded, so both
+    ``cute.copy`` emissions are always present.
+
+    All ``str`` fields name a Python identifier or expression in the
+    generated code; every name is guaranteed bound at the call site.
+    """
+
+    tma_pipeline: str
+    tma_producer_state: str
+    tma_barrier_ptr: str
+    tma_warp: str
+    tma_atom_a: str
+    tma_atom_b: str
+    tma_gA: str
+    tma_gB: str
+    tma_sA: str
+    tma_sB: str
+    tma_a_mcast_mask: str
+    tma_b_mcast_mask: str
+    is_two_cta: bool
+    use_tma_b_mcast_mask: bool
+    skip_producer_acquire: bool
+    skip_producer_advance: bool
+    tma_desc_ptr_a: str | None = None
+    tma_desc_ptr_b: str | None = None
+    # M-paired tiles: second A staging buffer's (gmem, smem) TMA partitions.
+    tma_gA2: str = ""
+    tma_sA2: str = ""
+    a_producer_predicate: str | None = None
+
+
+def _initial_prefetch_copy_a_src(
+    args: _InitialPrefetchTmaArgs, *, k_offset: str
+) -> str:
+    """Initial-prefetch TMA copy source for A.
+
+    A only multicasts in 2-CTA mode (asymmetric vs. B, which can also
+    multicast across cluster CTAs); matches the asymmetry pinned by
+    ``test_mcast_mask_asymmetry_between_a_and_b`` for the per-K-iter
+    builders. With M-paired tiles a second copy fills the paired subtile's
+    A buffer (same barrier / transaction).
+    """
+    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
+    desc = f", tma_desc_ptr={args.tma_desc_ptr_a}" if args.tma_desc_ptr_a else ""
+    src = (
+        f"    cute.copy({args.tma_atom_a}, "
+        f"{args.tma_gA}[None, {k_offset}], "
+        f"{args.tma_sA}[None, {args.tma_producer_state}.index], "
+        f"tma_bar_ptr={args.tma_barrier_ptr}{mcast}{desc})\n"
+    )
+    if args.tma_gA2:
+        src += (
+            f"    cute.copy({args.tma_atom_a}, "
+            f"{args.tma_gA2}[None, {k_offset}], "
+            f"{args.tma_sA2}[None, {args.tma_producer_state}.index], "
+            f"tma_bar_ptr={args.tma_barrier_ptr}{mcast}{desc})\n"
+        )
+    if args.a_producer_predicate is not None:
+        src = f"    if {args.a_producer_predicate}:\n" + textwrap.indent(src, "    ")
+    return src
+
+
+def _initial_prefetch_copy_b_src(
+    args: _InitialPrefetchTmaArgs, *, k_offset: str
+) -> str:
+    """Initial-prefetch TMA copy source for B.
+
+    Callers pass a mask whenever the B TMA atom is multicast. The guarded
+    clustered CtaGroup.ONE bridge uses a self-only mask so each CTA duplicates
+    local-B loads while satisfying CuTe's multicast-atom contract.
+    """
+    mcast = f", mcast_mask={args.tma_b_mcast_mask}" if args.use_tma_b_mcast_mask else ""
+    desc = f", tma_desc_ptr={args.tma_desc_ptr_b}" if args.tma_desc_ptr_b else ""
+    return (
+        f"    cute.copy({args.tma_atom_b}, "
+        f"{args.tma_gB}[None, {k_offset}], "
+        f"{args.tma_sB}[None, {args.tma_producer_state}.index], "
+        f"tma_bar_ptr={args.tma_barrier_ptr}{mcast}{desc})\n"
+    )
+
+
+def _initial_producer_acquire_src(
+    args: _InitialPrefetchTmaArgs, *, fresh_ring: bool
+) -> str:
+    """``producer_acquire`` line of an initial-prefill stage.
+
+    See ``_build_initial_prefetch_if`` for the fresh-ring token.
+    """
+    token = ", True" if fresh_ring else ""
+    return (
+        f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state}{token})\n"
+    )
+
+
+def _build_initial_prefetch_if(
+    args: _InitialPrefetchTmaArgs,
+    *,
+    full_tile_gates: list[str],
+    k_offset: str,
+    skip_producer_acquire: bool | None = None,
+    gate_tma_warp: bool = True,
+    fresh_ring: bool = False,
+) -> ast.stmt:
+    """Initial-prefetch ``if`` block for stage ``k_offset``.
+
+    The predicate is ``<full_tile_gates joined with ' and '>`` plus
+    ``{args.tma_warp}`` when ``gate_tma_warp`` is true: stage-0 callers pass
+    ``[tma_initial_full_tile]``; stage-(N-1) callers (only when
+    ``ab_stage_count > 1``) extend with ``tma_initial_next_full_tile``. The body
+    performs optional ``producer_acquire``, then ``get_barrier / copy A / copy B
+    / producer_commit`` and optional producer-state ``advance``. Optional edges
+    are omitted only when config explicitly requests skipping them. Caller
+    passes a literal ``cutlass.Int32(stage_idx)`` for ``k_offset``.
+
+    ``fresh_ring`` marks the once-per-launch prefill of a pipeline nobody has
+    consumed from yet (one tile per CTA, ``one_shot_role_scheduler``): the
+    producer start state's phase makes the empty-barrier wait of every one of
+    its first ``num_stages`` acquires pass by construction, so the acquire
+    takes ``True`` as its try-acquire token and skips the ``try_wait`` round
+    trip while still arming the full barrier (``arrive_and_expect_tx``). A
+    multi-tile persistent kernel re-runs this prefill per tile on a ring the
+    previous tile's MMA is still releasing, so its acquires keep the wait
+    (skipping it there arms a barrier still in flight and the launch fails).
+    The round trip sat on the TMA warp's serial issue path: with it the bmm
+    8x256x256x512 one-CTA kernel issued its four stages 170 ns apart, without
+    it 107 ns (%globaltimer probes; the last stage landed 176 ns earlier, the
+    fp8 1024^3 one-CTA kernel's eighth stage 384 ns earlier).
+    """
+    predicate_terms = [*full_tile_gates]
+    if gate_tma_warp:
+        predicate_terms.append(args.tma_warp)
+    predicate = " and ".join(predicate_terms)
+    if skip_producer_acquire is None:
+        skip_producer_acquire = args.skip_producer_acquire
+    producer_advance_src = (
+        emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        if not args.skip_producer_advance
+        else ""
+    )
+    copy_src = _initial_prefetch_copy_a_src(
+        args, k_offset=k_offset
+    ) + _initial_prefetch_copy_b_src(args, k_offset=k_offset)
+    src = f"if {predicate}:\n"
+    if not skip_producer_acquire:
+        src += _initial_producer_acquire_src(args, fresh_ring=fresh_ring)
+    src += (
+        f"    {args.tma_barrier_ptr} = "
+        f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
+        + copy_src
+        + f"    {args.tma_pipeline}.producer_commit({args.tma_producer_state})\n"
+        + producer_advance_src
+    )
+    return statement_from_string(src)
+
+
+def _build_split_initial_prefetch(
+    args: _InitialPrefetchTmaArgs,
+    *,
+    stages: list[tuple[list[str], str, bool]],
+    dependent_side: str,
+    clone_state: str,
+    clone_barrier: str,
+    gate_tma_warp: bool,
+    fresh_ring: bool = False,
+) -> list[ast.stmt]:
+    """Initial prefetch split around a programmatic dependency wait.
+
+    A materialized operand is produced by the kernel launched just ahead of
+    this one; the other operand is an ordinary input. Every stage's
+    ``producer_acquire`` arms its transaction barrier for both operands, so
+    the independent operand's TMA loads can be issued for all initial stages
+    first, then the TMA warp waits on the producer grid, then the dependent
+    operand's loads complete the same barriers. ``producer_commit`` is a no-op
+    for TMA pipelines (the transaction bytes complete the phase), so the
+    barriers can be re-derived from a cloned producer state. Each entry of
+    ``stages`` is ``(full_tile_gates, k_offset, skip_producer_acquire)``.
+    """
+    if dependent_side == "rhs":
+        independent_src, dependent_src = (
+            _initial_prefetch_copy_a_src,
+            _initial_prefetch_copy_b_src,
+        )
+    else:
+        independent_src, dependent_src = (
+            _initial_prefetch_copy_b_src,
+            _initial_prefetch_copy_a_src,
+        )
+
+    def predicate(gates: list[str]) -> str:
+        return " and ".join([*gates, *([args.tma_warp] if gate_tma_warp else [])])
+
+    statements = [
+        statement_from_string(f"{clone_state} = {args.tma_producer_state}.clone()")
+    ]
+    for gates, k_offset, skip_producer_acquire in stages:
+        src = f"if {predicate(gates)}:\n"
+        if not skip_producer_acquire:
+            src += _initial_producer_acquire_src(args, fresh_ring=fresh_ring)
+        src += (
+            f"    {args.tma_barrier_ptr} = "
+            f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
+            + independent_src(args, k_offset=k_offset)
+            + emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        )
+        statements.append(statement_from_string(src))
+    wait = "cute.arch.griddepcontrol_wait()"
+    statements.append(
+        statement_from_string(
+            f"if {args.tma_warp}:\n    {wait}" if gate_tma_warp else wait
+        )
+    )
+    dependent_args = replace(
+        args, tma_producer_state=clone_state, tma_barrier_ptr=clone_barrier
+    )
+    for gates, k_offset, _ in stages:
+        src = (
+            f"if {predicate(gates)}:\n"
+            f"    {clone_barrier} = "
+            f"{args.tma_pipeline}.producer_get_barrier({clone_state})\n"
+            + dependent_src(dependent_args, k_offset=k_offset)
+            + emit_pipeline_advance(clone_state, indent="    ")
+        )
+        statements.append(statement_from_string(src))
+    return statements
+
+
+def _is_persistent_pid_config(config: Mapping[str, object]) -> bool:
+    pid_type = config.get("pid_type", "flat")
+    return isinstance(pid_type, str) and pid_type.startswith("persistent")
+
+
+def _clone_k_loop_with_body(
+    device_loop: DeviceLoopState,
+    body: list[ast.stmt],
+    *,
+    iter_expr: ast.expr | None = None,
+) -> ast.For:
+    """Clone the active K-loop header with a replacement body."""
+    # Do not reuse the original target / iter AST nodes: the original loop
+    # remains the shared consumer loop, while this clone becomes the
+    # TMA-load producer loop. Round-tripping the simple generated
+    # ``for offset_k in range(...)`` header avoids shared mutable AST nodes.
+    parsed_loop = ast.parse(
+        f"for {ast.unparse(device_loop.for_node.target)} in ():\n    pass"
+    ).body[0]
+    assert isinstance(parsed_loop, ast.For)
+    if iter_expr is None:
+        iter_expr = cast(
+            "ast.expr", expr_from_string(ast.unparse(device_loop.for_node.iter))
+        )
+    return ast.copy_location(
+        ast.For(
+            target=parsed_loop.target,
+            iter=iter_expr,
+            body=body,
+            orelse=[],
+            type_comment=device_loop.for_node.type_comment,
+        ),
+        device_loop.for_node,
+    )
+
+
+def _tcgen05_k_loop_nounroll_iter_expr(device_loop: DeviceLoopState) -> ast.expr:
+    """Preserve the active K-loop bounds while adding CuTe no-unroll metadata."""
+    iter_expr = cast(
+        "ast.expr", expr_from_string(ast.unparse(device_loop.for_node.iter))
+    )
+    assert isinstance(iter_expr, ast.Call)
+    assert isinstance(iter_expr.func, ast.Name)
+    assert iter_expr.func.id == "range"
+    assert not any(
+        keyword.arg in ("unroll", "unroll_full") for keyword in iter_expr.keywords
+    )
+    iter_expr.func = cast("ast.expr", expr_from_string("cutlass.range"))
+    iter_expr.keywords.append(ast.keyword(arg="unroll", value=ast.Constant(value=1)))
+    return iter_expr
+
+
+def _tcgen05_grouped_k_loop_iter_expr(*, problem_k: str, bk: int) -> ast.expr:
+    return cast(
+        "ast.expr",
+        expr_from_string(
+            f"cutlass.range(cutlass.Int32(0), {problem_k}, "
+            f"cutlass.Int32({bk}), unroll=1)"
+        ),
+    )
+
+
+def _wrap_stmt_in_if(stmt: ast.stmt, predicate_src: str) -> ast.If:
+    return ast.copy_location(
+        ast.If(
+            test=cast("ast.expr", expr_from_string(predicate_src)),
+            body=[stmt],
+            orelse=[],
+        ),
+        stmt,
+    )
+
+
+def _trace_mma_to_stores(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> tuple[Node, ...] | None:
+    """Forward-trace ``mma_node`` to all reachable supported stores."""
+    import operator
+
+    from ...language import _tracing_ops
+    from ...language import memory_ops
+
+    graph_id_of: dict[torch.fx.Graph, int] = {}
+    for_loop_calls_by_graph_id: dict[int, list[Node]] = {}
+    for graph_info in graphs:
+        graph_id_of[graph_info.graph] = graph_info.graph_id
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if not _tracing_ops.is_for_loop_target(node.target):
+                continue
+            graph_id_arg = node.args[0] if node.args else None
+            if not isinstance(graph_id_arg, int):
+                continue
+            for_loop_calls_by_graph_id.setdefault(graph_id_arg, []).append(node)
+
+    if mma_node.graph not in graph_id_of:
+        return None
+
+    stores: set[Node] = set()
+    visited: set[Node] = set()
+    stack: list[Node] = [mma_node]
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        for user in cur.users:
+            if user.op == "output":
+                graph_id = graph_id_of.get(cur.graph)
+                if graph_id is None:
+                    return None
+                output_args = user.args[0] if user.args else None
+                if not isinstance(output_args, (list, tuple)):
+                    return None
+                output_args_seq = cast("list[object] | tuple[object, ...]", output_args)
+                out_indices = [i for i, arg in enumerate(output_args_seq) if arg is cur]
+                if not out_indices:
+                    return None
+                for outer_call in for_loop_calls_by_graph_id.get(graph_id, []):
+                    for outer_user in outer_call.users:
+                        if (
+                            outer_user.op == "call_function"
+                            and outer_user.target is operator.getitem
+                            and len(outer_user.args) >= 2
+                            and outer_user.args[1] in out_indices
+                            and outer_user not in visited
+                        ):
+                            stack.append(outer_user)
+                continue
+            if user.op != "call_function":
+                continue
+            target = user.target
+            if target is memory_ops.store:
+                stores.add(user)
+                continue
+            if (
+                target is _tracing_ops._phi
+                or target is _tracing_ops._new_var
+                or target is operator.getitem
+                or target in _TRACE_THROUGH_TARGETS
+                or target in _DTYPE_TRACE_EXTRA_TARGETS
+            ):
+                stack.append(user)
+                continue
+            return None
+
+    return tuple(stores) if stores else None
+
+
+def _trace_mma_to_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Forward-trace ``mma_node`` to a unique reachable store dtype."""
+    stores = _trace_mma_to_stores(mma_node, graphs)
+    if stores is None:
+        return None
+    discovered: set[torch.dtype] = set()
+    for store in stores:
+        tensor_node = store.args[0] if store.args else None
+        if not isinstance(tensor_node, Node):
+            return None
+        fake = tensor_node.meta.get("val")
+        if not isinstance(fake, torch.Tensor):
+            return None
+        discovered.add(fake.dtype)
+    return next(iter(discovered)) if len(discovered) == 1 else None
+
+
+def _analyze_packed_split_mma_output_store(
+    mma_node: Node,
+    analysis: _MmaOperandAnalysis,
+    worklist_store: _Rank3RhsWorklistStoreInfo,
+    *,
+    graphs: list[GraphInfo],
+) -> _MmaOutputStoreAnalysis | None:
+    """Validate the compact rank-2 identity store for early tcgen05 search."""
+    from ..compile_environment import CompileEnvironment
+
+    store = worklist_store.store_node
+    tensor_node = store.args[0] if store.args else None
+    tensor_fake = tensor_node.meta.get("val") if isinstance(tensor_node, Node) else None
+    subscripts = store.args[1] if len(store.args) > 1 else None
+    if (
+        not isinstance(tensor_fake, torch.Tensor)
+        or tensor_fake.ndim != 2
+        or tensor_fake.dtype != analysis.lhs.source_fake.dtype
+        or not isinstance(subscripts, list | tuple)
+        or len(subscripts) != 2
+        or not isinstance(subscripts[1], Node)
+    ):
+        return None
+    env = CompileEnvironment.current()
+    store_n_block_id = _rank3_rhs_exact_index_block_id(subscripts[1], reduction=False)
+    if (
+        store_n_block_id is None
+        or env.canonical_block_id(store_n_block_id)
+        != env.canonical_block_id(analysis.n_block_id)
+        or not env.known_equal(tensor_fake.shape[0], analysis.lhs.source_fake.shape[0])
+        or not env.known_equal(tensor_fake.shape[1], analysis.rhs.matrix_cols)
+    ):
+        return None
+    analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+    if (
+        analyzed_stores is None
+        or len(analyzed_stores) != 1
+        or analyzed_stores[0][0] is not store
+        or analyzed_stores[0][1].steps
+    ):
+        return None
+    return _MmaOutputStoreAnalysis(
+        explicit_epi_tile_compatible=True,
+        output_column_major=_tcgen05_tma_matrix_major(tensor_fake) == "col",
+    )
+
+
+def _analyze_mma_output_stores(
+    mma_node: Node,
+    analysis: _MmaOperandAnalysis,
+    *,
+    graphs: list[GraphInfo],
+) -> _MmaOutputStoreAnalysis | None:
+    from ..compile_environment import CompileEnvironment
+
+    analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+    if analyzed_stores is None:
+        if analyze_tcgen05_fragment_epilogue_candidate(
+            graphs,
+            mma_node,
+            expected_output_block_ids=analysis.output_block_ids,
+        ):
+            return _MmaOutputStoreAnalysis(
+                explicit_epi_tile_compatible=False,
+                output_column_major=False,
+                requires_fragment_epilogue=True,
+            )
+        return None
+    env = CompileEnvironment.current()
+    explicit_epi_tile_compatible = True
+    output_column_major: bool | None = None
+    for store, chain in analyzed_stores:
+        tensor_node = store.args[0] if store.args else None
+        tensor_fake = (
+            tensor_node.meta.get("val") if isinstance(tensor_node, Node) else None
+        )
+        if (
+            not isinstance(tensor_fake, torch.Tensor)
+            or tensor_fake.dtype not in _MMA_SUPPORTED_DTYPES
+        ):
+            return None
+        subscripts = store.args[1] if len(store.args) > 1 else None
+        if not isinstance(subscripts, (list, tuple)):
+            return None
+        if exact_tile_block_ids(env, subscripts) != analysis.output_block_ids:
+            return None
+        if len(store.args) > 3 and store.args[3] is not None:
+            return None
+        explicit_epi_tile_compatible &= (
+            tensor_fake.dtype == analysis.lhs.source_fake.dtype
+            and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_loads)
+        )
+        store_major = _tcgen05_tma_matrix_major(tensor_fake)
+        if store_major is None:
+            return None
+        store_column_major = store_major == "col"
+        if output_column_major is None:
+            output_column_major = store_column_major
+        elif output_column_major != store_column_major:
+            return None
+    return _MmaOutputStoreAnalysis(
+        explicit_epi_tile_compatible=explicit_epi_tile_compatible,
+        output_column_major=bool(output_column_major),
+    )
+
+
+def _tcgen05_fp32_lowering_blocked(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    lhs_operand: _MmaOperandInfo,
+    rhs_operand: _MmaOperandInfo,
+    config: object,
+) -> bool:
+    """Whether an fp32 (tf32) matmul must keep the exact universal lowering.
+
+    fp32 reaches tcgen05 only through the TMA AB pipeline (the descriptors
+    recast Float32 -> TFloat32 via ``internal_type``; the SIMT-staged AB path
+    has no such recast), only when every consuming store chain is on the
+    fused-epilogue splice whitelist (the tcgen05 grid does not bind the
+    per-block-id index/mask vars the SIMT store fallback needs, so a rejected
+    chain is otherwise a hard ``BackendUnsupported``), and only when the config
+    does not request ``epilogue_subtile`` (the splice emits exactly one store
+    per output tile). Everything blocked here keeps the exact universal (SIMT)
+    lowering fp32 matmuls used before the tf32 path existed; 16-bit/fp8 keep
+    their historical loud-failure behavior.
+
+    Called by both ``prepare_cute_collective_lane_loop_suppression`` and
+    ``_emit_mma_pipeline`` — the two must agree, otherwise suppression would
+    drop the index/mask definitions the universal fallback needs (see the
+    mirror-bailout comment in the suppression planner).
+    """
+    if not (
+        lhs_operand.matrix_major == "row" and rhs_operand.matrix_major in ("row", "col")
+    ):
+        return True
+    # Batched (leading-passthrough) and grouped/worklist/rank-3 forms are
+    # validated 16-bit/fp8 families only.
+    if (
+        lhs_operand.is_leading_passthrough
+        or rhs_operand.is_leading_passthrough
+        or rhs_operand.rhs_rank3_grouped_nt
+        or rhs_operand.rhs_segment_group is not None
+        or rhs_operand.rhs_packed_group is not None
+        or _tcgen05_grouped_mode(cast("_ConfigLike", config)) is not None
+    ):
+        return True
+    subtile = cast("_ConfigLike", config).get("epilogue_subtile")
+    if subtile is not None and (isinstance(subtile, bool) or subtile != 1):
+        return True
+    return analyze_tcgen05_matmul_store_chains(cg.codegen_graphs, node) is None
+
+
+def _rank3_rhs_worklist_store_info(
+    cg: GenerateAST,
+    mma_node: Node,
+    worklist_lhs_info: _Rank3RhsWorklistLhsInfo,
+    segment_group: _Rank3RhsSegmentGroupInfo | None = None,
+    *,
+    n_block_id: int,
+    allow_store_extent_metadata: bool = False,
+) -> _Rank3RhsWorklistStoreInfo | None:
+    import operator
+
+    from ...language import memory_ops
+    from ..compile_environment import CompileEnvironment
+
+    stores = _trace_mma_to_stores(mma_node, cg.codegen_graphs)
+    if stores is None or len(stores) != 1:
+        return None
+    store_node = stores[0]
+    if (
+        store_node.op != "call_function"
+        or store_node.target is not memory_ops.store
+        or len(store_node.args) < 4
+    ):
+        return None
+    index = store_node.args[1]
+    extra_mask = store_node.args[3]
+    if (
+        not isinstance(index, list | tuple)
+        or len(index) != 2
+        or not isinstance(index[0], Node)
+        or not isinstance(index[1], Node)
+        or not isinstance(extra_mask, Node)
+    ):
+        return None
+    env = CompileEnvironment.current()
+    store_n_block_id = _rank3_rhs_exact_index_block_id(index[1], reduction=False)
+    if store_n_block_id is None or env.canonical_block_id(
+        store_n_block_id
+    ) != env.canonical_block_id(n_block_id):
+        return None
+    store_row = _trace_to_outer_graph_arg(cg, index[0])
+    if store_row is not worklist_lhs_info.row_index:
+        return None
+    store_mask = _trace_to_outer_graph_arg(cg, extra_mask)
+    store_valid_m = _rank3_rhs_broadcast_mask_base(store_mask, broadcast_dim=1)
+    if store_valid_m is None:
+        return None
+    store_valid_m = _trace_to_outer_graph_arg(cg, store_valid_m)
+    store_extent_load = worklist_lhs_info.group_m
+    uses_scheduler_store_extent = False
+    if store_valid_m is not worklist_lhs_info.valid_m:
+        if not allow_store_extent_metadata or segment_group is None:
+            return None
+        if (
+            store_valid_m.op != "call_function"
+            or store_valid_m.target not in (operator.lt, torch.ops.aten.lt.Tensor)
+            or len(store_valid_m.args) != 2
+            or not all(isinstance(arg, Node) for arg in store_valid_m.args)
+        ):
+            return None
+        store_lhs, store_rhs = cast("tuple[Node, Node]", store_valid_m.args)
+        if (
+            worklist_lhs_info.valid_m.op != "call_function"
+            or worklist_lhs_info.valid_m.target
+            not in (operator.lt, torch.ops.aten.lt.Tensor)
+            or len(worklist_lhs_info.valid_m.args) != 2
+            or not all(isinstance(arg, Node) for arg in worklist_lhs_info.valid_m.args)
+        ):
+            return None
+        load_lhs, _load_rhs = cast("tuple[Node, Node]", worklist_lhs_info.valid_m.args)
+        if _trace_to_outer_graph_arg(cg, store_lhs) is not _trace_to_outer_graph_arg(
+            cg, load_lhs
+        ):
+            return None
+        loaded_store_extent = _rank3_rhs_segment_metadata_load(
+            cg,
+            store_rhs,
+            column=3,
+            expected_tensor=segment_group.metadata_tensor,
+            expected_segment_id=segment_group.segment_id,
+        )
+        if loaded_store_extent is None:
+            return None
+        _metadata, _segment_id, store_extent_load = loaded_store_extent
+        uses_scheduler_store_extent = True
+    return _Rank3RhsWorklistStoreInfo(
+        store_node=store_node,
+        row_index=store_row,
+        valid_m=store_valid_m,
+        extent_load=store_extent_load,
+        uses_scheduler_store_extent=uses_scheduler_store_extent,
+    )
+
+
+def _rank3_rhs_packed_split_consumers_are_exclusive(
+    cg: GenerateAST,
+    rhs_info: _MmaOperandInfo,
+    lhs_info: _Rank3RhsWorklistLhsInfo,
+    store_info: _Rank3RhsWorklistStoreInfo,
+) -> bool:
+    """Require every replaced packed-split scalar to serve this MMA/store only."""
+    packed_group = rhs_info.rhs_packed_group
+    if packed_group is None or rhs_info.rhs_group_index is None:
+        return False
+    group_index = packed_group.group_index
+    if _trace_to_outer_graph_arg(cg, rhs_info.rhs_group_index) is not group_index:
+        return False
+
+    group_loop_users = {
+        user for user in group_index.users if _is_tracing_for_loop_node(user)
+    }
+    row_loop_users = {
+        user for user in lhs_info.row_index.users if _is_tracing_for_loop_node(user)
+    }
+    valid_loop_users = {
+        user for user in lhs_info.valid_m.users if _is_tracing_for_loop_node(user)
+    }
+    expected_group_loops = (
+        set() if rhs_info.rhs_shared_group_count is not None else row_loop_users
+    )
+    if (
+        len(row_loop_users) != 1
+        or group_loop_users != expected_group_loops
+        or row_loop_users != valid_loop_users
+    ):
+        return False
+    (mma_loop,) = tuple(row_loop_users)
+
+    store_mask = store_info.store_node.args[3]
+    if not isinstance(store_mask, Node):
+        return False
+    store_mask = _trace_to_outer_graph_arg(cg, store_mask)
+    if store_mask is lhs_info.valid_m:
+        valid_store_user = store_info.store_node
+    else:
+        if _rank3_rhs_broadcast_mask_base(
+            store_mask, broadcast_dim=1
+        ) is not lhs_info.valid_m or set(store_mask.users) != {store_info.store_node}:
+            return False
+        valid_store_user = store_mask
+
+    scaffold_nodes = set(lhs_info.dependency_nodes)
+    if not {
+        group_index,
+        lhs_info.group_m,
+        lhs_info.row_start,
+        lhs_info.row_index,
+        lhs_info.valid_m,
+    }.issubset(scaffold_nodes):
+        return False
+    allowed_external_users = {
+        group_index: expected_group_loops,
+        lhs_info.row_index: {mma_loop, store_info.store_node},
+        lhs_info.valid_m: {mma_loop, valid_store_user},
+    }
+    return all(
+        set(node.users) - scaffold_nodes == allowed_external_users.get(node, set())
+        for node in scaffold_nodes
+    )
+
+
+def _requested_tcgen05_grouped_schedule(
+    grouped_mode: str | None,
+) -> Tcgen05Orientation | None:
+    if grouped_mode != TCGEN05_GROUPED_MODE_WORKLIST_NM:
+        return None
+    return Tcgen05Orientation.NM
+
+
+def _tcgen05_full_allocation_b_index_domain(m: int, k: int, tile_m: int) -> bool:
+    """Bound the old signed element offsets and the padded TMA row coordinates."""
+    return (
+        m > 0
+        and k > 0
+        and tile_m > 0
+        and m * k <= (1 << 31) - 1
+        and m + tile_m - 1 <= (1 << 31) - 1
+    )
+
+
+def _emit_tcgen05_device_segments_setup(
+    prefix: list[ast.AST],
+    df: DeviceFunction,
+    grouped: CuteTcgen05GroupedPlan,
+    *,
+    n_size: int,
+    k_size: int,
+    layout_dtype: torch.dtype,
+) -> None:
+    """Materialize clipped source intervals from a compact device layout."""
+    assert grouped.device_split_sizes
+    assert grouped.m_size is not None
+    assert grouped.device_layout_kind in ("split_sizes", "offsets")
+    assert layout_dtype in (torch.int32, torch.int64)
+    layout_int_type = (
+        "cutlass.Int64" if layout_dtype is torch.int64 else "cutlass.Int32"
+    )
+    group_count = int(grouped.count)
+    problem_sizes_ptr = df.new_var("tcgen05_grouped_problem_sizes_smem_ptr")
+    starts_ptr = df.new_var("tcgen05_grouped_starts_smem_ptr")
+    if grouped.device_layout_kind == "offsets":
+        running_start = None
+        raw_split_value = None
+        raw_start = df.new_var("tcgen05_grouped_raw_start")
+        raw_extent = df.new_var("tcgen05_grouped_raw_extent")
+    else:
+        running_start = df.new_var("tcgen05_grouped_running_start")
+        raw_split_value = df.new_var("tcgen05_grouped_raw_split_value")
+        raw_start = None
+        raw_extent = None
+    raw_end = df.new_var("tcgen05_grouped_raw_end")
+    source_end = df.new_var("tcgen05_grouped_source_end")
+    visible_start = df.new_var("tcgen05_grouped_visible_start")
+    visible_end = df.new_var("tcgen05_grouped_visible_end")
+    visible_extent = df.new_var("tcgen05_grouped_visible_extent")
+    prefix.extend(
+        [
+            statement_from_string(
+                f"{problem_sizes_ptr} = cute.arch.alloc_smem("
+                f"cutlass.Int32, {group_count * 4}, alignment=16)"
+            ),
+            statement_from_string(
+                f"{grouped.problem_sizes} = cute.make_tensor("
+                f"{problem_sizes_ptr}, cute.make_layout(({group_count}, 4), "
+                "stride=(4, 1)))"
+            ),
+            statement_from_string(
+                f"{starts_ptr} = cute.arch.alloc_smem("
+                f"cutlass.Int32, {group_count}, alignment=16)"
+            ),
+            statement_from_string(
+                f"{grouped.starts} = cute.make_tensor("
+                f"{starts_ptr}, cute.make_layout(({group_count},), stride=(1,)))"
+            ),
+        ]
+    )
+    setup_lines = [
+        (
+            "if (cute.arch.thread_idx()[0] == 0) and "
+            "(cute.arch.thread_idx()[1] == 0) and "
+            "(cute.arch.thread_idx()[2] == 0):"
+        )
+    ]
+    if grouped.device_layout_kind == "split_sizes":
+        assert running_start is not None
+        setup_lines.append(f"    {running_start} = {layout_int_type}(0)")
+    for group_idx in range(group_count):
+        layout_load = (
+            f"({grouped.layout}.iterator + cutlass.Int64({group_idx}) * "
+            f"cutlass.Int64({grouped.layout}.layout.stride[0])).load()"
+        )
+        if grouped.device_layout_kind == "offsets":
+            assert raw_start is not None and raw_extent is not None
+            next_layout_load = (
+                f"({grouped.layout}.iterator + cutlass.Int64({group_idx + 1}) * "
+                f"cutlass.Int64({grouped.layout}.layout.stride[0])).load()"
+            )
+            setup_lines.extend(
+                [
+                    f"    {raw_start} = {layout_int_type}({layout_load})",
+                    f"    {raw_end} = {layout_int_type}({next_layout_load})",
+                    (
+                        f"    {raw_extent} = max({raw_end} - {raw_start}, "
+                        f"{layout_int_type}(0))"
+                    ),
+                ]
+            )
+            if grouped.clipped_negative_start:
+                setup_lines.extend(
+                    [
+                        (
+                            f"    {visible_start} = min(max({raw_start}, "
+                            f"{layout_int_type}(0)), "
+                            f"{layout_int_type}({grouped.m_size}))"
+                        ),
+                        (
+                            f"    {visible_extent} = min(max({raw_extent} + "
+                            f"min({raw_start}, {layout_int_type}(0)), "
+                            f"{layout_int_type}(0)), "
+                            f"{layout_int_type}({grouped.m_size}) - {visible_start})"
+                        ),
+                    ]
+                )
+            else:
+                setup_lines.extend(
+                    [
+                        (
+                            f"    {source_end} = {raw_start} + min({raw_extent}, "
+                            f"{layout_int_type}({grouped.m_size}))"
+                        ),
+                        (
+                            f"    {visible_start} = min(max({raw_start}, "
+                            f"{layout_int_type}(0)), "
+                            f"{layout_int_type}({grouped.m_size}))"
+                        ),
+                        (
+                            f"    {visible_end} = min(max({source_end}, "
+                            f"{layout_int_type}(0)), "
+                            f"{layout_int_type}({grouped.m_size}))"
+                        ),
+                        (
+                            f"    {visible_extent} = max({visible_end} - "
+                            f"{visible_start}, {layout_int_type}(0)) if "
+                            f"{raw_extent} > {layout_int_type}(0) else "
+                            f"{layout_int_type}(0)"
+                        ),
+                    ]
+                )
+        else:
+            assert running_start is not None and raw_split_value is not None
+            setup_lines.extend(
+                [
+                    f"    {raw_split_value} = {layout_int_type}({layout_load})",
+                    f"    {raw_end} = {running_start} + {raw_split_value}",
+                    (
+                        f"    {source_end} = {running_start} + min(max("
+                        f"{raw_split_value}, {layout_int_type}(0)), "
+                        f"{layout_int_type}({grouped.m_size}))"
+                    ),
+                    (
+                        f"    {visible_start} = min(max({running_start}, "
+                        f"{layout_int_type}(0)), "
+                        f"{layout_int_type}({grouped.m_size}))"
+                    ),
+                    (
+                        f"    {visible_end} = min(max({source_end}, "
+                        f"{layout_int_type}(0)), "
+                        f"{layout_int_type}({grouped.m_size}))"
+                    ),
+                    (
+                        f"    {visible_extent} = max({visible_end} - "
+                        f"{visible_start}, {layout_int_type}(0)) if "
+                        f"{raw_split_value} > {layout_int_type}(0) else "
+                        f"{layout_int_type}(0)"
+                    ),
+                ]
+            )
+        setup_lines.extend(
+            [
+                (
+                    f"    {grouped.starts}[cutlass.Int32({group_idx})] = "
+                    f"cutlass.Int32({visible_start})"
+                ),
+                (
+                    f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
+                    f"cutlass.Int32(0)] = cutlass.Int32({n_size})"
+                ),
+                (
+                    f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
+                    f"cutlass.Int32(1)] = cutlass.Int32({visible_extent})"
+                ),
+                (
+                    f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
+                    f"cutlass.Int32(2)] = cutlass.Int32({k_size})"
+                ),
+                (
+                    f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
+                    "cutlass.Int32(3)] = cutlass.Int32(1)"
+                ),
+            ]
+        )
+        if grouped.device_layout_kind == "split_sizes":
+            assert running_start is not None
+            setup_lines.append(f"    {running_start} = {raw_end}")
+    initializer = statement_from_string("\n".join(setup_lines))
+    if grouped.full_coverage is not None:
+        assert isinstance(initializer, ast.If)
+        initializer.body.extend(full_row_union_statements(df, grouped))
+    prefix.extend([initializer, statement_from_string("cute.arch.sync_threads()")])
+    if grouped.full_coverage is not None:
+        prefix.append(full_row_union_predicate(grouped))
+
+
+def _emit_mma_pipeline(
+    cg: GenerateAST,
+    mma: _CuteMmaNode | Node,
+    rhs_node: Node | None = None,
+    acc_expr: ast.AST | None = None,
+    fx_node: Node | None = None,
+    lowering_ctx: LoweringContext | None = None,
+    grouped_mode: str | None = None,
+) -> ast.AST | None:
+    """Core MMA codegen shared by both aten and hl.dot paths.
+
+    Emits outer_prefix (MMA setup + acc init), loop body (smem staging +
+    gemm), and outer_suffix (fragment → per-thread scalar via smem).
+
+    Returns a per-thread scalar expression, or None on failure.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    candidate = mma if isinstance(mma, _CuteMmaNode) else None
+    lhs_node = candidate.lhs if candidate is not None else mma
+    rhs_node = candidate.rhs if candidate is not None else rhs_node
+    if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
+        return None
+    output_column_major = (
+        candidate.output_column_major if candidate is not None else False
+    )
+
+    env = CompileEnvironment.current()
+    row_union_requested = cg.device_function.config.get(GROUPED_ROW_UNION_KEY, False)
+    row_union_plan: GroupedRowUnionPlan | None = None
+    requested_schedule = _requested_tcgen05_grouped_schedule(grouped_mode)
+
+    def _unsupported_schedule(reason: str) -> None:
+        if requested_schedule is not None:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} requires the "
+                "generated N,M-oriented worklist tcgen05 schedule; " + reason,
+            )
+        return None
+
+    def _static_int(value: object) -> int | None:
+        with contextlib.suppress(TypeError, ValueError):
+            return int(cast("Any", value))
+        return None
+
+    def _is_contiguous_mk_source_fake(source_fake: torch.Tensor) -> bool:
+        if source_fake.ndim != 2:
+            return False
+        source_k = _static_int(source_fake.shape[1])
+        stride_m = _static_int(source_fake.stride(0))
+        return (
+            source_k is not None
+            and stride_m is not None
+            and _static_int(source_fake.stride(1)) == 1
+            and stride_m == source_k
+        )
+
+    def _is_contiguous_grouped_rhs_source_fake(
+        source_fake: torch.Tensor,
+        *,
+        k_major: bool,
+    ) -> bool:
+        """Recognize contiguous physical [G,N,K] or [G,K,N] storage."""
+        if source_fake.ndim != 3:
+            return False
+        source_n = _static_int(source_fake.shape[1])
+        source_k = _static_int(source_fake.shape[2])
+        stride_g = _static_int(source_fake.stride(0))
+        contiguous_axis = 2 if k_major else 1
+        outer_axis = 1 if k_major else 2
+        contiguous_extent = source_k if k_major else source_n
+        stride_outer = _static_int(source_fake.stride(outer_axis))
+        return (
+            source_n is not None
+            and source_k is not None
+            and stride_g is not None
+            and contiguous_extent is not None
+            and stride_outer is not None
+            and _static_int(source_fake.stride(contiguous_axis)) == 1
+            and stride_outer == contiguous_extent
+            and stride_g == source_n * source_k
+        )
+
+    def _runtime_int_tensor_values(
+        arg_name: str,
+        *,
+        expected_numel: int,
+    ) -> list[int] | None:
+        value = CompileEnvironment.current().runtime_arg_values_by_name.get(arg_name)
+        if not (
+            isinstance(value, torch.Tensor)
+            and value.ndim == 1
+            and int(value.numel()) == expected_numel
+            and value.dtype in (torch.int32, torch.int64)
+        ):
+            return None
+        with unset_fake_temporarily():
+            return [int(item) for item in value.detach().cpu().tolist()]
+
+    def _runtime_ordered_group_m_tail(
+        layout_arg_name: str,
+        *,
+        group_count: int,
+        bm: int,
+        m_tail_preserve: bool,
+    ) -> bool | None:
+        layout_value = CompileEnvironment.current().runtime_arg_values_by_name.get(
+            layout_arg_name
+        )
+        if not (
+            isinstance(layout_value, torch.Tensor)
+            and layout_value.ndim == 1
+            and layout_value.dtype in (torch.int32, torch.int64)
+        ):
+            return None
+        with unset_fake_temporarily():
+            layout_values = [int(item) for item in layout_value.detach().cpu().tolist()]
+        cursor = 0
+        has_m_tail = False
+        for expected_group in range(group_count):
+            if m_tail_preserve and expected_group > 0:
+                next_m_boundary = ((cursor + bm - 1) // bm) * bm
+                while (
+                    cursor < len(layout_values)
+                    and cursor < next_m_boundary
+                    and layout_values[cursor] < 0
+                ):
+                    cursor += 1
+                if cursor != next_m_boundary or (
+                    cursor < len(layout_values) and layout_values[cursor] < 0
+                ):
+                    return None
+            if cursor >= len(layout_values) or layout_values[cursor] != expected_group:
+                return None
+            start = cursor
+            while (
+                cursor < len(layout_values) and layout_values[cursor] == expected_group
+            ):
+                cursor += 1
+            actual_m = cursor - start
+            if start % bm != 0:
+                return None
+            has_m_tail = has_m_tail or actual_m % bm != 0
+        if cursor != len(layout_values):
+            if m_tail_preserve and all(value < 0 for value in layout_values[cursor:]):
+                cursor = len(layout_values)
+        if cursor != len(layout_values):
+            return None
+        return has_m_tail
+
+    def _runtime_grouped_static_tail_facts(
+        *,
+        layout_arg_name: str,
+        n_sizes_arg_name: str | None,
+        group_count: int,
+        bm: int,
+        bn: int,
+        n_size: int,
+        m_tail_preserve: bool,
+    ) -> tuple[bool, bool] | None:
+        n_sizes_values = (
+            _runtime_int_tensor_values(
+                n_sizes_arg_name,
+                expected_numel=group_count,
+            )
+            if n_sizes_arg_name is not None
+            else [n_size] * group_count
+        )
+        if n_sizes_values is None or any(
+            group_n <= 0 or group_n > n_size for group_n in n_sizes_values
+        ):
+            return None
+        has_m_tail = _runtime_ordered_group_m_tail(
+            layout_arg_name,
+            group_count=group_count,
+            bm=bm,
+            m_tail_preserve=m_tail_preserve,
+        )
+        if has_m_tail is None:
+            return None
+        has_n_tail = any(group_n % bn != 0 for group_n in n_sizes_values)
+        return has_m_tail, has_n_tail
+
+    tcgen05_grouped_static_persistent_requested = grouped_mode is not None
+    tcgen05_grouped_dynamic_ab_tensormaps_requested = grouped_mode in (
+        TCGEN05_GROUPED_MODE_DYNAMIC,
+        TCGEN05_GROUPED_MODE_DIRECT,
+        TCGEN05_GROUPED_MODE_WORKLIST_NM,
+    )
+    tcgen05_grouped_direct_pointer_metadata_requested = (
+        grouped_mode == TCGEN05_GROUPED_MODE_DIRECT
+    )
+    allow_grouped_k_mask = tcgen05_grouped_static_persistent_requested
+    analysis = candidate.operands if candidate is not None else None
+    if analysis is None:
+        lhs_info = _trace_to_mma_operand(
+            lhs_node,
+            role="lhs",
+            cg=cg,
+            allow_grouped_k_mask=allow_grouped_k_mask,
+        )
+        rhs_info = _trace_to_mma_operand(
+            rhs_node,
+            role="rhs",
+            allow_rank3_rhs_nt=lowering_ctx is not None,
+            cg=cg,
+            allow_grouped_k_mask=allow_grouped_k_mask,
+            allow_rank3_rhs_mn_major=(
+                grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                or row_union_requested is True
+            ),
+        )
+        if lhs_info is None or rhs_info is None:
+            return _unsupported_schedule("MMA operand tracing failed")
+    else:
+        lhs_info = analysis.lhs
+        rhs_info = analysis.rhs
+    rhs_info = _with_shared_rhs_group(cg, lhs_info, rhs_info)
+    tcgen05_shared_rhs = rhs_info.rhs_shared_group_count is not None
+    rhs_contiguous_shared = tcgen05_shared_rhs and (
+        _is_contiguous_mk_source_fake(rhs_info.source_fake)
+        or _is_contiguous_mk_source_fake(rhs_info.source_fake.T)
+    )
+    lhs_fake = lhs_info.logical_fake
+    rhs_fake = rhs_info.logical_fake
+    if analysis is None and (lhs_fake.ndim != 2 or rhs_fake.ndim != 2):
+        return _unsupported_schedule("MMA operands are not rank-2")
+    rhs_rank3_group_expr: str | None = None
+    rhs_rank3_group_index: Node | None = None
+    rhs_rank3_segment_metadata = rhs_info.rhs_segment_group is not None
+    rhs_rank3_packed_split = rhs_info.rhs_packed_group is not None
+    rhs_rank3_worklist_lhs_info: _Rank3RhsWorklistLhsInfo | None = None
+    rhs_rank3_worklist_store_info: _Rank3RhsWorklistStoreInfo | None = None
+    rhs_rank3_grouped_proof: _Rank3RhsGroupedProof | None = None
+    tcgen05_grouped_external_direct_pointers_name = cg.device_function.config.get(
+        TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY
+    )
+    tcgen05_grouped_external_direct_strides_name = cg.device_function.config.get(
+        TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY
+    )
+    tcgen05_grouped_external_direct_pointers_arg_name: str | None = None
+    tcgen05_grouped_external_direct_strides_arg_name: str | None = None
+    tcgen05_grouped_static_problem_shapes = (
+        parse_tcgen05_grouped_static_problem_signature(signature)
+        if (
+            signature := cg.device_function.config.get(
+                TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
+            )
+        )
+        is not None
+        else None
+    )
+    tcgen05_grouped_static_reserved_sms = int(
+        cast(
+            "Any",
+            cg.device_function.config.get(
+                TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+                0,
+            ),
+        )
+    )
+    tcgen05_use_grouped_static_single_tma_producer_loop = False
+    if requested_schedule is not None and not (
+        tcgen05_grouped_static_persistent_requested
+        and tcgen05_grouped_dynamic_ab_tensormaps_requested
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+            f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} requires the grouped "
+            "worklist path with dynamic A/B TensorMaps",
+        )
+    if (tcgen05_grouped_external_direct_pointers_name is None) != (
+        tcgen05_grouped_external_direct_strides_name is None
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "external grouped direct pointer metadata requires both pointer "
+            "and stride tensor argument names",
+        )
+    if tcgen05_grouped_external_direct_pointers_name is not None:
+        if not tcgen05_grouped_direct_pointer_metadata_requested:
+            raise exc.BackendUnsupported(
+                "cute",
+                "external grouped direct pointer metadata requires "
+                f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                f"{TCGEN05_GROUPED_MODE_DIRECT!r}",
+            )
+        if not isinstance(tcgen05_grouped_external_direct_pointers_name, str):
+            raise exc.BackendUnsupported(
+                "cute",
+                "external grouped direct pointer metadata pointer argument "
+                "name must be a string",
+            )
+        if not isinstance(tcgen05_grouped_external_direct_strides_name, str):
+            raise exc.BackendUnsupported(
+                "cute",
+                "external grouped direct pointer metadata stride argument "
+                "name must be a string",
+            )
+        tcgen05_grouped_external_direct_pointers_arg_name = (
+            tcgen05_grouped_external_direct_pointers_name
+        )
+        tcgen05_grouped_external_direct_strides_arg_name = (
+            tcgen05_grouped_external_direct_strides_name
+        )
+    if rhs_info.rhs_is_grouped:
+        if lowering_ctx is None or rhs_info.rhs_group_index is None:
+            return _unsupported_schedule(
+                "rank3 grouped RHS did not expose a lowering group index"
+            )
+        rhs_rank3_group_index = rhs_info.rhs_group_index
+        if rhs_info.rhs_rank3_grouped_nt:
+            rhs_rank3_group_expr = (
+                rhs_info.rhs_segment_group.group_load.name
+                if rhs_info.rhs_segment_group is not None
+                else rhs_info.rhs_group_index.name
+            )
+
+    # Universal-MMA / tcgen05 MMA kernels rely on runtime tensor layouts
+    # for SMEM-load guards and TMA descriptors; baking literal shapes
+    # silently miscompiles those paths.  Mirror the flag set in
+    # ``_emit_cute_matmul`` so the host-side launcher disables the bake.
+    if analysis is None:
+        cg.cute_uses_matmul = True
+    lhs_operand = lhs_info
+    rhs_operand = rhs_info
+    lhs_m_size = lhs_operand.matrix_rows
+    lhs_k_size = lhs_operand.matrix_cols
+    rhs_k_size = rhs_operand.matrix_rows
+    rhs_n_size = rhs_operand.matrix_cols
+
+    df = cg.device_function
+    lhs_arg = df.tensor_arg(lhs_info.source_fake)
+    rhs_arg = df.tensor_arg(rhs_info.source_fake)
+    lhs_arg_name = lhs_arg.name
+    rhs_arg_name = rhs_arg.name
+
+    input_dtype = lhs_fake.dtype
+    _dtype_map = {
+        torch.float16: "cutlass.Float16",
+        torch.bfloat16: "cutlass.BFloat16",
+        torch.float32: "cutlass.Float32",
+        torch.float8_e4m3fn: "cutlass.Float8E4M3FN",
+    }
+    input_dtype_str = _dtype_map[input_dtype]
+    acc_dtype_str = "cutlass.Float32"
+    # The kernel-side `tcgen05_epi_tile` (built in
+    # `_make_tcgen05_layout_plan_setup`) and the store-side
+    # `tcgen05_store_epi_tile` (built in `_codegen_cute_store_tcgen05_tile`)
+    # must agree on the `elem_ty_d` / `elem_ty_c` passed to
+    # `compute_epilogue_tile_shape` — `tile_n` differs between the
+    # with-source bf16/fp16 `n_perf=64` branch and the fp32-with-source
+    # `n_perf=32` branch, and a mismatch silently corrupts SMEM staging.
+    # Forward-trace the matmul fx_node to its consuming store target so
+    # both sides see the same dtype. When the trace fails (no fx_node,
+    # multi-store fan-out, opaque op) or returns a dtype outside the
+    # known matmul output family, we fall back to the input dtype here;
+    # the store-side equality check on the registered
+    # `CuteTcgen05StoreValue` is the loud-failure backstop and
+    # surfaces `BackendUnsupported` if the runtime D-tensor dtype
+    # disagrees with the matmul plan's assumption.
+    epi_elem_dtype: torch.dtype | None = None
+    if fx_node is not None:
+        traced = _trace_mma_to_store_dtype(fx_node, cg.codegen_graphs)
+        if traced in _dtype_map:
+            epi_elem_dtype = traced
+    epi_elem_dtype_str = (
+        _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
+    )
+
+    _dtype_tma_ok = input_dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ) or (input_dtype == torch.float32 and cute_fp32_dot_uses_tf32())
+    _lhs_major = lhs_operand.matrix_major
+    _rhs_major = rhs_operand.matrix_major
+    # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
+    # layout Helion emits expects the standard row-major A. Only B's major
+    # mode is made layout-aware here.
+    tcgen05_use_tma_a = _dtype_tma_ok and _lhs_major == "row"
+    tcgen05_use_tma_b = _dtype_tma_ok and _rhs_major in ("row", "col")
+    # The wrapper constructs an A/B descriptor pair. Keep both scalar
+    # producers if either descriptor's alignment is unproved; this also
+    # retains the common producer/consumer protocol for these layouts.
+    if (tcgen05_use_tma_a or tcgen05_use_tma_b) and not (
+        _tcgen05_tma_operand_is_aligned(env, lhs_operand)
+        and _tcgen05_tma_operand_is_aligned(env, rhs_operand)
+    ):
+        tcgen05_use_tma_a = False
+        tcgen05_use_tma_b = False
+    # B is K-major when its (K, N) storage is K-contiguous (column-major),
+    # i.e. stride[0] == 1 -> _rhs_major == "col".
+    tcgen05_b_k_major = _rhs_major == "col"
+    tcgen05_use_tma = tcgen05_use_tma_a or tcgen05_use_tma_b
+    tcgen05_use_tma_pipeline = tcgen05_use_tma_a and tcgen05_use_tma_b
+    if rhs_rank3_segment_metadata and not (
+        tcgen05_grouped_static_persistent_requested
+        and tcgen05_grouped_dynamic_ab_tensormaps_requested
+    ):
+        tcgen05_use_tma_a = False
+        tcgen05_use_tma_b = False
+        tcgen05_use_tma = False
+        tcgen05_use_tma_pipeline = False
+    tcgen05_requested_pure_matmul_role_lifecycle = is_pure_matmul_role_lifecycle_config(
+        df.config
+    )
+
+    k_total_size = int(lhs_k_size)
+
+    k_loop_info = _get_mma_k_loop_info(
+        cg,
+        env,
+        lhs_fake,
+        rhs_fake,
+        fx_node=fx_node,
+        lhs_k_size=lhs_k_size,
+        rhs_k_size=rhs_k_size,
+    )
+    if k_loop_info is None:
+        return _unsupported_schedule("K loop analysis failed")
+    device_loop, k_block_id, k_offset_var, bk = k_loop_info
+    if analysis is not None and k_block_id != analysis.k_block_id:
+        return None
+    if analysis is None and _has_non_root_lane_loops(
+        cg, allowed_loop_states=(device_loop,)
+    ):
+        return _unsupported_schedule("unexpected nested lane loops")
+    k_loop_begin_expr = _device_loop_begin_expr(device_loop)
+
+    # Get M, N offsets and block sizes from grid state
+    m_offset_var: str | None = None
+    n_offset_var: str | None = None
+    m_block_id: int | None = None
+    n_block_id: int | None = None
+    bm: int | None = None
+    bn: int | None = None
+    grid_state = cg.current_grid_state
+    if analysis is not None:
+        if (
+            grid_state is not None
+            and tuple(grid_state.block_ids) == analysis.output_block_ids
+        ):
+            m_block_id = analysis.m_block_id
+            n_block_id = analysis.n_block_id
+            m_offset_var = grid_state.strategy.offset_var(m_block_id)
+            n_offset_var = grid_state.strategy.offset_var(n_block_id)
+            m_bs = df.resolved_block_size(m_block_id)
+            n_bs = df.resolved_block_size(n_block_id)
+            bm = int(m_bs) if isinstance(m_bs, int) else None
+            bn = int(n_bs) if isinstance(n_bs, int) else None
+    elif grid_state is not None:
+        if len(grid_state.block_ids) == 2:
+            m_block_id, n_block_id = grid_state.block_ids
+            m_offset_var = grid_state.strategy.offset_var(m_block_id)
+            n_offset_var = grid_state.strategy.offset_var(n_block_id)
+            m_bs = df.resolved_block_size(m_block_id)
+            n_bs = df.resolved_block_size(n_block_id)
+            bm = int(m_bs) if isinstance(m_bs, int) else None
+            bn = int(n_bs) if isinstance(n_bs, int) else None
+        else:
+            canonical_block_id = env.canonical_block_id
+            if (
+                rhs_rank3_segment_metadata or rhs_rank3_packed_split
+            ) and rhs_info.rhs_n_block_id is not None:
+                # Segment metadata already proves the work axis and RHS proves N;
+                # the remaining root axis is M, with exact LHS/store proof below.
+                segment_block_id = cast("int", rhs_info.rhs_grouped_leading_block_id)
+                segment_canonical = canonical_block_id(segment_block_id)
+                n_canonical = canonical_block_id(rhs_info.rhs_n_block_id)
+                m_candidates = [
+                    bid
+                    for bid in grid_state.block_ids
+                    if canonical_block_id(bid)
+                    not in (
+                        segment_canonical,
+                        n_canonical,
+                    )
+                ]
+                if len(m_candidates) == 1:
+                    m_block_id = m_candidates[0]
+                    n_block_id = next(
+                        (
+                            bid
+                            for bid in grid_state.block_ids
+                            if canonical_block_id(bid) == n_canonical
+                        ),
+                        None,
+                    )
+                    if n_block_id is not None:
+                        m_offset_var = grid_state.strategy.offset_var(m_block_id)
+                        n_offset_var = grid_state.strategy.offset_var(n_block_id)
+                        m_bs = env.block_sizes[m_block_id].from_config(df.config)
+                        n_bs = env.block_sizes[n_block_id].from_config(df.config)
+                        bm = int(m_bs) if isinstance(m_bs, int) else None
+                        bn = int(n_bs) if isinstance(n_bs, int) else None
+            if m_block_id is None or n_block_id is None:
+                for bid in grid_state.block_ids:
+                    offset = grid_state.strategy.offset_var(bid)
+                    bs_info = env.block_sizes[bid]
+                    size = bs_info.size
+                    bs = bs_info.from_config(df.config)
+                    if isinstance(size, (int, torch.SymInt)):
+                        if m_offset_var is None and env.known_equal(
+                            size, lhs_fake.shape[0]
+                        ):
+                            m_offset_var = offset
+                            m_block_id = bid
+                            bm = int(bs) if isinstance(bs, int) else None
+                        elif n_offset_var is None and env.known_equal(
+                            size, rhs_fake.shape[1]
+                        ):
+                            n_offset_var = offset
+                            n_block_id = bid
+                            bn = int(bs) if isinstance(bs, int) else None
+
+    if (
+        bm is None
+        or bn is None
+        or m_offset_var is None
+        or n_offset_var is None
+        or m_block_id is None
+        or n_block_id is None
+    ):
+        return _unsupported_schedule("M/N tile axes were not resolved")
+    if rhs_info.rhs_is_grouped:
+        if fx_node is None:
+            return _unsupported_schedule("MMA fx node was unavailable")
+        canonical_block_id = env.canonical_block_id
+        rhs_rank3_segment_metadata = rhs_info.rhs_segment_group is not None
+        rhs_rank3_packed_split = rhs_info.rhs_packed_group is not None
+        segment_block_id = None
+        if rhs_rank3_segment_metadata or rhs_rank3_packed_split:
+            assert grid_state is not None
+            grouped_leading_block_id = cast(
+                "int", rhs_info.rhs_grouped_leading_block_id
+            )
+            segment_block_ids = [
+                bid
+                for bid in grid_state.block_ids
+                if canonical_block_id(bid)
+                not in (
+                    canonical_block_id(m_block_id),
+                    canonical_block_id(n_block_id),
+                )
+            ]
+            if len(segment_block_ids) != 1 or canonical_block_id(
+                segment_block_ids[0]
+            ) != canonical_block_id(grouped_leading_block_id):
+                return _unsupported_schedule("grouped leading work axis was not unique")
+            segment_block_id = segment_block_ids[0]
+            if df.resolved_block_size(segment_block_id) != 1:
+                return _unsupported_schedule(
+                    "segment metadata work axis block size was not 1"
+                )
+        rhs_rank3_grouped_proof = _analyze_rank3_rhs_grouped_mma(
+            cg,
+            fx_node,
+            axes=_GroupedMmaAxes(
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                k_block_id=k_block_id,
+                segment_block_id=segment_block_id,
+            ),
+        )
+        if rhs_rank3_grouped_proof is None:
+            return _unsupported_schedule("rank3 grouped semantic proof failed")
+        if row_union_requested is True:
+            metadata = _grouped_row_union_metadata(
+                cg,
+                fx_node,
+                rhs_rank3_grouped_proof,
+                schedule=physical_schedule(df.config),
+            )
+            if (
+                metadata is None
+                or segment_block_id is None
+                or not row_union_schedule_supported(df.config.config, (bm, bn, bk))
+                or env.config_spec.target_device_capability != (10, 0)
+                or not tcgen05_use_tma_pipeline
+                or (
+                    (selected_row_profile := physical_schedule(df.config)) is not None
+                    and selected_row_profile.shared_upper_bound
+                    > CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
+                )
+                or (
+                    df.config.get(GROUPED_RESIDENT_CTAS_KEY, 1) != 1
+                    and not resident_ctas_supported(
+                        df.config.get(GROUPED_RESIDENT_CTAS_KEY),
+                        CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device),
+                    )
+                )
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "dense row-union requires the proved full-tile BF16 pipeline",
+                )
+            groups, row_m, row_n, row_k = metadata
+            row_union_plan = GroupedRowUnionPlan(
+                groups=groups,
+                m=row_m,
+                n=row_n,
+                k=row_k,
+                group_block_id=segment_block_id,
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                offsets=df.tensor_arg(rhs_rank3_grouped_proof.layout_tensor).name,
+                prefix=df.new_var("row_union"),
+                resident_ctas=cast("int", df.config.get(GROUPED_RESIDENT_CTAS_KEY, 1)),
+                schedule=physical_schedule(df.config),
+            )
+        elif not _rank3_rhs_grouped_schedule_is_legal(
+            rhs_rank3_grouped_proof, grouped_mode=grouped_mode
+        ):
+            return _unsupported_schedule("rank3 grouped semantic proof failed")
+        lhs_info = rhs_rank3_grouped_proof.lhs
+        rhs_info = rhs_rank3_grouped_proof.rhs
+        rhs_fake = rhs_info.logical_fake
+        rhs_rank3_worklist_lhs_info = rhs_rank3_grouped_proof.worklist_lhs
+        rhs_rank3_worklist_store_info = rhs_rank3_grouped_proof.worklist_store
+        rhs_rank3_packed_split = rhs_rank3_grouped_proof.packed_split is not None
+        if rhs_info.rhs_group_index is None:
+            return _unsupported_schedule("rank3 RHS group index was missing")
+        rhs_rank3_group_index = rhs_info.rhs_group_index
+        if rhs_info.rhs_rank3_grouped_nt:
+            rhs_rank3_group_expr = (
+                rhs_info.rhs_segment_group.group_load.name
+                if rhs_info.rhs_segment_group is not None
+                else rhs_info.rhs_group_index.name
+            )
+    tcgen05_grouped_worklist_static_full_tiles = (
+        tcgen05_grouped_static_persistent_requested
+        and tcgen05_grouped_dynamic_ab_tensormaps_requested
+        and rhs_rank3_worklist_lhs_info is not None
+    )
+    if row_union_requested is True and row_union_plan is None:
+        raise exc.BackendUnsupported("cute", "dense row-union semantic proof failed")
+    # tcgen05 epilogues are emitted by `_codegen_cute_store_tcgen05_tile` in
+    # `helion/language/memory_ops.py`. Static-full flat kernels and validated
+    # role-local persistent kernels use the SMEM-staged TMA-store epilogue;
+    # partial/unsupported fallbacks keep the direct TMEM->register->GMEM SIMT
+    # path.
+
+    m_index_var = cg.index_var(m_block_id)
+    n_index_var = cg.index_var(n_block_id)
+    leading_index_var: str | None = None
+    lp_block_id = (
+        analysis.leading_passthrough_block_id if analysis is not None else None
+    )
+    if lp_block_id is not None:
+        if grid_state is None or lp_block_id not in grid_state.block_ids:
+            return None
+        if df.resolved_block_size(lp_block_id) != 1:
+            return None
+        leading_index_var = cg.index_var(lp_block_id)
+    # Use thread_idx directly for local indices within the tile.
+    # indices_0 - offset_0 SHOULD equal thread_idx[0], but the CuTe DSL
+    # compiler may not simplify the subtraction, leading to illegal memory
+    # accesses when partition shapes depend on dynamic values.
+    assert grid_state is not None
+    m_local = _local_mma_coord_expr(cg, m_block_id)
+    n_local = _local_mma_coord_expr(cg, n_block_id)
+    # ``m_physical`` / ``n_physical`` strip the lane-var offset so SMEM-load
+    # guards select the same hardware thread across every iteration of an
+    # outer ``for lane_<n> in range(elements_per_thread):`` loop. The
+    # universal-MMA SMEM load below would otherwise gate on ``n_local == 0``
+    # which is only true on the lane=0 iteration when ``n`` has a lane var,
+    # leaving ``sA`` stale from the previous lane iteration and producing
+    # wrong-output for the entire post-lane-0 accumulator.
+    m_physical = _physical_mma_coord_expr(cg, m_block_id)
+    n_physical = _physical_mma_coord_expr(cg, n_block_id)
+    m_global = f"cutlass.Int32({m_index_var})"
+    n_global = f"cutlass.Int32({n_index_var})"
+    leading_global = (
+        f"cutlass.Int32({leading_index_var})" if leading_index_var is not None else None
+    )
+    m_size = int(lhs_m_size)
+    n_size = int(rhs_n_size)
+
+    def _operand_gmem_access(
+        operand: _MmaOperandInfo, arg_name: str, logical_indices: tuple[str, ...]
+    ) -> str:
+        source_indices = logical_indices
+        if (order := operand.source_to_logical_order) is not None:
+            # Scalar SMEM producers address the source tensor directly. Undo
+            # the logical permutation just as the TMA descriptor setup does.
+            source_indices = tuple(
+                logical_indices[order.index(dim)] for dim in range(len(order))
+            )
+        return f"{arg_name}[{', '.join(source_indices)}]"
+
+    def _lhs_gmem_access(m_expr: str, k_expr: str) -> str:
+        if lhs_operand.is_leading_passthrough:
+            assert leading_global is not None
+            return _operand_gmem_access(
+                lhs_operand, lhs_arg_name, (leading_global, m_expr, k_expr)
+            )
+        return _operand_gmem_access(lhs_operand, lhs_arg_name, (m_expr, k_expr))
+
+    def _rhs_gmem_access(k_expr: str, n_expr: str) -> str:
+        if rhs_rank3_group_expr is not None:
+            return f"{rhs_arg_name}[{rhs_rank3_group_expr}, {n_expr}, {k_expr}]"
+        if rhs_operand.is_leading_passthrough:
+            assert leading_global is not None
+            return _operand_gmem_access(
+                rhs_operand, rhs_arg_name, (leading_global, k_expr, n_expr)
+            )
+        return _operand_gmem_access(rhs_operand, rhs_arg_name, (k_expr, n_expr))
+
+    tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
+    row_profile = row_union_plan.schedule if row_union_plan is not None else None
+    tcgen05_nm_orientation = (
+        requested_schedule is Tcgen05Orientation.NM or row_profile is not None
+    )
+    if row_profile is not None:
+        output_column_major = True
+    # N,M orientation computes C.T = B @ A.T. Therefore the original grouped
+    # B becomes physical operand A, while packed A becomes physical operand B.
+    tcgen05_mma_a_k_major = not tcgen05_nm_orientation or tcgen05_b_k_major
+    tcgen05_mma_b_k_major = True if tcgen05_nm_orientation else tcgen05_b_k_major
+    worklist_profile = None
+    tcgen05_worklist_source_m_tile: int | None = None
+    tcgen05_one_cta_worklist_shape = False
+    if row_profile is not None:
+        tcgen05_cluster_m = row_profile.cluster_m
+        tcgen05_mma_bm, tcgen05_mma_bn = row_profile.mma_m, row_profile.mma_n
+        tcgen05_source_bm, tcgen05_source_bn, _ = row_profile.source_tile
+    elif tcgen05_nm_orientation:
+        worklist_profile = resolve_tcgen05_grouped_worklist_mma_profile(
+            df.config,
+            block_k=bk,
+        )
+        if worklist_profile is None:
+            return _unsupported_schedule(
+                "worklist N,M requires block_k in (64, 128), cluster_m=2, "
+                "or cluster_m=1 with "
+                f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY}="
+                f"{TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE}"
+            )
+        tcgen05_cluster_m = worklist_profile.cluster_m
+        tcgen05_worklist_source_m_tile = worklist_profile.source_m_tile
+        tcgen05_mma_bm = worklist_profile.mma_m
+        tcgen05_mma_bn = worklist_profile.mma_n
+        tcgen05_one_cta_worklist_shape = tcgen05_cluster_m == 1
+        tcgen05_source_bm = tcgen05_worklist_source_m_tile
+        tcgen05_source_bn = tcgen05_mma_bm
+    else:
+        tcgen05_mma_bm = tcgen05_source_bm = bm
+        tcgen05_mma_bn = tcgen05_source_bn = bn
+        if bm == 2 * TCGEN05_TWO_CTA_BLOCK_M:
+            # M-paired tiles (nvjet's B-reuse design): block_m=512 lowers as
+            # TWO 256-row CtaGroup.TWO UMMA subtiles per work tile. B is
+            # staged once per K stage and shared by both subtiles, halving
+            # B's SMEM/L2/DRAM traffic; each subtile owns one TMEM
+            # accumulator (the two acc stages) and the epilogue drains both.
+            # Full eligibility (plain full-tile static family) is enforced
+            # after the family flags are derived below.
+            tcgen05_mma_bm = TCGEN05_TWO_CTA_BLOCK_M
+    tcgen05_m_subtile_count = bm // tcgen05_mma_bm if not tcgen05_nm_orientation else 1
+
+    tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(df.config)
+    if tcgen05_large_bn_proof and (
+        not _tcgen05_large_bn_proof_shape(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            tcgen05_cluster_m=tcgen05_cluster_m,
+        )
+        or (m_size, n_size, k_total_size) != TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+        or cast("_ConfigLike", df.config).get("pid_type", "flat")
+        != TCGEN05_LARGE_BN_PROOF_PID_TYPE
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY}=True requires the guarded "
+            "G4 proof envelope "
+            f"M={TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE[0]},"
+            f"N={TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE[1]},"
+            f"K={TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE[2]},"
+            f"bm={TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES[0]},"
+            f"bn={TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES[1]},"
+            f"bk={TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES[2]},"
+            f"tcgen05_cluster_m={TCGEN05_LARGE_BN_PROOF_CLUSTER_M},"
+            f"pid_type={TCGEN05_LARGE_BN_PROOF_PID_TYPE!r}",
+        )
+
+    mma_impl = _choose_mma_impl(
+        input_dtype,
+        bm=tcgen05_mma_bm,
+        bn=tcgen05_mma_bn,
+        bk=bk,
+        config=df.config,
+        input_device=lhs_fake.device,
+        defer_grouped_worklist_smem_check=(
+            worklist_profile is not None
+            or physical_schedule(cg.device_function.config) is not None
+        ),
+    )
+    if mma_impl == "tcgen05" and input_dtype == torch.float32:
+        # fp32 operands run the tcgen05 MMA as tf32 (permitted by
+        # settings.dot_precision, checked in _mma_impl_matches_problem_shape).
+        # GMEM tensors stay Float32; the TMA descriptors recast to TFloat32 via
+        # internal_type (see the launcher's tcgen05_ab_tma emission), so the
+        # SMEM staging, tiled MMA, and layout plan all use TFloat32. The
+        # SIMT-staged (non-TMA) AB path would load Float32 into TFloat32 SMEM
+        # without that recast, so it stays unsupported for fp32; such kernels
+        # keep the exact universal lowering fp32 used before the tf32 path
+        # (the suppression planner applies the same gate, so no root lane
+        # loops were suppressed for a demoted config).
+        fp32_blocked = (
+            not tcgen05_use_tma_pipeline
+            or fx_node is None
+            or _tcgen05_fp32_lowering_blocked(
+                cg,
+                fx_node,
+                lhs_operand=lhs_operand,
+                rhs_operand=rhs_operand,
+                config=df.config,
+            )
+        )
+        if fp32_blocked:
+            if (
+                os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
+                == "tcgen05"
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "fp32 (tf32) tcgen05 matmul requires TMA-eligible A/B "
+                    "layouts and whitelisted fused-epilogue store chains",
+                )
+            mma_impl = "universal"
+        else:
+            input_dtype_str = "cutlass.TFloat32"
+    if (
+        mma_impl == "tcgen05"
+        and fx_node is not None
+        and df.cute_state.collective_lane_loop_suppression_is_vetoed()
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 thread-local epilogue requires a unique MMA anchor before root "
+            "lane loops can be suppressed",
+        )
+    unplanned_fragment_candidate = (
+        candidate
+        if candidate is not None
+        and candidate.requires_fragment_epilogue
+        and fx_node is not None
+        and df.cute_state.tcgen05_fragment_epilogue_plan_for_anchor(fx_node) is None
+        else None
+    )
+    if unplanned_fragment_candidate is not None:
+        if env.config_spec.cute_tcgen05_search_enabled:
+            # A thread-local tcgen05 config suppresses root lane loops on the
+            # promise that the exhaustive plan can rendezvous all demanded values.
+            # Refuse that config if the plan was not committed.
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 thread-local epilogue ownership proof rejected this config",
+            )
+        if mma_impl == "tcgen05":
+            # Search preflight declined this kernel, so the K loop retained its
+            # scalar lane loop.  Falling back here is safe even for logical
+            # shape transforms; the generic CuTe reshape lowering owns them.
+            return None
+    mma_tiles_are_static_full = (
+        _mma_tiles_are_static_full(analysis, bm=bm, bn=bn, bk=bk)
+        if analysis is not None
+        else m_size % bm == 0 and n_size % bn == 0 and k_total_size % bk == 0
+    )
+    if (
+        analysis is not None
+        and analysis.has_leading_passthrough
+        and not mma_tiles_are_static_full
+    ):
+        return None
+    # A leading-passthrough collective absorbs its serialized K loop. Other
+    # non-root lane loops must already have been suppressed by MMA planning;
+    # reusing one fragment across their logical iterations is wrong.
+    allowed_k_lane_loops: tuple[DeviceLoopState, ...] = (
+        (device_loop,) if analysis is None or analysis.has_leading_passthrough else ()
+    )
+    if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
+        return None
+    if (
+        mma_impl == "tcgen05"
+        and m_block_id is not None
+        and _grid_thread_extent(cg, m_block_id) > 32
+    ):
+        # The tcgen05 role launch is one physical warp per role row (see
+        # ``_tcgen05_root_m_threads``).  Only an explicit ``num_threads``
+        # request maps more threads along M; the MMA detection already
+        # declined it (``_specialized_mma_root_threads_support_impl``), so the
+        # matmul takes the generic SIMT lowering like any other unsupported
+        # thread layout instead of reaching the launch guard below.
+        return None
+    zero_acc_expr = acc_expr is not None and _is_zero_acc_expr(acc_expr)
+    if (
+        analysis is None
+        and not zero_acc_expr
+        and acc_expr is not None
+        and fx_node is not None
+        and fx_node.target is torch.ops.aten.addmm.default
+    ):
+        acc_node = fx_node.args[0] if fx_node.args else None
+        if isinstance(acc_node, Node) and _is_zero_init_acc_node(
+            acc_node, graphs=cg.codegen_graphs
+        ):
+            zero_acc_expr = True
+    if acc_expr is not None and mma_impl != "universal" and not zero_acc_expr:
+        mma_impl = "universal"
+    if mma_impl != "universal" and zero_acc_expr:
+        acc_expr = None
+    if analysis is None and mma_impl != "tcgen05" and _has_non_root_lane_loops(cg):
+        return _unsupported_schedule("non-tcgen05 MMA does not own nested lane loops")
+    if rhs_info.rhs_is_grouped:
+        if mma_impl != "tcgen05":
+            return _unsupported_schedule("tcgen05 MMA was not selected")
+        if not rhs_rank3_segment_metadata and not tcgen05_use_tma_pipeline:
+            return _unsupported_schedule("rank3 RHS TMA pipeline was disabled")
+    if (
+        analysis is not None
+        and mma_impl == "universal"
+        and (
+            analysis.has_leading_passthrough
+            or _tcgen05_candidate_exceeds_smem(
+                input_dtype,
+                input_device=lhs_fake.device,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                config=df.config,
+                defer_grouped_worklist_smem_check=(
+                    worklist_profile is not None
+                    or physical_schedule(cg.device_function.config) is not None
+                ),
+            )
+        )
+    ):
+        return None
+    # Non-tcgen05 paths inspect runtime layouts. tcgen05 wrapper schemas are
+    # specialized by shape and stride, so they can keep tensor layouts baked.
+    if analysis is not None and mma_impl != "tcgen05":
+        cg.cute_uses_matmul = True
+    tcgen05_requested_flat_role_coordinates = bool(
+        df.config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False)
+    )
+    if tcgen05_requested_flat_role_coordinates and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
+            "tcgen05 MMA codegen",
+        )
+    tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
+    tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
+        bm=tcgen05_mma_bm,
+        cluster_m=tcgen05_cluster_m,
+        input_dtype=input_dtype,
+        cta_group=cast("str", df.config.get(TCGEN05_CTA_GROUP_CONFIG_KEY, "auto")),
+    )
+    if tcgen05_nm_orientation and tcgen05_cluster_m == 2:
+        tcgen05_requested_two_cta = True
+    tcgen05_cluster_n_requested = _tcgen05_cluster_n(df.config)
+    # A leading-batch grid axis composes with the CtaGroup.TWO cluster: the
+    # 2-CTA MMA/TMA-multicast operate within each (m, n) tile while the batch
+    # axis only offsets the per-tile TMA source.  The cluster_n=2 A-multicast
+    # needs the scheduler's dim 1 to be N (``program_id`` swaps the trailing
+    # dims for batched grids) and whole N-tile pairs, and the plain raster:
+    # the L2-grouped and L2-swizzled pid decodes pair the cluster lanes on the
+    # first two grid dims, which are (batch, m) on a batched grid, so under
+    # ``l2_groupings > 1`` an odd M-tile count decodes tiles that do not exist
+    # and the multicast peers wait forever.
+    if (
+        analysis is not None
+        and analysis.has_leading_passthrough
+        and mma_impl == "tcgen05"
+        and tcgen05_cluster_n_requested != 1
+    ):
+        tcgen05_batched_n_tiles = (
+            n_size // bn if isinstance(n_size, int) and bn > 0 else None
+        )
+        if (
+            tcgen05_batched_n_tiles is None
+            or n_size % bn != 0
+            or tcgen05_batched_n_tiles % tcgen05_cluster_n_requested != 0
+            or l2_swizzle_size_from_config(df.config) != 1
+            or any(
+                grouping != 1
+                for grouping in cast("list[int]", df.config.get("l2_groupings", []))
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 matmul with a leading passthrough axis supports "
+                "tcgen05_cluster_n=2 only for whole N-tile pairs without an L2 "
+                "swizzle or L2 grouping",
+            )
+    # N,M worklists keep the public 256x128 logical scheduler tile, while their
+    # physical output tile is source_m_tile x physical_mma_m. Edge admission
+    # must use that physical orientation for both CTA-group sizes.
+    tcgen05_output_bm = (
+        tcgen05_source_bm if tcgen05_grouped_worklist_static_full_tiles else bm
+    )
+    tcgen05_output_bn = (
+        tcgen05_source_bn if tcgen05_grouped_worklist_static_full_tiles else bn
+    )
+    tcgen05_static_output_tiles = (
+        m_size % tcgen05_output_bm == 0 and n_size % tcgen05_output_bn == 0
+    )
+    tcgen05_static_full_tiles = mma_tiles_are_static_full
+    tcgen05_has_k_tail = k_total_size > bk and k_total_size % bk != 0
+    tcgen05_k_tail_only = tcgen05_static_output_tiles and tcgen05_has_k_tail
+    tcgen05_double_edge_output = (
+        m_size % tcgen05_output_bm != 0 and n_size % tcgen05_output_bn != 0
+    )
+    tcgen05_double_edge_tma = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested in (1, 2)
+        and tcgen05_requested_two_cta
+        and tcgen05_double_edge_output
+        and (k_total_size % bk == 0 or tcgen05_has_k_tail)
+    )
+    if (
+        mma_impl == "tcgen05"
+        and tcgen05_double_edge_output
+        and not tcgen05_double_edge_tma
+        and (tcgen05_pid_is_persistent or tcgen05_cluster_m != 1)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 SIMT edge epilogue double-edge output tiles are currently "
+            "validated only for flat tcgen05_cluster_m=1 kernels or "
+            "role-local CtaGroup.TWO kernels where K is divisible by block_k "
+            "or K > block_k with a tail; K <= block_k with a partial K tile "
+            "is still unsupported. "
+            "Choose a block_m or block_n that divides the static output extent, "
+            "choose a supported block_k for the static K extent, or use a "
+            "non-tcgen05 fallback for this persistent/clustered config.",
+        )
+    tcgen05_mixed_tma_scalar_fallback = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_static_full_tiles
+        and not tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 1
+    )
+    tcgen05_edge_scalar_fallback_needs_inter_smem_a = (
+        tcgen05_mixed_tma_scalar_fallback
+        and bk >= 128
+        and (m_size % bm != 0 or n_size % bn != 0)
+    )
+    tcgen05_sync_before_scalar_fallback = (
+        tcgen05_mixed_tma_scalar_fallback and k_total_size % bk != 0
+    )
+    tcgen05_preserve_tma_for_two_cta_k_tail = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested in (1, 2)
+        and tcgen05_requested_two_cta
+        and tcgen05_k_tail_only
+    )
+    tcgen05_m_edge_only = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested in (1, 2)
+        and tcgen05_requested_two_cta
+        and m_size % bm != 0
+        and n_size % bn == 0
+        and k_total_size % bk == 0
+    )
+    tcgen05_n_edge_only = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_n_requested == 1
+        and m_size % bm == 0
+        and n_size % bn != 0
+        and k_total_size % bk == 0
+        # Both supported tcgen05 CTA protocols can consume a general N
+        # remainder through the role-local TMA producer.
+        and (
+            (tcgen05_cluster_m == 2 and tcgen05_requested_two_cta)
+            or tcgen05_cluster_m == 1
+        )
+    )
+    if (
+        mma_impl == "tcgen05"
+        and not tcgen05_static_full_tiles
+        and not tcgen05_grouped_worklist_static_full_tiles
+        and not tcgen05_mixed_tma_scalar_fallback
+        and not tcgen05_preserve_tma_for_two_cta_k_tail
+        and not tcgen05_m_edge_only
+        and not tcgen05_n_edge_only
+        and not tcgen05_double_edge_tma
+    ):
+        # Mixed TMA full K tiles + scalar fallback tails are currently
+        # validated only for flat one-CTA kernels. Persistent CtaGroup.TWO
+        # K-tail-only kernels keep TMA enabled for
+        # tcgen05_role_local_k_tail_tma. Output-edge kernels keep TMA
+        # enabled for role-local AB production plus the predicated SIMT
+        # epilogue. Other persistent or clustered partial-output kernels keep
+        # the shared scalar path.
+        tcgen05_use_tma_a = False
+        tcgen05_use_tma_b = False
+        tcgen05_use_tma = False
+        tcgen05_use_tma_pipeline = False
+    # cluster_m == 2 has two valid shapes:
+    # - bm=128, CtaGroup.ONE, where each clustered CTA owns a different
+    #   128-row output tile. This legacy clustered shape remains guarded.
+    # - bm=256, CtaGroup.TWO, where two CTAs cooperate on one 256-row output
+    #   tile. That shape is valid even when the logical M tile count is 1, so
+    #   do not apply the old "at least cluster_m M tiles" demotion to it.
+    #
+    # Still demote unsupported or unguarded shapes before emitting cluster code.
+    # The autotune search is separately narrowed to the validated subset; this
+    # catches explicit user configs that bypass autotune. For non-tcgen05 MMA
+    # implementations the tcgen05 cluster knob is irrelevant, so normalize it
+    # away instead of rejecting an otherwise valid fallback config.
+    if mma_impl != "tcgen05":
+        tcgen05_cluster_m = 1
+    elif tcgen05_cluster_m > 1:
+        if not tcgen05_pid_is_persistent:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_cluster_m > 1 is currently supported only for "
+                "guarded persistent tcgen05 codegen while G3 validates "
+                "CtaGroup.TWO runtime ownership. Use tcgen05_cluster_m=1 "
+                "or a persistent pid_type.",
+            )
+        if (tcgen05_mma_bm if row_profile is not None else bm) < 128 or (
+            not tcgen05_requested_two_cta and m_size // bm < tcgen05_cluster_m
+        ):
+            tcgen05_cluster_m = 1
+    assert (
+        tcgen05_cluster_m == 1
+        or (tcgen05_mma_bm if row_profile is not None else bm) >= 128
+    )
+    tcgen05_is_two_cta = tcgen05_requested_two_cta and tcgen05_cluster_m > 1
+    # ``tcgen05_cluster_n`` is the multicast factor along the cluster's N
+    # axis. cluster_n=2 builds the canonical Quack-best 4-CTA cluster
+    # ``(cluster_m=2, cluster_n=2, 1)`` and only runs under
+    # ``use_2cta=True`` (V=2). At V=2 cluster_n=2 the V-leader gate
+    # (cute_plan.md §6.12.7) and ``mcast_size`` arrive count
+    # (``num_mcast_ctas_a + num_mcast_ctas_b - 1 = 2 + 1 - 1 = 2``) replace
+    # the cluster_n=1 cluster-leader / arrive_count=1 spelling. Outside
+    # this validated pairing demote to cluster_n=1 instead of throwing —
+    # explicit user configs hit the BackendUnsupported gate, and autotune
+    # stays narrowed to the validated subset.
+    if tcgen05_cluster_n_requested > 1 and not (
+        mma_impl == "tcgen05" and tcgen05_is_two_cta and tcgen05_cluster_m == 2
+    ):
+        if mma_impl == "tcgen05" and tcgen05_cluster_n_requested == 2:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_cluster_n=2 requires tcgen05_cluster_m=2 with "
+                "use_2cta=True (bm=256). See cute_plan.md §6.12 for the "
+                "validated 4-CTA cluster envelope.",
+            )
+        tcgen05_cluster_n = 1
+    else:
+        tcgen05_cluster_n = tcgen05_cluster_n_requested
+    cluster_n_tiles = (
+        (m_size + bm - 1) // bm if row_profile is not None else (n_size + bn - 1) // bn
+    )
+    if tcgen05_cluster_n > 1 and cluster_n_tiles % tcgen05_cluster_n != 0:
+        # The CUTLASS persistent scheduler builds its cluster grid with
+        # ceil_div and reports work validity at CLUSTER granularity, so
+        # when the N tile count is not divisible by cluster_n the padded
+        # trailing cluster hands its second CTA an out-of-range tile_n
+        # marked valid — an unmasked out-of-bounds store on the full-tile
+        # TMA path. (The l2_groupings remap itself is cluster-aware — see
+        # ``L2GroupingProgramIDs.codegen`` — so any grouping is fine on
+        # divisible grids.)
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05_cluster_n=2 requires the N tile count (cdiv(N, block_n)) "
+            "to be divisible by cluster_n; the persistent scheduler would "
+            "otherwise pad a partial cluster whose trailing CTA computes an "
+            "out-of-range tile. Use tcgen05_cluster_n=1 or a block_n that "
+            "gives an even N tile count.",
+        )
+    tcgen05_role_local_k_tail_tma = (
+        tcgen05_preserve_tma_for_two_cta_k_tail
+        and tcgen05_is_two_cta
+        and tcgen05_cluster_n in (1, 2)
+    )
+    # Mirror the K-tail role-local guard so later cluster demotion or
+    # cluster_n enablement cannot silently admit unvalidated edge ownership.
+    tcgen05_role_local_m_edge_tma = (
+        tcgen05_m_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n in (1, 2)
+    )
+    tcgen05_role_local_n_edge_tma = tcgen05_n_edge_only and tcgen05_cluster_n == 1
+    tcgen05_role_local_double_edge_tma = (
+        tcgen05_double_edge_tma and tcgen05_is_two_cta and tcgen05_cluster_n in (1, 2)
+    )
+    tcgen05_role_local_uses_k_tail_tma = tcgen05_role_local_k_tail_tma or (
+        tcgen05_role_local_double_edge_tma and tcgen05_has_k_tail
+    )
+    if (
+        tcgen05_cluster_n > 1
+        and (
+            tcgen05_double_edge_tma
+            or tcgen05_m_edge_only
+            or tcgen05_n_edge_only
+            or tcgen05_k_tail_only
+        )
+        and l2_swizzle_size_from_config(df.config) > 1
+    ):
+        # The edge/K-tail family's split full/fringe scheduler does not
+        # compose with the CUTLASS scheduler swizzle under a 4-CTA cluster:
+        # swizzle=8 HANGS at bf16 5000^3 (unkillable kernel) and swizzle=4
+        # fails NVVM compilation. Reject rather than hang; swizzle=1 is the
+        # measured-best edge configuration anyway.
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05_cluster_n=2 on edge/K-tail shapes requires "
+            "tcgen05_l2_swizzle_size=1 (the split full/fringe scheduler "
+            "does not compose with the scheduler swizzle under a 4-CTA "
+            "cluster).",
+        )
+    tcgen05_diagnose_cluster_m2_one_cta_role_local = bool(
+        df.config.get(TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY, False)
+    )
+    tcgen05_cluster_m2_one_cta_role_local_bridge = (
+        tcgen05_diagnose_cluster_m2_one_cta_role_local
+        and mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_static_full_tiles
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and not tcgen05_is_two_cta
+        and bm == 128
+        and bn == 256
+        and bk == 128
+    )
+    if (
+        tcgen05_diagnose_cluster_m2_one_cta_role_local
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY}=True requires "
+            "static-full persistent tcgen05 TMA codegen for the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_role_local_codegen_allowed = (
+        tcgen05_cluster_m == 1
+        or tcgen05_is_two_cta
+        or tcgen05_cluster_m2_one_cta_role_local_bridge
+    )
+    # The exact CtaGroup.ONE bridge duplicates A/B TMA production locally and
+    # remains runtime-guarded. Do not apply the CtaGroup.TWO deferred cluster
+    # pipeline protocol to that shape.
+    tcgen05_use_cluster_deferred_pipelines = (
+        tcgen05_cluster_m > 1 and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    )
+    # The clustered CtaGroup.ONE bridge flag is compile-proof only: ProgramID
+    # still emits the host guard because this runtime path is not validated.
+    tcgen05_use_role_local_tma_producer = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and (
+            tcgen05_static_full_tiles
+            or tcgen05_grouped_worklist_static_full_tiles
+            or tcgen05_role_local_k_tail_tma
+            or tcgen05_role_local_m_edge_tma
+            or tcgen05_role_local_n_edge_tma
+            or tcgen05_role_local_double_edge_tma
+        )
+        and tcgen05_role_local_codegen_allowed
+        and tcgen05_pid_is_persistent
+    )
+    tcgen05_use_pure_matmul_role_lifecycle = (
+        tcgen05_requested_pure_matmul_role_lifecycle
+        and mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_static_full_tiles
+        and not tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 1
+        and tcgen05_cluster_n == 1
+        and acc_expr is None
+    )
+    if (
+        tcgen05_requested_pure_matmul_role_lifecycle
+        and not tcgen05_use_pure_matmul_role_lifecycle
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05_strategy='pure_matmul_role_lifecycle' requires static-full "
+            "non-persistent tcgen05 TMA pure matmul with cluster_m=1, "
+            "cluster_n=1, and an identity/zero accumulator epilogue",
+        )
+    tcgen05_use_separate_tma_producer = (
+        tcgen05_use_role_local_tma_producer or tcgen05_use_pure_matmul_role_lifecycle
+    )
+    # Keep a distinct name so future MMA-exec gating changes are localized.
+    tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
+    tcgen05_use_separate_mma_exec = (
+        tcgen05_use_role_local_mma_exec or tcgen05_use_pure_matmul_role_lifecycle
+    )
+    tcgen05_pipeline_state_ns = (
+        "_helion_tcgen05_pipeline"
+        if tcgen05_use_pure_matmul_role_lifecycle
+        else "cutlass.pipeline"
+    )
+    # The role-local CtaGroup.TWO edge/K-tail families keep every
+    # per-iteration K-loop predicate the slow path would emit constant-true:
+    # the persistent scheduler only publishes in-grid tiles (a tile origin is
+    # always < the problem extent, so the M/N-edge "issue TMA over the partial
+    # stripe" predicates always hold), the K loop runs ceil(K/bk) iterations
+    # so every k_tile start is in range, and partial A/B stripes plus the K
+    # tail are TMA boxes that clamp against the descriptor's true extents and
+    # zero-fill SMEM (zeros accumulate as no-ops through the MMA). Take the
+    # predicate-free fast path (hoisted V-leader gate, unguarded pipeline
+    # waits/releases) instead of paying the per-iteration branch tax on every
+    # tile; the store-side full-tile/fringe split is governed separately by
+    # the TMA-store epilogue flags.
+    # Aux kernels stay on the predicated slow path: their guarded epilogue
+    # aux loads and the aux-TMA hybrid store protocol were validated with the
+    # per-iteration predicates present (removing them deadlocks the aux edge
+    # hybrid TMA-store runtime test), and only plain kernels were measured.
+    tcgen05_static_full_tma_fast_path = (
+        (
+            tcgen05_static_full_tiles
+            or (
+                tcgen05_is_two_cta
+                and not env.config_spec.cute_tcgen05_aux_kernel_detected
+                and (
+                    tcgen05_role_local_k_tail_tma
+                    or tcgen05_role_local_m_edge_tma
+                    or tcgen05_role_local_n_edge_tma
+                    or tcgen05_role_local_double_edge_tma
+                )
+            )
+        )
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_grouped_static_persistent_requested
+    )
+    tcgen05_acc_producer_mode = df.config.get(
+        TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
+        TCGEN05_ACC_PRODUCER_MODE_NORMAL,
+    )
+    diagnose_skip_umma_issue = (
+        tcgen05_acc_producer_mode == TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
+    )
+    if diagnose_skip_umma_issue and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY}="
+            f"{TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA!r} requires tcgen05 MMA codegen",
+        )
+    tcgen05_acc_producer_advance_mode = df.config.get(
+        TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+        TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL,
+    )
+    diagnose_skip_acc_producer_advance = (
+        tcgen05_acc_producer_advance_mode == TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP
+    )
+    if (
+        diagnose_skip_acc_producer_advance
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_producer_acquire_mode = df.config.get(
+        TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+        TCGEN05_AB_PRODUCER_ACQUIRE_MODE_NORMAL,
+    )
+    diagnose_skip_ab_producer_acquire = (
+        tcgen05_ab_producer_acquire_mode == TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP
+    )
+    if (
+        diagnose_skip_ab_producer_acquire
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_PRODUCER_ACQUIRE_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_initial_producer_acquire_mode = df.config.get(
+        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_NORMAL,
+    )
+    diagnose_skip_initial_ab_producer_acquire = (
+        tcgen05_ab_initial_producer_acquire_mode
+        == TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST
+    )
+    if (
+        diagnose_skip_initial_ab_producer_acquire
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_SKIP_FIRST!r} requires "
+            "the guarded cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_producer_advance_mode = df.config.get(
+        TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+        TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL,
+    )
+    diagnose_skip_ab_producer_advance = (
+        tcgen05_ab_producer_advance_mode == TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP
+    )
+    if (
+        diagnose_skip_ab_producer_advance
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_PRODUCER_ADVANCE_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_consumer_wait_mode = df.config.get(
+        TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
+        TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL,
+    )
+    diagnose_skip_ab_consumer_wait = (
+        tcgen05_ab_consumer_wait_mode == TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
+    )
+    if (
+        diagnose_skip_ab_consumer_wait
+        and not tcgen05_cluster_m2_one_cta_role_local_bridge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    tcgen05_ab_consumer_phase_mode = df.config.get(
+        TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
+        TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL,
+    )
+    diagnose_ab_consumer_phase1 = (
+        tcgen05_ab_consumer_phase_mode == TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
+    )
+    if diagnose_ab_consumer_phase1 and not tcgen05_cluster_m2_one_cta_role_local_bridge:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1!r} requires the guarded "
+            "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
+        )
+    # Static-full CtaGroup.TWO keeps a prefetched AB consumer token live
+    # across the accumulator acquire and each K-loop issue. CtaGroup.ONE
+    # keeps the older adjacent try-wait/wait sequence.
+    tcgen05_use_role_local_ab_consumer_prefetch = (
+        tcgen05_use_role_local_mma_exec
+        and tcgen05_is_two_cta
+        and tcgen05_use_tma_pipeline
+    )
+    # Keep a distinct name so future epi-role gating changes are localized.
+    tcgen05_use_role_local_epi = (
+        tcgen05_use_role_local_tma_producer or tcgen05_use_pure_matmul_role_lifecycle
+    )
+    # This is the kernel-wide contract ProgramID consumes. Today the TMA
+    # producer flag is the master predicate for all three role-local loops.
+    tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
+    tcgen05_ab_stage_count_value = _tcgen05_config_int(
+        df.config, "tcgen05_ab_stages", _tcgen05_ab_stage_count(df.config.num_stages)
+    )
+    tcgen05_c_stage_count_value = _tcgen05_config_int(
+        df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)
+    )
+    tcgen05_acc_stage_count_value = _tcgen05_config_int(
+        df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(tcgen05_mma_bn)
+    )
+    if tcgen05_m_subtile_count > 1:
+        # M-paired tiles: validated envelope is the plain (no-aux, no
+        # leading passthrough) full-tile static role-local CtaGroup.TWO
+        # family; cluster_n=2 composes (the 2x2 super-tile: A multicast
+        # across the cluster-N pairs on top of the SMEM-shared B within
+        # each pair). Both TMEM accumulator stages are repurposed as the
+        # two subtiles' accumulators, so acc_stages must be 2 (the pipeline
+        # still double-buffers ACROSS work tiles at the pair granularity
+        # via the two stages' phase flips).
+        if not (
+            mma_impl == "tcgen05"
+            and tcgen05_is_two_cta
+            and tcgen05_cluster_m == 2
+            and tcgen05_cluster_n in (1, 2)
+            and tcgen05_static_full_tiles
+            and tcgen05_use_tma_pipeline
+            and tcgen05_pid_is_persistent
+            and not env.config_spec.cute_tcgen05_aux_kernel_detected
+            and (analysis is None or not analysis.has_leading_passthrough)
+            and tcgen05_acc_stage_count_value == 2
+            and input_dtype in (torch.float16, torch.bfloat16)
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "block_m=512 (tcgen05 M-paired tiles) requires the plain "
+                "16-bit full-tile static persistent CtaGroup.TWO family: "
+                "tcgen05_cluster_m=2, tcgen05_cluster_n in (1, 2), "
+                "tcgen05_acc_stages=2, M/N/K divisible by "
+                "block_m/block_n/block_k, TMA pipeline, and no aux/batch "
+                "operands. Use block_m=256 otherwise.",
+            )
+    # Budget-driven admission for the output-edge TMA-store epilogue's extra
+    # C ring: the flat <=2 AB-stage cap was calibrated for the residual
+    # (source-C) family's (128, 64) epilogue tile; plain kernels stage a
+    # (128, 32) tile whose ring fits comfortably next to a 3-stage AB
+    # pipeline, and a deeper AB pipeline is worth ~15-25% on edge shapes.
+    # ``c_stages_fits`` fails CLOSED (False without a recorded budget), so
+    # keep the legacy cap as the fallback admission.
+    tcgen05_output_edge_tma_store_fits_smem = (
+        tcgen05_ab_stage_count_value <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+        or env.config_spec._cute_tcgen05_config.c_stages_fits(
+            bm=tcgen05_source_bm,
+            bn=tcgen05_source_bn,
+            bk=bk,
+            cluster_m=tcgen05_cluster_m,
+            ab_stages=tcgen05_ab_stage_count_value,
+            c_stages=tcgen05_c_stage_count_value,
+            has_source_c=True,
+        )
+    )
+    # ``tcgen05_is_two_cta`` below gates only the hybrid output-store protocol,
+    # not role-local edge-TMA input loading. The mixed full-tile TMA-store plus
+    # edge SIMT-store epilogue is validated for CtaGroup.TWO; enabling its
+    # conditional store-pipeline state and tile counters for one CTA currently
+    # produces IR that NVVM rejects. One-CTA N-edge kernels therefore keep the
+    # predicated SIMT epilogue for every tile. This is an implementation
+    # boundary, not a tcgen05 hardware requirement.
+    tcgen05_use_output_edge_tma_store_for_full_tiles = (
+        tcgen05_role_local_m_edge_tma
+        or (tcgen05_role_local_n_edge_tma and tcgen05_is_two_cta and n_size >= bn)
+        or tcgen05_role_local_double_edge_tma
+    ) and tcgen05_output_edge_tma_store_fits_smem
+    store_outer_extent = bn if output_column_major else bm
+    prefer_simt_narrow_store = (
+        input_dtype == torch.float8_e4m3fn and store_outer_extent < 32
+    )
+    # Flat kernels process one output tile per CTA, so the c_pipeline stage is
+    # just the subtile index. Persistent kernels use a role-local tile counter
+    # to rotate c_pipeline stages across work tiles. Static-full CtaGroup.TWO
+    # uses the same SMEM-staged TMA-store epilogue: each CTA's epilogue warp 0
+    # stores its partitioned C tile. Output-edge role-local kernels can use the
+    # same TMA-store path for interior full tiles while retaining the predicated
+    # SIMT fallback for fringe tiles, but only when the AB-stage count leaves
+    # enough SMEM budget for the extra epilogue tile.
+    tcgen05_direct_store_requested = (
+        df.config.get(TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL)
+        == TCGEN05_C_STORE_MODE_DIRECT
+    )
+    # Every store this accumulator reaches (``None`` when the fan-out is
+    # untraced; the store lowering then limits it to one store).
+    tcgen05_traced_output_stores = (
+        _trace_mma_to_stores(fx_node, cg.codegen_graphs)
+        if mma_impl == "tcgen05" and fx_node is not None
+        else None
+    )
+    # The TMA store needs a TensorMap over the destination: a 16-byte-aligned
+    # base, outer strides that are whole 16-byte multiples and a matrix whose
+    # contiguous axis is the one the staged D layout assumes.  The host
+    # wrapper builds the descriptor from the launch tensor without checking
+    # any of this, and a violating output (row stride 1032 B, an N-major
+    # view, an 8-byte-aligned base) was stored silently wrong.  The proof
+    # reuses the TMA-load operands' facts (the bound kernel's pointer/stride
+    # residue specialization for arguments, the allocator alignment of fresh
+    # host tensors, static alias views of one input); an unproved destination
+    # takes the SIMT store body, which addresses every element itself.  The
+    # grouped and row-union families (transposed NM stores, N,K-major grouped
+    # and segmented destinations) keep their own store protocols; the store
+    # lowering still refuses a destination known to break the rules. The
+    # structural grouped exemption is shared with the bind-time direct-entry
+    # seed gate (``_tcgen05_mma_output_tma_store_provable``).
+    tcgen05_output_tma_store_proven = (
+        tcgen05_nm_orientation
+        or row_union_plan is not None
+        or _tcgen05_grouped_rhs_keeps_store_protocol(rhs_info)
+        or grouped_mode is not None
+        or tcgen05_traced_output_stores is None
+        or all(
+            _tcgen05_tma_destination_is_legal(
+                env, store, output_column_major=output_column_major
+            )
+            for store in tcgen05_traced_output_stores
+        )
+    )
+    tcgen05_use_tma_store_epilogue = (
+        mma_impl == "tcgen05"
+        and (row_union_plan is None or row_profile is not None)
+        and tcgen05_use_tma_pipeline
+        and not prefer_simt_narrow_store
+        and not tcgen05_direct_store_requested
+        and tcgen05_output_tma_store_proven
+        and (
+            tcgen05_static_full_tiles
+            or (row_profile is not None and row_profile.linear_record_clc)
+            or tcgen05_grouped_worklist_static_full_tiles
+            or tcgen05_role_local_k_tail_tma
+            or tcgen05_use_output_edge_tma_store_for_full_tiles
+        )
+        and tcgen05_role_local_codegen_allowed
+        and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
+    )
+    # A proven compact fragment destination can use the same SMEM-staged TMA
+    # store pipeline as a same-shape epilogue.  The store renderer builds the
+    # destination-sized TMA descriptor and keeps the source T2R ownership
+    # separate from the compact destination partition.
+
+    def tcgen05_tma_store_full_tiles_only_for(
+        partial_output_tma_store: bool,
+    ) -> bool:
+        return (
+            tcgen05_use_tma_store_epilogue
+            and (
+                tcgen05_use_output_edge_tma_store_for_full_tiles
+                or (row_profile is not None and row_profile.linear_record_clc)
+            )
+            and not tcgen05_static_output_tiles
+            and not partial_output_tma_store
+        )
+
+    tcgen05_partial_output_tma_store = False
+    tcgen05_tma_store_full_tiles_only = tcgen05_tma_store_full_tiles_only_for(
+        tcgen05_partial_output_tma_store
+    )
+    if tcgen05_large_bn_proof and (
+        mma_impl != "tcgen05"
+        or tcgen05_is_two_cta
+        or not tcgen05_use_tma_pipeline
+        or not tcgen05_static_full_tiles
+        or not tcgen05_use_tma_store_epilogue
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_LARGE_BN_PROOF_CONFIG_KEY}=True requires final tcgen05 "
+            "CtaGroup.ONE TMA-load and TMA-store lowering for the G4 proof",
+        )
+    tcgen05_collective_handles_operand_loads = (
+        mma_impl == "tcgen05"
+        and fx_node is not None
+        and cg.current_grid_state is not None
+        and _operand_infos_exclusive_for_mma(lhs_info, rhs_info, fx_node)
+    )
+    tcgen05_grouped_dynamic_ab_tensormap_rank: int | None = None
+    # The selected host-worklist profile can address the packed A, grouped B,
+    # and packed D allocations through one immutable TensorMap each.  Keep this
+    # separate from ``dynamic_ab_tensormap_rank``: that value still describes
+    # the semantic rank used by validation, while this flag controls whether
+    # the device needs per-CTA mutable descriptor storage.
+    tcgen05_grouped_fixed_tensormaps = False
+    tcgen05_grouped_d_mode = Tcgen05GroupedDMode.NONE
+    tcgen05_grouped_worklist_persistent = False
+    grouped_worklist_supported = False
+    grouped_worklist_one_cta = False
+    grouped_worklist_two_cta = False
+    tcgen05_grouped_device_split_sizes = False
+    tcgen05_grouped_device_layout_kind: Literal["split_sizes", "offsets"] | None = None
+    tcgen05_grouped_layout_arg_name: str | None = None
+    tcgen05_grouped_n_sizes_arg_name: str | None = None
+    tcgen05_grouped_k_sizes_arg_name: str | None = None
+    tcgen05_grouped_ab_tensormaps: str | None = None
+    tcgen05_grouped_direct_pointers: str | None = None
+    tcgen05_grouped_direct_strides: str | None = None
+    tcgen05_grouped_d_tensormap: str | None = None
+    tcgen05_grouped_actual_has_m_tail: bool | None = None
+    tcgen05_grouped_actual_has_n_tail: bool | None = None
+    tcgen05_grouped_static_full_output_tiles_from_metadata = False
+    tcgen05_grouped_count: str | None = None
+    tcgen05_grouped_total_clusters: str | None = None
+    tcgen05_grouped_sched_params: str | None = None
+    tcgen05_grouped_problem_sizes: str | None = None
+    tcgen05_grouped_starts: str | None = None
+    tcgen05_grouped_runtime_tile_records: str | None = None
+    tcgen05_grouped_runtime_nm_direct = False
+    tcgen05_grouped_use_runtime_n_ptx = False
+    tcgen05_grouped_scheduler_mode = Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+    tcgen05_grouped_runtime_nm_clc_requested = (
+        df.config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, False) is True
+        and df.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+        == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+    )
+    tcgen05_l2_swizzle_size_value = 1
+    tcgen05_grouped_static_quota_args: tuple[str, ...] = ()
+    tcgen05_grouped_real_groups: str | None = None
+    tcgen05_grouped_metadata_idx: str | None = None
+    tcgen05_grouped_group_idx: str | None = None
+    tcgen05_grouped_cta_tile_idx_m: str | None = None
+    tcgen05_grouped_cta_tile_idx_n: str | None = None
+    tcgen05_grouped_problem_m: str | None = None
+    tcgen05_grouped_problem_n: str | None = None
+    tcgen05_grouped_problem_k: str | None = None
+    tcgen05_grouped_global_m_start: str | None = None
+    tcgen05_grouped_valid_m: str | None = None
+    tcgen05_grouped_store_m: str | None = None
+    tcgen05_grouped_tail_proof = (
+        rhs_rank3_grouped_proof.tail_epilogue
+        if rhs_rank3_grouped_proof is not None
+        else None
+    )
+    tcgen05_grouped_k_mask = (
+        rhs_rank3_grouped_proof.k_mask if rhs_rank3_grouped_proof is not None else None
+    )
+    if requested_schedule is not None:
+        from .memory_ops import runtime_tensor_has_specialized_alignment
+
+        lhs_source_fake = lhs_info.source_fake
+        rhs_source_fake = rhs_info.source_fake
+        lhs_source_k = (
+            _static_int(lhs_source_fake.shape[1]) if lhs_source_fake.ndim == 2 else None
+        )
+        rhs_source_n = _static_int(rhs_info.matrix_cols)
+        rhs_source_k = _static_int(rhs_info.matrix_rows)
+        lhs_contiguous_mk = _is_contiguous_mk_source_fake(lhs_source_fake)
+        rhs_contiguous_gnk = _is_contiguous_grouped_rhs_source_fake(
+            rhs_source_fake,
+            k_major=True,
+        )
+        rhs_contiguous_gkn = _is_contiguous_grouped_rhs_source_fake(
+            rhs_source_fake,
+            k_major=False,
+        )
+        worklist_nm_static_checks = {
+            "f16_or_bf16_operands": input_dtype in (torch.float16, torch.bfloat16),
+            "matching_f16_or_bf16_store": epi_elem_dtype_str == input_dtype_str,
+            "tile_256x128x64_or_128": (
+                bm == 256
+                and bn == 128
+                and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+            ),
+            "n_multiple_32": (
+                rhs_source_n is not None
+                and rhs_source_n > 0
+                and rhs_source_n % TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[2] == 0
+            ),
+            "k_multiple_block_k": (
+                lhs_source_k is not None
+                and rhs_source_k is not None
+                and lhs_source_k % bk == 0
+                and rhs_source_k % bk == 0
+            ),
+            "common_k": (
+                lhs_source_k is not None
+                and rhs_source_k is not None
+                and lhs_source_k == rhs_source_k
+            ),
+            "contiguous_a_packed": lhs_contiguous_mk,
+            "contiguous_b_grouped": (
+                rhs_contiguous_gnk or rhs_contiguous_gkn or rhs_contiguous_shared
+            ),
+            "aligned_shared_rhs_bases": (
+                not tcgen05_shared_rhs
+                or all(
+                    runtime_tensor_has_specialized_alignment(env, tensor, 16)
+                    for tensor in (lhs_source_fake, rhs_source_fake)
+                )
+            ),
+            "zero_accumulator": zero_acc_expr or acc_expr is None,
+        }
+        failed_static_checks = [
+            name for name, passed in worklist_nm_static_checks.items() if not passed
+        ]
+        if failed_static_checks:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} is validated only for "
+                "generated FP16/BF16 contiguous "
+                "segment-worklist kernels: contiguous A_packed[M,K], "
+                "logical B_grouped[G,N,K] or shared B[K,N] with contiguous K-major or "
+                "MN-major storage, common K%block_k==0, N%32==0, "
+                f"CtaGroup.TWO physical 256x"
+                f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES}x"
+                f"{TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES} or CtaGroup.ONE "
+                f"physical {TCGEN05_ONE_CTA_MAX_BLOCK_M}x"
+                f"{TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE}x"
+                f"{TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES} (logical tile "
+                "256x128), zero accumulator, and a matching-dtype "
+                "store; failed checks: " + ", ".join(failed_static_checks),
+            )
+    if tcgen05_grouped_static_persistent_requested:
+        if rhs_rank3_grouped_proof is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_MODE_CONFIG_KEY} requires the rank3 RHS "
+                "grouped-NT safe-group pattern layout[tile_m.begin]",
+            )
+        grouped_layout_tensor = rhs_rank3_grouped_proof.layout_tensor
+        tcgen05_grouped_device_split_sizes = (
+            rhs_rank3_grouped_proof.packed_split is not None
+        )
+        tcgen05_grouped_device_layout_kind = (
+            rhs_rank3_grouped_proof.packed_split.layout_kind
+            if rhs_rank3_grouped_proof.packed_split is not None
+            else None
+        )
+        tcgen05_grouped_worklist_persistent = (
+            rhs_rank3_grouped_proof.is_worklist
+            and tcgen05_grouped_dynamic_ab_tensormaps_requested
+        )
+        if (
+            tcgen05_grouped_worklist_persistent
+            and not tcgen05_grouped_device_split_sizes
+            and not tcgen05_grouped_runtime_nm_direct
+        ):
+            if grouped_layout_tensor.ndim != 2 or grouped_layout_tensor.shape[1] != 4:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped worklist persistent path requires "
+                    "work_tile_metadata with shape [W, 4]",
+                )
+        if grouped_layout_tensor.dtype not in (torch.int32, torch.int64):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_MODE_CONFIG_KEY} requires an int32/int64 "
+                "rank3 RHS group layout tensor",
+            )
+        grouped_warp_spec = (
+            warp_spec_from_config(df.config) if mma_impl == "tcgen05" else None
+        )
+        grouped_worklist_two_cta = (
+            tcgen05_grouped_worklist_persistent
+            and tcgen05_is_two_cta
+            and tcgen05_cluster_m == 2
+            and tcgen05_cluster_n == 1
+            and bm == TCGEN05_TWO_CTA_BLOCK_M
+            and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+        )
+        grouped_worklist_one_cta = (
+            tcgen05_grouped_worklist_persistent
+            and tcgen05_one_cta_worklist_shape
+            and not tcgen05_is_two_cta
+            and tcgen05_cluster_m == 1
+            and tcgen05_cluster_n == 1
+            and tcgen05_mma_bm == 128
+            and tcgen05_mma_bn in TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
+            and bm == TCGEN05_TWO_CTA_BLOCK_M
+            and bn == 128
+            and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+        )
+        grouped_worklist_supported = (
+            grouped_worklist_two_cta or grouped_worklist_one_cta
+        )
+        grouped_common_k_pair_allowed = (
+            tcgen05_grouped_k_mask is not None
+            or tcgen05_grouped_worklist_persistent
+            or bk == 128
+            or (k_total_size, bk) in TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
+        )
+        grouped_envelope_checks = {
+            "grouped_rhs": rhs_info.rhs_is_grouped,
+            "common_k": k_total_size == int(rhs_fake.shape[0]),
+            "common_k_block_multiple": k_total_size % bk == 0,
+            "common_k_block_pair_allowlisted": grouped_common_k_pair_allowed,
+            "f16_or_bf16": input_dtype in (torch.float16, torch.bfloat16),
+            "tcgen05": mma_impl == "tcgen05",
+            "tma_pipeline": tcgen05_use_tma_pipeline,
+            "collective_operand_loads": tcgen05_collective_handles_operand_loads,
+            "static_full_tiles": (
+                tcgen05_static_full_tiles or tcgen05_grouped_worklist_persistent
+            ),
+            "persistent_pid": tcgen05_pid_is_persistent,
+            "cluster_m_1_or_supported_worklist": (
+                tcgen05_cluster_m == 1 or grouped_worklist_supported
+            ),
+            "cluster_n_1": tcgen05_cluster_n == 1,
+            "cta_group_one_or_supported_worklist": (
+                not tcgen05_is_two_cta or grouped_worklist_supported
+            ),
+            "role_local_body": tcgen05_use_role_local_persistent_body,
+            "tma_store_epilogue": tcgen05_use_tma_store_epilogue,
+            "zero_accumulator": zero_acc_expr or acc_expr is None,
+            "block_m_128_or_supported_worklist": (
+                bm == 128 or grouped_worklist_supported
+            ),
+            "block_n_64_or_128": bn in (64, 128),
+            "block_k_16_32_or_64_or_128": (
+                bk in TCGEN05_GROUPED_STATIC_BLOCK_K_CHOICES
+                or (
+                    tcgen05_grouped_dynamic_ab_tensormaps_requested
+                    and bk == 64
+                    and (
+                        tcgen05_grouped_k_mask is not None
+                        or tcgen05_grouped_worklist_persistent
+                    )
+                )
+            ),
+            "block_k_64_static_common_or_dynamic": (
+                bk != 64
+                or tcgen05_grouped_k_mask is None
+                or tcgen05_grouped_dynamic_ab_tensormaps_requested
+                or tcgen05_grouped_worklist_persistent
+            ),
+            "dynamic_ab_tensormaps_supported_bk": (
+                not tcgen05_grouped_dynamic_ab_tensormaps_requested
+                or bk == 64
+                or (requested_schedule is not None and bk == 128)
+            ),
+            "dynamic_ab_tensormaps_exact_k_sizes": (
+                not tcgen05_grouped_dynamic_ab_tensormaps_requested
+                or tcgen05_grouped_k_mask is not None
+                or tcgen05_grouped_worklist_persistent
+            ),
+            "worklist_dynamic_ab_only": (
+                not tcgen05_grouped_worklist_persistent
+                or (
+                    tcgen05_grouped_dynamic_ab_tensormaps_requested
+                    and (bm == 128 or grouped_worklist_supported)
+                    and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+                )
+            ),
+            "supported_scheduler_warp": (
+                grouped_warp_spec is not None
+                and (
+                    grouped_warp_spec.scheduler_warps == 0
+                    or (
+                        tcgen05_grouped_runtime_nm_clc_requested
+                        and grouped_warp_spec.scheduler_warps == 1
+                    )
+                )
+            ),
+            "no_c_input_warp": (
+                grouped_warp_spec is not None and grouped_warp_spec.c_input_warps == 0
+            ),
+            "no_store_warp": (
+                grouped_warp_spec is not None and grouped_warp_spec.store_warps == 0
+            ),
+        }
+        failed_grouped_checks = [
+            name for name, passed in grouped_envelope_checks.items() if not passed
+        ]
+        if failed_grouped_checks:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_MODE_CONFIG_KEY} is currently validated "
+                "only for FP16/BF16 rank3 RHS grouped-NT CtaGroup.ONE "
+                "persistent_interleaved static-full 128x(64|128)x(16|32|64|128) "
+                "TMA-load + TMA-store kernels, or the generated segment "
+                "worklist BK64/BK128 or direct BK64 dynamic-TensorMap variant "
+                f"(including CtaGroup.TWO physical 256x"
+                f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES}x"
+                f"{TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES} and CtaGroup.ONE "
+                f"physical {TCGEN05_ONE_CTA_MAX_BLOCK_M}x"
+                f"{TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE}x"
+                f"{TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES} worklist shapes), "
+                "with optional one-warp CLC scheduling and no C-input/store "
+                "warp variants; failed checks: " + ", ".join(failed_grouped_checks),
+            )
+        grouped_count_value = (
+            rhs_info.rhs_group_count
+            if tcgen05_grouped_device_split_sizes
+            else int(grouped_layout_tensor.shape[0])
+            if tcgen05_grouped_worklist_persistent
+            else rhs_info.rhs_group_count
+        )
+        if grouped_count_value <= 0:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_MODE_CONFIG_KEY} requires at least one RHS group",
+            )
+        if (
+            tcgen05_grouped_static_problem_shapes is not None
+            and len(tcgen05_grouped_static_problem_shapes) != grouped_count_value
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY} describes "
+                f"{len(tcgen05_grouped_static_problem_shapes)} groups, but the "
+                f"grouped RHS has {grouped_count_value}",
+            )
+        tcgen05_grouped_dynamic_ab_tensormap_rank = (
+            3
+            if tcgen05_grouped_dynamic_ab_tensormaps_requested
+            and (bk == 64 or (requested_schedule is not None and bk == 128))
+            else None
+        )
+        tcgen05_grouped_layout_arg_name = df.tensor_arg(grouped_layout_tensor).name
+        if tcgen05_grouped_k_mask is not None:
+            tcgen05_grouped_k_sizes_arg_name = df.tensor_arg(
+                tcgen05_grouped_k_mask.k_sizes_tensor
+            ).name
+        if tcgen05_grouped_tail_proof is not None:
+            if tcgen05_grouped_tail_proof.n_sizes_tensor is not None:
+                tcgen05_grouped_n_sizes_arg_name = df.tensor_arg(
+                    tcgen05_grouped_tail_proof.n_sizes_tensor
+                ).name
+            tail_facts = _runtime_grouped_static_tail_facts(
+                layout_arg_name=tcgen05_grouped_layout_arg_name,
+                n_sizes_arg_name=tcgen05_grouped_n_sizes_arg_name or None,
+                group_count=grouped_count_value,
+                bm=bm,
+                bn=bn,
+                n_size=n_size,
+                m_tail_preserve=tcgen05_grouped_tail_proof.has_m_tail_mask,
+            )
+            if tail_facts is not None:
+                (
+                    tcgen05_grouped_actual_has_m_tail,
+                    tcgen05_grouped_actual_has_n_tail,
+                ) = tail_facts
+                tcgen05_grouped_static_full_output_tiles_from_metadata = (
+                    not tcgen05_grouped_actual_has_m_tail
+                    and not tcgen05_grouped_actual_has_n_tail
+                )
+            tcgen05_tma_store_full_tiles_only = True
+            grouped_static_d_tail_tensormap_n_only = (
+                (k_total_size, bk) in TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
+                and tcgen05_grouped_tail_proof.has_n_tail_mask
+                and tcgen05_grouped_actual_has_n_tail is True
+                and tcgen05_grouped_actual_has_m_tail is False
+            )
+            grouped_static_d_tail_tensormap_m_only = (
+                bk == 128
+                and tcgen05_grouped_tail_proof.has_m_tail_mask
+                and tcgen05_grouped_actual_has_m_tail is True
+                and tcgen05_grouped_actual_has_n_tail is False
+            )
+            grouped_static_d_tail_tensormap = (
+                tcgen05_grouped_dynamic_ab_tensormap_rank is None
+                and not tcgen05_grouped_worklist_persistent
+                and tcgen05_grouped_k_mask is None
+                and not tcgen05_is_two_cta
+                and tcgen05_cluster_m == 1
+                and tcgen05_cluster_n == 1
+                and n_size % bn == 0
+                and (
+                    grouped_static_d_tail_tensormap_n_only
+                    or grouped_static_d_tail_tensormap_m_only
+                )
+            )
+            if tcgen05_grouped_static_full_output_tiles_from_metadata:
+                tcgen05_tma_store_full_tiles_only = False
+            if tcgen05_grouped_dynamic_ab_tensormap_rank is not None:
+                tcgen05_grouped_d_mode = Tcgen05GroupedDMode.ALL_TILES
+                tcgen05_tma_store_full_tiles_only = False
+            elif grouped_static_d_tail_tensormap:
+                tcgen05_grouped_d_mode = Tcgen05GroupedDMode.EDGE_ONLY
+        if tcgen05_grouped_worklist_persistent:
+            tcgen05_grouped_d_mode = Tcgen05GroupedDMode.ALL_TILES
+            tcgen05_tma_store_full_tiles_only = False
+        if tcgen05_grouped_direct_pointer_metadata_requested:
+            if tcgen05_nm_orientation:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_DIRECT!r} "
+                    "currently supports the default M,N grouped TensorMap "
+                    "orientation only",
+                )
+            if tcgen05_grouped_dynamic_ab_tensormap_rank is None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_DIRECT!r} "
+                    "requires dynamic grouped A/B TensorMaps",
+                )
+            if tcgen05_grouped_d_mode is Tcgen05GroupedDMode.NONE:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_DIRECT!r} "
+                    "requires a dynamic grouped D TensorMap",
+                )
+        if requested_schedule is not None:
+            worklist_nm_envelope_checks = {
+                "rank3_work_metadata": (
+                    (rhs_rank3_segment_metadata or rhs_rank3_packed_split)
+                    and rhs_rank3_worklist_lhs_info is not None
+                    and rhs_rank3_worklist_store_info is not None
+                ),
+                "worklist_metadata": tcgen05_grouped_worklist_persistent,
+                "dynamic_ab_tensormaps": (
+                    tcgen05_grouped_dynamic_ab_tensormap_rank is not None
+                ),
+                "dynamic_d_tensormap": (
+                    tcgen05_grouped_d_mode is not Tcgen05GroupedDMode.NONE
+                ),
+                "supported_cta_group": grouped_worklist_supported,
+                "no_grouped_k_mask": tcgen05_grouped_k_mask is None,
+                "no_tail_epilogue": tcgen05_grouped_tail_proof is None,
+            }
+            failed_worklist_nm_checks = [
+                name
+                for name, passed in worklist_nm_envelope_checks.items()
+                if not passed
+            ]
+            if failed_worklist_nm_checks:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} is validated only "
+                    "for generated FP16/BF16 segment-worklist kernels: "
+                    "contiguous A_packed[M,K], logical B_grouped[G,N,K] or shared B[K,N] with "
+                    "contiguous K-major or MN-major storage, common "
+                    "K%block_k==0, N%32==0, "
+                    f"CtaGroup.TWO physical 256x"
+                    f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES}x"
+                    f"{TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES} or "
+                    f"CtaGroup.ONE physical {TCGEN05_ONE_CTA_MAX_BLOCK_M}x"
+                    f"{TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE}x"
+                    f"{TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES} (logical tile "
+                    "256x128), A/B/D TensorMaps with a fixed-map fast path "
+                    "when eligible, zero accumulator, and a matching-dtype store; "
+                    "failed checks: " + ", ".join(failed_worklist_nm_checks),
+                )
+            assert requested_schedule is not None
+        if (
+            tcgen05_grouped_dynamic_ab_tensormap_rank is not None
+            and not tcgen05_grouped_direct_pointer_metadata_requested
+            and _is_contiguous_mk_source_fake(lhs_info.source_fake)
+            and (
+                rhs_contiguous_shared
+                or _is_contiguous_grouped_rhs_source_fake(
+                    rhs_info.source_fake,
+                    k_major=True,
+                )
+                or _is_contiguous_grouped_rhs_source_fake(
+                    rhs_info.source_fake,
+                    k_major=False,
+                )
+            )
+        ):
+            tcgen05_grouped_dynamic_ab_tensormap_rank = 2
+        tcgen05_grouped_fixed_tensormaps = (
+            requested_schedule is Tcgen05Orientation.NM
+            and tcgen05_grouped_worklist_persistent
+            and not tcgen05_grouped_device_split_sizes
+            and tcgen05_grouped_dynamic_ab_tensormap_rank == 2
+            and tcgen05_grouped_d_mode is Tcgen05GroupedDMode.ALL_TILES
+            and tcgen05_worklist_source_m_tile
+            in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+            and n_size % tcgen05_mma_bm == 0
+            and k_total_size % bk == 0
+        )
+        if tcgen05_grouped_fixed_tensormaps:
+            # The host wrapper builds full-allocation descriptors.  Per-group
+            # starts and valid extents remain scheduler metadata, but no longer
+            # require rebasing A/B/D descriptors in the kernel.
+            tcgen05_grouped_d_mode = Tcgen05GroupedDMode.NONE
+        # Generic runtime-variable-M N,M worklists can bypass both the grouped
+        # scheduler search and its scheduler-warp/SMEM-mailbox broadcast.  The
+        # launcher expands the current worklist into one record per logical
+        # output tile; every role replays that runtime table directly without
+        # specializing on the current per-group M sizes.
+        tcgen05_grouped_runtime_nm_direct_requested = (
+            df.config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, False) is True
+        )
+        tcgen05_grouped_runtime_nm_direct = (
+            requested_schedule is Tcgen05Orientation.NM
+            and tcgen05_grouped_worklist_persistent
+            and not tcgen05_grouped_device_split_sizes
+            and tcgen05_grouped_runtime_nm_direct_requested
+            # Direct replay remains an explicit profile opt-in for both CTA
+            # group sizes.  The host table must use the physical MMA width,
+            # which is 128 for CTA-group::1 and 256 for CTA-group::2.
+            and (tcgen05_is_two_cta or grouped_worklist_one_cta)
+            and tcgen05_grouped_dynamic_ab_tensormap_rank is not None
+        )
+        if (
+            tcgen05_grouped_runtime_nm_direct_requested
+            and not tcgen05_grouped_runtime_nm_direct
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped runtime-direct was explicitly requested but "
+                "the kernel is not an eligible generic worklist_nm launch; it "
+                "requires persistent worklist metadata, no device split sizes "
+                "or static problem signature, a supported CTA-group tile, and "
+                "dynamic grouped A/B TensorMaps",
+            )
+        if (
+            tcgen05_grouped_runtime_nm_clc_requested
+            and not tcgen05_grouped_runtime_nm_direct
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped CLC persistence is supported only by the "
+                "worklist_nm runtime-direct path with an exact host-expanded "
+                "tile table and no static problem signature",
+            )
+        if (
+            tcgen05_grouped_runtime_nm_clc_requested
+            and not tcgen05_grouped_fixed_tensormaps
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped runtime-direct CLC currently requires fixed "
+                "full-allocation TensorMaps; dynamic TensorMap workspaces are "
+                "sized for the resident persistent grid, not the exact full "
+                "CLC request grid",
+            )
+        if tcgen05_grouped_runtime_nm_direct:
+            tcgen05_grouped_scheduler_mode = (
+                Tcgen05GroupedSchedulerMode.RUNTIME_CLC
+                if tcgen05_grouped_runtime_nm_clc_requested
+                else Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT
+            )
+            runtime_n_ptx_compatible = tcgen05_runtime_n_ptx_compatible()
+            tcgen05_grouped_use_runtime_n_ptx = (
+                input_dtype == torch.bfloat16 and runtime_n_ptx_compatible
+            )
+            if not runtime_n_ptx_compatible:
+                # Static-width typed MMA is the pre-existing correctness path:
+                # padded A rows are independent, and the epilogue zeros rows
+                # outside valid_m. FP16 also uses this path because raw
+                # runtime-N has only been validated for BF16 operands.
+                warn_tcgen05_runtime_n_ptx_fallback()
+        nm_deep_ab = (
+            requested_schedule is not None
+            and grouped_worklist_supported
+            and 4 <= tcgen05_ab_stage_count_value <= 7
+            and tcgen05_c_stage_count_value == 2
+            and _tcgen05_config_int(
+                df.config,
+                "tcgen05_acc_stages",
+                _tcgen05_acc_stage_count(tcgen05_mma_bn),
+            )
+            == 2
+        )
+        grouped_dynamic_deep_ab = (
+            tcgen05_grouped_dynamic_ab_tensormap_rank is not None
+            and tcgen05_grouped_d_mode is not Tcgen05GroupedDMode.NONE
+            and bm == 128
+            and bn == 64
+            and bk == 64
+            and tcgen05_cluster_m == 1
+            and tcgen05_cluster_n == 1
+            and not tcgen05_is_two_cta
+            and _tcgen05_config_int(
+                df.config,
+                "tcgen05_acc_stages",
+                _tcgen05_acc_stage_count(tcgen05_mma_bn),
+            )
+            == 2
+            and env.config_spec._tcgen05_grouped_dynamic_stages_fit_for_target(
+                dtype_bytes=input_dtype.itemsize,
+                output_dtype_bytes=(epi_elem_dtype or input_dtype).itemsize,
+                device=lhs_info.source_fake.device,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=tcgen05_cluster_m,
+                ab_stages=tcgen05_ab_stage_count_value,
+                c_stages=tcgen05_c_stage_count_value,
+            )
+        )
+        if tcgen05_ab_stage_count_value > 3 and not (
+            nm_deep_ab or grouped_dynamic_deep_ab
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_MODE_CONFIG_KEY} admits explicit "
+                "tcgen05_ab_stages>3 only for the generated N,M-oriented "
+                "worklist schedule up to 7 stages within target-device SMEM "
+                "headroom, or an admitted deep pipeline for the FP16/BF16 rank3 "
+                "grouped-NT dynamic TensorMap 128x64x64 CtaGroup.ONE "
+                "path with cluster_m=cluster_n=1, acc_stages=2, "
+                "dynamic D TensorMap, and target-device SMEM headroom",
+            )
+        tcgen05_grouped_count = str(grouped_count_value)
+        tcgen05_grouped_total_clusters = df.new_var("tcgen05_grouped_total_clusters")
+        tcgen05_grouped_sched_params = df.new_var("tcgen05_grouped_tile_sched_params")
+        tcgen05_grouped_problem_sizes = df.new_var("tcgen05_grouped_problem_sizes")
+        tcgen05_grouped_starts = df.new_var("tcgen05_grouped_starts")
+        if tcgen05_grouped_runtime_nm_direct:
+            tcgen05_grouped_runtime_tile_records = df.new_var(
+                "tcgen05_grouped_runtime_tile_records"
+            )
+        if (
+            tcgen05_grouped_static_problem_shapes is not None
+            and len(tcgen05_grouped_static_problem_shapes)
+            <= TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
+        ):
+            tcgen05_grouped_static_quota_args = tuple(
+                df.new_var("tcgen05_grouped_static_quota")
+                for _ in tcgen05_grouped_static_problem_shapes
+            )
+        if (
+            tcgen05_grouped_worklist_persistent
+            and not tcgen05_grouped_device_split_sizes
+        ):
+            tcgen05_grouped_real_groups = df.new_var("tcgen05_grouped_real_groups")
+        tcgen05_grouped_metadata_idx = df.new_var("tcgen05_grouped_metadata_idx")
+        tcgen05_grouped_group_idx = df.new_var("tcgen05_grouped_group_idx")
+        tcgen05_grouped_cta_tile_idx_m = df.new_var("tcgen05_grouped_cta_tile_idx_m")
+        tcgen05_grouped_cta_tile_idx_n = df.new_var("tcgen05_grouped_cta_tile_idx_n")
+        tcgen05_grouped_problem_m = df.new_var("tcgen05_grouped_problem_m")
+        tcgen05_grouped_problem_n = df.new_var("tcgen05_grouped_problem_n")
+        tcgen05_grouped_problem_k = df.new_var("tcgen05_grouped_problem_k")
+        tcgen05_grouped_global_m_start = df.new_var("tcgen05_grouped_global_m_start")
+        if requested_schedule is not None:
+            tcgen05_grouped_valid_m = df.new_var("tcgen05_grouped_valid_m")
+            tcgen05_grouped_store_m = df.new_var("tcgen05_grouped_store_m")
+        if (
+            tcgen05_grouped_dynamic_ab_tensormap_rank is not None
+            and not tcgen05_grouped_fixed_tensormaps
+        ):
+            tcgen05_grouped_ab_tensormaps = df.new_var("tcgen05_grouped_ab_tensormaps")
+            if tcgen05_grouped_d_mode is not Tcgen05GroupedDMode.NONE:
+                tcgen05_grouped_d_tensormap = tcgen05_grouped_ab_tensormaps
+        elif tcgen05_grouped_d_mode is not Tcgen05GroupedDMode.NONE:
+            tcgen05_grouped_d_tensormap = df.new_var("tcgen05_grouped_d_tensormaps")
+        if tcgen05_grouped_direct_pointer_metadata_requested:
+            tcgen05_grouped_direct_pointers = df.new_var(
+                "tcgen05_grouped_direct_pointers"
+            )
+            tcgen05_grouped_direct_strides = df.new_var(
+                "tcgen05_grouped_direct_strides"
+            )
+    if (
+        tcgen05_grouped_direct_pointer_metadata_requested
+        and not tcgen05_grouped_direct_pointers
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+            f"{TCGEN05_GROUPED_MODE_DIRECT!r} requires "
+            "the generated grouped static persistent dynamic TensorMap path",
+        )
+    tcgen05_grouped_plan: CuteTcgen05GroupedPlan | None = None
+    if tcgen05_grouped_static_persistent_requested:
+        tcgen05_grouped_plan = CuteTcgen05GroupedPlan(
+            orientation=requested_schedule or Tcgen05Orientation.MN,
+            layout=cast("str", tcgen05_grouped_layout_arg_name),
+            count=cast("str", tcgen05_grouped_count),
+            sched_params=cast("str", tcgen05_grouped_sched_params),
+            problem_sizes=cast("str", tcgen05_grouped_problem_sizes),
+            starts=cast("str", tcgen05_grouped_starts),
+            metadata_idx=cast("str", tcgen05_grouped_metadata_idx),
+            group_idx=cast("str", tcgen05_grouped_group_idx),
+            cta_tile_idx_m=cast("str", tcgen05_grouped_cta_tile_idx_m),
+            cta_tile_idx_n=cast("str", tcgen05_grouped_cta_tile_idx_n),
+            problem_m=cast("str", tcgen05_grouped_problem_m),
+            problem_n=cast("str", tcgen05_grouped_problem_n),
+            problem_k=cast("str", tcgen05_grouped_problem_k),
+            global_m_start=cast("str", tcgen05_grouped_global_m_start),
+            scheduler_mode=tcgen05_grouped_scheduler_mode,
+            runtime_tile_records=tcgen05_grouped_runtime_tile_records,
+            runtime_total_clusters=(
+                tcgen05_grouped_total_clusters
+                if tcgen05_grouped_runtime_nm_direct
+                else None
+            ),
+            static_problem_shapes=tcgen05_grouped_static_problem_shapes,
+            static_group_quota_args=tcgen05_grouped_static_quota_args,
+            real_groups=tcgen05_grouped_real_groups,
+            valid_m=tcgen05_grouped_valid_m,
+            store_m=tcgen05_grouped_store_m,
+            direct_pointers=tcgen05_grouped_direct_pointers,
+            direct_strides=tcgen05_grouped_direct_strides,
+            d_mode=tcgen05_grouped_d_mode,
+            d_tensormap=tcgen05_grouped_d_tensormap,
+            fixed_tensormaps=tcgen05_grouped_fixed_tensormaps,
+            source_m_tile=(
+                tcgen05_worklist_source_m_tile if tcgen05_nm_orientation else None
+            ),
+            m_size=m_size if tcgen05_grouped_device_split_sizes else None,
+            device_layout_kind=tcgen05_grouped_device_layout_kind,
+            clipped_negative_start=(
+                rhs_rank3_grouped_proof is not None
+                and rhs_rank3_grouped_proof.packed_split is not None
+                and rhs_rank3_grouped_proof.packed_split.clipped_negative_start
+            ),
+        )
+    if requested_schedule is not None and (
+        tcgen05_grouped_plan is None
+        or (
+            tcgen05_grouped_plan.real_groups is None
+            and not tcgen05_grouped_plan.device_split_sizes
+            and not tcgen05_grouped_plan.uses_runtime_tile_table
+        )
+        or tcgen05_grouped_plan.orientation is not requested_schedule
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+            f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} requires the "
+            "generated segment-worklist grouped tcgen05 path",
+        )
+    if requested_schedule is Tcgen05Orientation.NM:
+        assert tcgen05_grouped_plan is not None
+        grouped_smem_capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(
+            lhs_info.source_fake.device
+        )
+        grouped_smem_required = tcgen05_grouped_worklist_smem_bytes(
+            group_count=int(tcgen05_grouped_plan.count),
+            device_split_sizes=tcgen05_grouped_plan.device_split_sizes,
+            sched_stage_count=_tcgen05_config_int(
+                df.config, TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1
+            ),
+            bm=tcgen05_mma_bm,
+            bn=tcgen05_mma_bn,
+            bk=bk,
+            dtype_bytes=input_dtype.itemsize,
+            ab_stages=tcgen05_ab_stage_count_value,
+            acc_stages=tcgen05_acc_stage_count_value,
+            c_stages=tcgen05_c_stage_count_value,
+            cluster_m=tcgen05_cluster_m,
+        )
+        if grouped_smem_capacity <= 0 or grouped_smem_required > grouped_smem_capacity:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped N,M worklist generated allocations "
+                f"require {grouped_smem_required} bytes of per-CTA SMEM, "
+                f"exceeding the {grouped_smem_capacity}-byte capacity",
+            )
+    tcgen05_grouped_static_persistent = tcgen05_grouped_plan is not None
+    tcgen05_grouped_dynamic_ab_tensormaps = (
+        tcgen05_grouped_dynamic_ab_tensormap_rank is not None
+        and not tcgen05_grouped_fixed_tensormaps
+    )
+    tcgen05_grouped_direct_pointer_metadata = bool(
+        tcgen05_grouped_plan is not None
+        and tcgen05_grouped_plan.direct_pointers is not None
+    )
+    tcgen05_grouped_dynamic_d_tensormap = (
+        tcgen05_grouped_d_mode is not Tcgen05GroupedDMode.NONE
+    )
+    tcgen05_grouped_full_allocation_b = (
+        grouped_worklist_one_cta and tcgen05_grouped_device_split_sizes
+    )
+    tcgen05_grouped_two_cta_full_allocation_b = (
+        grouped_worklist_two_cta
+        and tcgen05_grouped_device_split_sizes
+        and tcgen05_shared_rhs
+        and input_dtype == torch.bfloat16
+        and rhs_rank3_grouped_proof is not None
+        and rhs_rank3_grouped_proof.layout_tensor.dtype == torch.int32
+        # Runtime-direct UMMA-N changes the peer row origin. It keeps the old
+        # descriptor path until its peer offset is proved with an absolute base.
+        and not tcgen05_grouped_runtime_nm_direct
+        and tcgen05_acc_stage_count_value == 2
+        and tcgen05_c_stage_count_value == 2
+        and _tcgen05_config_int(df.config, TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1) == 1
+        and full_allocation_b_two_cta_profile_supported(
+            tcgen05_mma_bm,
+            tcgen05_mma_bn,
+            bk,
+            tcgen05_ab_stage_count_value,
+            _tcgen05_consumer_regs_from_config(df.config),
+            tcgen05_cluster_m,
+            tcgen05_cluster_n,
+        )
+        and tcgen05_grouped_plan is not None
+        and full_allocation_b_two_cta_smem_upper_bound(int(tcgen05_grouped_plan.count))
+        <= CuteTcgen05Config.per_cta_smem_capacity_bytes(lhs_info.source_fake.device)
+    )
+    full_coverage_output: torch.Tensor | None = None
+    if tcgen05_grouped_full_allocation_b or tcgen05_grouped_two_cta_full_allocation_b:
+        # In N,M orientation physical B is the packed input. Its device
+        # intervals are clipped to that allocation. Keep the host-created
+        # TensorMap immutable and add the interval start to its coordinates,
+        # rather than replacing its base/extent while TMA uses the descriptor.
+        # Padding may read a different interval, so require a pure contraction
+        # into a fresh output. The dynamic D TensorMap still masks that padding.
+        # Bound both the old signed element offset and the new TMA coordinates;
+        # this is not pointer reassociation across an overflowing Int32 product.
+        assert rhs_rank3_worklist_store_info is not None
+        assert fx_node is not None
+        output_node = rhs_rank3_worklist_store_info.store_node.args[0]
+        output = output_node.meta.get("val") if isinstance(output_node, Node) else None
+        if isinstance(output, torch.Tensor):
+            full_coverage_output = output
+        full_allocation_b_checks = (
+            tcgen05_nm_orientation
+            and tcgen05_grouped_dynamic_ab_tensormaps
+            and tcgen05_grouped_dynamic_ab_tensormap_rank == 2
+            and not tcgen05_grouped_direct_pointer_metadata
+            and tcgen05_grouped_d_mode is Tcgen05GroupedDMode.ALL_TILES
+            and _is_contiguous_mk_source_fake(lhs_info.source_fake)
+            and _tcgen05_full_allocation_b_index_domain(
+                m_size, k_total_size, tcgen05_mma_bn
+            )
+            and isinstance(output, torch.Tensor)
+            and id(output.untyped_storage())
+            not in {id(tensor.untyped_storage()) for tensor in env.input_sources}
+            and _shared_rhs_region_is_exclusive(
+                cg, fx_node, rhs_rank3_worklist_store_info.store_node
+            )
+        )
+        if tcgen05_grouped_full_allocation_b and not full_allocation_b_checks:
+            raise exc.BackendUnsupported(
+                "cute",
+                "one-CTA device worklists require an immutable full-allocation "
+                "packed B TensorMap: contiguous signed-Int32-sized input, "
+                "a pure contraction into a fresh output, and dynamic D tail masking",
+            )
+        # ONE retains its existing mandatory proof. The new TWO profile opts
+        # in only when the same ownership/index proof holds; all other TWO
+        # bindings retain their original dynamic-input descriptor behavior.
+        tcgen05_grouped_two_cta_full_allocation_b = (
+            tcgen05_grouped_two_cta_full_allocation_b and full_allocation_b_checks
+        )
+        tcgen05_grouped_full_allocation_b = (
+            tcgen05_grouped_full_allocation_b
+            or tcgen05_grouped_two_cta_full_allocation_b
+        )
+    if df.config.config.get(TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY) in (
+        TCGEN05_GROUPED_FULL_COVERAGE_DENSE,
+        TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL,
+    ):
+        # All values here are guarded input metadata, not seed size hints.
+        # Keep the original descriptor workspaces, mailbox and resource gates.
+        # Only the proved full-union branch uses fixed D and a dense schedule.
+        full_coverage_checks = (
+            tcgen05_grouped_full_allocation_b
+            and tcgen05_shared_rhs
+            and tcgen05_grouped_plan is not None
+            and rhs_rank3_grouped_proof is not None
+            and fx_node is not None
+            and _grouped_full_coverage_semantics(cg, fx_node, rhs_rank3_grouped_proof)
+            and env.config_spec.target_device_capability == (10, 0)
+            and full_coverage_pipeline_supported(
+                bk,
+                tcgen05_ab_stage_count_value,
+                _tcgen05_consumer_regs_from_config(df.config),
+                source_m_tile=tcgen05_mma_bn,
+            )
+            and tcgen05_mma_bm == 128
+            and tcgen05_mma_bn in TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
+            and tcgen05_acc_stage_count_value == 2
+            and tcgen05_c_stage_count_value == 2
+            and full_coverage_output is not None
+            and _is_contiguous_mk_source_fake(full_coverage_output)
+            and int(full_coverage_output.shape[0]) == m_size
+            and int(full_coverage_output.shape[1]) == n_size
+            and full_coverage_index_domain(
+                int(tcgen05_grouped_plan.count),
+                m_size,
+                n_size,
+                k_total_size,
+                tcgen05_mma_bn,
+                tcgen05_mma_bm,
+                bk,
+            )
+            and (
+                bk != 128
+                or full_coverage_smem_upper_bound(
+                    int(tcgen05_grouped_plan.count),
+                    bk,
+                    tcgen05_ab_stage_count_value,
+                    source_m_tile=tcgen05_mma_bn,
+                )
+                <= CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                    lhs_info.source_fake.device
+                )
+            )
+        )
+        if not full_coverage_checks:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY} requires the "
+                "proved pure SM100 BF16 shared-RHS Int32-offset ONE worklist, "
+                "an identity contiguous output and complete signed-index tiles",
+            )
+        assert tcgen05_grouped_plan is not None
+        tcgen05_grouped_plan = replace(
+            tcgen05_grouped_plan,
+            full_coverage=Tcgen05GroupedFullCoveragePlan(
+                predicate=df.new_var("tcgen05_grouped_full_coverage"),
+                groups=int(tcgen05_grouped_plan.count),
+                m=m_size,
+                n=n_size,
+                k=k_total_size,
+                tile_m=tcgen05_mma_bn,
+                tile_n=tcgen05_mma_bm,
+                tile_k=bk,
+                consumer_local=(
+                    df.config.config.get(TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY)
+                    == TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
+                ),
+            ),
+        )
+    tcgen05_grouped_d_tensormap_tail_store = (
+        tcgen05_grouped_d_mode is Tcgen05GroupedDMode.EDGE_ONLY
+    )
+    if tcgen05_grouped_fixed_tensormaps:
+        # Runtime worklist validation proves dense source-tile-aligned packed
+        # extents, and this mode additionally requires N to be a whole selected
+        # MMA-M tile and K to be a whole BK tile. Every A/B TMA transaction is
+        # therefore full even when the logical valid-row mask zeros D padding.
+        tcgen05_static_full_tma_fast_path = True
+    rhs_rank3_tma_group_expr = rhs_rank3_group_expr
+    rhs_rank3_tma_group_setup: list[str] = []
+    if (
+        rhs_rank3_group_index is not None
+        and not rhs_rank3_segment_metadata
+        and not rhs_rank3_packed_split
+    ):
+        if (
+            mma_impl != "tcgen05"
+            or not tcgen05_use_tma_pipeline
+            or not tcgen05_static_full_tiles
+            or tcgen05_cluster_m != 1
+            or tcgen05_is_two_cta
+            or not tcgen05_collective_handles_operand_loads
+        ):
+            return _unsupported_schedule("rank3 grouped RHS TMA setup envelope failed")
+        if tcgen05_grouped_static_persistent:
+            rhs_rank3_tma_group_expr = tcgen05_grouped_group_idx
+            rhs_rank3_tma_group_setup = []
+        else:
+            rhs_rank3_tma_group_setup_info = _tcgen05_rank3_rhs_group_tma_setup(
+                cg,
+                rhs_rank3_group_index,
+                m_block_id=m_block_id,
+                m_offset_var=m_offset_var,
+            )
+            if rhs_rank3_tma_group_setup_info is None:
+                return _unsupported_schedule("rank3 RHS TMA setup failed")
+            rhs_rank3_tma_group_expr, rhs_rank3_tma_group_setup = (
+                rhs_rank3_tma_group_setup_info
+            )
+        safe_group_rewrite_plan = _rank3_rhs_safe_group_scalar_rewrite_plan(
+            cg,
+            rhs_info,
+            m_offset_var=m_offset_var,
+        )
+        if safe_group_rewrite_plan is None:
+            return _unsupported_schedule(
+                "rank3 RHS safe-group scalar rewrite was infeasible"
+            )
+        k_mask_dependency_nodes = tuple(
+            dict.fromkeys(
+                (
+                    *lhs_info.collective_dependency_nodes,
+                    *rhs_info.collective_dependency_nodes,
+                )
+            )
+        )
+        operand_pass_rewrite_plan = _owned_scalar_statement_pass_rewrite_plan(
+            cg,
+            (lhs_info.load, rhs_info.load),
+            optional_nodes=k_mask_dependency_nodes,
+        )
+        if operand_pass_rewrite_plan is None:
+            return _unsupported_schedule("owned scalar pass rewrite failed")
+        safe_group_stmt_ids = {id(stmt) for stmt in safe_group_rewrite_plan[2]}
+        if any(
+            id(stmt) in safe_group_stmt_ids
+            for _node_id, _body, _index, stmt in operand_pass_rewrite_plan
+        ):
+            return _unsupported_schedule(
+                "safe-group scalar rewrite statements overlapped"
+            )
+        _apply_rank3_rhs_safe_group_scalar_rewrite(safe_group_rewrite_plan)
+        _apply_owned_scalar_statement_pass_rewrite(
+            cg,
+            operand_pass_rewrite_plan,
+        )
+    if rhs_rank3_worklist_lhs_info is not None:
+        operand_pass_rewrite_plan = _owned_scalar_statement_pass_rewrite_plan(
+            cg,
+            (lhs_info.load, rhs_info.load),
+        )
+        if operand_pass_rewrite_plan is None:
+            return _unsupported_schedule("segment operand scalar pass rewrite failed")
+        row_index_node = rhs_rank3_worklist_lhs_info.row_index
+        valid_m_node = rhs_rank3_worklist_lhs_info.valid_m
+        segment_scalar_replacements = {
+            row_index_node: "cutlass.Int32(0)",
+            valid_m_node: "cutlass.Boolean(0)",
+        }
+        packed_scaffold_pass_rewrite_plan = ()
+        cast_then_expr_nodes: tuple[Node, ...] = ()
+        if tcgen05_grouped_worklist_persistent or row_union_plan is not None:
+            if rhs_info.rhs_segment_group is not None:
+                segment_scalar_replacements.update(
+                    {
+                        rhs_info.rhs_segment_group.group_load: "cutlass.Int32(0)",
+                        rhs_rank3_worklist_lhs_info.row_start: "cutlass.Int32(0)",
+                        rhs_rank3_worklist_lhs_info.group_m: "cutlass.Int32(0)",
+                    }
+                )
+            else:
+                assert (
+                    rhs_rank3_grouped_proof is not None
+                    and rhs_rank3_grouped_proof.packed_split is not None
+                )
+                if (
+                    rhs_rank3_grouped_proof.packed_split.layout_tensor.dtype
+                    is torch.int64
+                ):
+                    # Int64 split sizes lower these exact proof nodes to an
+                    # Int32 cast followed by the row/mask operation. The
+                    # rewrite helper validates that two-statement shape before
+                    # removing the cast temporary.
+                    cast_then_expr_nodes = (row_index_node, valid_m_node)
+                if rhs_rank3_grouped_proof.packed_split.clipped_negative_start:
+                    # Scalar clamp lowering materializes its zero argument in
+                    # an owned temporary before the final max expression.
+                    cast_then_expr_nodes = (
+                        *cast_then_expr_nodes,
+                        rhs_rank3_worklist_lhs_info.row_start,
+                        rhs_rank3_worklist_lhs_info.group_m,
+                    )
+                for scaffold_node in (
+                    rhs_rank3_worklist_lhs_info.row_start,
+                    rhs_rank3_worklist_lhs_info.group_m,
+                ):
+                    scaffold_value = scaffold_node.meta.get("val")
+                    replacement_expr = (
+                        "cutlass.Boolean(0)"
+                        if isinstance(scaffold_value, torch.Tensor)
+                        and scaffold_value.dtype is torch.bool
+                        else "cutlass.Int32(0)"
+                    )
+                    segment_scalar_replacements[scaffold_node] = replacement_expr
+                packed_scaffold_nodes = tuple(
+                    node
+                    for node in rhs_rank3_worklist_lhs_info.dependency_nodes
+                    if node not in segment_scalar_replacements
+                )
+                packed_scaffold_pass_rewrite_plan = (
+                    _owned_scalar_statement_pass_rewrite_plan(
+                        cg,
+                        (),
+                        optional_nodes=packed_scaffold_nodes,
+                    )
+                )
+                if packed_scaffold_pass_rewrite_plan is None:
+                    return _unsupported_schedule(
+                        "packed split scaffold replacement failed"
+                    )
+            if rhs_rank3_worklist_store_info is not None:
+                segment_scalar_replacements.update(
+                    {
+                        rhs_rank3_worklist_store_info.valid_m: "cutlass.Boolean(0)",
+                        rhs_rank3_worklist_store_info.extent_load: "cutlass.Int32(0)",
+                    }
+                )
+        assert fx_node is not None
+        if escaped := [
+            scaffold.name
+            for scaffold in segment_scalar_replacements
+            if _grouped_scaffold_value_escapes(cg, scaffold, fx_node)
+        ]:
+            return _unsupported_schedule(
+                f"the worklist scaffolding ({', '.join(sorted(escaped))}) the "
+                "schedule replaces feeds statements beside the matmul"
+            )
+        segment_expr_rewrite_plan = _owned_scalar_statement_expr_rewrite_plan(
+            cg,
+            segment_scalar_replacements,
+            cast_then_expr_nodes=cast_then_expr_nodes,
+        )
+        if segment_expr_rewrite_plan is None:
+            return _unsupported_schedule("segment scalar scaffold replacement failed")
+        operand_stmt_ids = {
+            id(stmt) for _node_id, _body, _index, stmt in operand_pass_rewrite_plan
+        }
+        if any(
+            id(stmt) in operand_stmt_ids
+            for _body, _index, stmt, _value in segment_expr_rewrite_plan
+        ):
+            return _unsupported_schedule("segment scalar rewrite statements overlapped")
+        _apply_owned_scalar_statement_pass_rewrite(
+            cg,
+            operand_pass_rewrite_plan,
+        )
+        _apply_owned_scalar_statement_pass_rewrite(
+            cg,
+            packed_scaffold_pass_rewrite_plan,
+        )
+        _apply_owned_scalar_statement_expr_rewrite(segment_expr_rewrite_plan)
+    if tcgen05_collective_handles_operand_loads:
+        cute_state = df.cute_state
+        _register_collective_handled_loads(
+            cute_state,
+            lhs_info.load,
+            rhs_info.load,
+            extra_dependency_nodes=(
+                *lhs_info.collective_dependency_nodes,
+                *rhs_info.collective_dependency_nodes,
+            ),
+        )
+        grid_state = cg.current_grid_state
+        assert grid_state is not None
+        if grid_state.has_lane_loops():
+            cute_state.request_root_lane_loop_suppression()
+
+    # Variable names
+    tiled_mma = df.new_var("tiled_mma")
+    tiled_mma2 = df.new_var("tcgen05_msub_tiled_mma")
+    thr_mma = df.new_var("thr_mma")
+    acc_frag = df.new_var("acc_frag")
+    acc_frag2 = df.new_var("tcgen05_msub_acc_frag")
+    acc_frag_base = df.new_var("acc_frag_base")
+    tcgen05_exec_acc_frag_base = df.new_var("tcgen05_exec_acc_frag_base")
+    tcgen05_exec_acc_tmem_ptr = df.new_var("tcgen05_exec_acc_tmem_ptr")
+    tcgen05_epi_acc_tmem_ptr = df.new_var("tcgen05_epi_acc_tmem_ptr")
+    tcgen05_epi_acc_frag_base = df.new_var("tcgen05_epi_acc_frag_base")
+    tcgen05_plan = _new_tcgen05_layout_plan(df) if mma_impl == "tcgen05" else None
+    tcgen05_cluster_layout_vmnk = df.new_var("tcgen05_cluster_layout_vmnk")
+    tcgen05_runtime_n_specialization = (
+        mma_impl == "tcgen05"
+        and tcgen05_nm_orientation
+        and tcgen05_grouped_plan is not None
+        and tcgen05_grouped_worklist_persistent
+        and tcgen05_grouped_runtime_nm_direct
+        and tcgen05_grouped_use_runtime_n_ptx
+    )
+    if tcgen05_runtime_n_specialization:
+        assert tcgen05_worklist_source_m_tile is not None
+        # Runtime UMMA-N narrows ragged runtime-direct source-M tails.  Mailbox
+        # scheduling and the newer-DSL fallback retain public typed static-width
+        # MMA. The exact BF16/FP32 shape envelope below fails closed; the pinned
+        # CuTe/CUTLASS environment is validation provenance, and upgrades require
+        # revalidating raw PTX.
+        runtime_n_shape_supported = (
+            input_dtype == torch.bfloat16
+            and input_dtype_str == "cutlass.BFloat16"
+            and acc_dtype_str == "cutlass.Float32"
+            and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+            and tcgen05_cluster_n == 1
+            and tcgen05_worklist_source_m_tile
+            in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+            and (
+                (
+                    tcgen05_is_two_cta
+                    and tcgen05_cluster_m == 2
+                    and tcgen05_mma_bm == 256
+                )
+                or (
+                    not tcgen05_is_two_cta
+                    and tcgen05_cluster_m == 1
+                    and tcgen05_mma_bm == 128
+                )
+            )
+        )
+        if not runtime_n_shape_supported:
+            raise exc.BackendUnsupported(
+                "cute",
+                "runtime worklist-NM UMMA-N specialization requires the "
+                "validated BF16/FP32-accumulate CTA1-M128 or CTA2-M256 "
+                "source32/source224/source256 BK64/BK128 shape",
+            )
+        assert tcgen05_use_role_local_mma_exec
+        assert tcgen05_grouped_valid_m is not None
+    tcgen05_runtime_mma_n = (
+        df.new_var("tcgen05_runtime_mma_n")
+        if tcgen05_runtime_n_specialization
+        else None
+    )
+    tcgen05_runtime_instr_desc = (
+        df.new_var("tcgen05_runtime_instr_desc")
+        if tcgen05_runtime_n_specialization
+        else None
+    )
+
+    # === outer_prefix: MMA setup + shared memory alloc + accumulator init ===
+    prefix = device_loop.outer_prefix
+    suffix = device_loop.outer_suffix
+    if tcgen05_grouped_plan is not None and tcgen05_grouped_plan.device_split_sizes:
+        assert (
+            rhs_rank3_grouped_proof is not None
+            and rhs_rank3_grouped_proof.packed_split is not None
+        )
+        _emit_tcgen05_device_segments_setup(
+            prefix,
+            df,
+            tcgen05_grouped_plan,
+            n_size=n_size,
+            k_size=k_total_size,
+            layout_dtype=rhs_rank3_grouped_proof.packed_split.layout_tensor.dtype,
+        )
+    # This call corresponds to one MMA FX-node lowering. The later
+    # register_tcgen05_kloop_owned_stmts slice starts here, so pre-existing
+    # K-loop prelude remains outside the cleanup region and later FX-node code
+    # remains unowned. Future role-lifecycle cleanup must pass that exact slice.
+    # Operand-load scaffolding emitted before this snapshot is owned separately
+    # by the FX-node statement-owner hook in GenerateAST.add_statement.
+    tcgen05_kloop_stmt_start = len(device_loop.inner_statements)
+    # Statements appended to ``prefix`` that reference per-tile coordinates
+    # (m_offset_var, n_offset_var, advancing pipeline state). When the
+    # persistent kernel splits the device-loop prefix, these stay inside the
+    # work-tile loop while everything else hoists out. See
+    # ``DeviceFunction.cute_state.register_tcgen05_per_tile_stmts`` and
+    # ``ProgramID._split_tcgen05_invariant_setup``.
+    per_tile_stmts: list[ast.AST] = []
+    # Statements that conceptually belong to the TMA-load warp's role
+    # block (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
+    # Statements get tagged only when the role-local producer path is active:
+    # - The initial TMA tile/partition setup and prefetch cycle at the
+    #   start of each tile. These are top-level statements added via
+    #   ``_emit_per_tile(..., tma_load=True)``.
+    # - The per-K-iter producer loop emitted as a top-level sibling of
+    #   the shared consumer K-loop for persistent tcgen05 TMA-pipeline
+    #   kernels. The role-local-while partitioner extracts that whole
+    #   loop into the TMA-load warp's persistent loop.
+    tma_load_role_stmts: list[ast.AST] = []
+    # Statements conceptually owned by the MMA-exec warp. These are
+    # extracted only with the same narrow static-full persistent tcgen05
+    # predicate as the role-local TMA producer path.
+    mma_exec_role_stmts: list[ast.AST] = []
+
+    def _emit_per_tile(
+        text: str, *, tma_load: bool = False, mma_exec: bool = False
+    ) -> ast.stmt:
+        """Append a per-tile statement to ``prefix`` and tag it for the
+        persistent-loop splitter. Returns the AST node so callers can
+        chain (e.g. when constructing ``If`` bodies). When ``tma_load``
+        is true the statement is ALSO tagged for the role-block
+        partitioner so it lands in the TMA-load warp's role block; when
+        ``mma_exec`` is true it lands in the MMA-exec warp's role block.
+        """
+        stmt = statement_from_string(text)
+        prefix.append(stmt)
+        per_tile_stmts.append(stmt)
+        if tma_load:
+            tma_load_role_stmts.append(stmt)
+        if mma_exec:
+            mma_exec_role_stmts.append(stmt)
+        return stmt
+
+    paired_prefetch_args: _InitialPrefetchTmaArgs | None = None
+    tcgen05_tmem_setup_emitted = False
+    tcgen05_tmem_publication: ast.stmt | None = None
+
+    def _emit_tcgen05_tmem_setup() -> None:
+        nonlocal tcgen05_tmem_setup_emitted, tcgen05_tmem_publication
+
+        assert not tcgen05_tmem_setup_emitted
+        assert tcgen05_plan is not None
+        assert epi_active is not None
+        tcgen05_tmem_setup_emitted = True
+
+        if tcgen05_use_cluster_deferred_pipelines:
+            # Keep the two-CTA cluster rendezvous after the AB/acc pipeline
+            # objects exist and before any role allocates or retrieves TMEM.
+            tcgen05_cluster_init_arrive = statement_from_string(
+                "cutlass.pipeline.pipeline_init_arrive("
+                f"cluster_shape_mn={tcgen05_cluster_layout_vmnk}, "
+                "is_relaxed=True)"
+            )
+            prefix.append(tcgen05_cluster_init_arrive)
+            tcgen05_cluster_init_wait = (
+                "cutlass.pipeline.pipeline_init_wait("
+                f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})"
+            )
+            if tcgen05_hoist_tma_role:
+                # The TMA-load warp's role block is moved right after the
+                # arrive and carries its own wait (ahead of its first stage);
+                # every other warp waits here.
+                df.cute_state.tcgen05_tma_role_hoist_anchor = (
+                    tcgen05_cluster_init_arrive
+                )
+                tcgen05_cluster_init_wait = (
+                    f"if not {tma_warp}:\n    {tcgen05_cluster_init_wait}"
+                )
+            prefix.append(statement_from_string(tcgen05_cluster_init_wait))
+        if row_union_plan is not None and row_union_plan.linear_record_clc:
+            assert warp_idx is not None and lane_idx is not None
+            prefix.extend(
+                ast.parse(
+                    row_union_plan.cooperative_setup(warp=warp_idx, lane=lane_idx)
+                ).body
+            )
+        prefix.append(
+            statement_from_string(
+                f"if {epi_active}:\n"
+                f"    {tcgen05_plan.tmem_allocator}.allocate({tcgen05_plan.acc_tmem_cols})"
+                + (
+                    f"\n    {tcgen05_plan.tmem_allocator}.relinquish_alloc_permit()"
+                    if tcgen05_relinquish_permit_early
+                    else ""
+                )
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_exec_acc_tmem_ptr} = cute.make_ptr("
+                f"{acc_dtype_str}, 0, cute.AddressSpace.tmem, assumed_align=16)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_epi_acc_tmem_ptr} = cute.make_ptr("
+                f"{acc_dtype_str}, 0, cute.AddressSpace.tmem, assumed_align=16)"
+            )
+        )
+        # ``acc_frag`` is reassigned per-tile below to a stage-indexed
+        # slice; an extra ``acc_frag = acc_frag_base`` here would land
+        # in the hoisted setup with a different CuTe type and break the
+        # persistent ``while`` ("acc_frag is structured different after
+        # this while").
+        # Publish the TMEM allocation (and, on the plain path, the pipeline
+        # init) before any role retrieves a tensor-memory pointer.  The
+        # compiler may hoist the holding-buffer read out of the role
+        # predicates below, so every thread whose role uses the result must
+        # order that read after the allocating warp's write.
+        if tcgen05_use_merged_pipeline_init:
+            # Every pipeline above was created with ``defer_sync=True``; this
+            # fence and the two named barriers below are their (single) init
+            # rendezvous, so no role touches an mbarrier before it is
+            # initialized and visible.  Warp 0 (the initializing warp) arrives
+            # on both: the non-epilogue warps meet it on the pipeline-init
+            # barrier and proceed straight to their roles (the TMA warp issues
+            # its first loads while the epilogue warps are still waiting for
+            # the TMEM allocation); the MMA and epilogue warps meet it on
+            # ``tmem_alloc_barrier`` (``wait_for_alloc`` below), which also
+            # publishes the allocation result.  The TMA, scheduler and
+            # padding warps never wait for warp 1's ``tcgen05.alloc``: neither
+            # ``retrieve_ptr`` below is theirs, so a hoisted pre-allocation
+            # holding-buffer read on those threads is dead, while the MMA and
+            # epilogue warps read it only after their ``tmem_alloc_barrier``
+            # wait.
+            assert warp_idx is not None
+            tcgen05_init_fence = statement_from_string(
+                "cute.arch.mbarrier_init_fence()"
+            )
+            prefix.append(tcgen05_init_fence)
+            tcgen05_init_waiters = f"not {epi_active}"
+            if tcgen05_hoist_tma_role:
+                # The TMA-load warp's role block is moved right after the
+                # fence and arrives on the pipeline-init barrier from inside
+                # the role (ahead of its first stage); every other
+                # non-epilogue warp still meets warp 0 here.
+                df.cute_state.tcgen05_tma_role_hoist_anchor = tcgen05_init_fence
+                tcgen05_init_waiters = f"(not {epi_active} and not {tma_warp})"
+            tcgen05_tmem_publication = statement_from_string(
+                f"if {tcgen05_init_waiters} or {warp_idx} == cutlass.Int32(0):\n"
+                f"    {tcgen05_pipeline_init_barrier}.arrive_and_wait()"
+            )
+        elif (
+            tcgen05_use_cluster_deferred_pipelines
+            and row_union_plan is None
+            and tcgen05_grouped_plan is None
+        ):
+            # Plain clustered GEMM: the cluster-wide ``pipeline_init_arrive`` /
+            # ``pipeline_init_wait`` above already published every pipeline's
+            # mbarrier init; the only state left to publish is the TMEM
+            # allocation, and the ``tmem_alloc_barrier`` meet in
+            # ``wait_for_alloc`` below (the allocating epilogue warp arrives
+            # after ``tcgen05.alloc``) orders that for the two roles that
+            # retrieve the pointer.  A CTA-wide ``sync_threads`` here only held
+            # the TMA-load warp behind the ~150 ns allocation; later prefix
+            # insertions anchor on the ``wait_for_alloc`` statement instead.
+            tcgen05_tmem_publication = None
+        else:
+            # The grouped and row-union kernels keep the CTA-wide barrier: their
+            # prologues publish CTA-local SMEM tables through it (the
+            # linear-record profile's coverage flag and fallback intervals,
+            # written by the coverage warp in ``cooperative_setup`` right above
+            # and read by the epilogue warps), and the paired startup prefill
+            # anchors ahead of it.  Dropping it left those reads unordered
+            # (99.9% mismatches on test_ordinary_paired_profile_cuda).
+            tcgen05_tmem_publication = statement_from_string("cute.arch.sync_threads()")
+        if tcgen05_tmem_publication is not None:
+            prefix.append(tcgen05_tmem_publication)
+        # All participating roles must reach the same named-barrier wait before
+        # they retrieve their role-local tensor-memory pointers.
+        tcgen05_wait_for_alloc = statement_from_string(
+            f"if {tcgen05_plan.exec_active} or {epi_active}:\n"
+            f"    {tcgen05_plan.tmem_allocator}.wait_for_alloc()"
+        )
+        if tcgen05_tmem_publication is None:
+            tcgen05_tmem_publication = tcgen05_wait_for_alloc
+        prefix.append(tcgen05_wait_for_alloc)
+        prefix.append(
+            statement_from_string(
+                f"if {tcgen05_plan.exec_active}:\n"
+                f"    {tcgen05_exec_acc_tmem_ptr} = "
+                f"{tcgen05_plan.tmem_allocator}.retrieve_ptr({acc_dtype_str})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"if {epi_active}:\n"
+                f"    {tcgen05_epi_acc_tmem_ptr} = "
+                f"{tcgen05_plan.tmem_allocator}.retrieve_ptr({acc_dtype_str})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_exec_acc_frag_base} = cute.make_tensor("
+                f"{tcgen05_exec_acc_tmem_ptr}, {acc_frag_base}.layout)"
+            )
+        )
+        # ``acc_frag`` indexes ``tcgen05_exec_acc_frag_base`` by the current
+        # ``acc_producer_state.index`` stage. The K-loop suffix advances
+        # that producer state once per UMMA fence, so under the persistent
+        # path each tile sees a different index. Mark per-tile so the
+        # alias is recomputed inside the work-tile loop.
+        _emit_per_tile(
+            f"{acc_frag} = "
+            f"{tcgen05_exec_acc_frag_base}[None, None, None, "
+            f"{tcgen05_plan.acc_producer_state}.index]",
+            mma_exec=tcgen05_use_role_local_mma_exec,
+        )
+        if tcgen05_m_subtile_count > 1:
+            _emit_per_tile(
+                f"{acc_frag2} = "
+                f"{tcgen05_exec_acc_frag_base}[None, None, None, "
+                f"{tcgen05_plan.acc_producer_state2}.index]",
+                mma_exec=tcgen05_use_role_local_mma_exec,
+            )
+        if tcgen05_use_role_local_ab_consumer_prefetch:
+            ab_consumer_prefetch_owner_predicate = _tcgen05_two_cta_owner_predicate(
+                tcgen05_plan.exec_active,
+                is_two_cta=tcgen05_is_two_cta,
+                gate_exec_warp=False,
+                cluster_n=tcgen05_cluster_n,
+            )
+            assert ab_consumer_prefetch_owner_predicate is not None
+            _emit_per_tile(
+                f"{tma_consumer_try_token} = cutlass.Boolean(1)",
+                mma_exec=tcgen05_use_role_local_mma_exec,
+            )
+            _emit_per_tile(
+                f"if {ab_consumer_prefetch_owner_predicate}:\n"
+                f"    {tma_consumer_try_token} = "
+                f"{tma_pipeline}.consumer_try_wait({tma_consumer_state})",
+                mma_exec=tcgen05_use_role_local_mma_exec,
+            )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_epi_acc_frag_base} = cute.make_tensor("
+                f"{tcgen05_epi_acc_tmem_ptr}, {acc_frag_base}.layout)"
+            )
+        )
+        # Initial producer_acquire for stage 0 of the acc pipeline. The
+        # ``acc_producer_state`` advances once per UMMA fence inside the
+        # K-loop, so per tile we want to start by acquiring whatever stage
+        # the persistent loop currently points at. Tag as per-tile so this
+        # acquire stays in the work-tile body when the persistent loop
+        # splitter runs.
+        _emit_per_tile(
+            _tcgen05_emit_optional_gate(
+                f"{tcgen05_plan.acc_pipeline}.producer_acquire("
+                f"{tcgen05_plan.acc_producer_state})",
+                tcgen05_mma_owner_active,
+                indent="",
+            ),
+            mma_exec=tcgen05_use_role_local_mma_exec,
+        )
+        if tcgen05_m_subtile_count > 1:
+            # Acquire the paired subtile's acc stage up front: both subtiles
+            # accumulate across the same K loop, so both stages must be free
+            # (the epilogue drained the previous pair) before UMMAs issue.
+            _emit_per_tile(
+                _tcgen05_emit_optional_gate(
+                    f"{tcgen05_plan.acc_pipeline}.producer_acquire("
+                    f"{tcgen05_plan.acc_producer_state2})",
+                    tcgen05_mma_owner_active,
+                    indent="",
+                ),
+                mma_exec=tcgen05_use_role_local_mma_exec,
+            )
+        reset_accumulate_stmts = _build_tcgen05_mma_accumulate_reset_stmt(
+            tcgen05_plan.exec_active,
+            tiled_mma=tiled_mma,
+            input_dtype_str=input_dtype_str,
+            acc_dtype_str=acc_dtype_str,
+            gate_exec_warp=not tcgen05_use_role_local_mma_exec,
+            is_two_cta=tcgen05_is_two_cta,
+            cluster_n=tcgen05_cluster_n,
+            runtime_mma_n=tcgen05_runtime_mma_n,
+            runtime_instr_desc=tcgen05_runtime_instr_desc,
+            valid_m=(
+                tcgen05_grouped_valid_m if tcgen05_runtime_n_specialization else None
+            ),
+            static_mma_m=(tcgen05_mma_bm if tcgen05_runtime_n_specialization else None),
+            static_mma_n=(tcgen05_mma_bn if tcgen05_runtime_n_specialization else None),
+            a_k_major=tcgen05_mma_a_k_major,
+            b_k_major=tcgen05_mma_b_k_major,
+        )
+        prefix.extend(reset_accumulate_stmts)
+        per_tile_stmts.extend(reset_accumulate_stmts)
+        if tcgen05_use_role_local_mma_exec:
+            mma_exec_role_stmts.extend(reset_accumulate_stmts)
+        if tcgen05_m_subtile_count > 1:
+            reset_accumulate_stmts2 = _build_tcgen05_mma_accumulate_reset_stmt(
+                tcgen05_plan.exec_active,
+                tiled_mma=tiled_mma2,
+                input_dtype_str=input_dtype_str,
+                acc_dtype_str=acc_dtype_str,
+                gate_exec_warp=not tcgen05_use_role_local_mma_exec,
+                is_two_cta=tcgen05_is_two_cta,
+                cluster_n=tcgen05_cluster_n,
+                runtime_mma_n=None,
+                runtime_instr_desc=None,
+                valid_m=None,
+                static_mma_m=None,
+                static_mma_n=None,
+                a_k_major=tcgen05_mma_a_k_major,
+                b_k_major=tcgen05_mma_b_k_major,
+            )
+            prefix.extend(reset_accumulate_stmts2)
+            per_tile_stmts.extend(reset_accumulate_stmts2)
+            if tcgen05_use_role_local_mma_exec:
+                mma_exec_role_stmts.extend(reset_accumulate_stmts2)
+
+    mma_participant_linear: str | None = None
+    mma_slice_linear: str | None = None
+    mma_copy_linear: str | None = None
+    mma_active: str | None = None
+    tma_warp: str | None = None
+    warp_idx: str | None = None
+    lane_idx: str | None = None
+    epi_active: str | None = None
+    epi_tidx: str | None = None
+    mma_phys_n = _mma_active_n_threads(mma_impl)
+    mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
+    tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
+    if mma_impl == "warp" and tcgen05_cta_thread_count < bm * mma_phys_n:
+        raise exc.BackendUnsupported(
+            "cute", "warp MMA requires enough physical threads for every MMA warp"
+        )
+    if tcgen05_grouped_static_persistent and (
+        tcgen05_is_two_cta or tcgen05_nm_orientation
+    ):
+        # Grouped N,M worklists and CtaGroup.TWO use one physical warp per
+        # role row. The grouped root tile can otherwise choose a 16-thread
+        # SIMT M axis, leaving the exec/load/scheduler role ids unlaunched
+        # while the generated predicates still depend on them.
+        mma_physical_m_threads = max(mma_physical_m_threads, 32)
+        tcgen05_cta_thread_count = max(tcgen05_cta_thread_count, 4 * 32)
+    if mma_impl == "tcgen05" and mma_physical_m_threads > 32:
+        # The role launch is ``(physical_m_threads, launched_warps, 1)`` with
+        # warps indexed linearly: a wider row launches spare warps the role
+        # predicates and the pipeline-init barrier do not count (see
+        # ``_tcgen05_root_m_threads``).  The detection predicate
+        # (``_specialized_mma_root_threads_support_impl``) routes an explicit
+        # ``num_threads`` request of another width to the generic SIMT path
+        # before planning, so this is a last line: fail loudly rather than
+        # launch them.
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 role launch needs a 32-lane M axis (one physical warp per "
+            f"role row); the root tile maps {mma_physical_m_threads} threads "
+            "along M",
+        )
+    if mma_impl == "tcgen05" and tcgen05_cluster_m * tcgen05_cluster_n > 1:
+        df.cute_state.cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
+    # PipelineTmaUmma empty barriers are released by the leader CTA with the
+    # pipeline's multicast mask. Peer CTAs still advance local consumer state,
+    # but they must not add a second empty-barrier arrival: doing so lets the
+    # TMA producer reuse an AB stage before the leader's ordered release when
+    # the K loop has more than two tiles.
+    #
+    # ``mcast_size`` formula matches Quack's
+    # ``num_mcast_ctas_a + num_mcast_ctas_b - 1``
+    # (gemm_sm100.py:1839-1840). For Helion's V=2 path,
+    # ``num_mcast_ctas_a = cluster_layout_vmnk.shape[2] = cluster_n`` and
+    # ``num_mcast_ctas_b = cluster_layout_vmnk.shape[1] = cluster_m / V``.
+    #
+    # Concrete table (cute_plan.md §6.12.7 step 3):
+    #   - cluster_m=2 cluster_n=1 V=2: 1 + 1 - 1 = 1 (today's value)
+    #   - cluster_m=2 cluster_n=2 V=2: 2 + 1 - 1 = 2 (the cluster_n=2 fix)
+    #   - cluster_m=1 cluster_n=1 V=1 (no use_2cta): 1 (collapses to single
+    #     CTA; no multicast)
+    if tcgen05_is_two_cta and tcgen05_cluster_n > 1:
+        # V=2 absorbs cluster_m into the cluster_layout_vmnk V dim; the
+        # post-V CTAs along M (= cluster_m // V) carry the B multicast,
+        # while cluster_n CTAs along N carry the A multicast.
+        v_for_mcast = 2 if tcgen05_is_two_cta else 1
+        num_mcast_ctas_a = tcgen05_cluster_n
+        num_mcast_ctas_b = max(1, tcgen05_cluster_m // v_for_mcast)
+        tcgen05_ab_consumer_arrive_count_value = num_mcast_ctas_a + num_mcast_ctas_b - 1
+    else:
+        tcgen05_ab_consumer_arrive_count_value = 1
+    # Plain (single-CTA, non-grouped) tcgen05 kernels initialize every
+    # pipeline's mbarriers with ``defer_sync=True`` and publish them all with
+    # ONE ``mbarrier_init_fence`` followed by two named barriers in
+    # ``_emit_tcgen05_tmem_setup`` (the pipeline-init barrier for the
+    # non-epilogue warps, ``tmem_alloc_barrier`` for the TMEM consumers).
+    # Each ``Pipeline*.create`` otherwise ends in its own fence +
+    # ``__syncthreads``, so a kernel with acc + AB (+ sched / aux) pipelines
+    # serializes two to four CTA-wide barriers before the TMA warp can issue
+    # its first load (~100 ns each on B200).  Clustered kernels keep
+    # their cluster-wide ``pipeline_init_arrive`` / ``pipeline_init_wait``
+    # rendezvous (a multicast peer may arrive on this CTA's barriers, so the
+    # init must be published cluster-wide); the grouped and row-union families
+    # keep their validated per-pipeline syncs.
+    tcgen05_use_merged_pipeline_init = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_use_cluster_deferred_pipelines
+        and tcgen05_cluster_m == 1
+        and tcgen05_cluster_n == 1
+        and row_union_plan is None
+        and tcgen05_grouped_plan is None
+    )
+    tcgen05_defer_pipeline_sync_arg = (
+        ", defer_sync=True"
+        if tcgen05_use_cluster_deferred_pipelines or tcgen05_use_merged_pipeline_init
+        else ""
+    )
+    # Relinquish the TMEM allocation permit right after the (single)
+    # allocation on the plain path, as CUTLASS's sm100 kernels do, so the
+    # teardown does not serialize it behind the epilogue drain.
+    tcgen05_relinquish_permit_early = (
+        tcgen05_use_merged_pipeline_init
+        or tcgen05_use_cluster_deferred_pipelines
+        or (row_union_plan is not None and row_union_plan.resident_ctas == 2)
+    )
+    tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
+    tcgen05_mma_owner_active: str | None = None
+    # Initialized inside the ``mma_impl == "tcgen05"`` branch so the
+    # non-tcgen05 path doesn't pay for warp-spec / barrier-count work
+    # it never uses; consumed only at later tcgen05-gated emission
+    # sites that share this `if mma_impl == "tcgen05":` predicate.
+    tcgen05_epi_warp_count_value = 0
+    tcgen05_tmem_allocator_warp = 0
+    tcgen05_pipeline_init_barrier = ""
+    tcgen05_free_tmem_in_epilogue = False
+    tcgen05_one_shot_role_scheduler = False
+    tcgen05_hoist_tma_role = False
+    tcgen05_output_stores_value: tuple[Node, ...] | None = None
+    tcgen05_tmem_barrier_thread_count_value = 0
+    tcgen05_acc_consumer_arrive_count_value = 0
+    # Layout-override values are read by separate later
+    # ``if mma_impl == "tcgen05":`` blocks (the function has multiple
+    # gated emission sites). Initialize to ``None`` outside the
+    # branch so pyrefly's flow analysis sees a definition along every
+    # control path; the values are pulled from the active config
+    # below when the branch is entered.
+    tcgen05_smem_swizzle_a: int | None = None
+    tcgen05_smem_swizzle_b: int | None = None
+    tcgen05_explicit_epi_tile_configured = False
+    tcgen05_narrow_subtile_nounroll_k_loop = False
+    tcgen05_explicit_epi_tile_m: int | None = None
+    tcgen05_explicit_epi_tile_n: int | None = None
+    tcgen05_explicit_d_store_box_n: int | None = None
+    tcgen05_d_store_layout = (
+        "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
+        if tcgen05_nm_orientation or output_column_major
+        else "cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
+    )
+    nm_explicit_store_wave = False
+    nm_scheduler_decode = False
+    tcgen05_use_flat_role_coordinates = False
+    if mma_impl == "tcgen05":
+        tcgen05_warp_spec = warp_spec_from_config(df.config)
+        # The public NM profile reserves its scheduler warp internally.
+        nm_scheduler_decode = (
+            tcgen05_nm_orientation
+            and tcgen05_grouped_static_persistent
+            and tcgen05_grouped_worklist_persistent
+            and (
+                tcgen05_grouped_dynamic_ab_tensormaps
+                or tcgen05_grouped_fixed_tensormaps
+            )
+            and (
+                tcgen05_grouped_dynamic_d_tensormap or tcgen05_grouped_fixed_tensormaps
+            )
+            and grouped_worklist_supported
+            and tcgen05_warp_spec.scheduler_warps == 0
+            and tcgen05_warp_spec.c_input_warps == 0
+            and tcgen05_warp_spec.store_warps == 0
+            and not tcgen05_grouped_runtime_nm_direct
+        )
+        tcgen05_effective_scheduler_warps = (
+            1 if nm_scheduler_decode else tcgen05_warp_spec.scheduler_warps
+        )
+        # Validate overrides before CuTe constructs its layout atoms.
+        _tcgen05_layout_overrides = layout_overrides_from_config(df.config)
+        tcgen05_smem_swizzle_a = _tcgen05_layout_overrides.smem_swizzle_a
+        tcgen05_smem_swizzle_b = _tcgen05_layout_overrides.smem_swizzle_b
+        tcgen05_explicit_epi_tile_m = _tcgen05_layout_overrides.epi_tile_m
+        tcgen05_explicit_epi_tile_n = _tcgen05_layout_overrides.epi_tile_n
+        tcgen05_explicit_d_store_box_n = _tcgen05_layout_overrides.d_store_box_n
+        if tcgen05_nm_orientation:
+            nm_store_shape = (
+                tcgen05_explicit_epi_tile_m,
+                tcgen05_explicit_epi_tile_n,
+                tcgen05_explicit_d_store_box_n,
+            )
+            if all(value is None for value in nm_store_shape):
+                (
+                    tcgen05_explicit_epi_tile_m,
+                    tcgen05_explicit_epi_tile_n,
+                    tcgen05_explicit_d_store_box_n,
+                ) = TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+            elif nm_store_shape != (
+                (row_profile.epi_m, row_profile.epi_n, row_profile.epi_n)
+                if row_profile
+                else TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 N,M store requires explicit epi_tile=(128, 32) "
+                    "and d_store_box_n=32",
+                )
+        # The explicit tile the config (or the N,M worklist default) requested,
+        # taken before the matmul plan adds its own subtile below: the
+        # explicit-store family's no-unroll K loop keys off it.
+        tcgen05_explicit_epi_tile_configured = any(
+            value is not None
+            for value in (
+                tcgen05_explicit_epi_tile_m,
+                tcgen05_explicit_epi_tile_n,
+                tcgen05_explicit_d_store_box_n,
+            )
+        )
+        if tcgen05_edge_scalar_fallback_needs_inter_smem_a:
+            # The mixed TMA/scalar edge path writes logical (_row, _col)
+            # coordinates into the tcgen05 A SMEM view. With bk=128,
+            # CuTe's default SW128 A atom is correct for TMA-filled full
+            # tiles but corrupts scalar-filled output-edge tiles. Force
+            # the explicit INTER atom so fallback writes and the wrapper
+            # descriptor agree on the same layout.
+            if tcgen05_smem_swizzle_a not in (None, 0):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 output-edge scalar fallback with bk >= 128 "
+                    "requires smem_swizzle_a=0 (INTER); nonzero "
+                    "A swizzle overrides are not validated for this path.",
+                )
+            tcgen05_smem_swizzle_a = 0
+        if tcgen05_smem_swizzle_a is not None:
+            _validate_tcgen05_smem_swizzle_override(
+                operand="a",
+                k_major=tcgen05_mma_a_k_major,
+                swizzle_bytes=tcgen05_smem_swizzle_a,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                bk=bk,
+                input_dtype=input_dtype,
+            )
+        if tcgen05_smem_swizzle_b is not None:
+            _validate_tcgen05_smem_swizzle_override(
+                operand="b",
+                k_major=tcgen05_mma_b_k_major,
+                swizzle_bytes=tcgen05_smem_swizzle_b,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                bk=bk,
+                input_dtype=input_dtype,
+            )
+        tcgen05_epi_warp_count_value = _tcgen05_epi_warp_count(
+            tcgen05_warp_spec, cta_thread_count=tcgen05_cta_thread_count
+        )
+        tcgen05_tmem_barrier_thread_count_value = _tcgen05_tmem_barrier_thread_count(
+            tcgen05_epi_warp_count_value
+        )
+        # Each CtaGroup.TWO CTA has its own epilogue warps consuming
+        # the distributed accumulator slot, so the acc empty barrier
+        # expects each CTA's epi warp leaders. The CtaGroup.ONE
+        # clustered fallback remains on the single-CTA count until
+        # it has separate runtime coverage.
+        tcgen05_acc_consumer_arrive_count_value = tcgen05_epi_warp_count_value * (
+            2 if tcgen05_is_two_cta else 1
+        )
+        # Scheduler-warp pipeline depth. The default remains one stage because
+        # consumer warps advance their own register-state independently; with
+        # one shared mailbox, a multi-stage producer could overwrite metadata
+        # while a slower consumer still reads the previous tile. The optional
+        # two-stage diagnostic is paired with a staged SMEM mailbox in
+        # ``program_id.py`` so the scheduler can publish the next work tile
+        # without overwriting a slower consumer's current tile.
+        tcgen05_sched_stage_count_value = (
+            cast("int", df.config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1))
+            if tcgen05_effective_scheduler_warps > 0
+            else 0
+        )
+        # Persistence model from the active config. Default
+        # ``static_persistent`` keeps the existing path; G2-H
+        # ``clc_persistent`` (cute_plan.md, see plan: G2-H CLC)
+        # selects CLC issuance in the scheduler-warp role.
+        # Validation in ``ConfigSpec.normalize`` has already ensured
+        # the value is consistent with the chosen strategy + arch
+        # (rejecting CLC under MONOLITHIC or on arch < 100), so a
+        # missing field falls back to the static default rather
+        # than raising.
+        tcgen05_persistence_model_str = df.config.get(
+            "tcgen05_persistence_model",
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        assert isinstance(tcgen05_persistence_model_str, str), (
+            "tcgen05_persistence_model must be a string (the "
+            "Tcgen05PersistenceModel enum's .value); got "
+            f"{type(tcgen05_persistence_model_str).__name__}"
+        )
+        # ``tcgen05_l2_swizzle_size``: L2 tile-scheduler grouping factor
+        # (Quack ``max_swizzle_size`` equivalent). Default 1 keeps the
+        # cycle 41 byte-identity path; concrete values flow into the
+        # ``cutlass.utils.PersistentTileSchedulerParams(swizzle_size=...)``
+        # kwarg at every prelude site in ``program_id.py``. The value
+        # is validated upstream by ``ConfigSpec.normalize`` against
+        # ``TCGEN05_LEGAL_L2_SWIZZLE_SIZES`` so it is always a positive
+        # integer here.
+        tcgen05_l2_swizzle_size_value = l2_swizzle_size_from_config(df.config)
+        if (
+            tcgen05_grouped_static_problem_shapes is not None
+            and tcgen05_l2_swizzle_size_value != 1
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY} requires "
+                "tcgen05_l2_swizzle_size=1",
+            )
+        if tcgen05_grouped_static_problem_shapes is not None and any(
+            grouping != 1
+            for grouping in cast("list[int]", df.config.get("l2_groupings", []))
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY} requires "
+                "l2_groupings entries to all equal 1",
+            )
+        # Both production callers of ``_emit_mma_pipeline`` propagate
+        # an FX node into this codepath (``codegen_cute_mma_dot``
+        # passes ``state.fx_node``; the aten-style site passes the
+        # call node directly), so the tcgen05 branch requires an
+        # ``fx_node``. The default-``None`` signature is a leftover
+        # that the once-future-tcgen05 callers may set; assert it
+        # here so a future caller that forgets to thread the FX node
+        # fails loudly rather than silently producing an empty
+        # ``aux_tensor_descriptors`` tuple and breaking the
+        # productive-body codegen (which sizes the SMEM ring by
+        # descriptor count).
+        assert fx_node is not None, (
+            "tcgen05 MMA codegen requires a non-None fx_node so the "
+            "aux-tensor walker can identify downstream stores"
+        )
+        # Register the matmul fx_node in
+        # ``cute_state.matmul_fx_nodes`` before the aux-tensor
+        # walker runs. The walker's analyzer reads the same set to
+        # know where to stop, so the fx_node must be present
+        # *before* the walk. The registered-graph invariant: the
+        # matmul fx_node lives inside a K-loop body subgraph (one
+        # of the registered codegen graphs), so the cute_fx_walk
+        # carrier walker reaches it via ``_phi.args[1]`` (body
+        # branch), never ``_phi.args[0]`` (init value, e.g.
+        # ``hl.zeros``). This holds structurally because
+        # ``_emit_mma_pipeline`` only emits the MMA into the loop
+        # body — there is no path where the matmul appears as the
+        # phi's init value. The walker's ``_phi.args[1]``-only
+        # descent depends on this invariant; pinning it here
+        # prevents a future ``_emit_mma_pipeline`` refactor from
+        # registering an off-graph node and silently breaking the
+        # walker's fast-path. For non-residual kernels — and every
+        # kernel until the productive C-input body lands — the
+        # walker returns an empty tuple and the plan field defaults
+        # to ``()``, preserving byte identity for every existing
+        # config.
+        assert any(fx_node.graph is gi.graph for gi in cg.codegen_graphs), (
+            "matmul fx_node graph must be a registered codegen graph"
+        )
+        df.cute_state.matmul_fx_nodes.add(fx_node)
+        # Every output store this accumulator reaches (``None`` when the
+        # fanout is untraced, which the store lowering limits to one store).
+        tcgen05_output_stores_value = tcgen05_traced_output_stores
+        aux_tensor_descriptors_value = discover_tcgen05_aux_tensor_descriptors(
+            cg, fx_node
+        )
+        c_input_aux_tensor_descriptors_value = tuple(
+            d
+            for d in aux_tensor_descriptors_value
+            if d.broadcast_axis is None and d.host_tensor_val.ndim == 2
+        )
+        aux_tma_productive_body_gate_open = (
+            tcgen05_warp_spec.c_input_warps > 0
+            and bool(c_input_aux_tensor_descriptors_value)
+            and len({d.store_value_node for d in c_input_aux_tensor_descriptors_value})
+            <= 1
+        )
+        # CuTe's TMA descriptor bounds checks correctly suppress partial M/N
+        # output stores for the admitted aux-TMA output-edge family, so keep
+        # those edge tiles on the same TMA-store path as full tiles. The same
+        # holds for epilogues with no aux GMEM operands at all (plain store of
+        # the accumulator, possibly through thread-local transforms): with
+        # nothing to read out of bounds, the D descriptor's clamping is the
+        # complete edge story and every tile can take the TMA-store path
+        # instead of draining fringe tiles through the predicated SIMT store.
+        # Kernels with unstaged aux operands keep the original predicated
+        # full-tile/edge split.
+        tcgen05_partial_output_tma_store = (
+            tcgen05_use_tma_store_epilogue
+            and tcgen05_use_output_edge_tma_store_for_full_tiles
+            and not tcgen05_static_output_tiles
+            and (
+                (
+                    df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                    == TCGEN05_AUX_LOAD_MODE_TMA
+                    and aux_tma_productive_body_gate_open
+                )
+                or not aux_tensor_descriptors_value
+            )
+        )
+        tcgen05_tma_store_full_tiles_only = tcgen05_tma_store_full_tiles_only_for(
+            tcgen05_partial_output_tma_store
+        )
+        if tcgen05_grouped_worklist_persistent:
+            # The worklist output is either covered by an ALL_TILES dynamic
+            # TensorMap or by the validated fixed full-allocation TensorMap.
+            # Preserve that all-TMA contract across this late aux-epilogue
+            # recomputation; the grouped mailbox scheduler does not publish
+            # the two streams required by the generic full/edge store split.
+            tcgen05_tma_store_full_tiles_only = False
+        elif tcgen05_grouped_tail_proof is not None:
+            if tcgen05_grouped_static_full_output_tiles_from_metadata:
+                tcgen05_tma_store_full_tiles_only = False
+            else:
+                tcgen05_tma_store_full_tiles_only = (
+                    not tcgen05_grouped_dynamic_d_tensormap
+                    or tcgen05_grouped_d_tensormap_tail_store
+                )
+        if row_profile is not None:
+            tcgen05_tma_store_full_tiles_only = True
+        # Promoted row-vector epilogues (a 16-bit bias / scale row staged as
+        # FP32 by the store lowering, see ``memory_ops``) keep the FP32 row,
+        # the FP32 accumulator subtile and the packed output live at once; at
+        # the default (128, 64) subtile ptxas spills (12 LDL / 8 STL per
+        # subtile at 255 registers), so they take the (128, 32) subtile of the
+        # no-source CUTLASS rule (2048x4096x2048 fp16 bias GEMM: 27.0 vs
+        # 27.2 us). Decided here, on the same three values a configured
+        # explicit tile sets and on the store-site facts the store lowering's
+        # staging admission reads (one shared predicate,
+        # ``aux_leaf_takes_promoted_f32_stage``), so the matmul plan, the store
+        # body and the wrapper-side TMA store box agree and the subtile is only
+        # taken with the stage; a configured tile wins.
+        tcgen05_promoted_rowvec_subtile = (
+            not tcgen05_explicit_epi_tile_configured
+            and not tcgen05_nm_orientation
+            and row_union_plan is None
+            and tcgen05_grouped_plan is None
+            and tcgen05_use_tma_store_epilogue
+            and df.config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+            == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and epi_elem_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
+            and tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=tcgen05_is_two_cta,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                tile_shape=(128, 32, 32),
+            )
+            and tcgen05_promoted_rowvec_epilogue(
+                cg,
+                fx_node,
+                epi_warp_count=tcgen05_epi_warp_count_value,
+                bn=tcgen05_mma_bn,
+                output_column_major=output_column_major,
+                partial_output_tma_store=tcgen05_partial_output_tma_store,
+            )
+        )
+        if tcgen05_promoted_rowvec_subtile:
+            tcgen05_explicit_epi_tile_m = 128
+            tcgen05_explicit_epi_tile_n = 32
+            tcgen05_explicit_d_store_box_n = 32
+        # Plain 16-bit epilogues (no auxiliary GMEM operand: the accumulator
+        # is converted and stored once, static full tiles) take the same
+        # (128, 32) subtile on the two-CTA 256-wide tile, where CuTe's
+        # with-source rule would give (128, 64): halving the subtile doubles
+        # the T2R/R2S/TMA-store iterations but shortens each and lets the C
+        # ring turn over twice as often. Same-process A/B under flushed graph
+        # replay (device time), 2x1 256x256x64 ab6 c2 persistent fp16: plain
+        # 4096x1024x4096 (3.5 tiles per CTA pair) 29.4 -> 28.3 us with the
+        # subtile alone, 28.1 with the no-unroll loop as well (cuBLAS 27.0);
+        # bmm 16x512x768x1024 (2 tiles per pair) 17.15 -> 16.96; plain
+        # 2048x4096x2048 (one tile per pair) 26.8 -> 26.4, within noise. A
+        # configured tile wins, aux epilogues keep the promoted rule above,
+        # and narrower tiles already take (128, 32) from the default rule.
+        tcgen05_plain_narrow_subtile = (
+            not tcgen05_explicit_epi_tile_configured
+            and not tcgen05_promoted_rowvec_subtile
+            and not tcgen05_nm_orientation
+            and row_union_plan is None
+            and tcgen05_grouped_plan is None
+            and tcgen05_use_tma_store_epilogue
+            and tcgen05_static_full_tiles
+            and tcgen05_is_two_cta
+            and not output_column_major
+            and not aux_tensor_descriptors_value
+            and tcgen05_output_stores_value is not None
+            and len(tcgen05_output_stores_value) == 1
+            and input_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
+            and epi_elem_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
+            and tcgen05_mma_bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+            and tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=tcgen05_is_two_cta,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                tile_shape=(128, 32, 32),
+            )
+        )
+        if tcgen05_plain_narrow_subtile:
+            tcgen05_explicit_epi_tile_m = 128
+            tcgen05_explicit_epi_tile_n = 32
+            tcgen05_explicit_d_store_box_n = 32
+        # Both narrow subtiles also take the explicit-store family's no-unroll
+        # K loop (``cutlass.range(..., unroll=1)`` on the TMA and MMA warps,
+        # ``tcgen05_use_nounroll_k_loop`` below), decided here by name rather
+        # than inherited from the tile values. Same-process A/B under flushed
+        # graph replay (device time) at 4096x1024x4096 fp16 bias, 512 CTAs and
+        # 16 K steps: the subtile alone saves 1.8 us, the no-unroll loop alone
+        # 1.9 us, both 2.9 us (37.1 -> 34.2 us; cuBLAS 26.8); the plain kernel
+        # at the same shape: subtile 1.1 us, no-unroll 0.5 us, both 1.35 us;
+        # at 2048x4096x2048 (one tile per CTA) both are within noise. Whether
+        # every two-CTA bk=64 kernel should take the no-unroll loop is a
+        # separate measurement.
+        tcgen05_narrow_subtile_nounroll_k_loop = (
+            tcgen05_promoted_rowvec_subtile or tcgen05_plain_narrow_subtile
+        )
+        explicit_epi_tile_requested = any(
+            value is not None
+            for value in (
+                tcgen05_explicit_epi_tile_m,
+                tcgen05_explicit_epi_tile_n,
+                tcgen05_explicit_d_store_box_n,
+            )
+        )
+        tcgen05_use_flat_role_coordinates = tcgen05_requested_flat_role_coordinates
+        explicit_epi_tile_shape = (
+            tcgen05_explicit_epi_tile_m,
+            tcgen05_explicit_epi_tile_n,
+            tcgen05_explicit_d_store_box_n,
+        )
+        nm_explicit_store_wave = tcgen05_nm_orientation and explicit_epi_tile_shape == (
+            (row_profile.epi_m, row_profile.epi_n, row_profile.epi_n)
+            if row_profile
+            else TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+        )
+        explicit_epi_aux_supported = not c_input_aux_tensor_descriptors_value or (
+            tcgen05_warp_spec.c_input_warps == 0
+            and df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        explicit_epi_tile_supported = (
+            tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=tcgen05_is_two_cta,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                tile_shape=explicit_epi_tile_shape,
+            )
+            and explicit_epi_aux_supported
+        )
+        if tcgen05_nm_orientation and row_profile is None:
+            nm_worklist_metadata_checks = {
+                "supported_physical_store": nm_explicit_store_wave,
+                "dynamic_rank2_ab_tensormaps": (
+                    tcgen05_grouped_dynamic_ab_tensormap_rank == 2
+                ),
+            }
+            failed_nm_worklist_metadata_checks = [
+                name
+                for name, passed in nm_worklist_metadata_checks.items()
+                if not passed
+            ]
+            if failed_nm_worklist_metadata_checks:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} is validated "
+                    "only for the BF16 N,M-oriented explicit-store "
+                    "worklist route with rank-2 dynamic A/B TensorMaps; "
+                    "failed checks: " + ", ".join(failed_nm_worklist_metadata_checks),
+                )
+        if explicit_epi_tile_requested:
+            if nm_explicit_store_wave:
+                if aux_tensor_descriptors_value:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "tcgen05 N,M-oriented explicit store is validated only "
+                        "for the BF16 grouped worklist TMA-store "
+                        "path with logical block_m=256, block_n=128, "
+                        "a supported CtaGroup.ONE/TWO physical tile, and no "
+                        "auxiliary epilogue tensors",
+                    )
+            elif not explicit_epi_tile_supported:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "explicit tcgen05 epilogue tile must use M=64/128 and "
+                    "N=16/32/64, divide the MMA tile, and use N as the store "
+                    "box width without using staged auxiliary inputs",
+                )
+        if tcgen05_use_flat_role_coordinates:
+            if not (
+                explicit_epi_tile_requested
+                and (
+                    tcgen05_explicit_epi_tile_m,
+                    tcgen05_explicit_epi_tile_n,
+                    tcgen05_explicit_d_store_box_n,
+                )
+                == _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE
+                and tcgen05_static_full_tiles
+                and tcgen05_is_two_cta
+                and tcgen05_cluster_n == 1
+                and bm == TCGEN05_TWO_CTA_BLOCK_M
+                and bn == TCGEN05_TWO_CTA_BLOCK_N
+                # Both bk=64 and bk=128 share the bm=bn=256, cluster_m=2,
+                # cluster_n=1 envelope and use the same flat-role launch
+                # shape, for bf16 and fp16 operands alike.
+                and bk in (64, 128)
+                and (
+                    (
+                        input_dtype == torch.bfloat16
+                        and epi_elem_dtype_str == "cutlass.BFloat16"
+                    )
+                    or (
+                        input_dtype == torch.float16
+                        and epi_elem_dtype_str == "cutlass.Float16"
+                    )
+                )
+                and all(
+                    descriptor.broadcast_axis == 1
+                    for descriptor in aux_tensor_descriptors_value
+                )
+                and tcgen05_use_tma_store_epilogue
+                and tcgen05_warp_spec.scheduler_warps == 0
+                and tcgen05_warp_spec.c_input_warps == 0
+                and tcgen05_warp_spec.ab_load_warps == 1
+                and tcgen05_warp_spec.epi_warps == 4
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
+                    "the guarded static-full 16-bit (bf16/fp16) pure matmul "
+                    "CtaGroup.TWO 256x256 bk in {64,128} explicit-epilogue-tile "
+                    "path",
+                )
+        tcgen05_scheduler_warp_count_for_plan = tcgen05_effective_scheduler_warps
+        tcgen05_sched_stage_count_for_plan = tcgen05_sched_stage_count_value
+        tcgen05_persistence_model_for_plan = tcgen05_persistence_model_str
+
+        # When the entire grid fits in one wave, every persistent CTA receives
+        # exactly one tile. Use ceiling counts so the same proof covers both
+        # static-full grids and the validated FP8 role-local N-edge path.
+        one_shot_m_slots = ((m_size + bm - 1) // bm) * (2 if tcgen05_is_two_cta else 1)
+        one_shot_n_slots = (n_size + bn - 1) // bn
+        # A leading passthrough (batch) axis is one of the scheduler's
+        # dimensions (its position follows the loop order). Its tile size is
+        # pinned to 1 by ``_analyze_mma_operands``, so the static extent is its
+        # slot count; a symbolic extent, or a cluster (whose divisibility
+        # proofs below assume the scheduler M/N dims are the matrix dims),
+        # keeps the persistent while.
+        one_shot_l_slots: int | None = 1
+        if analysis is not None and analysis.has_leading_passthrough:
+            lp_block_id = analysis.leading_passthrough_block_id
+            assert lp_block_id is not None
+            lp_extent = env.block_sizes[lp_block_id].size
+            one_shot_l_slots = (
+                lp_extent
+                if isinstance(lp_extent, int)
+                and not isinstance(lp_extent, bool)
+                and tcgen05_cluster_m == 1
+                and tcgen05_cluster_n == 1
+                else None
+            )
+        one_shot_work_ctas = (
+            one_shot_m_slots * one_shot_n_slots * one_shot_l_slots
+            if one_shot_l_slots is not None
+            else None
+        )
+        tcgen05_one_shot_role_scheduler = (
+            tcgen05_pid_is_persistent
+            and row_union_plan is None
+            and (
+                tcgen05_static_full_tiles
+                or (
+                    tcgen05_role_local_n_edge_tma and input_dtype == torch.float8_e4m3fn
+                )
+            )
+            and one_shot_work_ctas is not None
+            and one_shot_work_ctas <= env.config_spec.num_sm
+            # A partial cluster could access out of bounds.
+            and one_shot_m_slots % tcgen05_cluster_m == 0
+            and one_shot_n_slots % tcgen05_cluster_n == 0
+            and tcgen05_use_role_local_persistent_body
+            and tcgen05_effective_scheduler_warps == 0
+            and tcgen05_grouped_plan is None
+        )
+        # With one tile per CTA every tile is in flight at once, so the L2
+        # raster swizzle (a permutation of the tile -> CTA map that only
+        # matters when CTAs walk several tiles) cannot change which lines are
+        # live together; the plan drops it on this path so the role-local
+        # schedulers take the unpadded identity raster (no swizzle padding
+        # slots, no padding guard) and the one-shot form is reached from any
+        # ``tcgen05_l2_swizzle_size`` the search picked.
+        tcgen05_plan_l2_swizzle_size = (
+            1 if tcgen05_one_shot_role_scheduler else tcgen05_l2_swizzle_size_value
+        )
+        # One tile per CTA: the epilogue frees TMEM right after issuing its
+        # last subtile's TMA store (the last ``tcgen05.ld`` fence + acc release
+        # stay at that subtile) so the dealloc handshake with the MMA warp
+        # overlaps the store drain instead of holding the last subtile's
+        # staging behind it or following the drain.  This
+        # is the single decision both sides follow: the store lowering emits
+        # the free in the plain full-tile TMA-store body and the post-loop
+        # teardown (``Tcgen05LifecycleContext.render_store_post_loop_lines``)
+        # drops its own handshake + free.  The accumulator must therefore
+        # reach exactly one store (a second store would register the full
+        # teardown before the final store's free: two handshakes against one
+        # MMA arrive, two deallocs) and the C-store body must be the normal
+        # one: the ``skip_epilogue_store`` diagnostic drops the whole t2r
+        # region, free included, the split epilogue layouts relocate it, and
+        # the compact (shape-changing) fragment epilogue owns T2R in its own
+        # SIMT schedule and never renders the TMA body.
+        tcgen05_fragment_plan = df.cute_state.tcgen05_fragment_epilogue_plan_for_anchor(
+            fx_node
+        )
+        tcgen05_free_tmem_in_epilogue = (
+            (tcgen05_use_merged_pipeline_init or tcgen05_use_cluster_deferred_pipelines)
+            and tcgen05_one_shot_role_scheduler
+            and tcgen05_static_full_tiles
+            and tcgen05_use_tma_store_epilogue
+            and tcgen05_m_subtile_count == 1
+            and (
+                tcgen05_output_stores_value is None
+                or len(tcgen05_output_stores_value) == 1
+            )
+            and df.config.get(
+                TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL
+            )
+            == TCGEN05_C_STORE_MODE_NORMAL
+            and df.config.get(
+                TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY, TCGEN05_EPILOGUE_LAYOUT_NORMAL
+            )
+            == TCGEN05_EPILOGUE_LAYOUT_NORMAL
+            and not (
+                candidate is not None
+                and candidate.requires_fragment_epilogue
+                and (
+                    tcgen05_fragment_plan is None or tcgen05_fragment_plan.changes_shape
+                )
+            )
+        )
+        # One tile per CTA: the TMA-load warp's whole role (scheduler, tile
+        # coordinates, TMA partitions, prefill, K loop) is re-emitted right
+        # after the pipeline objects exist (after the cluster
+        # ``pipeline_init_arrive`` on the clustered path, after the mbarrier
+        # init fence on the plain merged-init path) and the warp joins the
+        # init rendezvous itself just before its first stage (``program_id``
+        # moves the role block; the wait is the per-tile statement emitted
+        # ahead of the stage-0 prefetch below: ``pipeline_init_wait`` or the
+        # plain path's pipeline-init named barrier).  The ~300 ns of dependent
+        # uniform-datapath math before the first TMA issue then overlaps the
+        # rendezvous and ``tcgen05.alloc`` instead of following them; the
+        # other warps wait in the prefix as before.  Only the role-local TMA
+        # producer of a one-shot kernel qualifies: its per-tile statements run
+        # exactly once, so the wait is executed once, and the row-union
+        # startup prefill (which already issues its first stages ahead of the
+        # publication) is excluded.
+        tcgen05_hoist_tma_role = (
+            (tcgen05_use_cluster_deferred_pipelines or tcgen05_use_merged_pipeline_init)
+            and tcgen05_one_shot_role_scheduler
+            and tcgen05_use_role_local_tma_producer
+            and row_union_plan is None
+            and tcgen05_grouped_plan is None
+            and not df.config.get(STARTUP_PREFILL_KEY, False)
+        )
+        from .atomic_ops import reject_atomics_beside_warp_roles
+
+        reject_atomics_beside_warp_roles(
+            ctas_per_tile=(
+                "two-CTA pairs share each tile"
+                if tcgen05_is_two_cta
+                else "persistent CTAs own several tiles"
+                if tcgen05_pid_is_persistent and not tcgen05_one_shot_role_scheduler
+                else None
+            )
+        )
+        tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
+            bm=tcgen05_mma_bm,
+            bn=tcgen05_mma_bn,
+            bk=bk,
+            k_tile_count=(k_total_size + bk - 1) // bk,
+            cluster_m=tcgen05_cluster_m,
+            is_two_cta=tcgen05_is_two_cta,
+            uses_role_local_persistent_body=tcgen05_use_role_local_persistent_body,
+            uses_cluster_m2_one_cta_role_local_bridge=(
+                tcgen05_cluster_m2_one_cta_role_local_bridge
+            ),
+            cta_thread_count=tcgen05_cta_thread_count,
+            physical_m_threads=mma_physical_m_threads,
+            acc_stage_count=tcgen05_acc_stage_count_value,
+            ab_stage_count=tcgen05_ab_stage_count_value,
+            c_stage_count=tcgen05_c_stage_count_value,
+            epi_warp_count=tcgen05_epi_warp_count_value,
+            output_offsets=(m_offset_var, n_offset_var),
+            ab_load_warp_count=tcgen05_warp_spec.ab_load_warps,
+            one_shot_role_scheduler=tcgen05_one_shot_role_scheduler,
+            scheduler_warp_count=tcgen05_scheduler_warp_count_for_plan,
+            sched_stage_count=tcgen05_sched_stage_count_for_plan,
+            # ``c_input_warp_count`` plumbs the warp-spec slot
+            # through the matmul plan (``cute_plan.md`` §7.5.3.2).
+            # Validator restricts the value to ``{0, 1}`` under
+            # WITH_SCHEDULER and ``{0}`` under MONOLITHIC; codegen
+            # body for the C-input warp is inert today.
+            c_input_warp_count=tcgen05_warp_spec.c_input_warps,
+            # ``store_warp_count`` plumbs the Stage-3 store-warp slot
+            # (cycle 91, ``cute_plan.md`` §4.2) through the plan the same
+            # way. Validator restricts it to ``{0, 1}`` under WITH_SCHEDULER
+            # and ``{0}`` under MONOLITHIC; the store warp's body is inert in
+            # cycle 91 (it occupies the former padding slot, so launch
+            # accounting is unchanged), the R2S->TMA-D drain lands in Stage 4.
+            store_warp_count=tcgen05_warp_spec.store_warps,
+            persistence_model=tcgen05_persistence_model_for_plan,
+            cluster_n=tcgen05_cluster_n,
+            l2_swizzle_size=tcgen05_plan_l2_swizzle_size,
+            tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
+            m_subtile_count=tcgen05_m_subtile_count,
+            aux_tensor_descriptors=aux_tensor_descriptors_value,
+            flat_role_launch_warp_count=8
+            if tcgen05_use_flat_role_coordinates
+            else None,
+            grouped=tcgen05_grouped_plan,
+            row_union=row_union_plan,
+        )
+        assert tcgen05_plan is not None
+        tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
+            tcgen05_plan.exec_active,
+            is_two_cta=tcgen05_is_two_cta,
+            gate_exec_warp=not tcgen05_use_role_local_mma_exec,
+            cluster_n=tcgen05_cluster_n,
+        )
+        candidate_block_shape = tcgen05_matmul_plan.block_shape
+        df.cute_state.register_tcgen05_matmul_plan(tcgen05_matmul_plan)
+        if (
+            candidate_block_shape[0]
+            * candidate_block_shape[1]
+            * candidate_block_shape[2]
+            > 1024
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"tcgen05 launch block shape {candidate_block_shape} exceeds 1024 threads",
+            )
+        # SMEM-budget rejection: ``tcgen05_ab_stages=3`` +
+        # productive C-input warp
+        # (``tcgen05_warp_spec_c_input_warps=1`` AND non-empty
+        # ``aux_tensor_descriptors`` AND single-store fan-out
+        # gate open) is over the 232 KB B200 SMEM cap at every
+        # validated tcgen05 tile shape (canonical
+        # ``(bm=bn=256, bk=128, cluster_m=2)`` measured 263 KB
+        # used vs 232 KB cap; reducing the aux ring to
+        # ``num_stages=1`` only drops it to 246 KB, still 14 KB
+        # over). Reject loudly at MMA-codegen time so:
+        #   - explicit user configs fail with a clear message
+        #     instead of an opaque ``ptxas: uses too much
+        #     shared data`` deep inside the cute_dsl invocation;
+        #   - the autotune search-time fixup can demote
+        #     ``tcgen05_ab_stages=3`` candidates that would
+        #     otherwise trigger this raise mid-tuning (see
+        #     ``_fix_tcgen05_ab_stages_three_search_config``).
+        # The predicate mirrors the productive-body aux-pipeline
+        # allocation gate at ``_emit_mma_pipeline`` below
+        # (``has_aux_producer_warp AND aux_tensor_descriptors AND
+        # aux_single_store_value``), where the aux producer is the
+        # C-input warp (SIMT or TMA) OR — under the cycle-94 merge —
+        # the store warp (TMA only). The store-warp TMA aux ring has
+        # the SAME SMEM cost as the C-input TMA ring, so ab=3 overshoots
+        # the cap identically and must be rejected for it too. When the
+        # multi-store fan-out gate closes the productive body, the aux
+        # SMEM ring + ``c_pipeline_aux`` are NOT allocated and the
+        # kernel falls back to GMEM-aux reads with no extra SMEM cost,
+        # so the rejection must NOT fire — fan-out ``ab=3 + c_input=1``
+        # paths are legal and pinned by
+        # ``test_aux_pipeline_ab_stages_3_with_c_input_fanout_not_rejected``.
+        c_input_aux_tensor_descriptors = (
+            tcgen05_matmul_plan.c_input_aux_tensor_descriptors
+        )
+        aux_single_store_value = (
+            len({d.store_value_node for d in c_input_aux_tensor_descriptors}) <= 1
+        )
+        ab_reject_aux_tma_requested = (
+            df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        ab_reject_has_aux_producer_warp = tcgen05_matmul_plan.has_c_input_warp or (
+            tcgen05_matmul_plan.has_store_warp and ab_reject_aux_tma_requested
+        )
+        if (
+            ab_reject_has_aux_producer_warp
+            and c_input_aux_tensor_descriptors
+            and aux_single_store_value
+            and tcgen05_matmul_plan.ab_stage_count >= 3
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 ``tcgen05_ab_stages=3`` is incompatible "
+                "with a productive aux producer warp "
+                "(``tcgen05_warp_spec_c_input_warps=1``, or the "
+                "cycle-94 store-warp merge "
+                "``tcgen05_warp_spec_store_warps=1`` + "
+                "``tcgen05_aux_load_mode=tma``, + "
+                "non-empty aux tensors from the epilogue chain): "
+                "the aux SMEM ring + AB pipeline together "
+                "overshoot the 232 KB B200 SMEM cap at every "
+                "validated tile shape (the canonical "
+                "``(bm=bn=256, bk=128, cluster_m=2)`` shape uses "
+                "263 KB vs 232 KB cap). Drop to "
+                "``tcgen05_ab_stages=2`` for residual epilogues "
+                "with an aux producer warp, or drop the aux "
+                "producer warp to keep ``tcgen05_ab_stages=3``. See "
+                "``cute_plan.md`` §1.3 / §7.5.3.2.",
+            )
+        df.cute_state.block_shape = candidate_block_shape
+    if mma_impl == "universal":
+        prefix.extend(
+            _make_tiled_mma_setup(
+                mma_impl,
+                tiled_mma,
+                thr_mma,
+                f"{m_local} + ({n_local}) * cutlass.Int32({bm})",
+                input_dtype_str,
+                acc_dtype_str,
+                bm,
+                bn,
+                tcgen05_cluster_m=tcgen05_cluster_m,
+                a_k_major=tcgen05_mma_a_k_major,
+                b_k_major=tcgen05_mma_b_k_major,
+                tcgen05_use_2cta_instrs=tcgen05_is_two_cta,
+            )
+        )
+    else:
+        mma_participant_linear = df.new_var("mma_tidx")
+        mma_slice_linear = df.new_var("mma_slice_tidx")
+        mma_copy_linear = df.new_var("mma_copy_tidx")
+        mma_active = df.new_var("mma_active")
+        tma_warp = df.new_var("tcgen05_tma_warp")
+        warp_idx = df.new_var("tcgen05_warp_idx")
+        lane_idx = df.new_var("tcgen05_lane_idx")
+        epi_active = df.new_var("tcgen05_epi_active")
+        epi_tidx = df.new_var("tcgen05_epi_tidx")
+        prefix.append(
+            statement_from_string(
+                f"{warp_idx} = cute.arch.make_warp_uniform(cute.arch.warp_idx())"
+            )
+        )
+        prefix.append(statement_from_string(f"{lane_idx} = cute.arch.lane_idx()"))
+        if mma_impl == "warp":
+            # Warp MMA instructions require complete physical CUDA warps.
+            # Logical M/N coordinates can permute lanes or include serial
+            # elements, so use the same physical prefix for copies and MMA.
+            mma_tidx_expr = f"{warp_idx} * cutlass.Int32(32) + {lane_idx}"
+            mma_active_expr = (
+                f"{mma_participant_linear} < cutlass.Int32({bm * mma_phys_n})"
+            )
+            mma_copy_expr = mma_participant_linear
+        else:
+            if tcgen05_use_flat_role_coordinates:
+                mma_role_coordinates = _flat_mma_role_coordinate_plan(
+                    lane_idx=lane_idx,
+                    warp_idx=warp_idx,
+                    mma_active_n_threads=mma_phys_n,
+                )
+            else:
+                mma_role_coordinates = _launch_axis_mma_role_coordinate_plan(
+                    mma_m_thread_extent=mma_physical_m_threads,
+                    mma_active_n_threads=mma_phys_n,
+                )
+            mma_tidx_expr = mma_role_coordinates.mma_tidx_expr()
+            mma_active_expr = mma_role_coordinates.mma_active_expr()
+            mma_copy_expr = (
+                mma_participant_linear
+                if tcgen05_collective_handles_operand_loads
+                else f"{m_local} + ({n_local}) * cutlass.Int32({bm})"
+            )
+        prefix.append(
+            statement_from_string(f"{mma_participant_linear} = {mma_tidx_expr}")
+        )
+        prefix.append(statement_from_string(f"{mma_copy_linear} = {mma_copy_expr}"))
+        prefix.append(statement_from_string(f"{mma_active} = {mma_active_expr}"))
+        if mma_impl == "tcgen05":
+            assert tcgen05_plan is not None
+            assert tcgen05_matmul_plan is not None
+            # The current lowering has a single A/B load warp at
+            # `tma_warp_id`, so `tma_warp` doubles as the A/B-load-active
+            # predicate. When role-local persistent loops land and split
+            # those roles, this is the place to add a separate
+            # `tcgen05_ab_load_active` predicate.
+            prefix.append(
+                statement_from_string(
+                    f"{tma_warp} = {warp_idx} == cutlass.Int32({tcgen05_matmul_plan.tma_warp_id})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_plan.exec_active} = "
+                    f"{warp_idx} == cutlass.Int32({tcgen05_matmul_plan.exec_warp_id})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{epi_active} = "
+                    f"{warp_idx} < cutlass.Int32({tcgen05_matmul_plan.epi_warp_count})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{epi_tidx} = "
+                    f"{_mma_epi_tidx_expr(lane_idx=lane_idx, warp_idx=warp_idx, epi_active=epi_active)}"
+                )
+            )
+            # Register reallocation must be uniform within each four-warp
+            # warpgroup, including a partially populated final group. The
+            # epilogue occupies the leading complete warpgroups and needs the
+            # larger register budget. MMA execution, operand loading and any
+            # scheduler/auxiliary roles share the smaller budget. In particular,
+            # a six-warp monolithic CTA must decrease both warps 4 and 5.
+            # Keep these calls before any role enters its pipeline.
+            consumer_predicate = epi_active
+            # Cycle 15 H2 (cute_plan.md §6 Target 8): the consumer-warp
+            # register ceiling is config-driven. Default 256 preserves
+            # cycle-14 byte-identity; lower values cap ``ptxas``'s
+            # per-thread register allocation and force a spill rather
+            # than reserving at the natural 255-reg peak. The autotune
+            # gate ``consumer_regs_autotune_fragments`` admits the knob
+            # only for the T8 wide-N CLC + aux-TMA seed family (same
+            # gate as ``aux_stages``), so T1-T7 stay byte-identical at
+            # the 256 default.
+            consumer_regs_value = _tcgen05_consumer_regs_from_config(df.config)
+            if (
+                row_profile is None
+                or row_profile.paired_protocol is None
+                or not row_profile.paired_protocol.static_registers
+            ):
+                prefix.append(
+                    statement_from_string(
+                        f"if not ({consumer_predicate}):\n"
+                        f"    cute.arch.setmaxregister_decrease("
+                        f"{_TCGEN05_PRODUCER_REGS})"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(
+                        f"if {consumer_predicate}:\n"
+                        f"    cute.arch.setmaxregister_increase("
+                        f"{consumer_regs_value})"
+                    )
+                )
+            prefix.append(
+                statement_from_string(
+                    # tcgen05 tiled_mma slicing is CTA-scoped, not per-thread.
+                    # Quack/CUTLASS use the CTA's MMA tile coordinate here.
+                    # On Helion's 1-CTA path that is always 0, but clustered
+                    # widened kernels need the cluster-local CTA rank so each
+                    # CTA takes the right MMA slice.
+                    f"{mma_slice_linear} = "
+                    + (
+                        "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+                        f"% cutlass.Int32({tcgen05_cluster_m})"
+                        if tcgen05_cluster_m > 1
+                        else "cutlass.Int32(0)"
+                    )
+                )
+            )
+            prefix.extend(
+                _make_tiled_mma_setup(
+                    mma_impl,
+                    tiled_mma,
+                    thr_mma,
+                    mma_slice_linear,
+                    input_dtype_str,
+                    acc_dtype_str,
+                    tcgen05_mma_bm,
+                    tcgen05_mma_bn,
+                    tcgen05_cluster_m=tcgen05_cluster_m,
+                    a_k_major=tcgen05_mma_a_k_major,
+                    b_k_major=tcgen05_mma_b_k_major,
+                    tcgen05_use_2cta_instrs=tcgen05_is_two_cta,
+                )
+            )
+            if tcgen05_m_subtile_count > 1:
+                # Second tiled MMA object for the M-paired subtile so each
+                # subtile's ACCUMULATE flag is tracked independently.
+                prefix.append(
+                    statement_from_string(
+                        f"{tiled_mma2} = "
+                        + _tcgen05_tiled_mma_expr(
+                            input_dtype_str,
+                            acc_dtype_str,
+                            tcgen05_mma_bm,
+                            tcgen05_mma_bn,
+                            tcgen05_cluster_m=tcgen05_cluster_m,
+                            a_k_major=tcgen05_mma_a_k_major,
+                            b_k_major=tcgen05_mma_b_k_major,
+                            use_2cta_instrs=tcgen05_is_two_cta,
+                        )
+                    )
+                )
+        else:
+            prefix.append(
+                statement_from_string(f"{tma_warp} = {warp_idx} == cutlass.Int32(0)")
+            )
+            prefix.extend(
+                _make_tiled_mma_setup(
+                    mma_impl,
+                    tiled_mma,
+                    thr_mma,
+                    mma_participant_linear,
+                    input_dtype_str,
+                    acc_dtype_str,
+                    bm,
+                    bn,
+                    tcgen05_cluster_m=tcgen05_cluster_m,
+                    a_k_major=tcgen05_mma_a_k_major,
+                    b_k_major=tcgen05_mma_b_k_major,
+                    tcgen05_use_2cta_instrs=tcgen05_is_two_cta,
+                )
+            )
+    if mma_impl == "tcgen05":
+        assert tcgen05_plan is not None
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_cluster_layout_vmnk} = cute.tiled_divide("
+                f"cute.make_layout(({tcgen05_cluster_m}, {tcgen05_cluster_n}, 1)), "
+                f"({tiled_mma}.thr_id.shape,))"
+            )
+        )
+        prefix.extend(
+            _make_tcgen05_layout_plan_setup(
+                tcgen05_plan,
+                tiled_mma,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                bk=bk,
+                ab_stage_count=tcgen05_ab_stage_count_value,
+                is_two_cta=tcgen05_is_two_cta,
+                input_dtype_str=input_dtype_str,
+                acc_dtype_str=acc_dtype_str,
+                epi_elem_dtype_str=epi_elem_dtype_str,
+                smem_swizzle_a=tcgen05_smem_swizzle_a,
+                smem_swizzle_b=tcgen05_smem_swizzle_b,
+                explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
+                explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
+                nm_explicit_store_wave=nm_explicit_store_wave and row_profile is None,
+                a_k_major=tcgen05_mma_a_k_major,
+                b_k_major=tcgen05_mma_b_k_major,
+                c_layout=tcgen05_d_store_layout,
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{acc_frag_base} = {tiled_mma}.make_fragment_C("
+                f"cute.append({tiled_mma}.partition_shape_C("
+                f"({tcgen05_mma_bm}, {tcgen05_mma_bn})), "
+                f"{tcgen05_acc_stage_count_value}))"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.acc_tmem_cols} = cutlass.utils.get_num_tmem_alloc_cols("
+                f"{acc_frag_base}, arch='sm_100')"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.tmem_holding_buf} = cute.arch.alloc_smem(cutlass.Int32, 1)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.tmem_dealloc_mbar_ptr} = cute.arch.alloc_smem(cutlass.Int64, 1)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.tmem_alloc_barrier} = cutlass.pipeline.NamedBarrier("
+                f"barrier_id={_TCGEN05_TMEM_ALLOC_BARRIER_ID}, "
+                f"num_threads={tcgen05_tmem_barrier_thread_count_value})"
+            )
+        )
+        if tcgen05_use_merged_pipeline_init:
+            # Named barrier between the mbarrier-initializing warp (warp 0)
+            # and every warp that is not an epilogue warp: the TMA-load, MMA,
+            # scheduler and padding warps.  It publishes the pipeline init to
+            # those warps without making them wait for the TMEM allocation;
+            # the epilogue warps (and, again, the MMA warp) get the same
+            # publication from warp 0's arrival on ``tmem_alloc_barrier``.
+            assert tcgen05_matmul_plan is not None
+            tcgen05_launched_warps = (
+                tcgen05_matmul_plan.flat_role_launch_warp_count
+                if tcgen05_matmul_plan.flat_role_launch_warp_count is not None
+                else tcgen05_matmul_plan.launched_warp_count
+            )
+            tcgen05_pipeline_init_barrier = df.new_var("tcgen05_pipeline_init_barrier")
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_pipeline_init_barrier} = cutlass.pipeline.NamedBarrier("
+                    f"barrier_id={_TCGEN05_PIPELINE_INIT_BARRIER_ID}, "
+                    f"num_threads={32 * (tcgen05_launched_warps - tcgen05_epi_warp_count_value + 1)})"
+                )
+            )
+        # ``tcgen05.alloc`` stalls the issuing warp for ~150 ns on B200 and the
+        # DSL's mbarrier init runs on warp 0.  On the plain path let epilogue
+        # warp 1 allocate so the two prologue steps overlap instead of
+        # serializing on warp 0 (the MMA and epilogue warps wait for both at
+        # ``tmem_alloc_barrier``; the other warps wait only for the init, on
+        # the pipeline-init barrier).  ``free`` and ``relinquish`` follow the
+        # allocator warp inside ``TmemAllocator``; the retrieve barrier is
+        # unchanged.
+        tcgen05_tmem_allocator_warp = (
+            1
+            if tcgen05_use_merged_pipeline_init and tcgen05_epi_warp_count_value >= 2
+            else 0
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.tmem_allocator} = cutlass.utils.TmemAllocator("
+                f"{tcgen05_plan.tmem_holding_buf}, "
+                f"barrier_for_retrieve={tcgen05_plan.tmem_alloc_barrier}, "
+                f"allocator_warp_id={tcgen05_tmem_allocator_warp}, "
+                f"is_two_cta={tcgen05_is_two_cta!s}, "
+                f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_plan.tmem_dealloc_mbar_ptr})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.acc_pipeline_barriers} = cute.arch.alloc_smem("
+                f"cutlass.Int64, cutlass.Int32({tcgen05_acc_stage_count_value * 2}))"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.acc_pipeline_producer_group} = "
+                "cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.acc_pipeline_consumer_group} = "
+                f"cutlass.pipeline.CooperativeGroup("
+                f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_acc_consumer_arrive_count_value}))"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.acc_pipeline} = cutlass.pipeline.PipelineUmmaAsync.create("
+                f"num_stages={tcgen05_acc_stage_count_value}, "
+                f"producer_group={tcgen05_plan.acc_pipeline_producer_group}, "
+                f"consumer_group={tcgen05_plan.acc_pipeline_consumer_group}, "
+                f"barrier_storage={tcgen05_plan.acc_pipeline_barriers}, "
+                f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk}"
+                f"{tcgen05_defer_pipeline_sync_arg})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.acc_producer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
+                f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_acc_stage_count_value})"
+            )
+        )
+        if tcgen05_m_subtile_count > 1:
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_plan.acc_producer_state2} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
+                    f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_acc_stage_count_value})"
+                )
+            )
+            prefix.append(
+                statement_from_string(f"{tcgen05_plan.acc_producer_state2}.advance()")
+            )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_plan.acc_consumer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
+                f"cutlass.pipeline.PipelineUserType.Consumer, {tcgen05_acc_stage_count_value})"
+            )
+        )
+        # ``ROLE_LOCAL_WITH_SCHEDULER`` allocates a scheduler-broadcast
+        # ``PipelineAsync`` here. The plan and emission helpers live in
+        # this file (``_new_tcgen05_sched_pipeline_plan`` /
+        # ``_emit_sched_pipeline_setup``); the variable names are
+        # registered on ``DeviceFunction`` so ``program_id.py`` can
+        # emit consumer-side ``consumer_wait`` / ``consumer_release``
+        # against the same plan. The ``MONOLITHIC`` byte-identity
+        # path is preserved because this branch is gated on
+        # ``has_scheduler_warp`` and emits no ``df.new_var`` when
+        # scheduler_warps == 0.
+        assert tcgen05_matmul_plan is not None
+        if tcgen05_matmul_plan.has_scheduler_warp:
+            tcgen05_sched_plan = _new_tcgen05_sched_pipeline_plan(
+                df, use_clc=tcgen05_matmul_plan.is_clc_persistent
+            )
+            df.cute_state.register_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
+            # WITH_SCHEDULER's scheduler-warp topology: every CTA in
+            # the cluster runs its own scheduler warp, publishing to
+            # its own SMEM mailbox. Both CTAs converge on the same
+            # cluster-level virtual_pid because the consumer's
+            # ``virtual_pid = work_tile_smem[0] // cluster_m + ...``
+            # formula collapses the per-CTA ``cta_id_in_cluster``
+            # offset that ``StaticPersistentTileScheduler.create``
+            # bakes into ``tile_idx[0]``. So each CTA's scheduler
+            # publishes locally and each CTA's consumers release
+            # locally — no peer-CTA broadcast needed. The
+            # ``consumer_arrive_count`` is therefore *per-CTA*
+            # (no ``× cluster_size`` multiplier), and
+            # ``consumer_mask_to_leader=False`` keeps releases on
+            # the local empty barrier. Quack's
+            # ``make_sched_pipeline`` uses a different topology —
+            # single cluster-leader scheduler with peer-CTA
+            # broadcast — and consequently sets the cluster-wide
+            # arrive count and ``consumer_mask=Int32(0)``. Picking
+            # the wrong pair for the active topology starves
+            # non-leader CTAs of empty-barrier arrivals and hangs
+            # the kernel.
+            # CLC overlays a different sched_pipeline topology than
+            # the static path: leader-only producer + cluster-routed
+            # empty mbar (mirrors Quack's ``make_sched_pipeline`` for
+            # ``cluster_size > 1``). For cluster_size == 1 the two
+            # topologies degenerate to the same per-CTA shape.
+            # ``cluster_size`` is the full cluster envelope
+            # (``cluster_m * cluster_n``) so the cluster-wide arrive
+            # count under cluster_n=2 spans the full 4-CTA cluster
+            # AND the deferred-init protocol participates in the same
+            # cluster-wide barrier init as the AB / acc pipelines.
+            # For cluster_n=2 under ``ROLE_LOCAL_WITH_SCHEDULER`` the
+            # per-CTA-local scheduler topology is preserved (each CTA
+            # in the 4-CTA cluster runs its own scheduler that
+            # publishes locally and consumers release locally — see
+            # the ``consumer_mask_to_leader=False`` branch below);
+            # only the deferred-init participation needs the full
+            # cluster envelope so every CTA in the cluster contributes
+            # its arrival to the cluster-wide ``pipeline_init``
+            # barrier.
+            tcgen05_sched_cluster_size = tcgen05_cluster_m * tcgen05_cluster_n
+            # Consumer arrive count excludes the scheduler warp (the
+            # producer of this pipeline). The C-input warp's
+            # participation depends on whether the productive-body
+            # gate fires (``has_c_input_warp AND
+            # aux_tensor_descriptors``):
+            #
+            # - Gate fires: the C-input role-local while emitted by
+            #   ``program_id._build_c_input_warp_role_local_while``
+            #   consumer-waits on the sched_pipeline every iteration
+            #   (``cute_plan.md`` §7.5.3.2 cycle 1: empty body, but
+            #   the wait/release runs to receive the per-tile work
+            #   coords for cycles 2/3). Include the C-input warp in
+            #   the arrive count.
+            #
+            # - Gate does not fire (``c_input_warps=1`` without an
+            #   aux residual, or ``c_input_warps=0``): the C-input
+            #   warp body is fully inert and never calls
+            #   ``consumer_arrive`` on the sched_pipeline. Subtract
+            #   ``c_input_warp_count`` so ``producer_commit`` is not
+            #   blocked on a missing arrival.
+            #
+            # With ``c_input_warps=0`` the subtraction is a no-op
+            # and the byte-identity path is preserved exactly.
+            # Mirror the multi-store fan-out gate from
+            # ``_build_c_input_warp_role_local_while`` /
+            # the aux pipeline allocation below: the C-input
+            # warp only participates as a sched consumer when
+            # the productive body actually fires.
+            _aux_single_store_value = (
+                len(
+                    {
+                        d.store_value_node
+                        for d in tcgen05_matmul_plan.c_input_aux_tensor_descriptors
+                    }
+                )
+                <= 1
+            )
+            c_input_is_sched_consumer = (
+                tcgen05_matmul_plan.has_c_input_warp
+                and bool(tcgen05_matmul_plan.c_input_aux_tensor_descriptors)
+                and _aux_single_store_value
+            )
+            tcgen05_sched_consumer_role_count = (
+                tcgen05_matmul_plan.role_warp_count
+                - tcgen05_matmul_plan.scheduler_warp_count
+                - (
+                    0
+                    if c_input_is_sched_consumer
+                    else tcgen05_matmul_plan.c_input_warp_count
+                )
+                # Workstream A Stage 4 (cycle 93): the store warp now runs a
+                # PRODUCTIVE role-local body — it joins the (widened) epilogue
+                # role-local while and consumes the scheduler broadcast to read
+                # the per-tile coordinates it needs for the shared descriptor
+                # setup. It is therefore a REAL sched consumer, so the cycle-91
+                # ``- store_warp_count`` subtraction (which excluded the inert
+                # Stage-3 warp) is REMOVED: the count goes back to including the
+                # store warp. The store warp is a sched consumer + the C-store
+                # ring consumer; it is NOT an acc-pipeline or AB consumer.
+            )
+            # All lanes read the scheduler mailbox and arrive after their own
+            # reads. Count threads, not elected warp leaders: a leader-only
+            # release does not protect other lanes from stage reuse.
+            tcgen05_sched_consumer_thread_count = tcgen05_sched_consumer_role_count * 32
+            if tcgen05_matmul_plan.is_clc_persistent and tcgen05_sched_cluster_size > 1:
+                tcgen05_sched_consumer_arrive_count = (
+                    tcgen05_sched_consumer_thread_count * tcgen05_sched_cluster_size
+                )
+                tcgen05_sched_consumer_mask_to_leader = True
+            else:
+                tcgen05_sched_consumer_arrive_count = (
+                    tcgen05_sched_consumer_thread_count
+                )
+                tcgen05_sched_consumer_mask_to_leader = False
+            prefix.extend(
+                _emit_sched_pipeline_setup(
+                    tcgen05_sched_plan,
+                    sched_stage_count=tcgen05_matmul_plan.sched_stage_count,
+                    consumer_arrive_count=tcgen05_sched_consumer_arrive_count,
+                    cluster_size=tcgen05_sched_cluster_size,
+                    defer_sync=(
+                        tcgen05_use_cluster_deferred_pipelines
+                        or tcgen05_use_merged_pipeline_init
+                    ),
+                    consumer_mask_to_leader=tcgen05_sched_consumer_mask_to_leader,
+                    # One leader thread (lane 0 of the scheduler
+                    # warp) arrives on the full barrier per stage
+                    # via ``producer_commit``.
+                    producer_arrive_count=1,
+                )
+            )
+            # G2-H (cute_plan.md): allocate the CLC response
+            # buffer + mbarrier on the CLC path. The mbarrier-init
+            # call inside the scheduler-warp body (gated on
+            # lane 0 of the scheduler warp) follows in
+            # ``program_id._build_scheduler_warp_role_local_while_clc``.
+            # The SMEM allocations themselves are warp-uniform and
+            # safe to emit at the kernel prefix.
+            if tcgen05_matmul_plan.is_clc_persistent:
+                prefix.extend(_emit_clc_smem_setup(tcgen05_sched_plan))
+            # C-input warp aux SMEM ring + ``c_pipeline_aux``
+            # ``PipelineAsync`` (``cute_plan.md`` §7.5.3.2 cycle 2
+            # of the producer-body split). Fires only when the
+            # productive-body gate is open: ``c_input_warp_count > 0``
+            # AND a non-empty exact-shape ``c_input_aux_tensor_descriptors``
+            # tuple. Broadcast row-vector aux loads intentionally stay on the
+            # direct per-thread path; staging them as 2-D rings burns a full
+            # epilogue tile of SMEM for a one-dimensional input. The
+            # role-local while builder in
+            # ``program_id._build_c_input_warp_role_local_while``
+            # emits the per-descriptor producer body that issues
+            # ``producer_acquire`` → cooperative
+            # ``cute.copy(GMEM, SMEM_ring[stage])`` →
+            # ``producer_commit`` against the same plan; the
+            # consumer-side splice in
+            # ``memory_ops._aux_subtile_load_source`` reads from
+            # the SMEM ring under ``consumer_wait`` /
+            # ``consumer_release`` gating. Gate-closed configs
+            # (``c_input_warps=0`` or no aux residual) skip this
+            # allocation entirely and preserve byte identity.
+            # Multi-store fan-out safety gate: the productive body
+            # only fires when every aux descriptor for this matmul
+            # comes from a single store_value_node. With fan-out
+            # (one matmul → multiple stores with different aux
+            # operands), the producer would fire
+            # ``producer_commit`` on every ring per subtile while
+            # each store's per-store-codegen consumer covers only
+            # a subset of rings — leaving the unmatched rings
+            # uncommitted and deadlocking the producer once a CTA
+            # wraps the pipeline depth. The ``store_value_node``
+            # field on ``Tcgen05AuxTensorDescriptor`` is the
+            # discriminator; the descriptor walker dedups by it
+            # already, so single-store fan-out into multiple
+            # writes of the same value gives one ``store_value_node``
+            # in the descriptor set (and the GMEM fallback path
+            # remains byte-identical to the pre-cycle-2b shape).
+            c_input_aux_tensor_descriptors = (
+                tcgen05_matmul_plan.c_input_aux_tensor_descriptors
+            )
+            all_aux_tensor_descriptors = tcgen05_matmul_plan.aux_tensor_descriptors
+            tcgen05_aux_tma_requested = (
+                df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+            )
+            aux_store_value_nodes = {
+                desc.store_value_node for desc in c_input_aux_tensor_descriptors
+            }
+            aux_single_store_value = len(aux_store_value_nodes) <= 1
+            # Workstream A Stage 5 (cycle 94, the merge): the aux residual load
+            # runs on a dedicated PRODUCER warp. The C-input warp is the producer
+            # in BOTH the SIMT (cooperative ld/st) and the TMA (bulk copy) aux
+            # paths. The merge lets the STORE warp (id 7, 120-reg, idle between
+            # the early aux load and the late TMA-D drain) be that producer — but
+            # ONLY for the TMA path: the merge injects the store warp's aux body
+            # as a TMA bulk producer into the epilogue role-local while. There is
+            # no SIMT store-warp producer body, and the SIMT producer arrive
+            # count is hardcoded to ``c_input_warp_count * 32`` (= 0 with no
+            # C-input warp), which would pair a 0-thread producer group with a
+            # 32-thread SIMT copy and wedge the consumer. So ``store_warps=1 +
+            # SIMT aux`` must fall back to the direct-GMEM aux path (the producer
+            # gate stays closed), exactly as before this merge landed.
+            store_warp_is_aux_producer = (
+                tcgen05_matmul_plan.has_store_warp and tcgen05_aux_tma_requested
+            )
+            has_aux_producer_warp = (
+                tcgen05_matmul_plan.has_c_input_warp or store_warp_is_aux_producer
+            )
+            aux_productive_body_gate_open = (
+                has_aux_producer_warp
+                and c_input_aux_tensor_descriptors
+                and aux_single_store_value
+            )
+            if (
+                tcgen05_aux_tma_requested
+                and all_aux_tensor_descriptors
+                and not aux_productive_body_gate_open
+            ):
+                if not has_aux_producer_warp:
+                    reason = (
+                        "requires a productive aux producer warp "
+                        "(``tcgen05_warp_spec_c_input_warps=1`` or "
+                        "``tcgen05_warp_spec_store_warps=1``)"
+                    )
+                elif not c_input_aux_tensor_descriptors:
+                    reason = (
+                        "requires at least one exact-shape rank-2 auxiliary "
+                        "tensor; broadcast-only auxiliary tensors are not "
+                        "staged by the aux TMA path"
+                    )
+                else:
+                    reason = (
+                        "requires single-store fan-out for the staged aux descriptors"
+                    )
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_AUX_LOAD_MODE_TMA!r} {reason}",
+                )
+            if aux_productive_body_gate_open:
+                aux_descriptor_dtype_strs = tuple(
+                    env.backend.dtype_str(desc.host_tensor_val.dtype)
+                    for desc in c_input_aux_tensor_descriptors
+                )
+                # With dynamic M/N output shapes, a TMA-store epilogue is only
+                # enabled for the output-edge family, which routes partial tiles
+                # through either the full/edge split or the bounds-checked
+                # partial-output TMA-store path.
+                tma_store_handles_partial_tiles = tcgen05_use_tma_store_epilogue
+                aux_tma_needs_edge_routing = (
+                    tcgen05_aux_tma_requested
+                    and not tcgen05_static_output_tiles
+                    and not tma_store_handles_partial_tiles
+                )
+                if aux_tma_needs_edge_routing:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                        f"{TCGEN05_AUX_LOAD_MODE_TMA!r} with partial output "
+                        "tiles requires either a partial-output TMA-store "
+                        "epilogue or the full-tile/edge fallback split used "
+                        "by output-edge stores",
+                    )
+                if tcgen05_aux_tma_requested and any(
+                    dtype_str != epi_elem_dtype_str
+                    for dtype_str in aux_descriptor_dtype_strs
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                        f"{TCGEN05_AUX_LOAD_MODE_TMA!r} requires auxiliary "
+                        "tensor dtype to match the epilogue/output dtype",
+                    )
+                tcgen05_aux_use_tma_load = tcgen05_aux_tma_requested
+                tcgen05_aux_stage_count = _tcgen05_aux_pipeline_stage_count_from_config(
+                    df.config
+                )
+                tcgen05_aux_plan = _new_tcgen05_aux_pipeline_plan(
+                    df,
+                    num_rings=len(c_input_aux_tensor_descriptors),
+                    epi_tile_var=tcgen05_plan.epi_tile,
+                    use_tma_load=tcgen05_aux_use_tma_load,
+                    stage_count=tcgen05_aux_stage_count,
+                )
+                if tcgen05_aux_use_tma_load:
+                    for desc, ring, aux_dtype_str in zip(
+                        c_input_aux_tensor_descriptors,
+                        tcgen05_aux_plan.rings,
+                        aux_descriptor_dtype_strs,
+                        strict=True,
+                    ):
+                        tma_atom = ring.tma_atom
+                        tma_tensor = ring.tma_tensor
+                        assert tma_atom is not None
+                        assert tma_tensor is not None
+                        aux_tensor_name = df.tensor_arg(desc.host_tensor_val).name
+                        df.placeholder_args.add(aux_tensor_name)
+                        df.wrapper_only_params.extend([tma_atom, tma_tensor])
+                        cg.cute_wrapper_plans.append(
+                            {
+                                "kind": "tcgen05_aux_tma",
+                                "c_name": aux_tensor_name,
+                                "bm": bm,
+                                "bn": bn,
+                                "stage_count": tcgen05_aux_stage_count,
+                                "input_dtype": aux_dtype_str,
+                                "kernel_args": [tma_atom, tma_tensor],
+                            }
+                        )
+                df.cute_state.register_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
+                prefix.extend(
+                    _emit_tcgen05_aux_pipeline_setup(
+                        tcgen05_aux_plan,
+                        descriptor_dtype_strs=aux_descriptor_dtype_strs,
+                        # Each SMEM ring stage holds one ``epi_tile``
+                        # worth of aux data (one subtile of the
+                        # per-output-tile aux region). The producer
+                        # body in
+                        # ``program_id._build_c_input_warp_role_local_while``
+                        # loops over the matmul's subtile axis once
+                        # per output tile and cooperative-copies one
+                        # epi-tile into each ring stage; the
+                        # consumer's per-subtile loop waits, reads
+                        # the active stage with the existing
+                        # ``partition_C → flat_divide(epi_tile) →
+                        # partition_D`` pipeline, then releases
+                        # (TMA elected lanes, SIMT all readers).
+                        # Per-subtile staging reduces the
+                        # epilogue SMEM footprint vs whole-tile
+                        # staging, but the AB ring at ``bk=128`` plus
+                        # the aux/D-store rings still overshoots the
+                        # 232 KB B200 cap at ``cluster_m=2 +
+                        # tcgen05_ab_stages=3`` (cycle 48 measured
+                        # 263 KB used at bk=128; bk=64 fits).
+                        tile_shape_expr=tcgen05_plan.epi_tile,
+                        # SIMT producer thread count. A single C-input warp = 32
+                        # lanes (validator pins ``c_input_warp_count`` to
+                        # ``{0, 1}`` under WITH_SCHEDULER); all 32 lanes do the
+                        # cooperative SIMT copy. This is only consumed on the
+                        # SIMT aux path; the store-warp merge is TMA-only (the
+                        # ``store_warp_is_aux_producer`` gate above requires
+                        # ``aux_load_mode=tma``), where the producer group is the
+                        # 1-thread ``PipelineTmaAsync`` group and this SIMT count
+                        # is unused — so ``c_input_warp_count * 32`` (= 0 in the
+                        # merge) is correct and never reaches the SIMT branch.
+                        c_input_warp_thread_count=(
+                            tcgen05_matmul_plan.c_input_warp_count * 32
+                        ),
+                        # The emitter uses warp count for TMA and
+                        # thread count for SIMT releases.
+                        epi_warp_count=tcgen05_matmul_plan.epi_warp_count,
+                        defer_sync=(
+                            tcgen05_use_cluster_deferred_pipelines
+                            or tcgen05_use_merged_pipeline_init
+                        ),
+                    )
+                )
+        if not tcgen05_use_tma:
+            _emit_tcgen05_tmem_setup()
+    else:
+        prefix.append(
+            statement_from_string(
+                f"{acc_frag} = cute.make_rmem_tensor("
+                f"{tiled_mma}.partition_shape_C(({bm}, {bn})), {acc_dtype_str})"
+            )
+        )
+    # Allocate shared memory for A and B tiles (reused across K iterations)
+    # Keep these allocations in the device-loop prefix. Lane-loop MMA relies on
+    # per-iteration shared-memory state; hoisting them outside the lane loops
+    # regresses the existing lane-loop coverage.
+    smem_a_ptr = df.new_var("smem_a")
+    smem_a2_ptr = df.new_var("tcgen05_msub_smem_a")
+    smem_a2 = df.new_var("tcgen05_msub_sA")
+    gmem_a2_tma = df.new_var("tcgen05_msub_gA_tma")
+    gmem_a2_tma_part = df.new_var("tcgen05_msub_gA_tma_part")
+    tma_gA2 = df.new_var("tcgen05_msub_tma_gA")
+    tma_sA2 = df.new_var("tcgen05_msub_tma_sA")
+    tcgen05_frag_a2 = df.new_var("tcgen05_msub_tCrA")
+    smem_b_ptr = df.new_var("smem_b")
+    smem_a = df.new_var("sA")
+    smem_b = df.new_var("sB")
+    smem_a_mma = df.new_var("sA_mma")
+    smem_b_mma = df.new_var("sB_mma")
+    tma_smem_a_layout = df.new_var("sA_tma_layout")
+    tma_smem_b_layout = df.new_var("sB_tma_layout")
+    tma_thr_mma = df.new_var("tma_thr_mma")
+    gmem_a_tma = df.new_var("gA_tma")
+    gmem_b_tma = df.new_var("gB_tma")
+    gmem_a_tma_part = df.new_var("gA_tma_part")
+    gmem_b_tma_part = df.new_var("gB_tma_part")
+    tma_atom_a = df.new_var("tma_atom_a")
+    tma_atom_b = df.new_var("tma_atom_b")
+    tma_store_atom = (
+        df.new_var("tcgen05_tma_store_atom") if tcgen05_use_tma_store_epilogue else ""
+    )
+    tail_tma_store_atom = (
+        df.new_var("tcgen05_tail_tma_store_atom")
+        if tcgen05_use_tma_store_epilogue and tcgen05_grouped_d_tensormap_tail_store
+        else ""
+    )
+    tma_tensor_a = df.new_var("tma_tensor_a")
+    tma_tensor_b = df.new_var("tma_tensor_b")
+    tma_runtime_mma_n = (
+        df.new_var("tcgen05_tma_runtime_mma_n")
+        if tcgen05_runtime_n_specialization and tcgen05_is_two_cta
+        else None
+    )
+    tma_b_peer_delta = (
+        df.new_var("tcgen05_tma_b_peer_delta")
+        if tcgen05_runtime_n_specialization and tcgen05_is_two_cta
+        else None
+    )
+    tma_tensor_b_tail = (
+        df.new_var("tcgen05_tma_tensor_b_tail")
+        if tcgen05_runtime_n_specialization and tcgen05_is_two_cta
+        else None
+    )
+    tma_store_tensor = (
+        df.new_var("tcgen05_tma_store_tensor") if tcgen05_use_tma_store_epilogue else ""
+    )
+    tail_tma_store_tensor = (
+        df.new_var("tcgen05_tail_tma_store_tensor")
+        if tcgen05_use_tma_store_epilogue and tcgen05_grouped_d_tensormap_tail_store
+        else ""
+    )
+    tma_cta_layout = df.new_var("tma_cta_layout")
+    tma_a_cta_layout = df.new_var("tma_a_cta_layout")
+    tma_b_cta_layout = df.new_var("tma_b_cta_layout")
+    tma_a_cta_coord = df.new_var("tma_a_cta_coord")
+    tma_b_cta_coord = df.new_var("tma_b_cta_coord")
+    tma_gA = df.new_var("tma_gA")
+    tma_sA = df.new_var("tma_sA")
+    tma_gB = df.new_var("tma_gB")
+    tma_sB = df.new_var("tma_sB")
+    tma_initial_full_tile = df.new_var("tcgen05_tma_initial_full_tile")
+    tma_initial_next_full_tile = df.new_var("tcgen05_tma_initial_next_full_tile")
+    tma_full_tile = df.new_var("tcgen05_tma_full_tile")
+    tma_next_full_tile = df.new_var("tcgen05_tma_next_full_tile")
+    tma_next_consumer_tile = df.new_var("tcgen05_tma_next_consumer_tile")
+
+    def _tcgen05_tma_output_tile_predicate() -> str | None:
+        if tcgen05_grouped_dynamic_ab_tensormaps or tcgen05_grouped_fixed_tensormaps:
+            if tcgen05_grouped_static_full_output_tiles_from_metadata:
+                return None
+            predicate_m_tile = tcgen05_source_bm
+            predicate_n_tile = tcgen05_source_bn
+            return (
+                f"{tcgen05_grouped_cta_tile_idx_m} * "
+                f"cutlass.Int32({predicate_m_tile}) "
+                f"< {tcgen05_grouped_problem_m} "
+                f"and {tcgen05_grouped_cta_tile_idx_n} * "
+                f"cutlass.Int32({predicate_n_tile}) "
+                f"< {tcgen05_grouped_problem_n} "
+            )
+        if tcgen05_role_local_double_edge_tma:
+            # The role-local double-edge path lets TMA handle both partial AB
+            # stripes while the SIMT epilogue predicates aux loads and stores.
+            return (
+                f"{m_offset_var} < cutlass.Int32({m_size}) "
+                f"and {n_offset_var} < cutlass.Int32({n_size}) "
+            )
+        if tcgen05_role_local_m_edge_tma:
+            # The role-local M-edge path lets TMA handle the partial A stripe
+            # while the SIMT epilogue predicates aux loads and D stores.
+            return (
+                f"{m_offset_var} < cutlass.Int32({m_size}) "
+                f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+            )
+        if tcgen05_role_local_n_edge_tma:
+            # The role-local N-edge path lets TMA handle the partial B stripe
+            # while the SIMT epilogue predicates aux loads and D stores.
+            return (
+                f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                f"and {n_offset_var} < cutlass.Int32({n_size}) "
+            )
+        return (
+            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+        )
+
+    grouped_plan = tcgen05_grouped_plan
+    tcgen05_k_bound_expr: str = (
+        cast("str", tcgen05_grouped_problem_k)
+        if tcgen05_grouped_k_mask is not None
+        else f"cutlass.Int32({k_total_size})"
+    )
+
+    def _tcgen05_tma_k_tile_predicate(
+        *, k_tile_start_expr: str, full_tile_end_expr: str
+    ) -> str:
+        if (
+            tcgen05_role_local_uses_k_tail_tma
+            or tcgen05_grouped_dynamic_ab_tensormaps
+            or tcgen05_grouped_fixed_tensormaps
+        ):
+            return f"{k_tile_start_expr} < {tcgen05_k_bound_expr}"
+        return f"{full_tile_end_expr} <= {tcgen05_k_bound_expr}"
+
+    def _tcgen05_tma_tile_predicate(
+        *, k_tile_start_expr: str, full_tile_end_expr: str
+    ) -> str:
+        return " and ".join(
+            predicate
+            for predicate in (
+                _tcgen05_tma_output_tile_predicate(),
+                _tcgen05_tma_k_tile_predicate(
+                    k_tile_start_expr=k_tile_start_expr,
+                    full_tile_end_expr=full_tile_end_expr,
+                ),
+            )
+            if predicate
+        )
+
+    tma_k_tile = df.new_var("tcgen05_tma_k_tile")
+    tma_barrier_ptr = df.new_var("tcgen05_tma_barrier")
+    tma_producer_try_token = df.new_var("tcgen05_ab_producer_try_token")
+    tma_consumer_try_token = df.new_var("tcgen05_ab_consumer_try_token")
+    tma_cta_rank_in_cluster = df.new_var("tcgen05_cta_rank_in_cluster")
+    tma_block_in_cluster_coord_vmnk = df.new_var("tcgen05_block_in_cluster_coord_vmnk")
+    tma_a_mcast_mask = df.new_var("tcgen05_a_mcast_mask")
+    tma_b_mcast_mask = df.new_var("tcgen05_b_mcast_mask")
+    tcgen05_use_tma_b_mcast_mask = False
+    grouped_tensormap_manager = df.new_var("tcgen05_grouped_tensormap_manager")
+    grouped_tensormap_grid_dim = df.new_var("tcgen05_grouped_tensormap_grid_dim")
+    grouped_tensormap_workspace_idx = df.new_var(
+        "tcgen05_grouped_tensormap_workspace_idx"
+    )
+    grouped_tensormap_a_ptr = df.new_var("tcgen05_grouped_tensormap_a_ptr")
+    grouped_tensormap_b_ptr = df.new_var("tcgen05_grouped_tensormap_b_ptr")
+    grouped_tensormap_a_desc_ptr = df.new_var("tcgen05_grouped_tensormap_a_desc_ptr")
+    grouped_tensormap_b_desc_ptr = df.new_var("tcgen05_grouped_tensormap_b_desc_ptr")
+    grouped_tensormap_smem_ptr = df.new_var("tcgen05_grouped_tensormap_smem_ptr")
+    grouped_tensormap_a_smem_ptr = df.new_var("tcgen05_grouped_tensormap_a_smem_ptr")
+    grouped_tensormap_b_smem_ptr = df.new_var("tcgen05_grouped_tensormap_b_smem_ptr")
+    grouped_tensormap_init_done = df.new_var("tcgen05_grouped_tensormap_init_done")
+    grouped_tensormap_last_group = df.new_var("tcgen05_grouped_tensormap_last_group")
+    grouped_tensormap_group_changed = df.new_var(
+        "tcgen05_grouped_tensormap_group_changed"
+    )
+    grouped_tensormap_a_base = df.new_var("tcgen05_grouped_tensormap_a_base")
+    grouped_tensormap_b_base = df.new_var("tcgen05_grouped_tensormap_b_base")
+    grouped_tensormap_a_addr = df.new_var("tcgen05_grouped_tensormap_a_addr")
+    grouped_tensormap_b_addr = df.new_var("tcgen05_grouped_tensormap_b_addr")
+    grouped_tensormap_a_stride_m = df.new_var("tcgen05_grouped_tensormap_a_stride_m")
+    grouped_tensormap_a_stride_k = df.new_var("tcgen05_grouped_tensormap_a_stride_k")
+    grouped_tensormap_b_stride_n = df.new_var("tcgen05_grouped_tensormap_b_stride_n")
+    grouped_tensormap_b_stride_k = df.new_var("tcgen05_grouped_tensormap_b_stride_k")
+    grouped_tensormap_real_a = df.new_var("tcgen05_grouped_tensormap_real_a")
+    grouped_tensormap_real_b = df.new_var("tcgen05_grouped_tensormap_real_b")
+    grouped_tensormap_index_dtype = env.index_type()
+
+    def _grouped_dynamic_ab_shape_expr(outer_dim: str, k_dim: str) -> str:
+        if tcgen05_grouped_dynamic_ab_tensormap_rank == 2:
+            return f"({outer_dim}, {k_dim})"
+        return f"({outer_dim}, {k_dim}, cutlass.Int32(1))"
+
+    def _grouped_dynamic_ab_stride_expr(outer_stride: str, k_stride: str) -> str:
+        if tcgen05_grouped_dynamic_ab_tensormap_rank == 2:
+            return f"({outer_stride}, {k_stride})"
+        return f"({outer_stride}, {k_stride}, cutlass.Int32(0))"
+
+    def _grouped_direct_metadata_load(
+        tensor_name: str,
+        *indices: str | int,
+    ) -> str:
+        offset_terms = [
+            f"{grouped_tensormap_index_dtype}({index}) * "
+            f"{grouped_tensormap_index_dtype}({tensor_name}.layout.stride[{dim}])"
+            for dim, index in enumerate(indices)
+        ]
+        return f"({tensor_name}.iterator + {' + '.join(offset_terms)}).load()"
+
+    grouped_tensormap_a_base_expr = (
+        (
+            f"cute.make_ptr({input_dtype_str}, "
+            f"cutlass.Int64({grouped_tensormap_a_addr}), cute.AddressSpace.gmem)"
+        )
+        if tcgen05_grouped_direct_pointer_metadata
+        else (
+            f"{rhs_arg_name}.iterator + "
+            f"{grouped_tensormap_index_dtype}({tcgen05_grouped_group_idx}) * "
+            f"{grouped_tensormap_index_dtype}({rhs_arg_name}.layout.stride[0])"
+            if tcgen05_nm_orientation
+            else f"{lhs_arg_name}.iterator + "
+            f"{grouped_tensormap_index_dtype}({tcgen05_grouped_global_m_start}) * "
+            f"{grouped_tensormap_index_dtype}({lhs_arg_name}.layout.stride[0])"
+        )
+    )
+    grouped_tensormap_b_base_expr = (
+        (
+            f"cute.make_ptr({input_dtype_str}, "
+            f"cutlass.Int64({grouped_tensormap_b_addr}), cute.AddressSpace.gmem)"
+        )
+        if tcgen05_grouped_direct_pointer_metadata
+        else (
+            f"{lhs_arg_name}.iterator + "
+            f"{grouped_tensormap_index_dtype}({tcgen05_grouped_global_m_start}) * "
+            f"{grouped_tensormap_index_dtype}({lhs_arg_name}.layout.stride[0])"
+            if tcgen05_nm_orientation
+            else f"{rhs_arg_name}.iterator + "
+            f"{grouped_tensormap_index_dtype}({tcgen05_grouped_group_idx}) * "
+            f"{grouped_tensormap_index_dtype}({rhs_arg_name}.layout.stride[0])"
+        )
+    )
+    if grouped_plan is not None:
+        grouped_tensormap_real_a_shape_expr = _grouped_dynamic_ab_shape_expr(
+            grouped_plan.problem_n
+            if tcgen05_nm_orientation
+            else grouped_plan.problem_m,
+            grouped_plan.problem_k,
+        )
+        grouped_tensormap_real_b_shape_expr = _grouped_dynamic_ab_shape_expr(
+            grouped_plan.problem_m
+            if tcgen05_nm_orientation
+            else grouped_plan.problem_n,
+            grouped_plan.problem_k,
+        )
+        grouped_tensormap_real_a_stride_expr = (
+            _grouped_dynamic_ab_stride_expr(
+                grouped_tensormap_a_stride_m,
+                grouped_tensormap_a_stride_k,
+            )
+            if grouped_plan.direct_pointers is not None
+            else _grouped_dynamic_ab_stride_expr(
+                f"{rhs_arg_name}.layout.stride[1]"
+                if tcgen05_nm_orientation
+                else f"{lhs_arg_name}.layout.stride[0]",
+                f"{rhs_arg_name}.layout.stride[2]"
+                if tcgen05_nm_orientation
+                else f"{lhs_arg_name}.layout.stride[1]",
+            )
+        )
+        grouped_tensormap_real_b_stride_expr = (
+            _grouped_dynamic_ab_stride_expr(
+                grouped_tensormap_b_stride_n,
+                grouped_tensormap_b_stride_k,
+            )
+            if grouped_plan.direct_pointers is not None
+            else _grouped_dynamic_ab_stride_expr(
+                f"{lhs_arg_name}.layout.stride[0]"
+                if tcgen05_nm_orientation
+                else f"{rhs_arg_name}.layout.stride[1]",
+                f"{lhs_arg_name}.layout.stride[1]"
+                if tcgen05_nm_orientation
+                else f"{rhs_arg_name}.layout.stride[2]",
+            )
+        )
+        if (
+            grouped_plan.direct_pointers is not None
+            and grouped_plan.direct_strides is not None
+        ):
+            direct_idx = grouped_plan.metadata_idx or grouped_plan.group_idx
+            grouped_tensormap_direct_loads = (
+                f"    {grouped_tensormap_a_addr} = "
+                f"{_grouped_direct_metadata_load(grouped_plan.direct_pointers, direct_idx, 0)}\n"
+                f"    {grouped_tensormap_b_addr} = "
+                f"{_grouped_direct_metadata_load(grouped_plan.direct_pointers, direct_idx, 1)}\n"
+                f"    {grouped_tensormap_a_stride_m} = "
+                f"{_grouped_direct_metadata_load(grouped_plan.direct_strides, direct_idx, 0, 0)}\n"
+                f"    {grouped_tensormap_a_stride_k} = "
+                f"{_grouped_direct_metadata_load(grouped_plan.direct_strides, direct_idx, 0, 1)}\n"
+                f"    {grouped_tensormap_b_stride_n} = "
+                f"{_grouped_direct_metadata_load(grouped_plan.direct_strides, direct_idx, 1, 0)}\n"
+                f"    {grouped_tensormap_b_stride_k} = "
+                f"{_grouped_direct_metadata_load(grouped_plan.direct_strides, direct_idx, 1, 1)}\n"
+            )
+        else:
+            grouped_tensormap_direct_loads = ""
+    else:
+        grouped_tensormap_real_a_shape_expr = ""
+        grouped_tensormap_real_b_shape_expr = ""
+        grouped_tensormap_real_a_stride_expr = ""
+        grouped_tensormap_real_b_stride_expr = ""
+        grouped_tensormap_direct_loads = ""
+    tma_pipeline_mbars = df.new_var("tcgen05_ab_pipeline_mbars")
+    tma_pipeline_producer_group = df.new_var("tcgen05_ab_pipeline_producer_group")
+    tma_pipeline_consumer_group = df.new_var("tcgen05_ab_pipeline_consumer_group")
+    tma_pipeline_tx_count = df.new_var("tcgen05_ab_pipeline_tx_count")
+    tma_pipeline = df.new_var("tcgen05_ab_pipeline")
+    tma_producer_state = df.new_var("tcgen05_ab_producer_state")
+    tma_consumer_state = df.new_var("tcgen05_ab_consumer_state")
+    tcgen05_use_tma_store_role_tile_counter = (
+        tcgen05_use_tma_store_epilogue
+        and tcgen05_use_role_local_tma_producer
+        and _tcgen05_pid_initializes_epi_role_tile_counter(df.pid)
+    )
+    tma_store_role_tile_counter = (
+        df.new_var("tcgen05_tma_store_role_tile")
+        if tcgen05_use_tma_store_role_tile_counter
+        else ""
+    )
+    tcgen05_frag_a = df.new_var("tcgen05_tCrA")
+    tcgen05_frag_b = df.new_var("tcgen05_tCrB")
+    mma_stage = df.new_var("mma_stage")
+    if mma_impl == "tcgen05":
+        assert tcgen05_plan is not None
+        # ``tcgen05_matmul_plan`` is initialized in the same
+        # ``mma_impl == "tcgen05"`` branch upstream; the assert
+        # narrows the type for pyrefly so the ``is_clc_persistent``
+        # property access below doesn't trip a missing-attribute
+        # check on the ``Optional[CuteTcgen05MatmulPlan]`` annotation.
+        assert tcgen05_matmul_plan is not None
+        if tcgen05_use_tma:
+            # Applied for every tcgen05 TMA path even though only the role-local
+            # path strictly needs it: TMA wrapper plans consume the original
+            # tensor arguments on the host even when device DCE sees no scalar
+            # fallback references to those tensors.
+            df.placeholder_args.update((lhs_arg_name, rhs_arg_name))
+            if grouped_plan is not None:
+                df.placeholder_args.add(grouped_plan.layout)
+                if tcgen05_grouped_n_sizes_arg_name:
+                    df.placeholder_args.add(tcgen05_grouped_n_sizes_arg_name)
+                if tcgen05_grouped_k_sizes_arg_name:
+                    df.placeholder_args.add(tcgen05_grouped_k_sizes_arg_name)
+                if (
+                    tcgen05_grouped_direct_pointer_metadata
+                    and tcgen05_grouped_external_direct_pointers_arg_name is not None
+                    and tcgen05_grouped_external_direct_strides_arg_name is not None
+                ):
+                    _register_tensor_arg_by_host_name(
+                        df,
+                        tcgen05_grouped_external_direct_pointers_arg_name,
+                    )
+                    _register_tensor_arg_by_host_name(
+                        df,
+                        tcgen05_grouped_external_direct_strides_arg_name,
+                    )
+                    df.placeholder_args.update(
+                        (
+                            tcgen05_grouped_external_direct_pointers_arg_name,
+                            tcgen05_grouped_external_direct_strides_arg_name,
+                        )
+                    )
+                grouped_wrapper_params: list[str] = []
+                if (
+                    not grouped_plan.device_split_sizes
+                    and not grouped_plan.uses_runtime_tile_table
+                ):
+                    grouped_wrapper_params.extend(
+                        [
+                            grouped_plan.problem_sizes,
+                            grouped_plan.starts,
+                        ]
+                    )
+                if (
+                    grouped_plan.real_groups is not None
+                    and not grouped_plan.uses_runtime_tile_table
+                ):
+                    grouped_wrapper_params.append(grouped_plan.real_groups)
+                if grouped_plan.uses_runtime_tile_table:
+                    assert grouped_plan.runtime_tile_records is not None
+                    grouped_wrapper_params.append(grouped_plan.runtime_tile_records)
+                if tcgen05_grouped_ab_tensormaps is not None:
+                    grouped_wrapper_params.append(tcgen05_grouped_ab_tensormaps)
+                elif grouped_plan.d_tensormap is not None:
+                    grouped_wrapper_params.append(grouped_plan.d_tensormap)
+                if (
+                    grouped_plan.direct_pointers is not None
+                    and grouped_plan.direct_strides is not None
+                ):
+                    grouped_wrapper_params.extend(
+                        [
+                            grouped_plan.direct_pointers,
+                            grouped_plan.direct_strides,
+                        ]
+                    )
+                if not grouped_plan.uses_runtime_tile_table:
+                    grouped_wrapper_params.append(grouped_plan.sched_params)
+                else:
+                    assert grouped_plan.runtime_total_clusters is not None
+                    grouped_wrapper_params.append(grouped_plan.runtime_total_clusters)
+                grouped_wrapper_params.extend(grouped_plan.static_group_quota_args)
+                df.wrapper_only_params.extend(grouped_wrapper_params)
+                source64_profile: dict[str, object] = {}
+                if (
+                    grouped_plan.source_m_tile
+                    == TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE
+                ):
+                    # The device-offset host path needs the same proved profile
+                    # as codegen; width alone cannot admit this ONE-CTA family.
+                    assert grouped_plan.full_coverage is not None
+                    assert rhs_rank3_grouped_proof is not None
+                    assert rhs_rank3_grouped_proof.packed_split is not None
+                    source64_profile = {
+                        "source64_profile": {
+                            "full_coverage_mode": df.config.config[
+                                TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
+                            ],
+                            "consumer_local": grouped_plan.full_coverage.consumer_local,
+                            "use_2cta_instrs": tcgen05_is_two_cta,
+                            "ab_stage_count": tcgen05_ab_stage_count_value,
+                            "acc_stage_count": tcgen05_acc_stage_count_value,
+                            "c_stage_count": tcgen05_c_stage_count_value,
+                            "consumer_regs": _tcgen05_consumer_regs_from_config(
+                                df.config
+                            ),
+                            "input_dtype": input_dtype_str,
+                            "acc_dtype": acc_dtype_str,
+                            "offset_dtype": str(
+                                rhs_rank3_grouped_proof.packed_split.layout_tensor.dtype
+                            ),
+                        }
+                    }
+                cg.cute_wrapper_plans.append(
+                    {
+                        "kind": "tcgen05_grouped_static_persistent",
+                        "scheduler_mode": grouped_plan.scheduler_mode.value,
+                        "layout_name": grouped_plan.layout,
+                        **(
+                            {"n_sizes_name": tcgen05_grouped_n_sizes_arg_name}
+                            if tcgen05_grouped_n_sizes_arg_name
+                            else {}
+                        ),
+                        **(
+                            {"k_sizes_name": tcgen05_grouped_k_sizes_arg_name}
+                            if tcgen05_grouped_k_sizes_arg_name
+                            else {}
+                        ),
+                        "m_tail_preserve": bool(
+                            tcgen05_grouped_tail_proof is not None
+                            and tcgen05_grouped_tail_proof.has_m_tail_mask
+                        ),
+                        "n_tail_preserve": bool(
+                            tcgen05_grouped_tail_proof is not None
+                            and tcgen05_grouped_tail_proof.has_n_tail_mask
+                        ),
+                        **(
+                            {
+                                "grouped_static_has_m_tail": (
+                                    tcgen05_grouped_actual_has_m_tail
+                                ),
+                                "grouped_static_has_n_tail": (
+                                    tcgen05_grouped_actual_has_n_tail
+                                ),
+                            }
+                            if tcgen05_grouped_actual_has_n_tail is not None
+                            else {}
+                        ),
+                        "group_count": int(grouped_plan.count),
+                        **({"shared_rhs": True} if tcgen05_shared_rhs else {}),
+                        **(
+                            {
+                                "static_problem_shapes": (
+                                    grouped_plan.static_problem_shapes
+                                )
+                            }
+                            if grouped_plan.static_problem_shapes is not None
+                            else {}
+                        ),
+                        "bm": tcgen05_mma_bm,
+                        "bn": tcgen05_mma_bn,
+                        "bk": bk,
+                        **(
+                            {"source_m_tile": grouped_plan.source_m_tile}
+                            if grouped_plan.source_m_tile is not None
+                            else {}
+                        ),
+                        **source64_profile,
+                        "cluster_m": tcgen05_cluster_m,
+                        "cluster_n": tcgen05_cluster_n,
+                        "l2_swizzle_size": tcgen05_l2_swizzle_size_value,
+                        **(
+                            {
+                                TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: (
+                                    tcgen05_grouped_static_reserved_sms
+                                )
+                            }
+                            if tcgen05_grouped_static_reserved_sms
+                            else {}
+                        ),
+                        "n_size": n_size,
+                        **(
+                            {
+                                "device_split_sizes": True,
+                                "device_layout_kind": grouped_plan.device_layout_kind,
+                                "m_size": cast("int", grouped_plan.m_size),
+                            }
+                            if grouped_plan.device_split_sizes
+                            else {}
+                        ),
+                        "k_total_size": k_total_size,
+                        **(
+                            {
+                                "problem_sizes_arg": grouped_plan.problem_sizes,
+                                "starts_arg": grouped_plan.starts,
+                            }
+                            if not grouped_plan.uses_runtime_tile_table
+                            else {}
+                        ),
+                        **(
+                            {"real_groups_arg": grouped_plan.real_groups}
+                            if grouped_plan.real_groups is not None
+                            and not grouped_plan.uses_runtime_tile_table
+                            else {}
+                        ),
+                        "sched_params_arg": grouped_plan.sched_params,
+                        "total_clusters_arg": tcgen05_grouped_total_clusters,
+                        **(
+                            {
+                                "runtime_tile_records_arg": (
+                                    grouped_plan.runtime_tile_records
+                                )
+                            }
+                            if grouped_plan.uses_runtime_tile_table
+                            else {}
+                        ),
+                        **(
+                            {
+                                "static_group_quota_args": (
+                                    grouped_plan.static_group_quota_args
+                                )
+                            }
+                            if grouped_plan.static_group_quota_args
+                            else {}
+                        ),
+                        **({"orientation": "nm"} if tcgen05_nm_orientation else {}),
+                        **(
+                            {"worklist_metadata": True}
+                            if tcgen05_grouped_worklist_persistent
+                            else {}
+                        ),
+                        **(
+                            {
+                                "fixed_tensormaps": True,
+                                "dynamic_ab_tensormap_rank": 2,
+                                "lhs_name": lhs_arg_name,
+                                "rhs_name": rhs_arg_name,
+                            }
+                            if grouped_plan.fixed_tensormaps
+                            else {}
+                        ),
+                        **(
+                            {
+                                "dynamic_ab_tensormaps": True,
+                                "ab_tensormaps_arg": tcgen05_grouped_ab_tensormaps,
+                                "lhs_name": lhs_arg_name,
+                                "rhs_name": rhs_arg_name,
+                                **(
+                                    {"dynamic_ab_tensormap_rank": 2}
+                                    if tcgen05_grouped_dynamic_ab_tensormap_rank == 2
+                                    else {}
+                                ),
+                            }
+                            if tcgen05_grouped_dynamic_ab_tensormaps
+                            else {}
+                        ),
+                        **(
+                            {
+                                "direct_pointer_metadata": True,
+                                "direct_pointers_arg": grouped_plan.direct_pointers,
+                                "direct_strides_arg": grouped_plan.direct_strides,
+                                **(
+                                    {
+                                        "external_direct_pointer_metadata": True,
+                                        "direct_pointers_name": (
+                                            tcgen05_grouped_external_direct_pointers_arg_name
+                                        ),
+                                        "direct_strides_name": (
+                                            tcgen05_grouped_external_direct_strides_arg_name
+                                        ),
+                                    }
+                                    if tcgen05_grouped_external_direct_pointers_arg_name
+                                    is not None
+                                    and tcgen05_grouped_external_direct_strides_arg_name
+                                    is not None
+                                    else {}
+                                ),
+                            }
+                            if tcgen05_grouped_direct_pointer_metadata
+                            else {}
+                        ),
+                        **(
+                            {
+                                "dynamic_d_tensormap": True,
+                                "d_tensormaps_arg": grouped_plan.d_tensormap,
+                            }
+                            if tcgen05_grouped_dynamic_d_tensormap
+                            else {}
+                        ),
+                    }
+                )
+            df.wrapper_only_params.extend(
+                [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b]
+            )
+            ab_tma_plan: dict[str, object] = {
+                "kind": "tcgen05_ab_tma",
+                "lhs_name": (rhs_arg_name if tcgen05_nm_orientation else lhs_arg_name),
+                "rhs_name": (lhs_arg_name if tcgen05_nm_orientation else rhs_arg_name),
+                "bm": tcgen05_mma_bm,
+                "bn": tcgen05_mma_bn,
+                "bk": bk,
+                "cluster_m": tcgen05_cluster_m,
+                "cluster_n": tcgen05_cluster_n,
+                "ab_stage_count": tcgen05_ab_stage_count_value,
+                "input_dtype": input_dtype_str,
+                "acc_dtype": acc_dtype_str,
+                # The direct-entry validator also keys on the problem shape.
+                "m_size": m_size,
+                "n_size": n_size,
+                "k_total_size": k_total_size,
+                "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
+            }
+            if tcgen05_nm_orientation:
+                ab_tma_plan["orientation"] = "nm"
+            if row_profile is not None:
+                ab_tma_plan.update(
+                    {
+                        "row_union_schedule": row_profile.name,
+                        "a_producer_partition": row_profile.producer_cluster,
+                        "lhs_tma_order": (1, 0),
+                        "rhs_tma_order": (0, 1),
+                        "m_size": n_size,
+                        "n_size": m_size,
+                    }
+                )
+            if tcgen05_shared_rhs and row_union_plan is None:
+                ab_tma_plan["shared_rhs"] = True
+            if tcgen05_grouped_fixed_tensormaps:
+                ab_tma_plan["fixed_ab_tensormaps"] = True
+                if tcgen05_nm_orientation and not tcgen05_b_k_major:
+                    # MN-major logical B cannot flatten [G,N,K] to [G*N,K].
+                    # Preserve one immutable rank-3 full-allocation TensorMap.
+                    ab_tma_plan["fixed_grouped_b_rank3"] = True
+            # The bm=128 CtaGroup.TWO family cannot be derived from
+            # ``bm == 256`` by the host wrapper, so record the resolved 2-CTA
+            # decision on the plan. Only recorded for this family (where the
+            # wrapper's legacy ``bm == 256`` derivation would be wrong); the
+            # bm=256 path leaves the key absent so its golden wrapper-plan
+            # literal stays byte-identical and the wrapper falls back to the
+            # derivation. See ``_tcgen05_use_2cta_instrs``.
+            if tcgen05_is_two_cta and tcgen05_mma_bm != TCGEN05_TWO_CTA_BLOCK_M:
+                ab_tma_plan["use_2cta_instrs"] = True
+            if not tcgen05_mma_a_k_major:
+                ab_tma_plan["a_k_major"] = False
+            # K-major physical B. Only recorded when True so old wrapper plans
+            # remain byte-identical when the physical B operand is MN-major.
+            if tcgen05_mma_b_k_major:
+                ab_tma_plan["b_k_major"] = True
+            if rhs_rank3_group_expr is not None:
+                grouped_operand = "lhs" if tcgen05_nm_orientation else "rhs"
+                ab_tma_plan[f"{grouped_operand}_rank3_grouped_nt"] = True
+            if tcgen05_grouped_dynamic_ab_tensormaps:
+                ab_tma_plan["dynamic_ab_tensormaps"] = True
+                if tcgen05_grouped_dynamic_ab_tensormap_rank == 2:
+                    ab_tma_plan["dynamic_ab_tensormap_rank"] = 2
+            if lhs_operand.is_leading_passthrough:
+                ab_tma_plan["lhs_tma_order"] = (1, 2, 0)
+            elif lhs_operand.source_to_logical_order is not None:
+                # A TensorMaps use logical (M, K) order. Compose that order
+                # with the program's source-to-logical permutation.
+                ab_tma_plan["lhs_tma_order"] = _compose_axis_orders(
+                    lhs_operand.source_to_logical_order, (0, 1)
+                )
+            if rhs_operand.is_leading_passthrough:
+                ab_tma_plan["rhs_tma_order"] = (2, 1, 0)
+            elif rhs_operand.source_to_logical_order is not None:
+                # B TensorMaps use logical (N, K) order. For B=x.T, composing
+                # that swap with x's source-to-logical swap produces identity.
+                ab_tma_plan["rhs_tma_order"] = _compose_axis_orders(
+                    rhs_operand.source_to_logical_order, (1, 0)
+                )
+            # ``smem_swizzle_*`` overrides are recorded only when codegen
+            # selected an explicit SMEM atom kind (either from a user
+            # override or the scalar-edge fallback workaround). Keeping
+            # the keys absent on the default path preserves the legacy
+            # wrapper-plan literal. The wrapper-side
+            # ``_append_cute_wrapper_plan`` reads ``plan.get(..., None)``
+            # and emits the override-aware SMEM atom expression only
+            # when an explicit value is present.
+            if tcgen05_smem_swizzle_a is not None:
+                ab_tma_plan["smem_swizzle_a"] = tcgen05_smem_swizzle_a
+            if tcgen05_smem_swizzle_b is not None:
+                ab_tma_plan["smem_swizzle_b"] = tcgen05_smem_swizzle_b
+            # G2-H (cute_plan.md): CLC kernels need PDL enabled at
+            # the host launch so ``nvvm.clusterlaunchcontrol_try_cancel``
+            # returns valid responses (without PDL the very first
+            # ``cute.arch.clc_response`` returns ``valid=0``).
+            # Threaded through the wrapper plan rather than a
+            # side-channel attribute on the kernel object so the
+            # launch flag's provenance is the same as the cluster
+            # shape and other plan-level launch metadata.
+            # ``use_pdl`` only added to the dict when True so the
+            # static-path kernels' wrapper-plan literals stay
+            # byte-identical to the pre-G2-H golden.
+            if tcgen05_matmul_plan.is_clc_persistent or df.config.get(
+                "tcgen05_materialized_pdl", False
+            ):
+                ab_tma_plan["use_pdl"] = True
+            cg.cute_wrapper_plans.append(ab_tma_plan)
+            # Prefetch every TMA descriptor the kernel receives as an argument
+            # once at kernel entry, mirroring the CUTLASS sm100 kernels and the
+            # flash emitter: the TMA-load warp warms the A/B descriptors before
+            # its first ``producer_acquire`` and epilogue warp 0 warms the D
+            # store descriptor(s) so the first TMA store after the mainloop does
+            # not pay a cold descriptor fetch. Every launch after an L2 flush
+            # starts with cold descriptors, so this applies to the plain
+            # persistent and non-persistent GEMM families as well as the grouped
+            # ones (which additionally re-point their descriptors in-kernel).
+            assert tma_warp is not None
+            assert warp_idx is not None
+            prefix.append(
+                statement_from_string(
+                    f"if {tma_warp}:\n"
+                    f"    cute.nvgpu.cpasync.prefetch_descriptor({tma_atom_a})\n"
+                    f"    cute.nvgpu.cpasync.prefetch_descriptor({tma_atom_b})"
+                )
+            )
+            if tcgen05_use_tma_store_epilogue:
+                d_prefetch_atoms = [tma_store_atom]
+                if tail_tma_store_atom:
+                    d_prefetch_atoms.append(tail_tma_store_atom)
+                prefix.append(
+                    statement_from_string(
+                        f"if {warp_idx} == cutlass.Int32(0):\n"
+                        + "\n".join(
+                            f"    cute.nvgpu.cpasync.prefetch_descriptor({atom})"
+                            for atom in d_prefetch_atoms
+                        )
+                    )
+                )
+        prefix.append(
+            statement_from_string(
+                f"{smem_a_ptr} = cute.arch.alloc_smem("
+                f"{input_dtype_str}, cute.cosize({tcgen05_plan.smem_a_layout}.outer), alignment=128)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{smem_a} = cute.make_tensor("
+                f"cute.recast_ptr({smem_a_ptr}, {tcgen05_plan.smem_a_layout}.inner, dtype={input_dtype_str}), "
+                f"{tcgen05_plan.smem_a_layout}.outer)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{smem_b_ptr} = cute.arch.alloc_smem("
+                f"{input_dtype_str}, cute.cosize({tcgen05_plan.smem_b_layout}.outer), alignment=128)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{smem_b} = cute.make_tensor("
+                f"cute.recast_ptr({smem_b_ptr}, {tcgen05_plan.smem_b_layout}.inner, dtype={input_dtype_str}), "
+                f"{tcgen05_plan.smem_b_layout}.outer)"
+            )
+        )
+        if tcgen05_m_subtile_count > 1:
+            # Second A staging buffer for the M-paired subtile; B is staged
+            # once per K stage and shared by both subtiles.
+            prefix.append(
+                statement_from_string(
+                    f"{smem_a2_ptr} = cute.arch.alloc_smem("
+                    f"{input_dtype_str}, cute.cosize({tcgen05_plan.smem_a_layout}.outer), alignment=128)"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{smem_a2} = cute.make_tensor("
+                    f"cute.recast_ptr({smem_a2_ptr}, {tcgen05_plan.smem_a_layout}.inner, dtype={input_dtype_str}), "
+                    f"{tcgen05_plan.smem_a_layout}.outer)"
+                )
+            )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_frag_a} = {tiled_mma}.make_fragment_A({smem_a})"
+            )
+        )
+        if tcgen05_m_subtile_count > 1:
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_frag_a2} = {tiled_mma}.make_fragment_A({smem_a2})"
+                )
+            )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_frag_b} = {tiled_mma}.make_fragment_B({smem_b})"
+            )
+        )
+        if tcgen05_use_tma:
+            if tcgen05_is_two_cta:
+                assert mma_slice_linear is not None
+                tma_thr_mma_slice = mma_slice_linear
+            else:
+                tma_thr_mma_slice = "cutlass.Int32(0)"
+            prefix.append(
+                statement_from_string(
+                    f"{tma_smem_a_layout} = cute.slice_({tcgen05_plan.smem_a_layout}, (None, None, None, 0))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_smem_b_layout} = cute.select({tcgen05_plan.smem_b_layout}, mode=[0, 1, 2])"
+                    if row_profile is not None
+                    else f"{tma_smem_b_layout} = cute.slice_({tcgen05_plan.smem_b_layout}, (None, None, None, 0))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_thr_mma} = {tiled_mma}.get_slice({tma_thr_mma_slice})"
+                )
+            )
+            if tcgen05_grouped_dynamic_ab_tensormaps:
+                prefix.extend(
+                    [
+                        statement_from_string(
+                            f"{grouped_tensormap_manager} = "
+                            "cutlass.utils.TensorMapManager("
+                            "cutlass.utils.TensorMapUpdateMode.SMEM, 128)"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_grid_dim} = cute.arch.grid_dim()"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_workspace_idx} = ("
+                            f"cute.arch.block_idx()[2] * "
+                            f"{grouped_tensormap_grid_dim}[1] * "
+                            f"{grouped_tensormap_grid_dim}[0] + "
+                            f"cute.arch.block_idx()[1] * "
+                            f"{grouped_tensormap_grid_dim}[0] + "
+                            "cute.arch.block_idx()[0])"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_a_ptr} = "
+                            f"{grouped_tensormap_manager}.get_tensormap_ptr("
+                            f"{tcgen05_grouped_ab_tensormaps}"
+                            f"[({grouped_tensormap_workspace_idx}, 0, None)].iterator)"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_b_ptr} = "
+                            f"{grouped_tensormap_manager}.get_tensormap_ptr("
+                            f"{tcgen05_grouped_ab_tensormaps}"
+                            f"[({grouped_tensormap_workspace_idx}, 1, None)].iterator)"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_a_desc_ptr} = "
+                            f"{grouped_tensormap_manager}.get_tensormap_ptr("
+                            f"{grouped_tensormap_a_ptr}, cute.AddressSpace.generic)"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_b_desc_ptr} = "
+                            f"{grouped_tensormap_manager}.get_tensormap_ptr("
+                            f"{grouped_tensormap_b_ptr}, cute.AddressSpace.generic)"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_smem_ptr} = "
+                            "cute.arch.alloc_smem(cutlass.Int64, "
+                            "cutlass.Int32(32), alignment=128)"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_a_smem_ptr} = "
+                            f"{grouped_tensormap_smem_ptr}"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_b_smem_ptr} = "
+                            f"{grouped_tensormap_a_smem_ptr} + 16"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_init_done} = cutlass.Boolean(False)"
+                        ),
+                        statement_from_string(
+                            f"{grouped_tensormap_last_group} = cutlass.Int32(-1)"
+                        ),
+                    ]
+                )
+            # gA, gB depend on per-tile (m_offset_var, n_offset_var). Their
+            # downstream partitions and tma_partition outputs all inherit
+            # that per-tile dependency, so all of these stay inside the
+            # work-tile body when the persistent loop splitter runs.
+            for setup_stmt in rhs_rank3_tma_group_setup:
+                _emit_per_tile(
+                    setup_stmt,
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
+            if tcgen05_grouped_dynamic_ab_tensormaps:
+                dynamic_operands = [
+                    (
+                        tma_atom_a,
+                        grouped_tensormap_a_smem_ptr,
+                        grouped_tensormap_a_ptr,
+                        grouped_tensormap_real_a,
+                        grouped_tensormap_a_base,
+                        grouped_tensormap_a_base_expr,
+                        grouped_tensormap_real_a_shape_expr,
+                        grouped_tensormap_real_a_stride_expr,
+                    ),
+                    (
+                        tma_atom_b,
+                        grouped_tensormap_b_smem_ptr,
+                        grouped_tensormap_b_ptr,
+                        grouped_tensormap_real_b,
+                        grouped_tensormap_b_base,
+                        grouped_tensormap_b_base_expr,
+                        grouped_tensormap_real_b_shape_expr,
+                        grouped_tensormap_real_b_stride_expr,
+                    ),
+                ]
+                if tcgen05_shared_rhs:
+                    # N,M orientation puts the shared RHS in physical A.
+                    # It keeps its one immutable host-created descriptor.
+                    dynamic_operands = dynamic_operands[1:]
+                if tcgen05_grouped_full_allocation_b:
+                    dynamic_operands = dynamic_operands[:-1]
+                dynamic_init = "".join(
+                    f"        {grouped_tensormap_manager}.init_tensormap_from_atom("
+                    f"{atom}, {smem_ptr}, {tcgen05_matmul_plan.tma_warp_id})\n"
+                    for atom, smem_ptr, pointer, real, base, base_expr, shape, stride in dynamic_operands
+                )
+                dynamic_views = "".join(
+                    f"    {base} = {base_expr}\n"
+                    f"    {real} = cute.make_tensor({base}, "
+                    f"cute.make_layout({shape}, stride={stride}))\n"
+                    for atom, smem_ptr, pointer, real, base, base_expr, shape, stride in dynamic_operands
+                )
+                dynamic_tuples = [
+                    "(" + ", ".join(item[index] for item in dynamic_operands) + ",)"
+                    for index in (3, 0, 2, 1)
+                ]
+                grouped_tensormap_update_idx = (
+                    tcgen05_grouped_metadata_idx or tcgen05_grouped_group_idx
+                )
+                _emit_per_tile(
+                    (
+                        f"{grouped_tensormap_group_changed} = "
+                        f"{grouped_tensormap_update_idx} != "
+                        f"{grouped_tensormap_last_group}"
+                    ),
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
+                if dynamic_operands:
+                    _emit_per_tile(
+                        (
+                            f"if {grouped_tensormap_group_changed}:\n"
+                            f"    if not {grouped_tensormap_init_done}:\n"
+                            f"{dynamic_init}"
+                            f"        {grouped_tensormap_manager}.fence_tensormap_initialization()\n"
+                            f"        {grouped_tensormap_init_done} = cutlass.Boolean(True)\n"
+                            f"{grouped_tensormap_direct_loads}"
+                            f"{dynamic_views}"
+                            f"    {grouped_tensormap_manager}.update_tensormap("
+                            f"{dynamic_tuples[0]}, {dynamic_tuples[1]}, "
+                            f"{dynamic_tuples[2]}, "
+                            f"{tcgen05_matmul_plan.tma_warp_id}, "
+                            f"{dynamic_tuples[3]})\n"
+                            f"    {grouped_tensormap_last_group} = "
+                            f"{grouped_tensormap_update_idx}"
+                        ),
+                        tma_load=tcgen05_use_role_local_tma_producer,
+                    )
+            dynamic_ab_tile_trailing_coord = (
+                "" if tcgen05_grouped_dynamic_ab_tensormap_rank == 2 else ", 0"
+            )
+            if tcgen05_grouped_fixed_tensormaps:
+                assert tcgen05_grouped_group_idx is not None
+                assert tcgen05_grouped_global_m_start is not None
+                assert tcgen05_grouped_cta_tile_idx_m is not None
+                assert tcgen05_grouped_cta_tile_idx_n is not None
+                assert tcgen05_worklist_source_m_tile is not None
+                if not tcgen05_b_k_major:
+                    a_tile_coord = (
+                        f"({tcgen05_grouped_cta_tile_idx_n}, None, "
+                        f"{tcgen05_grouped_group_idx})"
+                    )
+                else:
+                    # K-major B can flatten [G,N,K] to [G*N,K].
+                    a_tile_coord = (
+                        f"({tcgen05_grouped_group_idx} * cutlass.Int32("
+                        f"{n_size // tcgen05_mma_bm}) + "
+                        f"{tcgen05_grouped_cta_tile_idx_n}, None)"
+                    )
+                b_tile_coord = (
+                    f"({tcgen05_grouped_global_m_start} // cutlass.Int32("
+                    f"{tcgen05_worklist_source_m_tile}) + "
+                    f"{tcgen05_grouped_cta_tile_idx_m}, None)"
+                )
+            else:
+                a_tile_coord = (
+                    (
+                        f"({tcgen05_grouped_cta_tile_idx_n}, None"
+                        f"{dynamic_ab_tile_trailing_coord})"
+                        if tcgen05_nm_orientation
+                        else f"({tcgen05_grouped_cta_tile_idx_m}, None"
+                        f"{dynamic_ab_tile_trailing_coord})"
+                    )
+                    if tcgen05_grouped_dynamic_ab_tensormaps
+                    else f"({m_offset_var} // cutlass.Int32({tcgen05_mma_bm}), None)"
+                )
+                b_tile_coord = (
+                    (
+                        f"({tcgen05_grouped_cta_tile_idx_m}, None"
+                        f"{dynamic_ab_tile_trailing_coord})"
+                        if tcgen05_nm_orientation
+                        else f"({tcgen05_grouped_cta_tile_idx_n}, None"
+                        f"{dynamic_ab_tile_trailing_coord})"
+                    )
+                    if tcgen05_grouped_dynamic_ab_tensormaps
+                    else (
+                        f"({n_offset_var} // cutlass.Int32({bn}), None, "
+                        f"{rhs_rank3_tma_group_expr})"
+                        if rhs_rank3_tma_group_expr is not None
+                        else f"({n_offset_var} // cutlass.Int32({bn}), None)"
+                    )
+                )
+            if row_profile is not None:
+                a_tile_coord = (
+                    f"({n_offset_var} // cutlass.Int32({row_profile.mma_m}), None)"
+                )
+                b_tile_coord = (
+                    f"({m_offset_var} // cutlass.Int32({row_profile.mma_n}), None)"
+                )
+            gmem_a_tma_tiler = f"({tcgen05_mma_bm}, {bk})"
+            gmem_b_tma_tiler = f"({tcgen05_mma_bn}, {bk})"
+            if tcgen05_grouped_fixed_tensormaps and not tcgen05_b_k_major:
+                gmem_a_tma_tiler = f"({tcgen05_mma_bm}, {bk}, 1)"
+            if lhs_operand.is_leading_passthrough:
+                assert leading_global is not None
+                gmem_a_tma_tiler = f"({bm}, {bk}, 1)"
+                a_tile_coord = (
+                    f"({m_offset_var} // cutlass.Int32({bm}), None, {leading_global})"
+                )
+            if rhs_operand.is_leading_passthrough:
+                assert leading_global is not None
+                gmem_b_tma_tiler = f"({bn}, {bk}, 1)"
+                b_tile_coord = (
+                    f"({n_offset_var} // cutlass.Int32({bn}), None, {leading_global})"
+                )
+            gmem_b_tma_tensor = tma_tensor_b
+            if tcgen05_grouped_full_allocation_b:
+                assert tcgen05_grouped_global_m_start is not None
+                gmem_b_tma_tensor = (
+                    f"cute.domain_offset(({tcgen05_grouped_global_m_start}, "
+                    f"cutlass.Int32(0)), {tma_tensor_b})"
+                )
+            if tcgen05_runtime_n_specialization and tcgen05_is_two_cta:
+                assert tcgen05_grouped_valid_m is not None
+                assert tma_runtime_mma_n is not None
+                assert tma_b_peer_delta is not None
+                assert tma_tensor_b_tail is not None
+                assert mma_slice_linear is not None
+                assert tcgen05_worklist_source_m_tile == tcgen05_mma_bn
+                # A CTA-group::2 UMMA-N instruction divides its N rows across
+                # the two peers.  The static partition starts peer 1 at
+                # static_N/2; a narrowed descriptor instead needs it to load
+                # from runtime_N/2.  Offset the base tensor before local_tile:
+                # the tiled tensor's dynamic layout cannot represent this
+                # runtime domain offset directly.
+                _emit_per_tile(
+                    f"{tma_runtime_mma_n} = cutlass.Int32({tcgen05_mma_bn})",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
+                _emit_per_tile(
+                    f"{tma_b_peer_delta} = cutlass.Int32(0)",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
+                _emit_per_tile(
+                    f"{tma_tensor_b_tail} = cute.domain_offset("
+                    f"({tma_b_peer_delta}, 0), {tma_tensor_b})",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
+                _emit_per_tile(
+                    f"if {tcgen05_grouped_valid_m} <= "
+                    f"cutlass.Int32("
+                    f"{tcgen05_mma_bn - _TCGEN05_RUNTIME_MMA_N_GRANULARITY}):\n"
+                    f"    {tma_runtime_mma_n} = "
+                    f"{_tcgen05_runtime_mma_n_expr(tcgen05_grouped_valid_m, tcgen05_mma_bn)}\n"
+                    f"    {tma_b_peer_delta} = {mma_slice_linear} * "
+                    f"({tma_runtime_mma_n} // cutlass.Int32(2) - "
+                    f"cutlass.Int32({tcgen05_mma_bn // 2}))\n"
+                    f"    {tma_tensor_b_tail} = cute.domain_offset("
+                    f"({tma_b_peer_delta}, 0), {tma_tensor_b})",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
+                gmem_b_tma_tensor = tma_tensor_b_tail
+            _emit_per_tile(
+                f"{gmem_a_tma} = cute.local_tile("
+                f"{tma_tensor_a}, {gmem_a_tma_tiler}, "
+                f"{a_tile_coord})",
+                tma_load=tcgen05_use_role_local_tma_producer,
+            )
+            if tcgen05_m_subtile_count > 1:
+                a2_tile_coord = (
+                    f"({m_offset_var} // cutlass.Int32({tcgen05_mma_bm})"
+                    " + cutlass.Int32(1), None)"
+                )
+                _emit_per_tile(
+                    f"{gmem_a2_tma} = cute.local_tile("
+                    f"{tma_tensor_a}, {gmem_a_tma_tiler}, "
+                    f"{a2_tile_coord})",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
+            _emit_per_tile(
+                f"{gmem_b_tma} = cute.local_tile("
+                f"{gmem_b_tma_tensor}, {gmem_b_tma_tiler}, "
+                f"{b_tile_coord})",
+                tma_load=tcgen05_use_role_local_tma_producer,
+            )
+            _emit_per_tile(
+                f"{gmem_a_tma_part} = {tma_thr_mma}.partition_A({gmem_a_tma})",
+                tma_load=tcgen05_use_role_local_tma_producer,
+            )
+            if tcgen05_m_subtile_count > 1:
+                _emit_per_tile(
+                    f"{gmem_a2_tma_part} = {tma_thr_mma}.partition_A({gmem_a2_tma})",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
+            _emit_per_tile(
+                f"{gmem_b_tma_part} = {tma_thr_mma}.partition_B({gmem_b_tma})",
+                tma_load=tcgen05_use_role_local_tma_producer,
+            )
+            # The guarded clustered CtaGroup.ONE bridge keeps one TMA producer
+            # transaction per CTA and duplicates B locally. The B atom is still
+            # a multicast TMA atom for cluster_m=2/CtaGroup.ONE, so feed it a
+            # self-only mask instead of the normal all-M peers mask.
+            tcgen05_use_tma_b_peer_mcast = (
+                tcgen05_cluster_m > 1 or tcgen05_is_two_cta
+            ) and not tcgen05_cluster_m2_one_cta_role_local_bridge
+            tcgen05_use_tma_b_self_mcast = tcgen05_cluster_m2_one_cta_role_local_bridge
+            tcgen05_use_tma_b_mcast_mask = (
+                tcgen05_use_tma_b_peer_mcast or tcgen05_use_tma_b_self_mcast
+            )
+            if tcgen05_is_two_cta:
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_a_cta_layout} = cute.make_layout(1)"
+                        if row_profile is not None
+                        else f"{tma_a_cta_layout} = cute.make_layout("
+                        f"cute.slice_({tcgen05_cluster_layout_vmnk}, "
+                        "(0, 0, None, 0)).shape)"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_b_cta_layout} = cute.make_layout("
+                        f"cute.slice_({tcgen05_cluster_layout_vmnk}, "
+                        "(0, None, 0, 0)).shape)"
+                    )
+                )
+            else:
+                prefix.append(
+                    statement_from_string(f"{tma_cta_layout} = cute.make_layout(1)")
+                )
+            if tcgen05_cluster_m > 1 or tcgen05_is_two_cta:
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_cta_rank_in_cluster} = cute.arch.make_warp_uniform("
+                        "cute.arch.block_idx_in_cluster())"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_block_in_cluster_coord_vmnk} = "
+                        f"{tcgen05_cluster_layout_vmnk}.get_flat_coord({tma_cta_rank_in_cluster})"
+                    )
+                )
+                if tcgen05_is_two_cta:
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_a_cta_coord} = 0"
+                            if row_profile is not None
+                            else f"{tma_a_cta_coord} = {tma_block_in_cluster_coord_vmnk}[2]"
+                        )
+                    )
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_b_cta_coord} = {tma_block_in_cluster_coord_vmnk}[1]"
+                        )
+                    )
+                if tcgen05_is_two_cta:
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_a_mcast_mask} = cute.nvgpu.cpasync.create_tma_multicast_mask("
+                            f"{tcgen05_cluster_layout_vmnk}, {tma_block_in_cluster_coord_vmnk}, "
+                            "mcast_mode=2)"
+                        )
+                    )
+                if tcgen05_use_tma_b_mcast_mask:
+                    tma_b_mcast_mode = 2 if tcgen05_use_tma_b_self_mcast else 1
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_b_mcast_mask} = cute.nvgpu.cpasync.create_tma_multicast_mask("
+                            f"{tcgen05_cluster_layout_vmnk}, {tma_block_in_cluster_coord_vmnk}, "
+                            f"mcast_mode={tma_b_mcast_mode})"
+                        )
+                    )
+            # tma_partition consumes the per-tile gA_part / gB_part, so the
+            # resulting (tma_sA, tma_gA) / (tma_sB, tma_gB) are also per-tile.
+            tma_a_cta_coord_expr = tma_a_cta_coord if tcgen05_is_two_cta else "0"
+            tma_b_cta_coord_expr = tma_b_cta_coord if tcgen05_is_two_cta else "0"
+            tma_a_cta_layout_expr = (
+                tma_a_cta_layout if tcgen05_is_two_cta else tma_cta_layout
+            )
+            tma_b_cta_layout_expr = (
+                tma_b_cta_layout if tcgen05_is_two_cta else tma_cta_layout
+            )
+            _emit_per_tile(
+                f"{tma_sA}, {tma_gA} = cute.nvgpu.cpasync.tma_partition("
+                f"{tma_atom_a}, {tma_a_cta_coord_expr}, {tma_a_cta_layout_expr}, "
+                f"cute.group_modes({smem_a}, 0, cute.rank({smem_a}) - 1), "
+                f"cute.group_modes({gmem_a_tma_part}, 0, "
+                f"cute.rank({gmem_a_tma_part}) - 1))",
+                tma_load=tcgen05_use_role_local_tma_producer,
+            )
+            if tcgen05_m_subtile_count > 1:
+                _emit_per_tile(
+                    f"{tma_sA2}, {tma_gA2} = cute.nvgpu.cpasync.tma_partition("
+                    f"{tma_atom_a}, {tma_a_cta_coord_expr}, {tma_a_cta_layout_expr}, "
+                    f"cute.group_modes({smem_a2}, 0, cute.rank({smem_a2}) - 1), "
+                    f"cute.group_modes({gmem_a2_tma_part}, 0, "
+                    f"cute.rank({gmem_a2_tma_part}) - 1))",
+                    tma_load=tcgen05_use_role_local_tma_producer,
+                )
+            _emit_per_tile(
+                f"{tma_sB}, {tma_gB} = cute.nvgpu.cpasync.tma_partition("
+                f"{tma_atom_b}, {tma_b_cta_coord_expr}, {tma_b_cta_layout_expr}, "
+                f"cute.group_modes({smem_b}, 0, cute.rank({smem_b}) - 1), "
+                f"cute.group_modes({gmem_b_tma_part}, 0, "
+                f"cute.rank({gmem_b_tma_part}) - 1))",
+                tma_load=tcgen05_use_role_local_tma_producer,
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_pipeline_mbars} = cute.arch.alloc_smem("
+                    f"cutlass.Int64, cutlass.Int32({tcgen05_ab_stage_count_value * 2}))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, 1)"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_pipeline_consumer_group} = cutlass.pipeline.CooperativeGroup("
+                    f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_ab_consumer_arrive_count_value}))"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_pipeline_tx_count} = "
+                    f"({'cute.size_in_bytes(' + input_dtype_str + ', ' + tma_smem_a_layout + ')' + (' * ' + str(tcgen05_m_subtile_count) if tcgen05_m_subtile_count > 1 else '') if tcgen05_use_tma_a else '0'} + "
+                    f"{'cute.size_in_bytes(' + input_dtype_str + ', ' + tma_smem_b_layout + ')' if tcgen05_use_tma_b else '0'})"
+                    + (
+                        f" * cute.size({tiled_mma}.thr_id.shape)"
+                        if tcgen05_is_two_cta
+                        else ""
+                    )
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_pipeline} = cutlass.pipeline.PipelineTmaUmma.create("
+                    f"num_stages={tcgen05_ab_stage_count_value}, "
+                    f"producer_group={tma_pipeline_producer_group}, "
+                    f"consumer_group={tma_pipeline_consumer_group}, "
+                    f"tx_count={tma_pipeline_tx_count}, "
+                    f"barrier_storage={tma_pipeline_mbars}, "
+                    f"cta_layout_vmnk={tcgen05_cluster_layout_vmnk}"
+                    f"{tcgen05_defer_pipeline_sync_arg})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_producer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
+                    f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_ab_stage_count_value})"
+                )
+            )
+            tma_consumer_state_init = (
+                # Diagnostic phase override intentionally uses the upstream
+                # raw state constructor; it does not participate in the Helion
+                # wrapper ownership experiment.
+                f"cutlass.pipeline.PipelineState({tcgen05_ab_stage_count_value}, "
+                "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(1))"
+                if diagnose_ab_consumer_phase1
+                else (
+                    f"{tcgen05_pipeline_state_ns}.make_pipeline_state("
+                    "cutlass.pipeline.PipelineUserType.Consumer, "
+                    f"{tcgen05_ab_stage_count_value})"
+                )
+            )
+            prefix.append(
+                statement_from_string(
+                    f"{tma_consumer_state} = {tma_consumer_state_init}"
+                )
+            )
+            _emit_tcgen05_tmem_setup()
+            if tcgen05_use_tma_pipeline:
+                tcgen05_use_grouped_static_single_tma_producer_loop = (
+                    tcgen05_grouped_static_persistent
+                    and tcgen05_use_role_local_tma_producer
+                )
+                if not tcgen05_use_grouped_static_single_tma_producer_loop:
+                    # Initial TMA prefetch warms stages 0..ab_stage_count-1 of
+                    # the AB pipeline at the START of each tile. Both the
+                    # boolean full-tile predicates and the TMA copies reference
+                    # per-tile gA/gB tensors and m_offset/n_offset, so they
+                    # must stay in the work-tile body.
+                    #
+                    # In the role-local producer path, the TMA-load warp needs
+                    # its own per-tile tensor partitions and full-tile
+                    # predicates because it no longer runs the shared work-tile
+                    # loop. Tag those prerequisites together with the prefetch
+                    # IFs so the partitioner extracts one self-contained
+                    # TMA-load role body.
+                    assert tma_warp is not None
+                    prefetch_args = _InitialPrefetchTmaArgs(
+                        tma_pipeline=tma_pipeline,
+                        tma_producer_state=tma_producer_state,
+                        tma_barrier_ptr=tma_barrier_ptr,
+                        tma_warp=tma_warp,
+                        tma_atom_a=tma_atom_a,
+                        tma_atom_b=tma_atom_b,
+                        tma_gA=tma_gA,
+                        tma_gB=tma_gB,
+                        tma_sA=tma_sA,
+                        tma_sB=tma_sB,
+                        a_producer_predicate=(
+                            f"cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) < cutlass.Int32({row_profile.cluster_m})"
+                            if row_profile is not None and row_profile.cluster_n > 1
+                            else None
+                        ),
+                        tma_a_mcast_mask=tma_a_mcast_mask,
+                        tma_b_mcast_mask=tma_b_mcast_mask,
+                        is_two_cta=tcgen05_is_two_cta,
+                        use_tma_b_mcast_mask=tcgen05_use_tma_b_mcast_mask,
+                        skip_producer_acquire=diagnose_skip_ab_producer_acquire,
+                        skip_producer_advance=diagnose_skip_ab_producer_advance,
+                        tma_desc_ptr_a=(
+                            grouped_tensormap_a_desc_ptr
+                            if tcgen05_grouped_dynamic_ab_tensormaps
+                            and not tcgen05_shared_rhs
+                            else None
+                        ),
+                        tma_desc_ptr_b=(
+                            grouped_tensormap_b_desc_ptr
+                            if tcgen05_grouped_dynamic_ab_tensormaps
+                            and not tcgen05_grouped_full_allocation_b
+                            else None
+                        ),
+                        tma_gA2=tma_gA2 if tcgen05_m_subtile_count > 1 else "",
+                        tma_sA2=tma_sA2 if tcgen05_m_subtile_count > 1 else "",
+                    )
+                    if (
+                        row_profile is not None
+                        and row_profile.paired_protocol is not None
+                        and row_profile.paired_protocol.rolled_ab_fill
+                    ):
+                        assert row_union_plan is not None
+                        paired_prefetch_args = prefetch_args
+                        assert tcgen05_use_role_local_tma_producer
+                        stage_var = df.new_var("tcgen05_initial_k")
+                        packet = _build_initial_prefetch_if(
+                            prefetch_args,
+                            full_tile_gates=["True"],
+                            k_offset=stage_var,
+                            gate_tma_warp=False,
+                        )
+                        assert isinstance(packet, ast.If)
+                        fill = statement_from_string(
+                            f"for {stage_var} in cutlass.range({tcgen05_ab_stage_count_value}, unroll=1):\n"
+                            + textwrap.indent(
+                                "\n".join(ast.unparse(x) for x in packet.body), "    "
+                            )
+                        )
+                        if df.config.get(STARTUP_PREFILL_KEY, False):
+                            startup = Tcgen05AbStartupPrefill(
+                                tcgen05_ab_stage_count_value,
+                                tma_producer_state,
+                                df.new_var("tcgen05_prefilled_first_record"),
+                            )
+                            assert df.cute_state.ab_startup_prefill is None
+                            df.cute_state.ab_startup_prefill = startup
+                            private_state = df.new_var("tcgen05_prefill_state")
+                            record = df.new_var("tcgen05_prefill_record")
+                            row, column = row_profile.record_coordinates(
+                                record, row_union_plan.m
+                            )
+                            ga = df.new_var("tcgen05_prefill_gA_tma")
+                            gb = df.new_var("tcgen05_prefill_gB_tma")
+                            pa = df.new_var("tcgen05_prefill_gA_part")
+                            pb = df.new_var("tcgen05_prefill_gB_part")
+                            sa, ta = (
+                                df.new_var("tcgen05_prefill_sA"),
+                                df.new_var("tcgen05_prefill_gA"),
+                            )
+                            sb, tb = (
+                                df.new_var("tcgen05_prefill_sB"),
+                                df.new_var("tcgen05_prefill_gB"),
+                            )
+                            private_k = df.new_var("tcgen05_prefill_k")
+                            private_args = replace(
+                                prefetch_args,
+                                tma_producer_state=private_state,
+                                tma_barrier_ptr=df.new_var("tcgen05_prefill_barrier"),
+                                tma_sA=sa,
+                                tma_gA=ta,
+                                tma_sB=sb,
+                                tma_gB=tb,
+                            )
+                            private_packet = _build_initial_prefetch_if(
+                                private_args,
+                                full_tile_gates=["True"],
+                                k_offset=private_k,
+                                gate_tma_warp=False,
+                            )
+                            assert isinstance(private_packet, ast.If)
+                            private_body = [
+                                "cute.arch.griddepcontrol_wait()",
+                                f"{private_state} = {tma_producer_state}.clone()",
+                                f"{record} = cutlass.Int32(cute.arch.block_idx()[2])",
+                                f"{ga} = cute.local_tile({tma_tensor_a}, ({row_profile.mma_m}, {bk}), ({column}, None))",
+                                f"{gb} = cute.local_tile({tma_tensor_b}, ({row_profile.mma_n}, {bk}), ({row}, None))",
+                                f"{pa} = {tma_thr_mma}.partition_A({ga})",
+                                f"{pb} = {tma_thr_mma}.partition_B({gb})",
+                                f"{sa}, {ta} = cute.nvgpu.cpasync.tma_partition({tma_atom_a}, {tma_a_cta_coord}, {tma_a_cta_layout}, cute.group_modes({smem_a}, 0, cute.rank({smem_a}) - 1), cute.group_modes({pa}, 0, cute.rank({pa}) - 1))",
+                                f"{sb}, {tb} = cute.nvgpu.cpasync.tma_partition({tma_atom_b}, {tma_b_cta_coord}, {tma_b_cta_layout}, cute.group_modes({smem_b}, 0, cute.rank({smem_b}) - 1), cute.group_modes({pb}, 0, cute.rank({pb}) - 1))",
+                                f"for {private_k} in cutlass.range({startup.stages}, unroll=1):\n"
+                                + textwrap.indent(
+                                    "\n".join(
+                                        ast.unparse(x) for x in private_packet.body
+                                    ),
+                                    "    ",
+                                ),
+                            ]
+                            private_guard = statement_from_string(
+                                f"if {tma_warp}:\n"
+                                + textwrap.indent("\n".join(private_body), "    ")
+                            )
+                            assert tcgen05_tmem_publication is not None
+                            prefix.insert(
+                                prefix.index(tcgen05_tmem_publication), private_guard
+                            )
+                            fill = ast.If(
+                                test=ast.UnaryOp(
+                                    op=ast.Not(),
+                                    operand=ast.Name(
+                                        id=startup.first_record, ctx=ast.Load()
+                                    ),
+                                ),
+                                body=[fill],
+                                orelse=[],
+                            )
+                        prefix.append(fill)
+                        per_tile_stmts.append(fill)
+                        tma_load_role_stmts.append(fill)
+                        if df.cute_state.ab_startup_prefill is not None:
+                            _emit_per_tile(
+                                f"{df.cute_state.ab_startup_prefill.first_record} = cutlass.Boolean(False)",
+                                tma_load=True,
+                            )
+                    else:
+                        _emit_per_tile(
+                            f"{tma_initial_full_tile} = "
+                            + _tcgen05_tma_tile_predicate(
+                                k_tile_start_expr="cutlass.Int32(0)",
+                                full_tile_end_expr=f"cutlass.Int32({bk})",
+                            ),
+                            tma_load=tcgen05_use_role_local_tma_producer,
+                        )
+                        # Per initial stage: the gate assignments emitted ahead
+                        # of its prefetch block, its full-tile gates, its k
+                        # offset and whether producer_acquire is skipped.
+                        initial_stages: list[tuple[list[str], list[str], str, bool]] = [
+                            (
+                                [],
+                                [tma_initial_full_tile],
+                                "cutlass.Int32(0)",
+                                bool(
+                                    diagnose_skip_ab_producer_acquire
+                                    or diagnose_skip_initial_ab_producer_acquire
+                                ),
+                            )
+                        ]
+                        if tcgen05_ab_stage_count_value > 1:
+                            # Warm every stage 1..ab_stage_count-1; each gated by
+                            # an ``i+1``-k_tile fits-in-K predicate. The old
+                            # two-call pattern only covered stages 0 and N-1
+                            # (sufficient for ab=2 where they're the same set);
+                            # ab>=3 leaves intermediate stages unarmed and the
+                            # consumer ``consumer_wait`` deadlocks on stage 1
+                            # phase 0. See cute_plan.md §6.9.1.
+                            stage_gate_sources = [
+                                f"{tma_initial_next_full_tile} = "
+                                + _tcgen05_tma_tile_predicate(
+                                    k_tile_start_expr=f"cutlass.Int32({bk * (tcgen05_ab_stage_count_value - 1)})",
+                                    full_tile_end_expr=f"cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                                )
+                            ]
+                            for stage_idx in range(1, tcgen05_ab_stage_count_value):
+                                if stage_idx == tcgen05_ab_stage_count_value - 1:
+                                    stage_gates = [
+                                        tma_initial_full_tile,
+                                        tma_initial_next_full_tile,
+                                    ]
+                                else:
+                                    stage_gate_var = df.new_var(
+                                        f"tcgen05_tma_initial_stage_{stage_idx}_full_tile"
+                                    )
+                                    stage_gate_sources.append(
+                                        f"{stage_gate_var} = "
+                                        + _tcgen05_tma_tile_predicate(
+                                            k_tile_start_expr=f"cutlass.Int32({bk * stage_idx})",
+                                            full_tile_end_expr=f"cutlass.Int32({bk * (stage_idx + 1)})",
+                                        )
+                                    )
+                                    stage_gates = [
+                                        tma_initial_full_tile,
+                                        stage_gate_var,
+                                    ]
+                                initial_stages.append(
+                                    (
+                                        stage_gate_sources,
+                                        stage_gates,
+                                        f"cutlass.Int32({stage_idx})",
+                                        prefetch_args.skip_producer_acquire,
+                                    )
+                                )
+                                stage_gate_sources = []
+                        pdl_roots = (
+                            CompileEnvironment.current().config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
+                            if df.config.get("tcgen05_materialized_pdl", False)
+                            else None
+                        )
+                        # Gate assignments (source text) and prefetch blocks
+                        # (statements), in emission order.
+                        initial_prefetch: list[str | ast.stmt] = []
+                        if (
+                            pdl_roots is not None
+                            and not tcgen05_is_two_cta
+                            and not prefetch_args.skip_producer_advance
+                            and not prefetch_args.tma_gA2
+                        ):
+                            # Issue the ordinary input's loads for every
+                            # initial stage before waiting on the producer
+                            # grid; only the materialized operand's loads
+                            # wait. The prelude wait is skipped for this role.
+                            # The paired family keeps its prelude wait: its
+                            # leader-armed multicast barriers measured slower
+                            # with the loads split around the wait. Every
+                            # stage gate is assigned ahead of the split, whose
+                            # first block already reads them all.
+                            for (
+                                gate_sources,
+                                _gates,
+                                _k_offset,
+                                _skip,
+                            ) in initial_stages:
+                                initial_prefetch.extend(gate_sources)
+                            initial_prefetch.extend(
+                                _build_split_initial_prefetch(
+                                    prefetch_args,
+                                    stages=[
+                                        (gates, k_offset, skip_acquire)
+                                        for _sources, gates, k_offset, skip_acquire in initial_stages
+                                    ],
+                                    dependent_side=pdl_roots.dependent_side,
+                                    clone_state=df.new_var(
+                                        "tcgen05_pdl_producer_state"
+                                    ),
+                                    clone_barrier=df.new_var("tcgen05_pdl_barrier"),
+                                    gate_tma_warp=not tcgen05_use_role_local_tma_producer,
+                                    fresh_ring=tcgen05_one_shot_role_scheduler,
+                                )
+                            )
+                            df.cute_state.tcgen05_pdl_wait_in_prefetch = True
+                        else:
+                            # Each stage's gates are assigned directly ahead of
+                            # its own prefetch block.
+                            for (
+                                gate_sources,
+                                gates,
+                                k_offset,
+                                skip_acquire,
+                            ) in initial_stages:
+                                initial_prefetch.extend(gate_sources)
+                                initial_prefetch.append(
+                                    _build_initial_prefetch_if(
+                                        prefetch_args,
+                                        full_tile_gates=gates,
+                                        k_offset=k_offset,
+                                        skip_producer_acquire=skip_acquire,
+                                        gate_tma_warp=not tcgen05_use_role_local_tma_producer,
+                                        fresh_ring=tcgen05_one_shot_role_scheduler,
+                                    )
+                                )
+                        if tcgen05_hoist_tma_role:
+                            # The hoisted TMA-load role joins the pipeline-init
+                            # rendezvous here (the cluster wait, or the plain
+                            # path's named barrier with warp 0), after its
+                            # tile math and before its first mbarrier / TMA
+                            # operation.
+                            first_prefetch_block = next(
+                                index
+                                for index, item in enumerate(initial_prefetch)
+                                if not isinstance(item, str)
+                            )
+                            initial_prefetch.insert(
+                                first_prefetch_block,
+                                f"{tcgen05_pipeline_init_barrier}.arrive_and_wait()"
+                                if tcgen05_use_merged_pipeline_init
+                                else "cutlass.pipeline.pipeline_init_wait("
+                                f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})",
+                            )
+                        for item in initial_prefetch:
+                            if isinstance(item, str):
+                                _emit_per_tile(
+                                    item, tma_load=tcgen05_use_role_local_tma_producer
+                                )
+                                continue
+                            prefix.append(item)
+                            per_tile_stmts.append(item)
+                            if tcgen05_use_role_local_tma_producer:
+                                tma_load_role_stmts.append(item)
+    else:
+        prefix.append(
+            statement_from_string(
+                f"{smem_a_ptr} = cute.arch.alloc_smem({input_dtype_str}, {bm * bk})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{smem_a} = cute.make_tensor("
+                f"{smem_a_ptr}, cute.make_layout(({bm}, {bk}), stride=({bk}, 1)))"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{smem_b_ptr} = cute.arch.alloc_smem({input_dtype_str}, {bn * bk})"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{smem_b} = cute.make_tensor("
+                f"{smem_b_ptr}, cute.make_layout(({bn}, {bk}), stride=({bk}, 1)))"
+            )
+        )
+    # === loop body: global → smem → register → gemm ===
+    rA = df.new_var("rA")
+    rB = df.new_var("rB")
+    tAsA = df.new_var("tAsA")
+    tBsB = df.new_var("tBsB")
+    # Built once below in the tcgen05+TMA branch; reused by the
+    # release block emitted later in the same branch.
+    tma_kloop_args: _PerKiterTmaArgs | None = None
+
+    # --- Global → Shared memory with masking ---
+    # Each thread loads elements into shared memory using scalar indexing
+    # with bounds checking for non-divisible tile boundaries.
+    if acc_expr is None and mma_impl == "universal":
+        cg.add_statement(
+            statement_from_string(
+                f"if {k_offset_var} == {k_loop_begin_expr}:\n"
+                f"    for _mma_i in range(cute.size({acc_frag})):\n"
+                f"        {acc_frag}[_mma_i] = {acc_dtype_str}(0.0)"
+            )
+        )
+    elif acc_expr is not None and mma_impl == "universal":
+        cg.add_statement(
+            statement_from_string(
+                f"if {k_offset_var} == {k_loop_begin_expr}:\n"
+                f"    for _mma_i in range(cute.size({acc_frag})):\n"
+                f"        {acc_frag}[_mma_i] = {acc_dtype_str}({{acc}})",
+                acc=acc_expr,
+            )
+        )
+    elif acc_expr is None:
+        assert mma_active is not None
+        if mma_impl == "warp":
+            cg.add_statement(
+                statement_from_string(
+                    f"if {mma_active} and {k_offset_var} == {k_loop_begin_expr}:\n"
+                    f"    for _mma_i in range(cute.size({acc_frag})):\n"
+                    f"        {acc_frag}[_mma_i] = {acc_dtype_str}(0.0)"
+                )
+            )
+    else:
+        raise AssertionError("non-universal MMA with acc_expr should fall back")
+    if mma_impl == "universal":
+        # Guards select the hardware thread that loads each row/column of
+        # the A/B SMEM cache. Use the *physical* thread coord (not the
+        # lane-aware local coord) so the same hardware threads load on
+        # every iteration of an outer ``for lane_<n> in range(epT):`` loop
+        # when ``elements_per_thread > 1``. ``n_local == 0`` only matches
+        # ``(thread_y, lane) == (0, 0)`` — fine for the no-lane case but
+        # leaves sA stale on ``lane > 0`` iterations because the guard
+        # never fires. ``n_physical == 0`` matches ``thread_y == 0`` on
+        # every lane iteration so sA is re-populated for the current K
+        # tile. The store target is still ``sA[m_local, _k]`` so different
+        # lane iterations naturally write to different rows of sA / sB if
+        # the m-axis has its own lane var.
+        #
+        # Local invariant: because the K loop is nested INSIDE the
+        # lane loop in the current scheduler, skipping the A/B load
+        # on lane>0 iterations would reuse the previous K tile's sA
+        # (overwritten by the previous K iteration) — incorrect.
+        # Deferred hoist would require K/lane interchange. See
+        # cute_plan.md for the deferred-restructure paths.
+        cg.add_statement(
+            statement_from_string(
+                f"if {n_physical} == cutlass.Int32(0):\n"
+                f"    for _k in range({bk}):\n"
+                f"        _gk = {k_offset_var} + cutlass.Int32(_k)\n"
+                f"        {smem_a}[{m_local}, cutlass.Int32(_k)] = ("
+                f"{_lhs_gmem_access(m_global, '_gk')} "
+                f"if {m_global} < cutlass.Int32({m_size}) "
+                f"and _gk < cutlass.Int32({k_total_size}) "
+                f"else {input_dtype_str}(0.0))"
+            )
+        )
+        cg.add_statement(
+            statement_from_string(
+                f"if {m_physical} == cutlass.Int32(0):\n"
+                f"    for _k in range({bk}):\n"
+                f"        _gk = {k_offset_var} + cutlass.Int32(_k)\n"
+                f"        {smem_b}[{n_local}, cutlass.Int32(_k)] = ("
+                f"{_rhs_gmem_access('_gk', n_global)} "
+                f"if {n_global} < cutlass.Int32({n_size}) "
+                f"and _gk < cutlass.Int32({k_total_size}) "
+                f"else {input_dtype_str}(0.0))"
+            )
+        )
+        cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+    else:
+        active_threads = bm * mma_phys_n
+        assert (
+            mma_active is not None
+            and mma_participant_linear is not None
+            and mma_copy_linear is not None
+        )
+        load_thread_count = (
+            mma_physical_m_threads * mma_phys_n
+            if mma_impl == "tcgen05" and tcgen05_collective_handles_operand_loads
+            else active_threads
+        )
+        load_guard = mma_active
+        mma_stage_stmt: ast.stmt | None = None
+        smem_a_mma_stmt: ast.stmt | None = None
+        smem_b_mma_stmt: ast.stmt | None = None
+        tma_full_tile_predicate_src: str | None = None
+        tma_full_tile_stmt: ast.stmt | None = None
+        if mma_impl == "tcgen05":
+            assert tcgen05_plan is not None
+            # The smem cache for A/B is laid out as (..., ab_stage_count); we
+            # index into the current stage every K-loop iteration.
+            #
+            # When the role-local persistent kernel uses the TMA pipeline,
+            # ``tma_consumer_state.index`` is the canonical stage index: it
+            # advances exactly once per K-loop iteration via ``consumer_release``
+            # + ``advance`` and carries its value across virtual tiles. Computing
+            # ``mma_stage`` from ``k_offset // bk`` resets to zero at each tile
+            # while the pipeline state stays where it was at the end of the
+            # prior tile -- the two diverge across persistent tile boundaries.
+            #
+            # Non-role-local edge fallback is different: scalar fallback loader
+            # warps also need the stage, but only the exec warp advances its
+            # thread-local AB consumer state on full TMA K tiles. Compute the
+            # stage from the K tile index there so loader and exec warps agree
+            # when a later partial K tile falls back to scalar SMEM fills.
+            #
+            # For the non-TMA tcgen05 path there is no pipeline state to track
+            # and ``ab_stage_count`` is always 1, so the modular form is a
+            # constant zero anyway.
+            if tcgen05_use_tma and tcgen05_use_separate_mma_exec:
+                mma_stage_stmt = statement_from_string(
+                    f"{mma_stage} = {tma_consumer_state}.index"
+                )
+            else:
+                mma_stage_stmt = statement_from_string(
+                    f"{mma_stage} = "
+                    f"({k_offset_var} // cutlass.Int32({bk})) "
+                    f"% cutlass.Int32({tcgen05_ab_stage_count_value})"
+                )
+            smem_a_mma_stmt = statement_from_string(
+                f"{smem_a_mma} = {smem_a}[(None, None, None, {mma_stage})]"
+            )
+            smem_b_mma_stmt = statement_from_string(
+                f"{smem_b_mma} = {smem_b}[(None, None, None, {mma_stage})]"
+            )
+            if not tcgen05_use_separate_mma_exec:
+                cg.add_statement(mma_stage_stmt)
+                cg.add_statement(smem_a_mma_stmt)
+                cg.add_statement(smem_b_mma_stmt)
+            if tcgen05_use_tma:
+                tma_k_tile_stmt = statement_from_string(
+                    f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
+                )
+                tma_full_tile_predicate_src = _tcgen05_tma_tile_predicate(
+                    k_tile_start_expr=k_offset_var,
+                    full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk})",
+                )
+                tma_full_tile_stmt = statement_from_string(
+                    f"{tma_full_tile} = " + tma_full_tile_predicate_src
+                )
+                if not tcgen05_use_separate_mma_exec:
+                    cg.add_statement(tma_k_tile_stmt)
+                    if not tcgen05_static_full_tma_fast_path:
+                        cg.add_statement(tma_full_tile_stmt)
+        smem_a_store = f"{smem_a}[_row, _col]"
+        smem_b_store = f"{smem_b}[_row, _col]"
+        if mma_impl == "tcgen05":
+            # Native SMEM is partitioned as ((atom_mn, atom_k), rest_mn,
+            # rest_k, stage). A scalar producer must address the rest modes
+            # too; extending coordinates past the atom is not equivalent
+            # when the tiled layout changes stride between K blocks.
+            def scalar_smem_element(name: str) -> str:
+                atom_mn = f"cute.size({name}.shape[0][0])"
+                atom_k = f"cute.size({name}.shape[0][1])"
+                return (
+                    f"{name}[((_row % {atom_mn}, _col % {atom_k}), "
+                    f"_row // {atom_mn}, _col // {atom_k})]"
+                )
+
+            smem_a_store = scalar_smem_element(smem_a_mma)
+            smem_b_store = scalar_smem_element(smem_b_mma)
+        if rhs_rank3_worklist_lhs_info is None:
+            scalar_load_a_row_setup = f"            _gm = {m_offset_var} + _row\n"
+            scalar_load_a_guard = (
+                f"_gm < cutlass.Int32({m_size}) and _gk < cutlass.Int32({k_total_size})"
+            )
+        else:
+            segment_start_expr = rhs_rank3_worklist_lhs_info.row_start.name
+            actual_m_expr = rhs_rank3_worklist_lhs_info.group_m.name
+            scalar_load_a_row_setup = (
+                f"            _segment_m = {m_offset_var} + _row\n"
+                f"            _gm = cutlass.Int32({segment_start_expr}) + _segment_m\n"
+            )
+            scalar_load_a_guard = (
+                f"_segment_m < cutlass.Int32({actual_m_expr}) "
+                f"and cutlass.Int32(0) <= _gm "
+                f"and _gm < cutlass.Int32({m_size}) "
+                f"and _gk < cutlass.Int32({k_total_size})"
+            )
+        scalar_load_a = statement_from_string(
+            f"if {load_guard}:\n"
+            f"    for _load_i in range(({bm * bk} + {load_thread_count} - 1) // {load_thread_count}):\n"
+            f"        _flat = {mma_copy_linear} + cutlass.Int32(_load_i) * cutlass.Int32({load_thread_count})\n"
+            f"        if _flat < cutlass.Int32({bm * bk}):\n"
+            f"            _row = _flat // cutlass.Int32({bk})\n"
+            f"            _col = _flat % cutlass.Int32({bk})\n"
+            f"{scalar_load_a_row_setup}"
+            f"            _gk = {k_offset_var} + _col\n"
+            f"            {smem_a_store} = ("
+            f"{_lhs_gmem_access('_gm', '_gk')} "
+            f"if {scalar_load_a_guard} "
+            f"else {input_dtype_str}(0.0))"
+        )
+        scalar_load_b = statement_from_string(
+            f"if {load_guard}:\n"
+            f"    for _load_i in range(({bn * bk} + {load_thread_count} - 1) // {load_thread_count}):\n"
+            f"        _flat = {mma_copy_linear} + cutlass.Int32(_load_i) * cutlass.Int32({load_thread_count})\n"
+            f"        if _flat < cutlass.Int32({bn * bk}):\n"
+            f"            _row = _flat // cutlass.Int32({bk})\n"
+            f"            _col = _flat % cutlass.Int32({bk})\n"
+            f"            _gn = {n_offset_var} + _row\n"
+            f"            _gk = {k_offset_var} + _col\n"
+            f"            {smem_b_store} = ("
+            f"{_rhs_gmem_access('_gk', '_gn')} "
+            f"if _gn < cutlass.Int32({n_size}) "
+            f"and _gk < cutlass.Int32({k_total_size}) "
+            f"else {input_dtype_str}(0.0))"
+        )
+        scalar_smem_sync = None
+        if (
+            mma_impl == "tcgen05"
+            and not tcgen05_is_two_cta
+            and not tcgen05_use_separate_mma_exec
+            and not tcgen05_static_full_tma_fast_path
+        ):
+            assert tcgen05_plan is not None
+            scalar_smem_sync = _Tcgen05ScalarSmemSync(
+                barrier_ptr=df.new_var("tcgen05_scalar_smem_mbar"),
+                phase=df.new_var("tcgen05_scalar_smem_phase"),
+                exec_active=tcgen05_plan.exec_active,
+            )
+            prefix.extend(scalar_smem_sync.setup_stmts())
+        if mma_impl == "tcgen05" and tcgen05_use_tma:
+            assert tcgen05_plan is not None
+            assert tma_warp is not None
+            # The validated explicit two-CTA store-box family uses a CuTe
+            # range with no-unroll metadata so its guarded K-iteration body
+            # remains compact.  The generated N,M worklist admits BK64 and
+            # BK128; other explicit-store families keep their BK64 envelope.
+            # The narrow-subtile epilogues opt in by name
+            # (``tcgen05_narrow_subtile_nounroll_k_loop``: promoted row-vector
+            # rows and plain 16-bit stores on the 256-wide two-CTA tile,
+            # decided with their subtile); every other kernel keeps the
+            # unrolled ``range``.
+            tcgen05_use_nounroll_k_loop = (
+                (
+                    tcgen05_explicit_epi_tile_configured
+                    or tcgen05_narrow_subtile_nounroll_k_loop
+                )
+                and tcgen05_static_full_tiles
+                and tcgen05_is_two_cta
+                and (bk == 64 or tcgen05_nm_orientation)
+            )
+            tma_kloop_args = _PerKiterTmaArgs(
+                tma_pipeline=tma_pipeline,
+                tma_producer_state=tma_producer_state,
+                tma_consumer_state=tma_consumer_state,
+                tma_producer_try_token=tma_producer_try_token,
+                tma_consumer_try_token=tma_consumer_try_token,
+                tma_barrier_ptr=tma_barrier_ptr,
+                tma_full_tile=tma_full_tile,
+                tma_next_full_tile=tma_next_full_tile,
+                tma_next_consumer_tile=tma_next_consumer_tile,
+                tma_warp=tma_warp,
+                tma_atom_a=tma_atom_a,
+                tma_atom_b=tma_atom_b,
+                tma_gA=tma_gA,
+                tma_gB=tma_gB,
+                tma_sA=tma_sA,
+                tma_sB=tma_sB,
+                tma_k_tile=tma_k_tile,
+                a_producer_predicate=(
+                    f"cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) < cutlass.Int32({row_profile.cluster_m})"
+                    if row_profile is not None
+                    else None
+                ),
+                tma_a_mcast_mask=tma_a_mcast_mask,
+                tma_b_mcast_mask=tma_b_mcast_mask,
+                ab_stage_count=tcgen05_ab_stage_count_value,
+                is_two_cta=tcgen05_is_two_cta,
+                use_tma_b_mcast_mask=tcgen05_use_tma_b_mcast_mask,
+                use_tma_a=tcgen05_use_tma_a,
+                use_tma_b=tcgen05_use_tma_b,
+                skip_producer_acquire=diagnose_skip_ab_producer_acquire,
+                skip_producer_advance=diagnose_skip_ab_producer_advance,
+                skip_consumer_wait=diagnose_skip_ab_consumer_wait,
+                exec_active=tcgen05_plan.exec_active,
+                scalar_load_a=scalar_load_a,
+                scalar_load_b=scalar_load_b,
+                cluster_n=tcgen05_cluster_n,
+                static_full_tiles=tcgen05_static_full_tma_fast_path,
+                tma_gA2=tma_gA2 if tcgen05_m_subtile_count > 1 else "",
+                tma_sA2=tma_sA2 if tcgen05_m_subtile_count > 1 else "",
+                tma_desc_ptr_a=(
+                    grouped_tensormap_a_desc_ptr
+                    if tcgen05_grouped_dynamic_ab_tensormaps and not tcgen05_shared_rhs
+                    else None
+                ),
+                tma_desc_ptr_b=(
+                    grouped_tensormap_b_desc_ptr
+                    if tcgen05_grouped_dynamic_ab_tensormaps
+                    and not tcgen05_grouped_full_allocation_b
+                    else None
+                ),
+                tma_desc_acquire_fence_src=(
+                    (
+                        f"if {grouped_tensormap_group_changed} and "
+                        f"{tma_k_tile} == cutlass.Int32(0):\n"
+                        + "\n".join(
+                            f"    {grouped_tensormap_manager}.fence_tensormap_update({pointer})"
+                            for pointer, dynamic in (
+                                (grouped_tensormap_a_ptr, not tcgen05_shared_rhs),
+                                (
+                                    grouped_tensormap_b_ptr,
+                                    not tcgen05_grouped_full_allocation_b,
+                                ),
+                            )
+                            if dynamic
+                        )
+                    )
+                    if tcgen05_grouped_dynamic_ab_tensormaps
+                    and not (tcgen05_shared_rhs and tcgen05_grouped_full_allocation_b)
+                    else None
+                ),
+                scalar_smem_sync=scalar_smem_sync,
+            )
+            if tcgen05_use_tma_pipeline:
+                grouped_k_loop_iter_expr = (
+                    _tcgen05_grouped_k_loop_iter_expr(
+                        problem_k=tcgen05_k_bound_expr,
+                        bk=bk,
+                    )
+                    if tcgen05_grouped_k_mask is not None
+                    else None
+                )
+                cloned_k_loop_iter_expr = (
+                    grouped_k_loop_iter_expr
+                    if grouped_k_loop_iter_expr is not None
+                    else (
+                        _tcgen05_k_loop_nounroll_iter_expr(device_loop)
+                        if tcgen05_use_nounroll_k_loop
+                        else None
+                    )
+                )
+                if tcgen05_use_separate_tma_producer:
+                    producer_loop_body = [
+                        statement_from_string(
+                            f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
+                        )
+                    ]
+                    if not tcgen05_static_full_tma_fast_path:
+                        assert tma_full_tile_predicate_src is not None
+                        producer_full_tile_predicate = tma_full_tile_predicate_src
+                        if tcgen05_grouped_two_cta_full_allocation_b:
+                            # Keep the TWO problem-K mailbox dependency after
+                            # removing its input-map update. Every initializer
+                            # and the full-union producer writes the common K.
+                            # Only the producer uses this equivalent bound;
+                            # the K loop and MMA consumer remain unchanged.
+                            assert tcgen05_grouped_problem_k is not None
+                            producer_full_tile_predicate = " and ".join(
+                                predicate
+                                for predicate in (
+                                    _tcgen05_tma_output_tile_predicate(),
+                                    f"{k_offset_var} < {tcgen05_grouped_problem_k}",
+                                )
+                                if predicate
+                            )
+                        producer_loop_body.append(
+                            statement_from_string(
+                                f"{tma_full_tile} = " + producer_full_tile_predicate
+                            )
+                        )
+                    if tcgen05_use_grouped_static_single_tma_producer_loop:
+                        producer_loop_body.extend(
+                            [
+                                statement_from_string(
+                                    f"{tma_producer_try_token} = cutlass.Boolean(0)"
+                                ),
+                                _build_kloop_pipeline_producer_if(
+                                    tma_kloop_args,
+                                    gate_tma_warp=False,
+                                    load_current_tile=True,
+                                ),
+                            ]
+                        )
+                    else:
+                        producer_loop_body.extend(
+                            [
+                                statement_from_string(
+                                    f"{tma_next_full_tile} = "
+                                    + _tcgen05_tma_tile_predicate(
+                                        k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                                        full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)})",
+                                    )
+                                ),
+                                statement_from_string(
+                                    f"{tma_producer_try_token} = cutlass.Boolean(0)"
+                                ),
+                                _build_kloop_pipeline_producer_if(
+                                    tma_kloop_args, gate_tma_warp=False
+                                ),
+                            ]
+                        )
+                    producer_loop = _clone_k_loop_with_body(
+                        device_loop,
+                        producer_loop_body,
+                        iter_expr=cloned_k_loop_iter_expr,
+                    )
+                    if paired_prefetch_args is not None:
+                        assert (
+                            row_union_plan is not None
+                            and row_union_plan.paired_protocol is not None
+                        )
+                        remaining_k = df.new_var("tcgen05_remaining_k")
+                        packet = _build_initial_prefetch_if(
+                            paired_prefetch_args,
+                            full_tile_gates=["True"],
+                            k_offset=remaining_k,
+                            skip_producer_acquire=True,
+                            gate_tma_warp=False,
+                        )
+                        assert isinstance(packet, ast.If)
+                        packet.body[:0] = ast.parse(
+                            f"{tma_producer_try_token} = {tma_pipeline}.producer_try_acquire({tma_producer_state})\n"
+                            f"{tma_pipeline}.producer_acquire({tma_producer_state}, {tma_producer_try_token})"
+                        ).body
+                        # Every launched record is in the guarded full allocation;
+                        # the final spatial B tile uses the same TMA OOB zero fill.
+                        # K is an exact multiple and S<=Ktiles. Therefore the
+                        # only remaining packets are S..Ktiles-1, with no idle
+                        # iterations. Keep the ordinary steady-state try/acquire
+                        # protocol; the initial S packets use plain acquire.
+                        producer_loop = cast(
+                            "ast.For",
+                            statement_from_string(
+                                f"for {remaining_k} in cutlass.range({tcgen05_ab_stage_count_value}, {row_union_plan.k // bk}, unroll=1):\n"
+                                + textwrap.indent(
+                                    "\n".join(ast.unparse(x) for x in packet.body),
+                                    "    ",
+                                )
+                            ),
+                        )
+                    producer_stmt: ast.stmt = producer_loop
+                    if tcgen05_use_pure_matmul_role_lifecycle:
+                        # Pure lifecycle emits role bodies directly instead of
+                        # relying on the generic role-local partitioner.
+                        producer_stmt = _wrap_stmt_in_if(producer_loop, tma_warp)
+                    prefix.append(producer_stmt)
+                    per_tile_stmts.append(producer_stmt)
+                    if tcgen05_use_role_local_tma_producer:
+                        tma_load_role_stmts.append(producer_loop)
+                if tcgen05_use_separate_mma_exec:
+                    assert mma_stage_stmt is not None
+                    assert smem_a_mma_stmt is not None
+                    assert smem_b_mma_stmt is not None
+                    outer_owner_gated_exec = (
+                        tcgen05_static_full_tma_fast_path
+                        and tcgen05_is_two_cta
+                        and tcgen05_cluster_m == 2
+                        and tcgen05_cluster_n == 1
+                    )
+                    exec_loop_body: list[ast.stmt] = [
+                        mma_stage_stmt,
+                        smem_a_mma_stmt,
+                        smem_b_mma_stmt,
+                    ]
+                    if not tcgen05_static_full_tma_fast_path:
+                        assert tma_full_tile_stmt is not None
+                        exec_loop_body.append(tma_full_tile_stmt)
+                    if tcgen05_use_role_local_ab_consumer_prefetch:
+                        exec_loop_body.append(
+                            statement_from_string(
+                                f"{tma_next_consumer_tile} = "
+                                + _tcgen05_tma_k_tile_predicate(
+                                    k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk})",
+                                    full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * 2})",
+                                )
+                            )
+                        )
+                    else:
+                        exec_loop_body.append(
+                            statement_from_string(
+                                f"{tma_consumer_try_token} = cutlass.Boolean(0)"
+                            )
+                        )
+                    exec_loop_body.append(
+                        _build_kloop_pipeline_consumer_if(
+                            tma_kloop_args,
+                            gate_exec_warp=tcgen05_static_full_tma_fast_path,
+                            include_scalar_fallback=False,
+                            use_existing_try_token=tcgen05_use_role_local_ab_consumer_prefetch,
+                        )
+                    )
+                    if not diagnose_skip_umma_issue:
+                        # The AB pipeline's ``consumer_wait`` is a
+                        # transaction-count ``mbarrier_try_wait`` that already
+                        # orders the TMA shared stores before the UMMA load,
+                        # so an extra ``fence_view_async_shared()`` is
+                        # redundant on this pipelined path. See cute_plan.md
+                        # §6.9.2 for the cycle's bench/NCU write-up.
+                        exec_loop_body.append(
+                            _build_tcgen05_mma_issue_stmt(
+                                exec_active=tcgen05_plan.exec_active,
+                                tiled_mma=tiled_mma,
+                                acc_frag=acc_frag,
+                                tcgen05_frag_a=tcgen05_frag_a,
+                                tcgen05_frag_b=tcgen05_frag_b,
+                                mma_stage=mma_stage,
+                                input_dtype_str=input_dtype_str,
+                                acc_dtype_str=acc_dtype_str,
+                                gate_exec_warp=tcgen05_static_full_tma_fast_path,
+                                is_two_cta=tcgen05_is_two_cta,
+                                cluster_n=tcgen05_cluster_n,
+                                runtime_mma_n=tcgen05_runtime_mma_n,
+                                runtime_instr_desc=tcgen05_runtime_instr_desc,
+                                static_mma_n=(
+                                    tcgen05_mma_bn
+                                    if tcgen05_runtime_n_specialization
+                                    else None
+                                ),
+                            )
+                        )
+                        if tcgen05_m_subtile_count > 1:
+                            # Paired subtile: same B stage, second A buffer,
+                            # second accumulator/tiled-mma.
+                            exec_loop_body.append(
+                                _build_tcgen05_mma_issue_stmt(
+                                    exec_active=tcgen05_plan.exec_active,
+                                    tiled_mma=tiled_mma2,
+                                    acc_frag=acc_frag2,
+                                    tcgen05_frag_a=tcgen05_frag_a2,
+                                    tcgen05_frag_b=tcgen05_frag_b,
+                                    mma_stage=mma_stage,
+                                    input_dtype_str=input_dtype_str,
+                                    acc_dtype_str=acc_dtype_str,
+                                    gate_exec_warp=tcgen05_static_full_tma_fast_path,
+                                    is_two_cta=tcgen05_is_two_cta,
+                                    cluster_n=tcgen05_cluster_n,
+                                    runtime_mma_n=None,
+                                    runtime_instr_desc=None,
+                                    static_mma_n=None,
+                                )
+                            )
+                    exec_loop_body.append(
+                        _build_kloop_pipeline_release_if(
+                            tma_kloop_args,
+                            gate_exec_warp=tcgen05_static_full_tma_fast_path,
+                            include_scalar_fallback=False,
+                        )
+                    )
+                    if tcgen05_use_role_local_ab_consumer_prefetch:
+                        exec_loop_body.extend(
+                            _build_kloop_pipeline_consumer_prefetch_stmts(
+                                tma_kloop_args,
+                                gate_exec_warp=False,
+                            )
+                        )
+                    exec_loop = _clone_k_loop_with_body(
+                        device_loop,
+                        exec_loop_body,
+                        iter_expr=cloned_k_loop_iter_expr,
+                    )
+                    exec_role_stmt: ast.stmt = exec_loop
+                    if outer_owner_gated_exec:
+                        # Only the V-leader consumes AB stages and issues UMMA.
+                        # Keep the follower out of the cloned K loop entirely;
+                        # it still participates in the TMA-load role.
+                        exec_role_stmt = _wrap_stmt_in_if(
+                            exec_loop, _TCGEN05_CLUSTER_LEADER_PREDICATE
+                        )
+                    exec_stmt: ast.stmt = exec_role_stmt
+                    if tcgen05_use_pure_matmul_role_lifecycle:
+                        exec_stmt = _wrap_stmt_in_if(
+                            exec_role_stmt, tcgen05_plan.exec_active
+                        )
+                    prefix.append(exec_stmt)
+                    per_tile_stmts.append(exec_stmt)
+                    if tcgen05_use_role_local_mma_exec:
+                        mma_exec_role_stmts.append(exec_role_stmt)
+                else:
+                    cg.add_statement(
+                        statement_from_string(
+                            f"{tma_next_full_tile} = "
+                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+                            f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
+                        )
+                    )
+                    cg.add_statement(
+                        statement_from_string(
+                            f"{tma_producer_try_token} = cutlass.Boolean(0)"
+                        )
+                    )
+                    cg.add_statement(
+                        statement_from_string(
+                            f"{tma_consumer_try_token} = cutlass.Boolean(0)"
+                        )
+                    )
+                    if not tcgen05_use_separate_tma_producer:
+                        # Legacy inline path: keep producer and consumer
+                        # adjacent inside the shared K-loop. Persistent
+                        # role-local mode emits the producer as a top-level
+                        # sibling loop above so the TMA-load role can extract
+                        # it wholesale.
+                        pipeline_producer_stmt = _build_kloop_pipeline_producer_if(
+                            tma_kloop_args
+                        )
+                        cg.add_statement(pipeline_producer_stmt)
+                    cg.add_statement(
+                        _build_kloop_pipeline_consumer_if(
+                            tma_kloop_args,
+                            include_scalar_fallback=(
+                                not tcgen05_static_full_tma_fast_path
+                            ),
+                            sync_before_scalar_fallback=(
+                                tcgen05_sync_before_scalar_fallback
+                                and not tcgen05_static_full_tma_fast_path
+                            ),
+                        )
+                    )
+            else:
+                non_pipeline_producer_stmt = _build_kloop_non_pipeline_producer_if(
+                    tma_kloop_args
+                )
+                cg.add_statement(non_pipeline_producer_stmt)
+                cg.add_statement(_build_kloop_non_pipeline_consumer_if(tma_kloop_args))
+        else:
+            if scalar_smem_sync is not None:
+                for stmt in ast.parse(
+                    scalar_smem_sync.copy_src((scalar_load_a, scalar_load_b))
+                ).body:
+                    cg.add_statement(stmt)
+            else:
+                cg.add_statement(scalar_load_a)
+                cg.add_statement(scalar_load_b)
+                cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+
+    # --- Shared → Register with f16→f32 cast ---
+    if mma_impl == "universal":
+        cg.add_statement(
+            statement_from_string(f"{tAsA} = {thr_mma}.partition_A({smem_a})")
+        )
+        cg.add_statement(
+            statement_from_string(f"{tBsB} = {thr_mma}.partition_B({smem_b})")
+        )
+        cg.add_statement(
+            statement_from_string(
+                f"{rA} = cute.make_fragment_like({tAsA}, {acc_dtype_str})"
+            )
+        )
+        cg.add_statement(
+            statement_from_string(
+                f"{rB} = cute.make_fragment_like({tBsB}, {acc_dtype_str})"
+            )
+        )
+        cg.add_statement(
+            statement_from_string(
+                f"for _mma_i in range(cute.size({rA})):\n"
+                f"    {rA}[_mma_i] = {acc_dtype_str}({tAsA}[_mma_i])"
+            )
+        )
+        cg.add_statement(
+            statement_from_string(
+                f"for _mma_i in range(cute.size({rB})):\n"
+                f"    {rB}[_mma_i] = {acc_dtype_str}({tBsB}[_mma_i])"
+            )
+        )
+        cg.add_statement(
+            statement_from_string(
+                f"cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})"
+            )
+        )
+        # Order this iteration's SMEM reads before the next iteration's
+        # stores into sA / sB. The universal SMEM-load guards funnel the
+        # WRITES through a thin thread slice (``thread_y == 0`` for sA,
+        # ``thread_x == 0`` for sB) while the MmaUniversalOp register copy
+        # above READS the staged tile with every CTA thread. Writer set !=
+        # reader set, spanning multiple warps, so across the barrier-free
+        # K-loop back-edge a thread that finishes its gemm early overwrites
+        # sA / sB while a sibling in another warp is still reading the
+        # current K tile -- a cross-warp write-after-read hazard that yields
+        # nondeterministic wrong values (confirmed via compute-sanitizer
+        # racecheck). Warp MMA orders this boundary with a CTA barrier
+        # below; tcgen05 uses its pipeline/mbarrier protocol.
+        cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+    else:
+        assert mma_active is not None
+        if mma_impl == "warp":
+            cg.add_statement(
+                statement_from_string(
+                    f"if {mma_active}:\n"
+                    f"    {tAsA} = {thr_mma}.partition_A({smem_a})\n"
+                    f"    {tBsB} = {thr_mma}.partition_B({smem_b})\n"
+                    f"    {rA} = cute.make_fragment_like({tAsA}, {input_dtype_str})\n"
+                    f"    {rB} = cute.make_fragment_like({tBsB}, {input_dtype_str})\n"
+                    f"    for _mma_i in range(cute.size({rA})):\n"
+                    f"        {rA}[_mma_i] = {tAsA}[_mma_i]\n"
+                    f"    for _mma_i in range(cute.size({rB})):\n"
+                    f"        {rB}[_mma_i] = {tBsB}[_mma_i]\n"
+                    f"    cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})"
+                )
+            )
+            # Every participating warp must finish reading this tile before
+            # any warp overwrites shared operands for the next K iteration.
+            cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+        else:
+            assert tcgen05_plan is not None
+            if not tcgen05_use_separate_mma_exec:
+                if not diagnose_skip_umma_issue:
+                    # No async-shared fence: the pipelined AB consumer_wait
+                    # is a transaction-count ``mbarrier_try_wait`` and the
+                    # non-pipelined branch follows ``consumer_wait`` with a
+                    # CTA-wide ``sync_threads()`` (see
+                    # ``_build_kloop_non_pipeline_consumer_if``); both
+                    # already order the TMA shared stores before the UMMA
+                    # load. Mirrors the role-local path above.
+                    cg.add_statement(
+                        _build_tcgen05_mma_issue_stmt(
+                            exec_active=tcgen05_plan.exec_active,
+                            tiled_mma=tiled_mma,
+                            acc_frag=acc_frag,
+                            tcgen05_frag_a=tcgen05_frag_a,
+                            tcgen05_frag_b=tcgen05_frag_b,
+                            mma_stage=mma_stage,
+                            input_dtype_str=input_dtype_str,
+                            acc_dtype_str=acc_dtype_str,
+                            is_two_cta=tcgen05_is_two_cta,
+                            cluster_n=tcgen05_cluster_n,
+                            runtime_mma_n=tcgen05_runtime_mma_n,
+                            runtime_instr_desc=tcgen05_runtime_instr_desc,
+                            static_mma_n=(
+                                tcgen05_mma_bn
+                                if tcgen05_runtime_n_specialization
+                                else None
+                            ),
+                        )
+                    )
+                    if tcgen05_m_subtile_count > 1:
+                        cg.add_statement(
+                            _build_tcgen05_mma_issue_stmt(
+                                exec_active=tcgen05_plan.exec_active,
+                                tiled_mma=tiled_mma2,
+                                acc_frag=acc_frag2,
+                                tcgen05_frag_a=tcgen05_frag_a2,
+                                tcgen05_frag_b=tcgen05_frag_b,
+                                mma_stage=mma_stage,
+                                input_dtype_str=input_dtype_str,
+                                acc_dtype_str=acc_dtype_str,
+                                is_two_cta=tcgen05_is_two_cta,
+                                cluster_n=tcgen05_cluster_n,
+                                runtime_mma_n=None,
+                                runtime_instr_desc=None,
+                                static_mma_n=None,
+                            )
+                        )
+                if tcgen05_use_tma:
+                    assert tma_kloop_args is not None
+                    if tcgen05_use_tma_pipeline:
+                        cg.add_statement(
+                            _build_kloop_pipeline_release_if(
+                                tma_kloop_args,
+                                include_scalar_fallback=(
+                                    not tcgen05_static_full_tma_fast_path
+                                ),
+                            )
+                        )
+                    else:
+                        cg.add_statement(
+                            _build_kloop_non_pipeline_release_if(tma_kloop_args)
+                        )
+                else:
+                    cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+
+    # === outer_suffix: convert fragment → per-thread scalar ===
+    # Allocate smem_c in outer_prefix so all smem is allocated at the same
+    # scope level (CuTe DSL assigns static smem offsets per scope). Only the
+    # `universal` and `warp` MMA paths still need the staged smem_c buffer;
+    # tcgen05 epilogues are handled by `_codegen_cute_store_tcgen05_tile`
+    # and skip the older generic smem_c allocation.
+    smem_c_ptr = df.new_var("smem_c")
+    smem_c = df.new_var("smem_c_t")
+    tCsC = df.new_var("tCsC")
+    result_var = df.new_var("mma_result")
+
+    tile_numel = bm * bn
+    if mma_impl != "tcgen05":
+        prefix.append(
+            statement_from_string(
+                f"{smem_c_ptr} = cute.arch.alloc_smem({acc_dtype_str}, {tile_numel}, alignment=128)"
+            )
+        )
+        prefix.append(
+            statement_from_string(
+                f"{smem_c} = cute.make_tensor("
+                f"{smem_c_ptr}, cute.make_layout(({bm}, {bn}), stride=({bn}, 1)))"
+            )
+        )
+    if mma_impl == "universal":
+        suffix.append(
+            statement_from_string(f"{tCsC} = {thr_mma}.partition_C({smem_c})")
+        )
+        suffix.append(
+            statement_from_string(
+                f"for _mma_i in range(cute.size({tCsC})):\n"
+                f"    {tCsC}[_mma_i] = {acc_frag}[_mma_i]"
+            )
+        )
+    else:
+        assert mma_active is not None
+        if mma_impl == "warp":
+            suffix.append(
+                statement_from_string(
+                    f"if {mma_active}:\n"
+                    f"    {tCsC} = {thr_mma}.partition_C({smem_c})\n"
+                    f"    for _mma_i in range(cute.size({tCsC})):\n"
+                    f"        {tCsC}[_mma_i] = {acc_frag}[_mma_i]"
+                )
+            )
+            suffix.append(statement_from_string("cute.arch.sync_threads()"))
+        else:
+            assert tcgen05_plan is not None
+            assert epi_active is not None
+            assert epi_tidx is not None
+            # The K-loop suffix's `acc_pipeline.producer_commit` +
+            # `acc_producer_state.advance()` must run ONCE PER OUTPUT TILE.
+            # In the persistent path, the splitter walks top-level
+            # statements and only marks them per-tile if they read or
+            # write a name that's already per-tile. These suffix
+            # statements only mutate ``acc_producer_state`` via a method
+            # call (no AST-visible write) and reference no per-tile
+            # name directly, so without explicit tagging they get hoisted
+            # out of the work-tile loop -- which means the SECOND tile
+            # never commits its accumulator and the consumer-side
+            # ``consumer_wait`` deadlocks (or the data is silently wrong
+            # if no deadlock fires). Tag them per-tile via
+            # ``_emit_per_tile_suffix`` so they stay inside the work-tile
+            # loop.
+            suffix_stmt = statement_from_string(
+                _tcgen05_emit_optional_gate(
+                    f"{tcgen05_plan.acc_pipeline}.producer_commit("
+                    f"{tcgen05_plan.acc_producer_state})",
+                    tcgen05_mma_owner_active,
+                    indent="",
+                )
+            )
+            suffix.append(suffix_stmt)
+            per_tile_stmts.append(suffix_stmt)
+            if tcgen05_use_role_local_mma_exec:
+                mma_exec_role_stmts.append(suffix_stmt)
+            if tcgen05_m_subtile_count > 1:
+                suffix_stmt2 = statement_from_string(
+                    _tcgen05_emit_optional_gate(
+                        f"{tcgen05_plan.acc_pipeline}.producer_commit("
+                        f"{tcgen05_plan.acc_producer_state2})",
+                        tcgen05_mma_owner_active,
+                        indent="",
+                    )
+                )
+                suffix.append(suffix_stmt2)
+                per_tile_stmts.append(suffix_stmt2)
+                if tcgen05_use_role_local_mma_exec:
+                    mma_exec_role_stmts.append(suffix_stmt2)
+            # Bridge-only invalid-output diagnostic: preserve producer_commit
+            # while removing only the acc producer PipelineState advance edge.
+            if not diagnose_skip_acc_producer_advance:
+                advance_states = [tcgen05_plan.acc_producer_state]
+                if tcgen05_m_subtile_count > 1:
+                    advance_states.append(tcgen05_plan.acc_producer_state2)
+                for advance_state in advance_states:
+                    for _ in range(tcgen05_m_subtile_count):
+                        advance_stmt = statement_from_string(
+                            emit_pipeline_advance(advance_state)
+                        )
+                        suffix.append(advance_stmt)
+                        per_tile_stmts.append(advance_stmt)
+                        if tcgen05_use_role_local_mma_exec:
+                            mma_exec_role_stmts.append(advance_stmt)
+            # The tcgen05 epilogue + allocator teardown is emitted by
+            # `_codegen_cute_store_tcgen05_tile` when the kernel stores
+            # `out[tile_m, tile_n] = result`. Static-full flat and validated
+            # role-local persistent kernels, including CtaGroup.TWO, take the
+            # TMA-store path; partial/unsupported fallbacks keep SIMT.
+            sync_stmt = statement_from_string("cute.arch.sync_threads()")
+            suffix.append(sync_stmt)
+            per_tile_stmts.append(sync_stmt)
+
+    if mma_impl == "tcgen05":
+        assert tcgen05_plan is not None
+        assert tcgen05_matmul_plan is not None
+        assert epi_tidx is not None
+        assert epi_active is not None
+        assert tma_warp is not None
+        assert warp_idx is not None
+        tcgen05_lifecycle_context = Tcgen05LifecycleContext(
+            exec_active=tcgen05_plan.exec_active,
+            epi_active=epi_active,
+            tma_warp=tma_warp,
+            tma_pipeline=tma_pipeline,
+            tma_producer_state=tma_producer_state,
+            acc_pipeline=tcgen05_plan.acc_pipeline,
+            acc_producer_state=tcgen05_plan.acc_producer_state,
+            acc_consumer_state=tcgen05_plan.acc_consumer_state,
+            tmem_alloc_barrier=tcgen05_plan.tmem_alloc_barrier,
+            tmem_allocator=tcgen05_plan.tmem_allocator,
+            tmem_holding_buf=tcgen05_plan.tmem_holding_buf,
+            tmem_dealloc_mbar_ptr=tcgen05_plan.tmem_dealloc_mbar_ptr,
+            epi_acc_tmem_ptr=tcgen05_epi_acc_tmem_ptr,
+            acc_tmem_cols=tcgen05_plan.acc_tmem_cols,
+            is_two_cta=tcgen05_is_two_cta,
+            use_tma=tcgen05_use_tma,
+            skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
+            tmem_permit_released_early=tcgen05_relinquish_permit_early,
+            use_merged_pipeline_init=tcgen05_use_merged_pipeline_init,
+            tmem_allocator_warp=tcgen05_tmem_allocator_warp,
+            free_tmem_in_epilogue=tcgen05_free_tmem_in_epilogue,
+        )
+        tcgen05_pure_matmul_object = (
+            Tcgen05PureMatmulObjectModel(
+                lifecycle_context=tcgen05_lifecycle_context,
+                cleanup_loop=device_loop,
+            )
+            if tcgen05_use_pure_matmul_role_lifecycle
+            else None
+        )
+        segment_store_m_offset = ""
+        segment_store_start = ""
+        segment_store_actual_m = ""
+        segment_store_valid_m_bound = ""
+        segment_store_node: Node | None = None
+        segment_store_row_index: Node | None = None
+        segment_store_valid_m: Node | None = None
+        if rhs_rank3_worklist_store_info is not None:
+            assert rhs_rank3_worklist_lhs_info is not None
+            segment_store_m_offset = m_offset_var
+            segment_store_start = rhs_rank3_worklist_lhs_info.row_start.name
+            segment_store_actual_m = (
+                tcgen05_grouped_store_m
+                if (
+                    tcgen05_nm_orientation
+                    and tcgen05_grouped_store_m
+                    and rhs_rank3_worklist_store_info.uses_scheduler_store_extent
+                )
+                else rhs_rank3_worklist_store_info.extent_load.name
+            )
+            segment_store_valid_m_bound = (
+                tcgen05_grouped_valid_m
+                if tcgen05_nm_orientation and tcgen05_grouped_valid_m
+                else rhs_rank3_worklist_lhs_info.group_m.name
+            )
+            segment_store_node = rhs_rank3_worklist_store_info.store_node
+            segment_store_row_index = rhs_rank3_worklist_store_info.row_index
+            segment_store_valid_m = rhs_rank3_worklist_store_info.valid_m
+        if analysis is not None:
+            output_block_ids = analysis.output_block_ids
+        elif rhs_rank3_grouped_proof is not None:
+            grouped_output_segment = (
+                rhs_rank3_grouped_proof.rhs.rhs_grouped_leading_block_id
+            )
+            output_block_ids = (
+                *(() if grouped_output_segment is None else (grouped_output_segment,)),
+                m_block_id,
+                n_block_id,
+            )
+        else:
+            output_block_ids = tuple(grid_state.block_ids)
+        if row_union_plan is not None and row_union_plan.linear_record_clc:
+            prefix.extend(
+                ast.parse(
+                    f"{row_union_plan.all_rows} = cutlass.Boolean(False)\n"
+                    f"if {epi_active}:\n"
+                    f"    {row_union_plan.all_rows} = {row_union_plan.coverage_flag}[0] != cutlass.Int32(0)"
+                ).body
+            )
+        elif row_union_plan is not None:
+            assert epi_active is not None
+            interval_setup = ast.parse(row_union_plan.interval_setup()).body
+            prefix.extend(interval_setup[:2])
+            if row_profile is not None:
+                prefix.append(
+                    statement_from_string(
+                        f"{row_union_plan.all_rows} = cutlass.Boolean(False)"
+                    )
+                )
+                interval_setup.extend(ast.parse(row_union_plan.full_coverage()).body)
+            prefix.append(
+                ast.If(
+                    test=cast("ast.expr", expr_from_string(epi_active)),
+                    body=interval_setup[2:],
+                    orelse=[],
+                )
+            )
+        df.cute_state.register_tcgen05_store_value(
+            result_var,
+            CuteTcgen05StoreValue(
+                lifecycle_context=tcgen05_lifecycle_context,
+                output_block_ids=output_block_ids,
+                pure_matmul_object=tcgen05_pure_matmul_object,
+                output_stores=tcgen05_output_stores_value,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                bk=bk,
+                thr_mma=thr_mma,
+                epi_warp_count=tcgen05_epi_warp_count_value,
+                epi_acc_frag_base=tcgen05_epi_acc_frag_base,
+                epi_tidx=epi_tidx,
+                warp_idx=warp_idx,
+                epi_tile=tcgen05_plan.epi_tile,
+                c_stage_count=tcgen05_c_stage_count_value,
+                epilog_sync_barrier_id=_TCGEN05_EPILOG_SYNC_BARRIER_ID,
+                tmem_load_atom=tcgen05_plan.tmem_load_atom,
+                epilogue_rest_mode=tcgen05_plan.epilogue_rest_mode,
+                tma_store_atom=tma_store_atom,
+                tma_store_tensor=tma_store_tensor,
+                tail_tma_store_atom=tail_tma_store_atom,
+                tail_tma_store_tensor=tail_tma_store_tensor,
+                role_local_tile_counter=tma_store_role_tile_counter,
+                use_role_local_epi=tcgen05_use_role_local_epi,
+                use_tma_store_epilogue=tcgen05_use_tma_store_epilogue,
+                tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
+                partial_output_tma_store=tcgen05_partial_output_tma_store,
+                # Mirror the value passed to `_make_tcgen05_layout_plan_setup`
+                # above; the store path compares this against `target_dtype`
+                # to enforce the kernel/store equality contract on
+                # `compute_epilogue_tile_shape`'s dtype kwargs.
+                epi_elem_dtype_str=epi_elem_dtype_str,
+                explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
+                explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
+                explicit_d_store_box_n=tcgen05_explicit_d_store_box_n,
+                segment_store_m_offset=segment_store_m_offset,
+                segment_store_start=segment_store_start,
+                segment_store_actual_m=segment_store_actual_m,
+                segment_store_valid_m_bound=segment_store_valid_m_bound,
+                segment_store_node=segment_store_node,
+                segment_store_row_index=segment_store_row_index,
+                segment_store_valid_m=segment_store_valid_m,
+                orientation=tcgen05_matmul_plan.orientation,
+                output_column_major=output_column_major,
+                row_union=row_union_plan,
+            ),
+        )
+        if tcgen05_pure_matmul_object is not None:
+            tcgen05_pure_matmul_object.register_pending_store(df.cute_state)
+        if fx_node is not None:
+            # Map the matmul fx_node -> result_var so the G3.1.1 fused
+            # epilogue splice path can reuse the existing
+            # `CuteTcgen05StoreValue` registration via a backward FX
+            # walk from the user's store value through a whitelisted
+            # unary chain to this matmul fx_node.
+            df.cute_state.matmul_fx_node_result_vars[fx_node] = result_var
+        if tcgen05_grouped_tail_proof is not None:
+            df.cute_state.register_tcgen05_grouped_tail_proof(
+                tcgen05_grouped_tail_proof
+            )
+    else:
+        # Each thread reads its own (m, n) element from shared memory.
+        suffix.append(
+            statement_from_string(f"{result_var} = {smem_c}[{m_local}, {n_local}]")
+        )
+
+    # Register per-tile statements with the persistent-loop splitter so
+    # everything else hoists out of the work-tile loop. The splitter also
+    # auto-detects PID-decomposition statements via ``virtual_pid_var``
+    # name lookup, so callers don't need to plumb registration through
+    # ``_decompose_virtual_pid``. No-op when the kernel uses a
+    # non-persistent ``pid_type`` (the splitter is only invoked from
+    # ``_setup_tcgen05_persistent_kernel``).
+    if per_tile_stmts:
+        df.cute_state.register_tcgen05_per_tile_stmts(per_tile_stmts)
+    if mma_impl == "tcgen05":
+        df.cute_state.register_tcgen05_kloop_owned_stmts(
+            device_loop, device_loop.inner_statements[tcgen05_kloop_stmt_start:]
+        )
+    # Register role-block statements with the persistent role partitioner
+    # (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
+    # Two registration shapes land here:
+    # - Top-level prefix statements (the initial TMA prefetch IFs) --
+    #   these are ALSO registered as per-tile via ``_emit_per_tile``,
+    #   which is what keeps them inside the work-tile body so the
+    #   partitioner can see them at top level.
+    # - Nested statements emitted inside the K-loop body via
+    #   ``cg.add_statement(...)`` -- these are NOT per-tile-registered;
+    #   the K-loop itself rides into the work-tile body via per-tile
+    #   name propagation, and the partitioner recurses one level into
+    #   it to wrap these tagged children. The current static-full
+    #   role-local path emits producer and exec K-loops as top-level
+    #   sibling loops, so nested tags mainly serve the legacy inline path.
+    #   Revisit this traversal if the legacy inline path is removed.
+    # The partitioner asserts at run time that every registered tag was
+    # visited, so a misregistered top-level stmt fails loudly rather
+    # than silently dropping its role gate.
+    if tma_load_role_stmts:
+        df.cute_state.register_tcgen05_tma_load_role_stmts(tma_load_role_stmts)
+    if mma_exec_role_stmts:
+        df.cute_state.register_tcgen05_mma_exec_role_stmts(mma_exec_role_stmts)
+
+    return expr_from_string(result_var)
+
+
+def _mma_active_n_threads(mma_impl: str) -> int:
+    if mma_impl in ("warp", "tcgen05"):
+        return 2
+    return 0
+
+
+def _tcgen05_root_m_threads(bm: int, bn: int) -> int:
+    # The tcgen05 role launch is one physical warp per role row: the plan's
+    # block shape multiplies this width by the launched warp count, and the
+    # role predicates, ``epi_tidx`` and the pipeline-init named barrier (sized
+    # from the launched warps) all index warps linearly.  So the SIMT M axis
+    # of a tcgen05 root is one warp wide whatever the tile, and the root lane
+    # loops over the rest of M are the ones the MMA lowering suppresses.  The
+    # narrow N=8 tiles used to keep a tile-wide M axis for a direct
+    # accumulator drain that no longer exists: it launched 64-lane rows (twice
+    # the warps the roles and the init barrier counted; the spare warps could
+    # release the TMA warp from the init barrier before warp 0 had initialized
+    # the mbarriers, an illegal-instruction fault on its first ``try_wait``),
+    # and, with no root lane loops, the thread-barrier pass ran over the body
+    # and put CTA-wide ``sync_threads`` between the TMA prologue stages, which
+    # deadlocks the one-shot role-local chain whenever the K extent exceeds
+    # the AB ring (the TMA warp cannot reach the barrier before the MMA warp
+    # releases a stage, and the MMA warp waits at the barrier).
+    return min(32, bm)
+
+
+def _tcgen05_root_n_threads(bn: int) -> int:
+    # The SIMT N axis of a tcgen05 root.  The launch planning resolves an
+    # automatic count to this width, and the launch shape takes the smaller
+    # of it and the plan's role warp count along y (six warps, eight with a
+    # scheduler or C-input warp), so it has to cover every role warp: a
+    # narrower explicit count (four) launched a CTA without the MMA and TMA
+    # role warps and the 96-thread pipeline-init barrier could never
+    # complete, a wider one was only ever clamped to the role count.  An
+    # explicit count of another width is declined by the MMA detection
+    # (``_specialized_mma_root_threads_support_impl``) like the M axis.
+    return min(bn, 8)
+
+
+def _tcgen05_tmem_barrier_thread_count(epi_warp_count: int) -> int:
+    return 32 * (epi_warp_count + 1)
+
+
+def _tcgen05_c_stage_count(bn: int) -> int:
+    # Match the SM100 GEMM helper: narrow epilogues use a deeper TMA-store
+    # ring buffer, while wider-N tiles fall back to two stages.
+    return 4 if bn <= 16 else 2
+
+
+def _tcgen05_ab_stage_count(num_stages: int) -> int:
+    return max(1, min(int(num_stages), 2))
+
+
+def _tcgen05_acc_stage_count(bn: int) -> int:
+    # Match Quack/CUTLASS SM100 staging for the current non-blockscaled path:
+    # keep two accumulator stages for all currently supported N<=256 tiles.
+    return 2 if bn <= 256 else 1
+
+
+def _tcgen05_config_int(config: object, key: str, default: int) -> int:
+    value = cast("_ConfigLike", config).get(key, default)
+    if not isinstance(value, int):
+        return default
+    return value
+
+
+def _tcgen05_cluster_m(config: object) -> int:
+    return max(1, min(2, _tcgen05_config_int(config, "tcgen05_cluster_m", 1)))
+
+
+def _tcgen05_cluster_n(config: object) -> int:
+    """Read the validated ``tcgen05_cluster_n`` knob (default 1).
+
+    cluster_n=2 only runs under the canonical Quack-best 4-CTA cluster
+    (``cluster_m=2 use_2cta=True``); the ``cluster_n>1`` capability gate
+    in ``_codegen_cute_mma`` rejects unsupported pairings so this helper
+    returns the *requested* value and lets the caller demote.
+    """
+    return max(1, min(2, _tcgen05_config_int(config, "tcgen05_cluster_n", 1)))
+
+
+def _tcgen05_large_bn_proof_enabled(config: object | None) -> bool:
+    return config is not None and (
+        cast("_ConfigLike", config).get(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, False)
+        is True
+    )
+
+
+def _tcgen05_large_bn_proof_shape(
+    *, bm: int, bn: int, bk: int, tcgen05_cluster_m: int
+) -> bool:
+    return (
+        (bm, bn, bk) == TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
+        and tcgen05_cluster_m == TCGEN05_LARGE_BN_PROOF_CLUSTER_M
+    )
+
+
+def _tcgen05_use_2cta_instrs(
+    *,
+    bm: int,
+    cluster_m: int,
+    input_dtype: torch.dtype | str | None = None,
+    cta_group: str = "auto",
+) -> bool:
+    # Match Quack/CUTLASS SM100: clustered kernels are not automatically the
+    # tcgen05 "CTA pair" instruction family. CUTLASS admits the 2-CTA MMA for
+    # mma_m in {128, 256} (CTA tile m of 64 or 128). bm=256 is the legacy
+    # validated family. bm=128 (CTA tile 64xbn) is the small-grid family
+    # validated for fp8 on the 512x6144x2048 scaled_mm shape, where it beats
+    # both the bm=256 2-CTA and every 1-CTA config; it is fp8-gated because
+    # the f16/bf16 bm=128 + cluster_m=2 config point is owned by the legacy
+    # clustered CTA-local CtaGroup.ONE family (guarded bridge and multi-tile
+    # runtime guard).
+    if cta_group == "two":
+        if (
+            cluster_m != 2
+            or bm not in (128, 256)
+            or input_dtype
+            not in (
+                torch.float16,
+                torch.bfloat16,
+                "cutlass.Float16",
+                "cutlass.BFloat16",
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "explicit two-CTA MMA requires M128/M256 half or bfloat16 "
+                "operands and tcgen05_cluster_m=2",
+            )
+        return True
+    if cluster_m != 2:
+        return False
+    if bm == TCGEN05_TWO_CTA_BLOCK_M:
+        return True
+    is_fp8 = input_dtype == torch.float8_e4m3fn or input_dtype == "cutlass.Float8E4M3FN"
+    return bm == 128 and is_fp8
+
+
+def _tcgen05_epi_warp_count(
+    warp_spec: Tcgen05WarpSpec, *, cta_thread_count: int
+) -> int:
+    """Pick the epilogue warp count for a tcgen05 matmul kernel.
+
+    Returns at most ``cta_thread_count // 32`` warps, capped by
+    ``warp_spec.epi_warps`` (the strategy data model's source of
+    truth, sourced from the ``tcgen05_num_epi_warps`` autotune
+    knob, default 4). The other roles (one MMA exec warp + one A/B
+    load warp) are added on top of this in
+    ``CuteTcgen05MatmulPlan.role_warp_count``.
+
+    Today the only correct value for the SIMT-store epilogue is 4: the
+    CUTLASS ``epilogue_tmem_copy_and_partition`` helper uses
+    ``tmem_warp_shape_mn = (4, 1)`` for every supported tcgen05 path,
+    which hard-codes a 4-warp t2r partition; the hardware ``tcgen05.ld``
+    is per-warp so the partition is uncoverable by fewer warps. Both
+    the autotune search and ``Config.normalize()`` validation are
+    pinned to ``(4,)`` via
+    ``ConfigSpec.narrow_tcgen05_autotune_to_validated_configs``;
+    ``_codegen_cute_store_tcgen05_tile`` raises ``BackendUnsupported``
+    if a value other than 4 still slips through. The 1 / 2 branches
+    will only become meaningful when item 2's multi-warp epilogue
+    (c_pipeline SMEM ring + TMA bulk store) lands and lets the t2r
+    side keep its 4-warp partition independent of how many warps drive
+    the GMEM store. See ``cute_plan.md`` Section 2.
+    """
+    cta_warp_count = max(1, cta_thread_count // 32)
+    return min(cta_warp_count, max(1, warp_spec.epi_warps))
+
+
+def _mma_impl_matches_problem_shape(
+    mma_impl: str,
+    input_dtype: torch.dtype,
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    tcgen05_cluster_m: int = 1,
+    tcgen05_large_bn_proof: bool = False,
+) -> bool:
+    if mma_impl == "universal":
+        return True
+    is_fp8 = input_dtype == torch.float8_e4m3fn
+    is_tf32 = input_dtype == torch.float32 and cute_fp32_dot_uses_tf32()
+    # tf32 needs bn >= 32: the (128, 8|16) tf32 epilogue corrupts inside the
+    # CUTLASS tmem/epilogue-tile helpers (bn is power-of-two constrained, so
+    # 32 closes the whole unsafe set); narrower fp32 tiles keep the exact
+    # universal/SIMT lowering.
+    min_n = 16 if is_fp8 else (32 if is_tf32 else 8)
+    n_multiple = 16 if is_fp8 else 8
+    if (
+        (
+            input_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+            and not is_tf32
+        )
+        or bn < min_n
+        or bn % n_multiple != 0
+    ):
+        return False
+    if bn > 256 and (
+        mma_impl != "tcgen05"
+        or not tcgen05_large_bn_proof
+        or not _tcgen05_large_bn_proof_shape(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            tcgen05_cluster_m=tcgen05_cluster_m,
+        )
+    ):
+        return False
+    if mma_impl == "warp":
+        # Warp MMA atom is fixed-K (16 elements per BF16/FP16 instruction);
+        # fp8 and tf32 are only wired through tcgen05.
+        if is_fp8 or is_tf32:
+            return False
+        return bk == 16 and bm >= 16 and bm % 16 == 0 and bn == 8
+    if mma_impl == "tcgen05":
+        # tcgen05 mma instruction K is 16 elements for BF16/FP16 (32 for FP8,
+        # 8 for fp32-as-tf32: 256 bits of K per instruction / operand width),
+        # but the tile's K can be any positive multiple of that (the inner
+        # cute.gemm loop just runs more instructions per K iteration). Larger
+        # tile_k roughly halves the per-K-iter overhead per doubling.
+        # Production remains capped at block_n=256 to keep AB SMEM staging
+        # budget sane; the explicit G4 proof key admits only the smallest
+        # 512-N candidate.
+        mma_k = 32 if is_fp8 else (8 if is_tf32 else 16)
+        if bk < mma_k or bk > 256 or bk % mma_k != 0:
+            return False
+        if bm in (64, 128):
+            return True
+        if bm == TCGEN05_TWO_CTA_BLOCK_M and tcgen05_cluster_m == 2:
+            return True
+        # block_m=512 lowers as two 256-row M-paired CtaGroup.TWO subtiles
+        # (16-bit only); the codegen envelope gate rejects ineligible
+        # families with a loud BackendUnsupported.
+        return (
+            bm == 2 * TCGEN05_TWO_CTA_BLOCK_M
+            and tcgen05_cluster_m == 2
+            and input_dtype in (torch.float16, torch.bfloat16)
+        )
+    return False
+
+
+def _is_zero_acc_expr(acc_expr: ast.AST) -> bool:
+    if isinstance(acc_expr, ast.Constant):
+        return acc_expr.value in (0, 0.0)
+    if isinstance(acc_expr, ast.Call):
+        if len(acc_expr.args) != 1 or acc_expr.keywords:
+            return False
+        if not _is_zero_acc_expr(acc_expr.args[0]):
+            return False
+        if isinstance(acc_expr.func, ast.Attribute):
+            return acc_expr.func.attr in {"Float16", "Float32", "BFloat16"}
+        if isinstance(acc_expr.func, ast.Name):
+            return acc_expr.func.id in {"float", "int"}
+    return False
+
+
+def _tcgen05_candidate_exceeds_smem(
+    input_dtype: torch.dtype,
+    *,
+    input_device: torch.device | None,
+    bm: int,
+    bn: int,
+    bk: int,
+    config: object | None,
+    defer_grouped_worklist_smem_check: bool = False,
+) -> bool:
+    """Whether tcgen05 A/B staging exceeds the device's per-CTA budget."""
+    if input_device is None or config is None:
+        return False
+    worklist_profile = (
+        resolve_tcgen05_grouped_worklist_mma_profile(
+            cast("_ConfigLike", config), block_k=bk
+        )
+        if defer_grouped_worklist_smem_check
+        else None
+    )
+    if worklist_profile is not None and (bm, bn) == (
+        worklist_profile.mma_m,
+        worklist_profile.mma_n,
+    ):
+        # The grouped worklist owns scheduler mailboxes, TensorMap storage, and
+        # an explicit C ring. Its conservative allocation upper bound is checked
+        # by ``tcgen05_grouped_worklist_smem_bytes`` in the resolved worklist
+        # lowering. The explicit defer flag prevents unrelated MMA nodes that
+        # share this config from bypassing ordinary AB admission.
+        return False
+    row_config = cast("_ConfigLike", config)
+    row_profile = (
+        physical_schedule(row_config) if defer_grouped_worklist_smem_check else None
+    )
+    if (
+        row_profile is not None
+        and input_dtype == torch.bfloat16
+        and row_config.get(GROUPED_ROW_UNION_KEY, False) is True
+        and all(type(value) is int for value in (bm, bn, bk))
+        and (bm, bn, bk) == (row_profile.mma_m, row_profile.mma_n, row_profile.block_k)
+        and row_union_schedule_supported(row_config, row_profile.source_tile)
+    ):
+        # This proved physical schedule accounts for its AB ring, C ring and
+        # bookkeeping together. The resolved row-union lowering checks that
+        # complete bound against capacity; subtracting the generic 28KiB
+        # reservation here would count the non-AB storage twice. Keep the
+        # explicit defer flag and exact protocol/geometry proof so unrelated
+        # MMA nodes sharing this config retain ordinary AB admission.
+        return False
+    env_choice = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
+    if env_choice not in ("auto", "tcgen05"):
+        return False
+    cluster_m = _tcgen05_cluster_m(config)
+    if not _mma_impl_matches_problem_shape(
+        "tcgen05",
+        input_dtype,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        tcgen05_cluster_m=cluster_m,
+        tcgen05_large_bn_proof=_tcgen05_large_bn_proof_enabled(config),
+    ):
+        return False
+    support = get_cute_mma_support()
+    if not tcgen05_supports_input_dtype(support, input_dtype):
+        return False
+    if cast("_ConfigLike", config).get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two":
+        # Config normalization already checked the complete AB + epilogue +
+        # bookkeeping allocation using the proven single-output facts. This
+        # earlier AB-only prefilter must not subtract the old fixed 28KiB
+        # reservation a second time.
+        budget = CuteTcgen05Config.per_cta_smem_capacity_bytes(input_device)
+    else:
+        budget = CuteTcgen05Config.per_cta_smem_budget_bytes(input_device)
+    if budget <= 0:
+        return True
+    num_stages = _tcgen05_config_int(config, "num_stages", 3)
+    ab_stages = _tcgen05_config_int(
+        config,
+        "tcgen05_ab_stages",
+        _tcgen05_ab_stage_count(num_stages),
+    )
+    required = tcgen05_ab_smem_bytes_per_cta(
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        dtype_bytes=input_dtype.itemsize,
+        ab_stages=ab_stages,
+        cluster_m=cluster_m,
+    )
+    return required > budget
+
+
+def _choose_mma_impl(
+    input_dtype: torch.dtype,
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    config: object | None = None,
+    input_device: torch.device | None = None,
+    defer_grouped_worklist_smem_check: bool = False,
+) -> str:
+    tcgen05_cluster_m = 1
+    if config is not None:
+        tcgen05_cluster_m = _tcgen05_cluster_m(config)
+    tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(config)
+    env_choice = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
+    support = get_cute_mma_support()
+    if env_choice != "auto":
+        if env_choice not in support.supported_impls:
+            raise exc.BackendUnsupported(
+                "cute",
+                (
+                    f"Requested HELION_CUTE_MMA_IMPL={env_choice!r} is not supported "
+                    f"on this machine. Supported: {support.supported_impls}"
+                ),
+            )
+        if _mma_impl_matches_problem_shape(
+            env_choice,
+            input_dtype,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            tcgen05_cluster_m=tcgen05_cluster_m,
+            tcgen05_large_bn_proof=tcgen05_large_bn_proof,
+        ):
+            if env_choice == "tcgen05" and _tcgen05_candidate_exceeds_smem(
+                input_dtype,
+                input_device=input_device,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                config=config,
+                defer_grouped_worklist_smem_check=defer_grouped_worklist_smem_check,
+            ):
+                return "universal"
+            return env_choice
+        return "universal"
+    if _mma_impl_matches_problem_shape(
+        "tcgen05",
+        input_dtype,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        tcgen05_cluster_m=tcgen05_cluster_m,
+        tcgen05_large_bn_proof=tcgen05_large_bn_proof,
+    ):
+        tcgen05_ok = tcgen05_supports_input_dtype(support, input_dtype)
+        if tcgen05_ok and not _tcgen05_candidate_exceeds_smem(
+            input_dtype,
+            input_device=input_device,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            config=config,
+            defer_grouped_worklist_smem_check=defer_grouped_worklist_smem_check,
+        ):
+            return "tcgen05"
+    if _mma_impl_matches_problem_shape("warp", input_dtype, bm=bm, bn=bn, bk=bk):
+        if support.warp_f16bf16:
+            return "warp"
+    return "universal"
+
+
+def _make_tiled_mma_setup(
+    mma_impl: str,
+    tiled_mma: str,
+    thr_mma: str,
+    mma_thread_linear: str,
+    input_dtype_str: str,
+    acc_dtype_str: str,
+    bm: int,
+    bn: int,
+    *,
+    tcgen05_cluster_m: int = 1,
+    a_k_major: bool = True,
+    b_k_major: bool = False,
+    tcgen05_use_2cta_instrs: bool | None = None,
+) -> list[ast.AST]:
+    if mma_impl == "warp":
+        tiled_mma_expr = (
+            "cute.make_tiled_mma("
+            "cute.make_mma_atom("
+            f"cute.nvgpu.warp.MmaF16BF16Op({input_dtype_str}, {acc_dtype_str}, (16, 8, 16))"
+            f"), atom_layout_mnk=({bm // 16}, 1, 1))"
+        )
+    elif mma_impl == "tcgen05":
+        tiled_mma_expr = _tcgen05_tiled_mma_expr(
+            input_dtype_str,
+            acc_dtype_str,
+            bm,
+            bn,
+            tcgen05_cluster_m=tcgen05_cluster_m,
+            a_k_major=a_k_major,
+            b_k_major=b_k_major,
+            use_2cta_instrs=tcgen05_use_2cta_instrs,
+        )
+    else:
+        assert mma_thread_linear
+        return [
+            statement_from_string(
+                f"{tiled_mma} = cute.make_tiled_mma("
+                f"cute.nvgpu.MmaUniversalOp(abacc_dtype={acc_dtype_str}), "
+                f"atom_layout_mnk=({bm}, {bn}, 1))"
+            ),
+            statement_from_string(
+                f"{thr_mma} = {tiled_mma}.get_slice({mma_thread_linear})"
+            ),
+        ]
+    return [
+        statement_from_string(f"{tiled_mma} = {tiled_mma_expr}"),
+        statement_from_string(
+            f"{thr_mma} = {tiled_mma}.get_slice({mma_thread_linear})"
+        ),
+    ]
+
+
+def _tcgen05_tiled_mma_expr(
+    input_dtype_str: str,
+    acc_dtype_str: str,
+    bm: int,
+    bn: int,
+    *,
+    tcgen05_cluster_m: int = 1,
+    a_k_major: bool = True,
+    b_k_major: bool = False,
+    use_2cta_instrs: bool | None = None,
+) -> str:
+    # ``use_2cta_instrs`` lets the caller thread the resolved CtaGroup decision
+    # (which depends on the input dtype, not just bm/cluster_m) instead of
+    # re-deriving it here without dtype context. When omitted, fall back to the
+    # bm/cluster_m derivation for the legacy bm=256 family and non-fp8 callers.
+    if use_2cta_instrs is None:
+        use_2cta_instrs = _tcgen05_use_2cta_instrs(
+            bm=bm, cluster_m=tcgen05_cluster_m, input_dtype=input_dtype_str
+        )
+    cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.ONE"
+    if use_2cta_instrs:
+        cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.TWO"
+    a_major_expr = (
+        "cute.nvgpu.OperandMajorMode.K"
+        if a_k_major
+        else "cute.nvgpu.OperandMajorMode.MN"
+    )
+    b_major_expr = (
+        "cute.nvgpu.OperandMajorMode.K"
+        if b_k_major
+        else "cute.nvgpu.OperandMajorMode.MN"
+    )
+    return (
+        "cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
+        f"{input_dtype_str}, "
+        f"{input_dtype_str}, "
+        f"{a_major_expr}, "
+        f"{b_major_expr}, "
+        f"{acc_dtype_str}, "
+        f"{cta_group_expr}, "
+        f"({bm}, {bn}), "
+        "cute.nvgpu.tcgen05.OperandSource.SMEM)"
+    )
+
+
+def _new_tcgen05_layout_plan(df: DeviceFunction) -> _Tcgen05LayoutPlan:
+    return _Tcgen05LayoutPlan(
+        exec_active=df.new_var("tcgen05_exec_active"),
+        smem_a_layout=df.new_var("sA_layout"),
+        smem_b_layout=df.new_var("sB_layout"),
+        c_layout=df.new_var("tcgen05_c_layout"),
+        epi_tile=df.new_var("tcgen05_epi_tile"),
+        tmem_load_atom=df.new_var("tcgen05_tmem_load_atom"),
+        acc_tmem_cols=df.new_var("tcgen05_acc_tmem_cols"),
+        tmem_holding_buf=df.new_var("tcgen05_tmem_holding_buf"),
+        tmem_dealloc_mbar_ptr=df.new_var("tcgen05_tmem_dealloc_mbar_ptr"),
+        tmem_alloc_barrier=df.new_var("tcgen05_tmem_alloc_barrier"),
+        tmem_allocator=df.new_var("tcgen05_tmem_allocator"),
+        acc_pipeline_barriers=df.new_var("tcgen05_acc_pipeline_barriers"),
+        acc_pipeline_producer_group=df.new_var("tcgen05_acc_pipeline_producer_group"),
+        acc_pipeline_consumer_group=df.new_var("tcgen05_acc_pipeline_consumer_group"),
+        acc_pipeline=df.new_var("tcgen05_acc_pipeline"),
+        acc_producer_state=df.new_var("tcgen05_acc_producer_state"),
+        acc_consumer_state=df.new_var("tcgen05_acc_consumer_state"),
+        epilogue_rest_mode=df.new_var("tcgen05_epilogue_rest_mode"),
+        acc_producer_state2=df.new_var("tcgen05_msub_acc_producer_state"),
+    )
+
+
+def _make_tcgen05_layout_plan_setup(
+    plan: _Tcgen05LayoutPlan,
+    tiled_mma: str,
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    ab_stage_count: int,
+    is_two_cta: bool,
+    input_dtype_str: str,
+    acc_dtype_str: str,
+    epi_elem_dtype_str: str | None = None,
+    smem_swizzle_a: int | None = None,
+    smem_swizzle_b: int | None = None,
+    explicit_epi_tile_m: int | None = None,
+    explicit_epi_tile_n: int | None = None,
+    nm_explicit_store_wave: bool = False,
+    a_k_major: bool = True,
+    b_k_major: bool = False,
+    c_layout: str = "cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+) -> list[ast.AST]:
+    # `compute_epilogue_tile_shape` must receive `elem_ty_d` and `elem_ty_c`
+    # equal to the eventual D-output dtype so the helper takes the
+    # with-source branch (e.g. bf16 → `tile_n=64`) rather than the
+    # `disable_source=True` branch (`tile_n=32`); the matmul-plan epi_tile
+    # built here, the store-side epi_tile in
+    # `_codegen_cute_store_tcgen05_tile`, and the wrapper-side TMA atom in
+    # `helion/runtime/__init__.py` must all see the same `tile_n`. When
+    # `epi_elem_dtype_str` is omitted the input dtype is used as a fallback;
+    # the store-side equality check on the registered `CuteTcgen05StoreValue`
+    # is the loud-failure backstop for any mismatch.
+    if epi_elem_dtype_str is None:
+        epi_elem_dtype_str = input_dtype_str
+    if (explicit_epi_tile_m is None) != (explicit_epi_tile_n is None):
+        raise exc.BackendUnsupported(
+            "cute",
+            "explicit tcgen05 epilogue tile requires both tile dimensions",
+        )
+    # The bm=128 CtaGroup.TWO family uses the per-CTA epilogue tile (m of 64,
+    # ``use_2cta=True``, no-source) -- see
+    # ``tcgen05_two_cta_m128_epilogue_tile_expr``. ``get_tmem_load_op`` and the
+    # SMEM staging on this path must also see the per-CTA M of ``bm // 2``;
+    # the legacy bm=256/bm=128-1CTA paths keep the full ``bm``. Resolved through
+    # the shared helper so this device-side ``(epi_tile_m, epi_tile_expr)`` pair
+    # stays identical to the store side in ``memory_ops.py``.
+    explicit_epi_tile_expr = (
+        tcgen05_explicit_epilogue_tile_expr(explicit_epi_tile_m, explicit_epi_tile_n)
+        if explicit_epi_tile_m is not None and explicit_epi_tile_n is not None
+        else None
+    )
+    epi_tile_m, epi_tile_expr = tcgen05_resolve_epilogue_tile(
+        bm=bm,
+        bn=bn,
+        is_two_cta=is_two_cta,
+        elem_dtype=epi_elem_dtype_str,
+        c_layout=plan.c_layout,
+        explicit_expr=explicit_epi_tile_expr,
+    )
+    tmem_load_atom_expr = (
+        "cute.make_copy_atom("
+        "cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x4), "
+        f"{acc_dtype_str})"
+        if nm_explicit_store_wave
+        else (
+            "cutlass.utils.blackwell_helpers.get_tmem_load_op("
+            f"({epi_tile_m}, {bn}, {bk}), {plan.c_layout}, "
+            f"{acc_dtype_str}, {acc_dtype_str}, {plan.epi_tile}, {is_two_cta!s})"
+        )
+    )
+    return [
+        statement_from_string(
+            f"{plan.smem_a_layout} = "
+            f"{tcgen05_smem_layout_expr(tiled_mma=tiled_mma, bm=bm, bn=bn, bk=bk, dtype_str=input_dtype_str, num_stages=ab_stage_count, operand='a', swizzle_override=smem_swizzle_a, k_major=a_k_major)}"
+        ),
+        statement_from_string(
+            f"{plan.smem_b_layout} = "
+            f"{tcgen05_smem_layout_expr(tiled_mma=tiled_mma, bm=bm, bn=bn, bk=bk, dtype_str=input_dtype_str, num_stages=ab_stage_count, operand='b', swizzle_override=smem_swizzle_b, k_major=b_k_major)}"
+        ),
+        statement_from_string(f"{plan.c_layout} = {c_layout}"),
+        statement_from_string(f"{plan.epi_tile} = {epi_tile_expr}"),
+        statement_from_string(f"{plan.tmem_load_atom} = {tmem_load_atom_expr}"),
+        statement_from_string(
+            f"{plan.epilogue_rest_mode} = cute.make_layout(1, stride=0)"
+        ),
+    ]
+
+
+def _new_tcgen05_sched_pipeline_plan(
+    df: DeviceFunction,
+    *,
+    use_clc: bool = False,
+) -> _Tcgen05SchedPipelinePlan:
+    """Allocate variable names for the scheduler-broadcast pipeline.
+
+    The ``tcgen05_sched_pipeline_*`` prefix family is shared with
+    the existing cluster_m=2 ONE-CTA bridge emission in
+    ``program_id._build_tcgen05_persistent_layout``: ``df.new_var``
+    appends an incrementing suffix so the two emissions cannot
+    actually collide, but a future cycle that consolidates the two
+    paths should drive both call sites through this allocator.
+
+    ``use_clc=True`` additionally allocates the CLC response buffer
+    + mbarrier variable names (G2-H, cute_plan.md). Static path
+    leaves them empty so consumers can detect via simple string
+    truthiness.
+    """
+    clc_response_smem_ptr = ""
+    clc_response_tensor = ""
+    clc_mbar_smem_ptr = ""
+    clc_mbar_tensor = ""
+    clc_mbar_phase = ""
+    if use_clc:
+        clc_response_smem_ptr = df.new_var("tcgen05_clc_response_smem_ptr")
+        clc_response_tensor = df.new_var("tcgen05_clc_response_tensor")
+        clc_mbar_smem_ptr = df.new_var("tcgen05_clc_mbar_smem_ptr")
+        clc_mbar_tensor = df.new_var("tcgen05_clc_mbar_tensor")
+        clc_mbar_phase = df.new_var("tcgen05_clc_mbar_phase")
+    return _Tcgen05SchedPipelinePlan(
+        barriers=df.new_var("tcgen05_sched_pipeline_mbars"),
+        producer_group=df.new_var("tcgen05_sched_pipeline_producer_group"),
+        consumer_group=df.new_var("tcgen05_sched_pipeline_consumer_group"),
+        pipeline=df.new_var("tcgen05_sched_pipeline"),
+        producer_state=df.new_var("tcgen05_sched_pipeline_producer_state"),
+        consumer_state=df.new_var("tcgen05_sched_pipeline_consumer_state"),
+        clc_response_smem_ptr=clc_response_smem_ptr,
+        clc_response_tensor=clc_response_tensor,
+        clc_mbar_smem_ptr=clc_mbar_smem_ptr,
+        clc_mbar_tensor=clc_mbar_tensor,
+        clc_mbar_phase=clc_mbar_phase,
+    )
+
+
+def _emit_clc_smem_setup(plan: _Tcgen05SchedPipelinePlan) -> list[ast.AST]:
+    """Emit the SMEM allocation + CLC mbarrier-init for the CLC path.
+
+    Mirrors Quack's ``TileScheduler._init_clc_mbarrier``: allocate a
+    SMEM tile sized for the CLC response (4 Int32 = 16 bytes) and a
+    one-arrival mbarrier that the scheduler warp uses with
+    ``nvvm.clusterlaunchcontrol_try_cancel``. Quack packs the
+    mbarrier next to the response in a single SMEM tile keyed by
+    pipeline index; Helion's CLC path uses the simpler one-stage
+    layout (the broadcast pipeline already serializes the consumer
+    handoff), so a single 4-Int32 response buffer + a 2-Int32
+    mbarrier (one Int64 cell) is enough.
+
+    The mbarrier itself is initialized with ``mbarrier_init(addr,
+    1)`` — only the single CLC issuer (lane 0 of the scheduler warp)
+    arrives — and a phase counter is materialized so the wait
+    flips between 0/1 each iteration. ``mbarrier_init_fence`` +
+    ``sync_warp`` follow Quack's pattern; both are warp-uniform and
+    happen before the persistent loop begins.
+
+    Caller wires this into the prefix immediately after the
+    ``_emit_sched_pipeline_setup`` block so the alloc / init pair
+    sits where the existing pipeline init lives.
+    """
+    assert plan.clc_response_smem_ptr, (
+        "CLC SMEM setup requires plan.clc_response_smem_ptr; was "
+        "_new_tcgen05_sched_pipeline_plan called with use_clc=True?"
+    )
+    return [
+        # CLC response buffer: 4 Int32 (bidx, bidy, bidz, valid).
+        # ``cute.arch.clc_response`` reads the 16-byte block back
+        # into 4 register values.
+        statement_from_string(
+            f"{plan.clc_response_smem_ptr} = cute.arch.alloc_smem("
+            f"cutlass.Int32, cutlass.Int32(4), alignment=16)"
+        ),
+        statement_from_string(
+            f"{plan.clc_response_tensor} = cute.make_tensor("
+            f"{plan.clc_response_smem_ptr}, cute.make_layout((4,), stride=(1,)))"
+        ),
+        # CLC mbarrier: one Int64 cell. ``mbarrier_init`` arms it
+        # with arrival count 1 (only the CLC issuer arrives via
+        # ``mbarrier_arrive_and_expect_tx``).
+        statement_from_string(
+            f"{plan.clc_mbar_smem_ptr} = cute.arch.alloc_smem("
+            f"cutlass.Int64, cutlass.Int32(1), alignment=8)"
+        ),
+        statement_from_string(
+            f"{plan.clc_mbar_tensor} = cute.make_tensor("
+            f"{plan.clc_mbar_smem_ptr}, cute.make_layout((1,), stride=(1,)))"
+        ),
+        # Phase counter for the CLC mbarrier wait. The scheduler-warp
+        # body flips this each iteration; initialized to 0 so the
+        # first wait pairs with the first arrival's phase.
+        statement_from_string(f"{plan.clc_mbar_phase} = cutlass.Int32(0)"),
+    ]
+
+
+def _emit_sched_pipeline_setup(
+    plan: _Tcgen05SchedPipelinePlan,
+    *,
+    sched_stage_count: int,
+    consumer_arrive_count: int,
+    cluster_size: int,
+    defer_sync: bool,
+    producer_arrive_count: int,
+    consumer_mask_to_leader: bool = True,
+) -> list[ast.AST]:
+    """Emit the prefix statements that construct the sched pipeline.
+
+    Mirrors Quack's ``make_sched_pipeline`` in
+    ``quack/quack/gemm_sm100.py``. The cluster_m=2 ONE-CTA bridge
+    diagnostic in
+    ``program_id.Tcgen05PersistentProgramIDs._build_tcgen05_persistent_layout``
+    already inlines an equivalent emission for a different role
+    topology (peer-CTA work-tile publish via
+    ``_cute_store_shared_remote_x4``); G2-C should consider
+    consolidating that path onto this helper rather than carrying
+    two parallel emitters.
+
+    Parameters:
+
+    - ``consumer_arrive_count``: caller-supplied total number of
+      consumer arrivals per stage on the empty barrier. With
+      ``consumer_mask_to_leader=True`` (Quack pattern) every CTA's
+      consumer release routes to the leader CTA's empty barrier so
+      this is the cluster-wide total
+      (``warps_per_cta * 32 * cluster_size``). With
+      ``consumer_mask_to_leader=False`` releases stay local so this
+      is the per-CTA count (``warps_per_cta * 32``). Every consumer
+      lane arrives after reading the shared scheduler mailbox.
+    - ``cluster_size``: cluster-multicast factor. ``> 1`` lets
+      ``defer_sync`` participate in cluster-wide barrier init.
+    - ``consumer_mask_to_leader``: ``True`` emits
+      ``consumer_mask=cutlass.Int32(0)`` so every consumer release
+      arrives on the leader CTA's empty barrier (matches Quack's
+      single-cluster-leader scheduler topology where only the
+      leader runs the producer side and broadcasts via peer-CTA
+      writes). ``False`` omits the mask so each CTA's empty
+      barrier collects its own consumers' arrivals (matches the
+      "every CTA runs its own scheduler that publishes to its own
+      consumers" topology used by the WITH_SCHEDULER strategy).
+      Picking the wrong topology for the actual scheduler
+      placement causes a clean-on-cluster_m=1 / hang-on-cluster_m>1
+      regression because the asymmetric arrival counts mismatch.
+      Ignored when ``cluster_size <= 1`` (no mask is emitted in
+      either case).
+    - ``defer_sync``: emits ``defer_sync=True`` so the pipeline
+      participates in the cluster-wide deferred-init protocol
+      coordinated via ``pipeline_init_arrive`` /
+      ``pipeline_init_wait``. The caller threads
+      ``tcgen05_use_cluster_deferred_pipelines`` (see
+      ``cute_mma._codegen_cute_mma``) the same way the AB / acc
+      pipelines do via ``tcgen05_defer_pipeline_sync_arg``;
+      forgetting this on a clustered call site risks barrier-init
+      ordering hangs.
+
+    ``num_stages`` and ``make_pipeline_state`` count arguments are
+    bare ints (matching the existing AB / acc / c pipeline
+    emissions), but the SMEM mbar size and the consumer-arrive
+    count are wrapped in ``cutlass.Int32(...)`` literals (also
+    matching the existing emissions and the established pattern in
+    ``program_id.py``'s scheduler emission). No named compile-time
+    constants are materialized — same convention as
+    ``_make_tcgen05_layout_plan_setup``.
+    """
+    extra_args = ""
+    if cluster_size > 1 and consumer_mask_to_leader:
+        extra_args += ", consumer_mask=cutlass.Int32(0)"
+    if defer_sync:
+        extra_args += ", defer_sync=True"
+    return [
+        statement_from_string(
+            f"{plan.barriers} = cute.arch.alloc_smem("
+            f"cutlass.Int64, cutlass.Int32({sched_stage_count * 2}))"
+        ),
+        statement_from_string(
+            f"{plan.producer_group} = "
+            "cutlass.pipeline.CooperativeGroup("
+            f"cutlass.pipeline.Agent.Thread, {producer_arrive_count})"
+        ),
+        statement_from_string(
+            f"{plan.consumer_group} = "
+            "cutlass.pipeline.CooperativeGroup("
+            f"cutlass.pipeline.Agent.Thread, cutlass.Int32({consumer_arrive_count}))"
+        ),
+        statement_from_string(
+            f"{plan.pipeline} = cutlass.pipeline.PipelineAsync.create("
+            f"num_stages={sched_stage_count}, "
+            f"producer_group={plan.producer_group}, "
+            f"consumer_group={plan.consumer_group}, "
+            f"barrier_storage={plan.barriers}"
+            f"{extra_args})"
+        ),
+        statement_from_string(
+            f"{plan.producer_state} = cutlass.pipeline.make_pipeline_state("
+            f"cutlass.pipeline.PipelineUserType.Producer, {sched_stage_count})"
+        ),
+        statement_from_string(
+            f"{plan.consumer_state} = cutlass.pipeline.make_pipeline_state("
+            f"cutlass.pipeline.PipelineUserType.Consumer, {sched_stage_count})"
+        ),
+    ]
+
+
+def _tcgen05_aux_pipeline_stage_count_from_config(config: object) -> int:
+    """Return the aux-pipeline stage count for ``config``, defaulting to
+    ``TCGEN05_AUX_STAGE_COUNT_DEFAULT`` when the knob is absent.
+
+    Bad values raise via the downstream
+    ``_new_tcgen05_aux_pipeline_plan`` assert; the validator gate
+    (``_validate_int_enum_config`` in ``tcgen05_config.py``) is the
+    single source of truth that rejects out-of-range values before
+    they reach codegen, so any value seen here that fails the
+    downstream assert is a programmer bug, not user input.
+    """
+    return _tcgen05_config_int(
+        config, TCGEN05_AUX_STAGES_CONFIG_KEY, TCGEN05_AUX_STAGE_COUNT_DEFAULT
+    )
+
+
+def _tcgen05_consumer_regs_from_config(config: object) -> int:
+    """Return the consumer-warp ``setmaxregister_increase`` ceiling for
+    ``config``.
+
+    Cycle 15 H2 (``cute_plan.md`` §6 Target 8). The default preserves
+    cycle-14 byte-identical emission outside the opt-in grouped static
+    scheduler path. The grouped static scheduler defaults to 240 to keep
+    the generated proof under the ptxas 255-register ceiling without
+    changing dense persistent kernels. Explicit ``tcgen05_consumer_regs``
+    configs still win.
+
+    Lower values force ``ptxas`` to cap the consumer-warp per-thread register
+    count. The validator
+    (``_validate_int_enum_config`` in ``tcgen05_config.py``) is the
+    single source of truth that rejects out-of-range values before
+    they reach codegen; values seen here that are outside
+    ``TCGEN05_CONSUMER_REGS_CHOICES`` are programmer bugs, not user
+    input, so this helper falls back to the default rather than
+    asserting (matching the ``_tcgen05_aux_pipeline_stage_count_from_config``
+    pattern). The default is included in ``CHOICES`` so the
+    default-with-knob configuration emits the same code as the
+    default-without-knob configuration.
+    """
+    grouped_static = _tcgen05_grouped_mode(cast("_ConfigLike", config)) is not None
+    default = 240 if grouped_static else TCGEN05_CONSUMER_REGS_DEFAULT
+    value = cast("_ConfigLike", config).get(TCGEN05_CONSUMER_REGS_CONFIG_KEY, default)
+    if not isinstance(value, int):
+        return default
+    if value not in TCGEN05_CONSUMER_REGS_CHOICES:
+        return default
+    return value
+
+
+def _new_tcgen05_aux_pipeline_plan(
+    df: DeviceFunction,
+    *,
+    num_rings: int,
+    epi_tile_var: str,
+    use_tma_load: bool,
+    stage_count: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
+) -> _Tcgen05AuxPipelinePlan:
+    """Allocate variable names for the C-input warp's aux-tensor
+    SMEM-ring pipeline (``cute_plan.md`` §7.5.3.2).
+
+    ``num_rings`` is the number of aux-tensor descriptors registered
+    on the matmul plan; the producer body indexes the rings by
+    descriptor position, and the consumer-side flip in
+    ``memory_ops._aux_subtile_load_source`` consumes the same
+    ordering.
+
+    ``epi_tile_var`` is the matmul-plan ``epi_tile`` variable name;
+    the producer body uses it to subdivide the per-output-tile aux
+    GMEM region into epi-tile-sized chunks. The ``(bm, bn)`` block
+    shape is read directly from the matmul plan by the
+    producer-body codegen, so no block-shape fields are plumbed
+    through the aux pipeline plan.
+
+    ``stage_count`` controls the depth of the SMEM ring. Cycle 10
+    makes this config-driven so the T8 wide-N CLC + aux-TMA seed
+    family can sample ``{2, 3}`` while every other path keeps the
+    pre-cycle-10 default of 2 (preserving T1-T7 byte-identity).
+    """
+    assert num_rings >= 1, (
+        "aux pipeline plan requires at least one descriptor; the gate "
+        "in ``_codegen_cute_mma`` should not call this with an empty "
+        "descriptor tuple"
+    )
+    assert stage_count in TCGEN05_AUX_STAGE_COUNT_CHOICES, (
+        f"aux pipeline stage_count={stage_count!r} not in "
+        f"TCGEN05_AUX_STAGE_COUNT_CHOICES={TCGEN05_AUX_STAGE_COUNT_CHOICES!r}"
+    )
+    rings = tuple(
+        _Tcgen05AuxPerDescriptorRingNames(
+            smem_layout=df.new_var(f"tcgen05_aux_smem_layout_{idx}"),
+            smem_ptr=df.new_var(f"tcgen05_aux_smem_ptr_{idx}"),
+            smem=df.new_var(f"tcgen05_aux_smem_{idx}"),
+            tma_atom=(
+                df.new_var(f"tcgen05_aux_tma_atom_{idx}") if use_tma_load else None
+            ),
+            tma_tensor=(
+                df.new_var(f"tcgen05_aux_tma_tensor_{idx}") if use_tma_load else None
+            ),
+        )
+        for idx in range(num_rings)
+    )
+    return _Tcgen05AuxPipelinePlan(
+        barriers=df.new_var("tcgen05_aux_pipeline_mbars"),
+        producer_group=df.new_var("tcgen05_aux_pipeline_producer_group"),
+        consumer_group=df.new_var("tcgen05_aux_pipeline_consumer_group"),
+        pipeline=df.new_var("tcgen05_aux_pipeline"),
+        producer_state=df.new_var("tcgen05_aux_pipeline_producer_state"),
+        consumer_state=df.new_var("tcgen05_aux_pipeline_consumer_state"),
+        rings=rings,
+        use_tma_load=use_tma_load,
+        stage_count=stage_count,
+        epi_tile_var=epi_tile_var,
+    )
+
+
+def _emit_tcgen05_aux_pipeline_setup(
+    plan: _Tcgen05AuxPipelinePlan,
+    *,
+    descriptor_dtype_strs: tuple[str, ...],
+    tile_shape_expr: str,
+    c_input_warp_thread_count: int,
+    epi_warp_count: int,
+    defer_sync: bool,
+) -> list[ast.AST]:
+    """Emit the prefix statements that construct the aux SMEM rings
+    + ``c_pipeline_aux`` ``PipelineAsync`` for cycle 2 of the
+    producer-body split (``cute_plan.md`` §7.5.3.2).
+
+    Per descriptor, allocates a SMEM ring sized by
+    ``make_smem_layout_epi(<aux_dtype>, ROW_MAJOR, epi_tile,
+    plan.stage_count)`` — each ring stage holds ONE subtile
+    (``epi_tile``-shaped slice) of the per-output-tile aux region,
+    not the full ``(bm, bn)`` tile. Per-subtile staging keeps the
+    SMEM ring footprint at one ``epi_tile`` chunk per stage rather
+    than one ``(bm, bn)`` chunk, which is essential to fit
+    cluster_m=2 + ``tcgen05_ab_stages=3`` in the 228 KB B200 SMEM
+    cap. The producer issues one cooperative
+    ``cute.copy(GMEM_aux_subtile, SMEM_aux_ring[stage])`` *per
+    subtile* (looping over the per-output-tile subtile axis),
+    framed by ``producer_acquire`` / ``producer_commit`` / state
+    advance; the consumer issues one ``consumer_wait`` / Quack-
+    style ``tiled_copy_s2r`` ``cute.copy(SMEM_ring[stage], rmem)``
+    / ``consumer_release`` / state advance per subtile.
+    ``tile_shape_expr`` is the ``epi_tile`` variable name so the
+    SMEM ring sizing matches the producer-side subtile copy
+    extent. ``plan.stage_count`` controls the depth — cycle 10
+    makes it config-driven so the T8 wide-N CLC + aux-TMA seed
+    family can sample ``{2, 3}``.
+
+    Pipeline parameters:
+
+    - SIMT aux loads use ``producer_arrive_count =
+      c_input_warp_thread_count`` (32 for the single C-input warp).
+      The producer body issues ``producer_acquire`` /
+      ``producer_commit`` per-thread, so the cooperative-group
+      arrive count is per-thread. TMA aux loads use a
+      ``PipelineTmaAsync`` producer group matching the CUTLASS TMA
+      pipeline convention.
+    - TMA consumers elect one arrival per warp (``epi_warp_count``).
+      SIMT consumers all arrive (``epi_warp_count * 32``), matching
+      the conditional release in ``memory_ops._aux_subtile_load_source``.
+      Both paths retain the reader fence before releasing the stage.
+    - ``defer_sync`` mirrors the AB / acc / sched pipelines'
+      cluster-deferred-init participation so the
+      ``pipeline_init_arrive`` / ``pipeline_init_wait`` rendezvous
+      spans every pipeline.
+    """
+    extra_args = ", defer_sync=True" if defer_sync else ""
+    stage_count = plan.stage_count
+    lines: list[ast.AST] = []
+    for ring, dtype_str in zip(plan.rings, descriptor_dtype_strs, strict=True):
+        lines.extend(
+            [
+                statement_from_string(
+                    f"{ring.smem_layout} = "
+                    f"cutlass.utils.blackwell_helpers.make_smem_layout_epi("
+                    f"{dtype_str}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{tile_shape_expr}, {stage_count})"
+                ),
+                statement_from_string(
+                    f"{ring.smem_ptr} = cute.arch.alloc_smem("
+                    f"{dtype_str}, cute.cosize({ring.smem_layout}.outer), "
+                    "alignment=1024)"
+                ),
+                statement_from_string(
+                    f"{ring.smem} = cute.make_tensor("
+                    f"cute.recast_ptr({ring.smem_ptr}, "
+                    f"{ring.smem_layout}.inner, dtype={dtype_str}), "
+                    f"{ring.smem_layout}.outer)"
+                ),
+            ]
+        )
+    lines.append(
+        statement_from_string(
+            f"{plan.barriers} = cute.arch.alloc_smem("
+            f"cutlass.Int64, cutlass.Int32({stage_count * 2}))"
+        )
+    )
+    if plan.use_tma_load:
+        tx_terms = [
+            f"cute.size_in_bytes({dtype_str}, cute.slice_({ring.smem_layout}.outer, "
+            "(None, None, 0)))"
+            for ring, dtype_str in zip(plan.rings, descriptor_dtype_strs, strict=True)
+        ]
+        tx_count = " + ".join(tx_terms)
+        lines.extend(
+            [
+                statement_from_string(
+                    f"{plan.producer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread)"
+                ),
+                statement_from_string(
+                    f"{plan.consumer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, "
+                    f"cutlass.Int32({epi_warp_count}))"
+                ),
+                statement_from_string(
+                    f"{plan.pipeline} = cutlass.pipeline.PipelineTmaAsync.create("
+                    f"num_stages={stage_count}, "
+                    f"producer_group={plan.producer_group}, "
+                    f"consumer_group={plan.consumer_group}, "
+                    f"tx_count={tx_count}, "
+                    f"barrier_storage={plan.barriers}"
+                    f"{extra_args})"
+                ),
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                statement_from_string(
+                    f"{plan.producer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, "
+                    f"cutlass.Int32({c_input_warp_thread_count}))"
+                ),
+                statement_from_string(
+                    f"{plan.consumer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, "
+                    f"cutlass.Int32({epi_warp_count * 32}))"
+                ),
+                statement_from_string(
+                    f"{plan.pipeline} = cutlass.pipeline.PipelineAsync.create("
+                    f"num_stages={stage_count}, "
+                    f"producer_group={plan.producer_group}, "
+                    f"consumer_group={plan.consumer_group}, "
+                    f"barrier_storage={plan.barriers}"
+                    f"{extra_args})"
+                ),
+            ]
+        )
+    lines.extend(
+        [
+            statement_from_string(
+                f"{plan.producer_state} = cutlass.pipeline.make_pipeline_state("
+                f"cutlass.pipeline.PipelineUserType.Producer, {stage_count})"
+            ),
+            statement_from_string(
+                f"{plan.consumer_state} = cutlass.pipeline.make_pipeline_state("
+                f"cutlass.pipeline.PipelineUserType.Consumer, {stage_count})"
+            ),
+        ]
+    )
+    return lines
+
+
+def _validate_tcgen05_smem_swizzle_override(
+    *,
+    operand: str,
+    k_major: bool,
+    swizzle_bytes: int,
+    bm: int,
+    bn: int,
+    bk: int,
+    input_dtype: torch.dtype,
+) -> None:
+    """Reject illegal ``smem_swizzle_a/b`` overrides at codegen time.
+
+    CuTe's ``make_smem_layout_atom`` requires the major-mode bytes-per-row
+    to be a multiple of the swizzle pattern's contiguous bytes. The resolved
+    operand major mode determines the contiguous extent: K-major
+    operands use ``bk``; MN-major A uses ``bm`` and MN-major B uses ``bn``.
+
+    This helper computes the active bytes-per-row from the live tile
+    shape + dtype and rejects swizzle overrides that violate the atom
+    contract with a structured ``BackendUnsupported`` error so the
+    autotune surface drops the bad config rather than crashing inside
+    CuTe at runtime.
+
+    Caller has already verified ``swizzle_bytes`` is a member of
+    ``TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES`` (the data-model validator
+    in ``strategies.validate_tcgen05_strategy_invariants`` does that).
+    Here we layer the *contract* check (does the active tile fit the
+    requested swizzle?) on top of the *value* check.
+    """
+    assert swizzle_bytes in TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES, (
+        f"_validate_tcgen05_smem_swizzle_override: invalid swizzle byte "
+        f"{swizzle_bytes!r}; expected one of {TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r}"
+    )
+    # ``torch.dtype.itemsize`` is bytes; the major-mode size in bytes is
+    # the major-mode tile extent times the dtype width in bytes. (We
+    # could equivalently express this in bits to mirror CuTe's
+    # ``num_contiguous_bits`` constants — bytes is more readable and
+    # the comparison is exact since dtype widths divide 8 for every
+    # MMA-supported dtype.)
+    dtype_bytes = input_dtype.itemsize
+    assert operand in ("a", "b"), f"unexpected operand {operand!r}"
+    major_mode_axis, major_mode_extent = (
+        ("K", bk) if k_major else ("M", bm) if operand == "a" else ("N", bn)
+    )
+    major_mode_bytes = major_mode_extent * dtype_bytes
+    min_required = smem_swizzle_min_major_mode_bytes(swizzle_bytes)
+    if major_mode_bytes % min_required != 0:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 smem_swizzle_{operand}={swizzle_bytes} requires "
+            f"the {major_mode_axis}-axis bytes-per-row to be a multiple "
+            f"of {min_required} (CuTe SmemLayoutAtom contract); active "
+            f"tile shape (bm={bm}, bn={bn}, bk={bk}) with dtype "
+            f"{input_dtype!s} ({dtype_bytes}B) yields "
+            f"{major_mode_axis}-axis bytes={major_mode_bytes}",
+        )
+
+
+# ---- Aten lowering entry point (addmm/mm/bmm/baddbmm) ----
+
+
+def codegen_cute_mma(
+    ctx: LoweringContext,
+    node: Node,
+    with_acc: bool,
+) -> ast.AST | None:
+    """Generate MMA code for an aten addmm/mm node.  Returns None to fall back."""
+    from ..generate_ast import GenerateAST
+
+    if not isinstance(ctx.cg, GenerateAST):
+        return None
+    grouped_mode = _tcgen05_grouped_mode(ctx.cg.device_function.config)
+    row_union_requested = ctx.cg.device_function.config.get(
+        GROUPED_ROW_UNION_KEY, False
+    )
+    requested_schedule = _requested_tcgen05_grouped_schedule(grouped_mode)
+
+    def _unsupported_schedule(reason: str) -> None:
+        if physical_schedule(ctx.cg.device_function.config) is not None:
+            raise exc.BackendUnsupported(
+                "cute", "row-union physical schedule was not admitted: " + reason
+            )
+        if requested_schedule is not None:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} requires the "
+                "generated N,M-oriented worklist tcgen05 schedule; " + reason,
+            )
+        return None
+
+    if ctx.cg.current_grid_state is None:
+        return _unsupported_schedule("MMA was not inside a grid tile")
+    candidate = analyze_cute_mma_node(node, graphs=ctx.cg.codegen_graphs)
+    if candidate is not None and (candidate.with_acc != with_acc or candidate.is_dot):
+        candidate = None
+
+    rhs_node: Node | None
+    if candidate is None:
+        if node.target is not torch.ops.aten.addmm.default or not with_acc:
+            return _unsupported_schedule("MMA target was not grouped addmm")
+        if len(node.args) < 3:
+            return _unsupported_schedule("MMA operands were missing")
+        acc_node, lhs_arg, rhs_arg = node.args[:3]
+        if not all(isinstance(arg, Node) for arg in (acc_node, lhs_arg, rhs_arg)):
+            return _unsupported_schedule("MMA operands were not nodes")
+        assert isinstance(acc_node, Node)
+        assert isinstance(lhs_arg, Node)
+        assert isinstance(rhs_arg, Node)
+        allow_grouped_k_mask = grouped_mode is not None
+        rhs_info = _trace_to_mma_operand(
+            rhs_arg,
+            role="rhs",
+            allow_rank3_rhs_nt=True,
+            cg=ctx.cg,
+            allow_grouped_k_mask=allow_grouped_k_mask,
+            allow_rank3_rhs_mn_major=(
+                grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                or row_union_requested is True
+            ),
+        )
+        lhs_info = _trace_to_mma_operand(lhs_arg, role="lhs", cg=ctx.cg)
+        if lhs_info is not None and rhs_info is not None:
+            rhs_info = _with_shared_rhs_group(ctx.cg, lhs_info, rhs_info)
+        if rhs_info is None or not rhs_info.rhs_is_grouped:
+            return _unsupported_schedule("MMA operands did not expose group metadata")
+        acc_expr = (
+            None
+            if _is_zero_init_acc_node(acc_node, graphs=ctx.cg.codegen_graphs)
+            else ctx.to_ast(ctx.env[acc_node])
+        )
+        mma: _CuteMmaNode | Node = lhs_arg
+        rhs_node = rhs_arg
+    else:
+        mma = candidate
+        rhs_node = None
+        if with_acc:
+            acc_node = candidate.acc
+            assert acc_node is not None
+            acc_expr = (
+                ctx.to_ast(ctx.env[acc_node])
+                if candidate.requires_accumulator_seed
+                else None
+            )
+        else:
+            acc_expr = None
+
+    result = _emit_mma_pipeline(
+        ctx.cg,
+        mma,
+        rhs_node,
+        acc_expr=acc_expr,
+        fx_node=node,
+        lowering_ctx=ctx,
+        grouped_mode=grouped_mode,
+    )
+    if result is None:
+        return _unsupported_schedule("MMA pipeline was not admitted")
+    return result
+
+
+def codegen_cute_mma_direct_mm(
+    ctx: LoweringContext,
+    node: Node,
+    *,
+    serial_k_extent: int | None,
+) -> ast.AST | None:
+    from ..generate_ast import GenerateAST
+
+    if not isinstance(ctx.cg, GenerateAST):
+        return None
+    plan = getattr(ctx, "cute_matmul_plan", None)
+    if not isinstance(plan, MatmulExecutionPlan):
+        return None
+    if plan.kind is not MatmulExecutionKind.DIRECT_GROUPED_N:
+        return None
+    if serial_k_extent is None or serial_k_extent <= 0:
+        return None
+    if node.target is not torch.ops.aten.mm.default:
+        return None
+
+    lhs_node = node.args[0]
+    rhs_node = node.args[1]
+    if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
+        return None
+    lhs_info = _direct_load_tensor(lhs_node)
+    rhs_info = _direct_load_tensor(rhs_node)
+    if lhs_info is None or rhs_info is None:
+        return None
+    lhs_load, _, lhs_fake = lhs_info
+    rhs_load, _, rhs_fake = rhs_info
+    # The grouped-N tiles re-read both operands from global memory at the mm.
+    if _cute_matmul_reread_unsafe(ctx.cg, lhs_load) or _cute_matmul_reread_unsafe(
+        ctx.cg, rhs_load
+    ):
+        return None
+    lhs_val = lhs_node.meta.get("val")
+    rhs_val = rhs_node.meta.get("val")
+    if (
+        lhs_fake.ndim != 2
+        or rhs_fake.ndim != 2
+        or not isinstance(lhs_val, torch.Tensor)
+        or not isinstance(rhs_val, torch.Tensor)
+        or lhs_val.ndim != 2
+        or rhs_val.ndim != 2
+    ):
+        return None
+    if lhs_fake.dtype not in (torch.float16, torch.bfloat16):
+        return None
+    load_plan = analyze_direct_grouped_n_loads(
+        lhs_load,
+        rhs_load,
+        k_extent=serial_k_extent,
+        n_extent=int(rhs_val.shape[1]),
+    )
+    if load_plan is None:
+        return None
+
+    mma_impl = _choose_mma_impl(
+        lhs_fake.dtype,
+        bm=plan.bm,
+        bn=plan.bn,
+        bk=plan.bk,
+        config=ctx.cg.device_function.config,
+        input_device=lhs_fake.device,
+    )
+    # The grouped-N direct path only emits warp MMA. Auto-selection prefers
+    # tcgen05 for plan.bm in (64, 128), but tcgen05 isn't implemented here, so
+    # transparently fall back to warp on tcgen05-capable machines as long as
+    # the user didn't explicitly request a different implementation.
+    if (
+        mma_impl == "tcgen05"
+        and os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower() == "auto"
+        and _mma_impl_matches_problem_shape(
+            "warp", lhs_fake.dtype, bm=plan.bm, bn=plan.bn, bk=plan.bk
+        )
+        and get_cute_mma_support().warp_f16bf16
+    ):
+        mma_impl = "warp"
+    if mma_impl != "warp":
+        return None
+
+    cg = ctx.cg
+    grid_state = cg.current_grid_state
+    if grid_state is None:
+        return None
+    prefix = grid_state.outer_prefix
+    scalar_axis = grid_state.block_thread_axes.get(plan.scalar_block_id)
+    if scalar_axis is None:
+        return None
+    scalar_strategy = cg.device_function.tile_strategy.block_id_to_strategy.get(
+        (plan.scalar_block_id,)
+    )
+    lane_var = getattr(scalar_strategy, "_synthetic_cute_lane_var", None)
+    if plan.lane_extent > 1 and not isinstance(lane_var, str):
+        return None
+
+    m_index_var = grid_state.strategy.index_var(plan.m_block_id)
+    m_local = _local_mma_coord_expr(cg, plan.m_block_id)
+    m_tile_origin = f"cutlass.Int32({m_index_var}) - ({m_local})"
+    scalar_thread = f"cutlass.Int32(cute.arch.thread_idx()[{scalar_axis}])"
+    lane_group_base = (
+        "cutlass.Int32(0)"
+        if not isinstance(lane_var, str)
+        else f"cutlass.Int32({lane_var}) * cutlass.Int32({plan.groups_per_lane})"
+    )
+    tile_group = f"({scalar_thread}) // cutlass.Int32({plan.bn})"
+    tile_n_local = f"({scalar_thread}) % cutlass.Int32({plan.bn})"
+    mma_active = f"({tile_n_local}) < cutlass.Int32({_mma_active_n_threads(mma_impl)})"
+    mma_thread_linear = f"{m_local} + ({tile_n_local}) * cutlass.Int32({plan.bm})"
+    m_size = int(lhs_fake.shape[0])
+    n_size = int(rhs_val.shape[1])
+    k_size = serial_k_extent
+
+    df = cg.device_function
+    input_dtype_str = (
+        "cutlass.Float16" if lhs_fake.dtype is torch.float16 else "cutlass.BFloat16"
+    )
+    acc_dtype_str = "cutlass.Float32"
+    lhs_arg_name = df.tensor_arg(lhs_fake).name
+    rhs_arg_name = df.tensor_arg(rhs_fake).name
+
+    tiled_mma = df.new_var("direct_tiled_mma")
+    thr_mma = df.new_var("direct_thr_mma")
+    acc_frag = df.new_var("direct_acc_frag")
+    smem_a_ptr = df.new_var("direct_smem_a")
+    smem_a = df.new_var("direct_sA")
+    smem_b_ptr = df.new_var("direct_smem_b")
+    smem_b = df.new_var("direct_sB")
+    smem_c_ptr = df.new_var("direct_smem_c")
+    smem_c = df.new_var("direct_sC")
+    tAsA = df.new_var("direct_tAsA")
+    tBsB = df.new_var("direct_tBsB")
+    tCsC = df.new_var("direct_tCsC")
+    rA = df.new_var("direct_rA")
+    rB = df.new_var("direct_rB")
+    k_offset_var = df.new_var("direct_k_offset")
+    result_var = df.new_var("direct_mma_result")
+
+    for stmt in _make_tiled_mma_setup(
+        mma_impl,
+        tiled_mma,
+        thr_mma,
+        mma_thread_linear,
+        input_dtype_str,
+        acc_dtype_str,
+        plan.bm,
+        plan.bn,
+    ):
+        prefix.append(stmt)
+    prefix.append(
+        statement_from_string(
+            f"{acc_frag} = cute.make_rmem_tensor("
+            f"{tiled_mma}.partition_shape_C(({plan.bm}, {plan.bn})), {acc_dtype_str})"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_a_ptr} = cute.arch.alloc_smem({input_dtype_str}, {plan.bm * plan.bk})"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_a} = cute.make_tensor("
+            f"{smem_a_ptr}, cute.make_layout(({plan.bm}, {plan.bk}), stride=({plan.bk}, 1)))"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_b_ptr} = cute.arch.alloc_smem({input_dtype_str}, {plan.bn * plan.bk})"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_b} = cute.make_tensor("
+            f"{smem_b_ptr}, "
+            f"cute.make_layout(({plan.bn}, {plan.bk}), stride=({plan.bk}, 1)))"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_c_ptr} = cute.arch.alloc_smem({acc_dtype_str}, {plan.bm * plan.bn}, alignment=128)"
+        )
+    )
+    prefix.append(
+        statement_from_string(
+            f"{smem_c} = cute.make_tensor("
+            f"{smem_c_ptr}, "
+            f"cute.make_layout(({plan.bm}, {plan.bn}), stride=({plan.bn}, 1)))"
+        )
+    )
+    cg.add_statement(statement_from_string(f"{result_var} = {acc_dtype_str}(0.0)"))
+    cg.add_statement(
+        statement_from_string(
+            f"if {mma_active}:\n"
+            f"    for _mma_i in range(cute.size({acc_frag})):\n"
+            f"        {acc_frag}[_mma_i] = {acc_dtype_str}(0.0)"
+        )
+    )
+    cg.add_statement(
+        statement_from_string(
+            f"for {k_offset_var} in range(0, {k_size}, {plan.bk}):\n"
+            f"    if {mma_active} and ({tile_group}) == cutlass.Int32(0):\n"
+            f"        for _load_i in range(({plan.bm * plan.bk} + {plan.bm * 2} - 1) // {plan.bm * 2}):\n"
+            f"            _flat = {mma_thread_linear} + cutlass.Int32(_load_i) * cutlass.Int32({plan.bm * 2})\n"
+            f"            if _flat < cutlass.Int32({plan.bm * plan.bk}):\n"
+            f"                _row = _flat // cutlass.Int32({plan.bk})\n"
+            f"                _col = _flat % cutlass.Int32({plan.bk})\n"
+            f"                _gm = {m_tile_origin} + _row\n"
+            f"                _gk = cutlass.Int32({load_plan.lhs_k_offset}) + cutlass.Int32({k_offset_var}) + _col\n"
+            f"                {smem_a}[_row, _col] = ("
+            f"{lhs_arg_name}[_gm, _gk] "
+            f"if _gm < cutlass.Int32({m_size}) and _gk < cutlass.Int32({load_plan.lhs_k_offset + k_size}) "
+            f"else {input_dtype_str}(0.0))\n"
+            f"    cute.arch.sync_threads()\n"
+            f"    for _n_group in range({plan.groups_per_lane}):\n"
+            f"        if {mma_active} and ({tile_group}) == cutlass.Int32(_n_group):\n"
+            f"            for _load_i in range(({plan.bn * plan.bk} + {plan.bm * 2} - 1) // {plan.bm * 2}):\n"
+            f"                _flat = {mma_thread_linear} + cutlass.Int32(_load_i) * cutlass.Int32({plan.bm * 2})\n"
+            f"                if _flat < cutlass.Int32({plan.bn * plan.bk}):\n"
+            f"                    _row = _flat // cutlass.Int32({plan.bk})\n"
+            f"                    _col = _flat % cutlass.Int32({plan.bk})\n"
+            f"                    _gn = cutlass.Int32({load_plan.rhs_n_offset}) + ({lane_group_base} + cutlass.Int32(_n_group)) * cutlass.Int32({plan.bn}) + _row\n"
+            f"                    _gk = cutlass.Int32({load_plan.rhs_k_offset}) + cutlass.Int32({k_offset_var}) + _col\n"
+            f"                    {smem_b}[_row, _col] = ("
+            f"{rhs_arg_name}[_gk, _gn] "
+            f"if _gn < cutlass.Int32({load_plan.rhs_n_offset + n_size}) and _gk < cutlass.Int32({load_plan.rhs_k_offset + k_size}) "
+            f"else {input_dtype_str}(0.0))\n"
+            f"        cute.arch.sync_threads()\n"
+            f"        if {mma_active} and ({tile_group}) == cutlass.Int32(_n_group):\n"
+            f"            {tAsA} = {thr_mma}.partition_A({smem_a})\n"
+            f"            {tBsB} = {thr_mma}.partition_B({smem_b})\n"
+            f"            {rA} = cute.make_fragment_like({tAsA}, {input_dtype_str})\n"
+            f"            {rB} = cute.make_fragment_like({tBsB}, {input_dtype_str})\n"
+            f"            for _mma_i in range(cute.size({rA})):\n"
+            f"                {rA}[_mma_i] = {tAsA}[_mma_i]\n"
+            f"            for _mma_i in range(cute.size({rB})):\n"
+            f"                {rB}[_mma_i] = {tBsB}[_mma_i]\n"
+            f"            cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})\n"
+            f"        cute.arch.sync_threads()"
+        )
+    )
+    cg.add_statement(
+        statement_from_string(
+            f"for _n_group in range({plan.groups_per_lane}):\n"
+            f"    if {mma_active} and ({tile_group}) == cutlass.Int32(_n_group):\n"
+            f"        {tCsC} = {thr_mma}.partition_C({smem_c})\n"
+            f"        for _mma_i in range(cute.size({tCsC})):\n"
+            f"            {tCsC}[_mma_i] = {acc_frag}[_mma_i]\n"
+            f"    cute.arch.sync_threads()\n"
+            f"    if ({tile_group}) == cutlass.Int32(_n_group):\n"
+            f"        {result_var} = {smem_c}[{m_local}, {tile_n_local}]\n"
+            f"    cute.arch.sync_threads()"
+        )
+    )
+    return expr_from_string(result_var)
+
+
+# ---- hl.dot entry point ----
+
+
+def codegen_cute_mma_dot(state: CodegenState) -> object | None:
+    """Generate MMA code for an hl.dot node.  Returns None to fall back."""
+    from ..generate_ast import GenerateAST
+
+    if not isinstance(state.codegen, GenerateAST):
+        return None
+    if state.codegen.current_grid_state is None:
+        return None
+    if state.fx_node is None:
+        return None
+    candidate = analyze_cute_mma_node(
+        state.fx_node, graphs=state.codegen.codegen_graphs
+    )
+    if candidate is None or not candidate.is_dot:
+        return None
+
+    acc_expr = None
+    if candidate.acc is not None and candidate.requires_accumulator_seed:
+        acc_expr = state.ast_arg(2)
+    result = _emit_mma_pipeline(
+        state.codegen,
+        candidate,
+        acc_expr=acc_expr,
+        fx_node=state.fx_node,
+        grouped_mode=_tcgen05_grouped_mode(state.device_function.config),
+    )
+    if result is None:
+        if is_pure_matmul_role_lifecycle_config(state.device_function.config):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_strategy='pure_matmul_role_lifecycle' requires hl.dot "
+                "to lower through the tcgen05 K-loop path",
+            )
+        return None
+
+    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
+    if isinstance(acc_proxy, FakeTensor) and acc_proxy.dtype != torch.float32:
+        return cast_ast(result, acc_proxy.dtype)
+
+    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
+    if isinstance(out_dtype_proxy, torch.dtype) and out_dtype_proxy != torch.float32:
+        return cast_ast(result, out_dtype_proxy)
+
+    return result
