@@ -305,6 +305,18 @@ def _fla():
 # it costs a device sync per probe, so never leave it on for a real run.
 GRAD_PROBE = bool(int(os.environ.get("SUFFIX_SFT_GRAD_PROBE", "0")))
 
+# --- host staging copies (SUFFIX_SFT_STAGE_ASYNC=1) --------------------------
+# Every host round trip below stages through a pinned buffer. `non_blocking`
+# is only safe when the buffer is never reused while the copy is in flight,
+# and these buffers ARE reused: a freed pinned block goes straight back to the
+# pinned allocator, so the next stage can land in it while the previous copy
+# is still reading it. Measured 2026-10-28 on qwen3.8-flash-next-nvfp4: async
+# staging corrupts the MoE expert backward past ~370 tokens (asynchronous
+# device-side assert in nvfp4_moe.quant_codes at `sf == 0`), and
+# CUDA_LAUNCH_BLOCKING=1 masks it. Blocking is the correct default; the sync
+# costs ~50 us per staged tensor, which is noise next to a multi-second step.
+STAGE_ASYNC = bool(int(os.environ.get("SUFFIX_SFT_STAGE_ASYNC", "0")))
+
 
 def _probe_report(tag, t, extra=""):
     """Print one line: is `t` finite, and how big is it."""
@@ -455,7 +467,7 @@ class _Park(torch.autograd.Function):
 class _Unpark(torch.autograd.Function):
     @staticmethod
     def forward(ctx, handle, slot):
-        return slot[0].to(handle.device, non_blocking=True, copy=True)
+        return slot[0].to(handle.device, non_blocking=STAGE_ASYNC, copy=True)
 
     @staticmethod
     def backward(ctx, g):
@@ -512,11 +524,11 @@ class _HostCkpt(torch.autograd.Function):
         ctx.host = []
         for a in args:
             if torch.is_tensor(a) and a.is_floating_point():
-                h = a if not a.is_cuda else _to_host(a, non_blocking=True)
+                h = a if not a.is_cuda else _to_host(a, non_blocking=STAGE_ASYNC)
                 ctx.host.append(h)
             else:
                 ctx.host.append(a)
-        dev = [h.to(device, non_blocking=True) if torch.is_tensor(h) else h for h in ctx.host]
+        dev = [h.to(device, non_blocking=STAGE_ASYNC) if torch.is_tensor(h) else h for h in ctx.host]
         with torch.no_grad():
             out = fn(*dev)
         if not isinstance(out, tuple):
@@ -525,7 +537,7 @@ class _HostCkpt(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
-        args = [h.to(ctx.device, non_blocking=True).detach() if torch.is_tensor(h) else h
+        args = [h.to(ctx.device, non_blocking=STAGE_ASYNC).detach() if torch.is_tensor(h) else h
                 for h in ctx.host]   # detach: fresh leaves even when .to() is a no-op
         for a in args:
             if torch.is_tensor(a) and a.is_floating_point():
@@ -536,7 +548,7 @@ class _HostCkpt(torch.autograd.Function):
             out = (out,)
         need = [a for a in args if torch.is_tensor(a) and a.is_floating_point()]
         # only differentiable outputs (int carries, no-grad side outputs are skipped)
-        pairs = [(o, x.to(ctx.device, non_blocking=True)) for o, x in zip(out, grads)
+        pairs = [(o, x.to(ctx.device, non_blocking=STAGE_ASYNC)) for o, x in zip(out, grads)
                  if torch.is_tensor(o) and o.requires_grad and torch.is_tensor(x)]
         outs, g = [o for o, _ in pairs], [x for _, x in pairs]
         # ONE backward pass: the recomputed inputs are leaves (requires_grad_
@@ -818,7 +830,7 @@ class TrainMode(contextlib.ContextDecorator):
                 h = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
             except RuntimeError:   # pinned pool exhausted: pageable still works
                 h = torch.empty(t.shape, dtype=t.dtype)
-            h.copy_(t, non_blocking=True)
+            h.copy_(t, non_blocking=STAGE_ASYNC)
             return ("h", h)
         return ("g", t)
 
@@ -826,7 +838,7 @@ class TrainMode(contextlib.ContextDecorator):
         tag, t = h
         if tag == "g":
             return t
-        return t.to(self.s.device, non_blocking=True)
+        return t.to(self.s.device, non_blocking=STAGE_ASYNC)
 
     def _tiled_mlp(self, orig, x):
         """Run a token-wise MLP in sequence tiles.
