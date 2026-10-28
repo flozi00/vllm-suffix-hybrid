@@ -1,0 +1,62 @@
+[
+  {
+    "key": {
+      "experts": 256,
+      "hidden": 2560,
+      "moe_intermediate": 640,
+      "topk": 10,
+      "act": "silu",
+      "experts_global": 512,
+      "numtokens": 1
+    },
+    "config": {
+      "block_sizes": [
+        1,
+        512
+      ],
+      "loop_orders": [
+        [
+          0,
+          1
+        ]
+      ],
+      "l2_groupings": [
+        2
+      ],
+      "range_unroll_factors": [
+        0,
+        1
+      ],
+      "range_warp_specializes": [
+        null,
+        false
+      ],
+      "range_num_stages": [
+        0,
+        1
+      ],
+      "range_multi_buffers": [
+        null,
+        true
+      ],
+      "range_flattens": [
+        null,
+        true
+      ],
+      "load_eviction_policies": [
+        "last",
+        "last"
+      ],
+      "num_warps": 4,
+      "num_stages": 6,
+      "indexing": [
+        "tensor_descriptor",
+        "tensor_descriptor",
+        "tensor_descriptor"
+      ],
+      "atomic_indexing": [],
+      "pid_type": "flat",
+      "host_tensor_descriptors": false
+    }
+  }
+]
