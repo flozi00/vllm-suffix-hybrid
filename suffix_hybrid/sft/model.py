@@ -261,6 +261,15 @@ def chunk_gated_delta_rule(q, k, v, g, beta, chunk=64):
     u = torch.linalg.solve_triangular(ut, vb, upper=False, unitriangular=True)
     w = torch.linalg.solve_triangular(ut, kb * g.exp()[..., None], upper=False,
                                       unitriangular=True)
+    if GRAD_PROBE:
+        # the UT transform is the only place this twin can blow up: `ut` is
+        # unit-lower-triangular by construction, so a huge |ut| entry makes
+        # solve_triangular ill-conditioned and the inverse explodes.
+        _probe_report("gdn.g", g, extra=f"min={float(g.min()):.3g} max={float(g.max()):.3g}")
+        _probe_report("gdn.decay", decay)
+        _probe_report("gdn.ut", ut, extra=f"absmax={float(ut.abs().max()):.3g}")
+        _probe_report("gdn.u", u)
+        _probe_report("gdn.w", w)
     q = q * g.exp()[..., None]
     k = k * (g[..., -1:] - g).exp()[..., None]
     last = g[..., -1].exp()[..., None, None]
@@ -288,6 +297,36 @@ def _fla():
                                       use_qk_l2norm_in_kernel=True)[0]
 
 
+# --- grad probe (SUFFIX_SFT_GRAD_PROBE=1) -----------------------------------
+# A training step that dies on "non-finite grad norm" says nothing about WHERE
+# the NaN was born: the norm is a single all-reduced scalar. This logs
+# finiteness per layer (the grad arriving at each layer's output) and per GDN
+# intermediate, so the first non-finite site names the culprit. Off by default;
+# it costs a device sync per probe, so never leave it on for a real run.
+GRAD_PROBE = bool(int(os.environ.get("SUFFIX_SFT_GRAD_PROBE", "0")))
+
+
+def _probe_report(tag, t, extra=""):
+    """Print one line: is `t` finite, and how big is it."""
+    if not torch.is_tensor(t):
+        return
+    ok = bool(torch.isfinite(t).all())
+    if ok:
+        n = float(t.detach().float().norm())
+        print(f"[sft grad] {tag}: finite norm={n:.6g} {extra}", file=sys.stderr, flush=True)
+    else:
+        bad = int((~torch.isfinite(t)).sum())
+        print(f"[sft grad] {tag}: NON-FINITE {bad}/{t.numel()} {extra}",
+              file=sys.stderr, flush=True)
+
+
+def _probe_grad(t, tag):
+    """Log the gradient that flows into `t` (i.e. the grad of the layer above)."""
+    if not (GRAD_PROBE and torch.is_tensor(t) and t.requires_grad):
+        return
+    t.register_hook(lambda g: _probe_report(tag, g))
+
+
 class _FlaRule(torch.autograd.Function):
     """[T, H, D] gated delta rule: forward = the serving kernel (exact serving
     numerics, Triton speed); backward = the chunked torch form recomputed
@@ -309,7 +348,13 @@ class _FlaRule(torch.autograd.Function):
             with torch.enable_grad():
                 part = [t[:, sl].detach().requires_grad_(True) for t in ins]
                 o = chunk_gated_delta_rule(*(x[None] for x in part))[0]
-                for dst, gr in zip(grads, torch.autograd.grad(o, part, do[:, sl])):
+                if GRAD_PROBE:
+                    _probe_report("gdn.recompute", o, extra=f"heads {sl.start}:{sl.stop}")
+                gs = torch.autograd.grad(o, part, do[:, sl])
+                if GRAD_PROBE:
+                    for nm, gr in zip(("dq", "dk", "dv", "dg", "dbeta"), gs):
+                        _probe_report(f"gdn.{nm}", gr, extra=f"heads {sl.start}:{sl.stop}")
+                for dst, gr in zip(grads, gs):
                     dst[:, sl] = gr
         return (*grads, None)
 
@@ -616,7 +661,7 @@ class TrainMode(contextlib.ContextDecorator):
                     _swap_out(layer)   # start every step with the tail on host
                 self._set(layer, "forward",
                           self._checkpointed(layer.forward, last=(_i == len(_layers) - 1),
-                                             mod=layer, swap=_swap))
+                                             mod=layer, swap=_swap, idx=_i))
             if _keep:
                 # serving shares these modules: put every layer back before the
                 # context exits, or the parity check runs against CPU weights
@@ -693,7 +738,7 @@ class TrainMode(contextlib.ContextDecorator):
                 if isinstance(op, IrOp) and op.get_priority():
                     st.enter_context(op.set_priority(["native"]))
 
-    def _checkpointed(self, fwd, last=False, mod=None, swap=False):
+    def _checkpointed(self, fwd, last=False, mod=None, swap=False, idx=None):
         def run(*args, **kwargs):
             if not torch.is_grad_enabled():
                 if swap:
@@ -755,6 +800,9 @@ class TrainMode(contextlib.ContextDecorator):
                 if last:   # the model's own norm/CE expect device tensors
                     out = tuple(o.to(self.s.device, non_blocking=False)
                                 if torch.is_tensor(o) else o for o in out)
+                if GRAD_PROBE:
+                    for o in (out if isinstance(out, (tuple, list)) else [out]):
+                        _probe_grad(o, f"layer{idx}")
                 return out
             if self.offload_saved:
                 vals = [v for k, v in slots if k in keys]
