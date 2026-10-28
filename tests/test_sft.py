@@ -906,6 +906,32 @@ def test_api_train_checkpoint_load_restore(tmp_path):
         W.SFT = None
 
 
+def test_api_snapshots_on_a_ten_percent_loss_drop(tmp_path):
+    """A mid-run checkpoint every time the loss beats the best so far by
+    ckpt_drop (relative). Snapshots land under runs/<run_id>/step-<n>/ and must
+    NOT touch latest.json -- a partial run can never reach serving."""
+    lm = build()
+    sft = sft_for(lm, rank=4)
+    s = _state(tmp_path, sft)
+    s.cfg.ckpt_drop = 0.10
+    try:
+        res = asyncio.run(s.train(dict(examples=CHATS + [{"prompt": "x", "completion": "yz"}],
+                                       steps=6, batch_size=4, learning_rate=5e-2)))
+        ck = res["checkpoints"]
+        assert ck, "a 6-step run at lr 5e-2 drops well past 10%; expected snapshots"
+        assert [c["step"] for c in ck] == sorted(c["step"] for c in ck)
+        assert all(b["loss"] <= a["loss"] * 0.9 for a, b in zip(ck, ck[1:]))
+        for c in ck:
+            d = s.hub.directory / c["path"]
+            assert (d / "adapter-tp0-of-1.safetensors").is_file()
+            assert json.loads((d / "metadata.json").read_text())["step"] == c["step"]
+        # the final publish is the only thing that moves latest.json
+        assert json.loads((s.hub.directory / "latest.json").read_text())["run_id"] == res["run_id"]
+        assert s.status["checkpoints"] == ck
+    finally:
+        W.SFT = None
+
+
 def test_api_validation_and_exclusivity(tmp_path):
     from fastapi import HTTPException
     s = _state(tmp_path, sft_for(build()))

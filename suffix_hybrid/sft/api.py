@@ -358,6 +358,33 @@ class State:
         _log("RESTORE FAILED: serving the BASE model; training refused until POST /v1/sft/load")
 
     # -- train --------------------------------------------------------------
+    async def snapshot(self, api, parent, run_id, step, loss):
+        """Mid-run checkpoint: this run's adapters at `step`, uploaded under
+        runs/<run_id>/step-<n>/ WITHOUT touching latest.json, so a partial run
+        can never reach serving. Returns (record, new parent sha)."""
+        d = self.hub.directory / "runs" / run_id / f"step-{step}"
+        d.mkdir(parents=True, exist_ok=True)
+        r = await self.rpc("save", {"dir": str(d)})
+        info = self.info or {}
+        files = [f"adapter-tp{i}-of-{info.get('tp', 1)}.safetensors"
+                 for i in range(info.get("tp", 1))]
+        meta = dict(run_id=run_id, checkpoint=f"runs/{run_id}/step-{step}", files=files,
+                    fingerprint=r["fingerprint"], step=step, loss=round(loss, 5),
+                    created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        (d / "metadata.json").write_text(json.dumps(meta, indent=2))
+        if api is not None:
+            from huggingface_hub import CommitOperationAdd
+            ops = [CommitOperationAdd(path_in_repo=f"{meta['checkpoint']}/{f}",
+                                      path_or_fileobj=str(d / f))
+                   for f in files + ["metadata.json"]]
+            commit = await asyncio.to_thread(
+                api.create_commit, repo_id=self.hub.repo_id, repo_type="model",
+                parent_commit=parent, operations=ops,
+                commit_message=f"SFT {run_id} step {step}: loss {loss:.5f}")
+            parent = getattr(commit, "oid", None) or parent
+        _log(f"[suffix sft] checkpoint step {step} loss {loss:.5f} -> {meta['checkpoint']}")
+        return dict(step=step, loss=round(loss, 5), path=meta["checkpoint"]), parent
+
     async def train(self, req):
         c = self.cfg
         examples, steps, bs = req.get("examples"), int(req.get("steps", 1)), int(req.get("batch_size", 1))
@@ -403,6 +430,7 @@ class State:
                 mem["kv_freed_gib"] = round(kv.get("free_gib", 0.0), 2)
             await self.rpc("begin", dict(lr=lr, weight_decay=wd))
             losses, first, checked = [], None, False
+            best, ckpts = None, []
             for step, idx in enumerate(schedule(len(data), steps, bs, int(req.get("seed", 0)))):
                 batch = [data[i] for i in idx]
                 norm = sum(sum(m[1:]) for _, m in batch)
@@ -429,9 +457,18 @@ class State:
                 losses.append(loss)
                 self.status.update(step=step + 1, loss=round(loss, 5), grad_norm=r["grad_norm"],
                                    memory=mem)
+                # A checkpoint every time the loss beats the best so far by
+                # ckpt_drop (relative, default 10%). Mid-run checkpoints go to
+                # runs/<run_id>/step-<n>/ and never touch latest.json, so a
+                # partial run can never reach serving.
+                if c.ckpt_drop > 0 and (best is None or loss <= best * (1.0 - c.ckpt_drop)):
+                    best = loss
+                    rec, parent = await self.snapshot(api, parent, run_id, step + 1, loss)
+                    ckpts.append(rec)
+                    self.status.update(checkpoints=ckpts)
                 await self.yield_to_serving(r["ms"])
             stage = "checkpoint"
-            run_dir.mkdir(parents=True)
+            run_dir.mkdir(parents=True, exist_ok=True)   # a mid-run snapshot may have made it
             r = await self.rpc("save", {"dir": str(run_dir)})
             info = self.info or {}
             files = [f"adapter-tp{i}-of-{info.get('tp', 1)}.safetensors" for i in range(info.get("tp", 1))]
@@ -441,6 +478,7 @@ class State:
                         parent=(self.status.get("checkpoint") or {}).get("run_id"),
                         examples=len(data), steps=steps, batch_size=bs, learning_rate=lr,
                         weight_decay=wd, loss_first=round(first, 5), loss=round(losses[-1], 5),
+                        checkpoints=ckpts,
                         created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
             (run_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
             stage = "upload"

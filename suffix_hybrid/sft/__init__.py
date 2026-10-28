@@ -114,6 +114,7 @@ class Config:
     repo_id: str = ""
     dir: str = ""
     parity_nats: float = 0.15
+    ckpt_drop: float = 0.10
     rpc_timeout_s: float = 600.0
 
     @classmethod
@@ -140,6 +141,7 @@ class Config:
                    max_steps=int(_env("MAX_STEPS", 1000)), repo_id=_env("REPO_ID", ""),
                    dir=_env("DIR", os.path.join(home, "sft")),
                    parity_nats=float(_env("PARITY_NATS", 0.15)),
+                   ckpt_drop=float(_env("CKPT_DROP", 0.10)),
                    rpc_timeout_s=float(_env("RPC_TIMEOUT_S", 600)))
 
 
