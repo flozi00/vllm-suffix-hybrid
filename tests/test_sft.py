@@ -1413,3 +1413,36 @@ def test_api_dataset_validation(tmp_path, monkeypatch):
         assert e.value.status_code == 400 and "SUFFIX_SFT_MAX_STEPS" in str(e.value.detail)
     finally:
         W.SFT = None
+
+
+def test_commit_retries_a_stale_parent():
+    """A concurrent commit to the model repo (a card update, a manual edit)
+    moves the head; the stale parent is refused with 412 and must be re-read
+    instead of turning a 2 h training chunk into a dead run."""
+    class Stale(Exception):
+        response = SimpleNamespace(status_code=412)
+
+    calls = []
+
+    class Api:
+        def create_commit(self, repo_id, repo_type, parent_commit, commit_message, operations):
+            calls.append(parent_commit)
+            if len(calls) == 1:
+                raise Stale()
+            return SimpleNamespace(oid="b" * 40)
+
+        def model_info(self, repo_id):
+            return SimpleNamespace(sha="c" * 40)
+
+    c = A._commit(Api(), "org/m", "a" * 40, [], "msg")
+    assert calls == ["a" * 40, "c" * 40] and c.oid == "b" * 40
+
+    class Always:
+        def create_commit(self, **kw):
+            raise Stale()
+
+        def model_info(self, repo_id):
+            return SimpleNamespace(sha="c" * 40)
+
+    with pytest.raises(Stale):      # a persistent 412 still fails loud
+        A._commit(Always(), "org/m", "a" * 40, [], "msg")

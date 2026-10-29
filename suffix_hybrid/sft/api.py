@@ -244,6 +244,30 @@ class Dataset:
         return out
 
 
+def _commit(api, repo_id, parent, ops, message, repo_type="model", attempts=3):
+    """create_commit, re-reading the head on 412.
+
+    A concurrent commit to the repo (a model-card update, a manual edit, another
+    run's publish) moves the head and the stale parent is refused with 412 --
+    which killed a 2 h training chunk on 2026-10-29. The parent is the only
+    stale part, so re-reading it and retrying is the fix, not a fallback.
+    """
+    for i in range(attempts):
+        try:
+            return api.create_commit(repo_id=repo_id, repo_type=repo_type,
+                                     parent_commit=parent, commit_message=message,
+                                     operations=ops)
+        except Exception as exc:  # noqa: BLE001 - keyed on the status code, re-raised otherwise
+            code = getattr(getattr(exc, "response", None), "status_code", None)
+            if code != 412 or i == attempts - 1:
+                raise
+            info = (api.model_info(repo_id) if repo_type == "model"
+                    else api.dataset_info(repo_id))
+            parent = info.sha
+            _log(f"commit parent was stale (412); retrying against {parent[:8]}")
+    raise AssertionError("unreachable")
+
+
 # ---------------------------------------------------------------------------
 # checkpoints (private HF Hub repo; local-only when no repo is configured)
 # ---------------------------------------------------------------------------
@@ -341,8 +365,7 @@ class Hub:
                 ops = [CommitOperationAdd(path_in_repo=f"{meta['checkpoint']}/{f}",
                                           path_or_fileobj=str(run_dir / f))
                        for f in files] + ops
-            commit = api.create_commit(repo_id=self.repo_id, repo_type="model",
-                                       parent_commit=parent, commit_message=message, operations=ops)
+            commit = _commit(api, self.repo_id, parent, ops, message)
         self._write_local_pointer(meta)
         return commit
 
@@ -594,10 +617,9 @@ class State:
                     path_in_repo=f"runs/{run_id}/progress.json",
                     path_or_fileobj=str(self._progress_path(run_id))))
             commit = await asyncio.to_thread(
-                api.create_commit, repo_id=self.hub.repo_id, repo_type="model",
-                parent_commit=parent, operations=ops,
-                commit_message=f"SFT {run_id} step {step}: loss {loss:.5f}"
-                               + (f", heldout {heldout_nll:.5f}" if heldout_nll else ""))
+                _commit, api, self.hub.repo_id, parent, ops,
+                f"SFT {run_id} step {step}: loss {loss:.5f}"
+                + (f", heldout {heldout_nll:.5f}" if heldout_nll else ""))
             parent = getattr(commit, "oid", None) or parent
         _log(f"[suffix sft] checkpoint step {step} loss {loss:.5f}"
              + (f" heldout {heldout_nll:.5f}" if heldout_nll else "")
@@ -685,7 +707,8 @@ class State:
         self.started += 1
         start = res["step"] if res else 0
         self.status.update(state="training", run_id=run_id, step=start, steps=steps, loss=None,
-                           resumed_from=start if res else None)
+                           resumed_from=start if res else None, heldout_nll=None,
+                           checkpoints=list(res["checkpoints"]) if res else [])
         # the resume marker: written locally after every step, committed with
         # every snapshot (so it survives a pod re-creation, not just a restart)
         prog = dict(run_id=run_id, dataset=spec["dataset"] if spec else None,
