@@ -1,0 +1,81 @@
+[
+  {
+    "key": {
+      "experts": 256,
+      "hidden": 2560,
+      "intermediate": 640,
+      "topk": 10,
+      "numtokens": 64
+    },
+    "config": {
+      "block_sizes": [
+        16
+      ],
+      "loop_orders": [
+        [
+          1,
+          0
+        ]
+      ],
+      "l2_groupings": [
+        64
+      ],
+      "range_unroll_factors": [
+        0,
+        1,
+        1
+      ],
+      "range_warp_specializes": [
+        null,
+        false,
+        null
+      ],
+      "range_num_stages": [
+        0,
+        2,
+        4
+      ],
+      "range_multi_buffers": [
+        null,
+        false,
+        null
+      ],
+      "range_flattens": [
+        null,
+        null,
+        null
+      ],
+      "load_eviction_policies": [
+        "",
+        "",
+        "first",
+        "",
+        "",
+        "last",
+        "first",
+        "first",
+        "last",
+        "last"
+      ],
+      "num_warps": 8,
+      "num_stages": 3,
+      "indexing": [
+        "tensor_descriptor",
+        "tensor_descriptor",
+        "tensor_descriptor",
+        "tensor_descriptor",
+        "tensor_descriptor",
+        "tensor_descriptor",
+        "pointer",
+        "tensor_descriptor",
+        "pointer",
+        "tensor_descriptor",
+        "pointer",
+        "pointer"
+      ],
+      "atomic_indexing": [],
+      "pid_type": "flat",
+      "host_tensor_descriptors": false
+    }
+  }
+]
