@@ -110,6 +110,8 @@ class Config:
     free_kv: bool = False
     duty: float = 0.5
     max_examples: int = 256
+    max_dataset: int = 20000
+    heldout_n: int = 20
     max_steps: int = 1000
     repo_id: str = ""
     dir: str = ""
@@ -138,6 +140,8 @@ class Config:
                    free_kv=bool(int(_env("FREE_KV", 0))),
                    duty=min(1.0, max(0.05, float(_env("DUTY", 0.5)))),
                    max_examples=int(_env("MAX_EXAMPLES", 256)),
+                   max_dataset=int(_env("MAX_DATASET", 20000)),
+                   heldout_n=int(_env("HELDOUT_N", 20)),
                    max_steps=int(_env("MAX_STEPS", 1000)), repo_id=_env("REPO_ID", ""),
                    dir=_env("DIR", os.path.join(home, "sft")),
                    parity_nats=float(_env("PARITY_NATS", 0.15)),

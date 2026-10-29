@@ -1297,3 +1297,119 @@ def test_qsa_leaves_an_unfused_projection_alone():
     out = TrainMode.qsa(SimpleNamespace(segments=[(0, 3)]), m, None, torch.randn(3, 8))
     assert seen["width"] == 2 * q_size + 2 * kv_size
     assert out.shape == (3, nh * hd)
+
+
+# ---------------------------------------------------------------------------
+# (h) whole-dataset runs: one request, per-snapshot held-out NLL, resume
+# ---------------------------------------------------------------------------
+HELD = [{"messages": [{"role": "user", "content": "held out"},
+                      {"role": "assistant", "content": "held answer!"}]}]
+
+
+def test_api_dataset_train_is_one_request_for_a_whole_epoch(tmp_path, monkeypatch):
+    """A dataset is read as raw JSONL and encoded per batch, so `epochs`
+    derives the step count and a whole-dataset epoch is ONE request. Every
+    snapshot carries the held-out NLL of the adapter it saved, and the run
+    leaves a progress marker behind."""
+    lm = build()
+    sft = sft_for(lm, rank=4)
+    s = _state(tmp_path, sft)
+    s.cfg.ckpt_drop = 0.10
+    monkeypatch.setattr(A.Dataset, "read", lambda self, spec: (CHATS, HELD))
+    try:
+        res = asyncio.run(s.train(dict(dataset="org/data", epochs=1, batch_size=2,
+                                       learning_rate=5e-2)))
+        assert res["steps"] == 2 and res["examples"] == len(CHATS)   # ceil(3/2) * 1
+        assert res["dataset"]["dataset"] == "org/data"
+        assert res["heldout_nll"] is not None
+        assert res["checkpoints"] and all(c["heldout_nll"] is not None for c in res["checkpoints"])
+        prog = json.loads((s.hub.directory / "runs" / res["run_id"] / "progress.json").read_text())
+        assert prog["done"] and prog["step"] == 2 and prog["dataset"] == "org/data"
+        assert prog["checkpoints"] == res["checkpoints"]
+        assert s.resumable() == []          # finished: nothing to resume
+        # an explicit "steps" wins over "epochs"
+        res2 = asyncio.run(s.train(dict(dataset="org/data", epochs=9, steps=1, batch_size=2,
+                                        learning_rate=5e-2)))
+        assert res2["steps"] == 1
+    finally:
+        W.SFT = None
+
+
+def test_api_resume_continues_an_unfinished_run(tmp_path, monkeypatch):
+    """An interrupted run resumes from its last snapshot under the SAME run id:
+    the schedule is a pure function of (n, steps, bs, seed), so the steps
+    already taken are skipped rather than repeated."""
+    lm = build()
+    sft = sft_for(lm, rank=4)
+    s = _state(tmp_path, sft)
+    s.cfg.ckpt_drop = 0.10
+    monkeypatch.setattr(A.Dataset, "read", lambda self, spec: (CHATS, []))
+    try:
+        res = asyncio.run(s.train(dict(dataset="org/data", steps=6, batch_size=4,
+                                       learning_rate=5e-2)))
+        run_id = res["run_id"]
+        p = s.hub.directory / "runs" / run_id / "progress.json"
+        prog = json.loads(p.read_text())
+        # simulate a pod that died at step 3, before the run published
+        prog.update(done=False, step=3)
+        p.write_text(json.dumps(prog))
+        assert [r["run_id"] for r in s.resumable()] == [run_id]
+        start = max(c["step"] for c in prog["checkpoints"] if c["step"] <= 3)
+
+        out = asyncio.run(s.train(dict(resume=run_id)))
+        assert out["run_id"] == run_id and out["steps"] == 6
+        assert out["resumed_from"] == start
+        assert out["loss_first"] == round(prog["loss_first"], 5)   # carried over, not re-measured
+        assert json.loads((s.hub.directory / "latest.json").read_text())["run_id"] == run_id
+        assert s.resumable() == []
+        # a finished run refuses to resume
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as e:
+            asyncio.run(s.train(dict(resume=run_id)))
+        assert e.value.status_code == 409
+    finally:
+        W.SFT = None
+
+
+def test_api_load_a_mid_run_snapshot(tmp_path):
+    """A snapshot is loadable by '<run>/step-<n>', so a checkpoint can be
+    evaluated before the run that produced it has finished."""
+    lm = build()
+    sft = sft_for(lm, rank=4)
+    s = _state(tmp_path, sft)
+    s.cfg.ckpt_drop = 0.10
+    try:
+        res = asyncio.run(s.train(dict(examples=CHATS, steps=6, batch_size=4,
+                                       learning_rate=5e-2)))
+        ck = res["checkpoints"][0]
+        asyncio.run(s.load(ck["path"][len("runs/"):]))
+        assert s.status["state"] == "idle"
+        assert s.status["checkpoint"]["checkpoint"] == ck["path"]
+        assert json.loads((s.hub.directory / "latest.json").read_text())["checkpoint"] == ck["path"]
+        from fastapi import HTTPException
+        for bad in ("../etc", res["run_id"] + "/step-x", res["run_id"] + "/other"):
+            with pytest.raises(HTTPException) as e:
+                asyncio.run(s.load(bad))
+            assert e.value.status_code == 400
+    finally:
+        W.SFT = None
+
+
+def test_api_dataset_validation(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+    s = _state(tmp_path, sft_for(build()))
+    monkeypatch.setattr(A.Dataset, "read", lambda self, spec: (CHATS, []))
+    try:
+        for bad in (dict(dataset="nodash"), dict(dataset="org/data", file="../x.jsonl"),
+                    dict(dataset="org/data", epochs=0), dict(dataset="org/data", revision=""),
+                    dict(dataset="org/data", heldout="x.txt")):
+            with pytest.raises(HTTPException) as e:
+                asyncio.run(s.train(bad))
+            assert e.value.status_code == 400, bad
+        # a whole epoch past the step cap names the env var that raises it
+        monkeypatch.setattr(A.Dataset, "read", lambda self, spec: (CHATS * 400, []))
+        with pytest.raises(HTTPException) as e:
+            asyncio.run(s.train(dict(dataset="org/data", epochs=1, batch_size=1)))
+        assert e.value.status_code == 400 and "SUFFIX_SFT_MAX_STEPS" in str(e.value.detail)
+    finally:
+        W.SFT = None

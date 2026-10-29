@@ -10,9 +10,20 @@ let every client retrain it; a server with neither refuses to enable SFT):
                         "learning_rate": 1e-4, "weight_decay": 0.0,
                         "chat_template_kwargs": {}, "seed": 0}
                         -> trains, saves, publishes, then serves the result
-  POST /v1/sft/load    {"run_id": "<published run>" | "base"} -> serves it
-                        and moves latest.json to it (durable rollback)
-  GET  /v1/sft/status
+                        OR {"dataset": "<org>/<name>", "file": "train.jsonl",
+                        "heldout": "heldout.jsonl", "revision": null,
+                        "epochs": 1, ...} -> the same, over a private HF
+                        dataset repo, encoded per batch (memory O(batch)), so
+                        a whole-dataset epoch is ONE request instead of a
+                        client-side chunk loop. "steps" wins over "epochs".
+                        OR {"resume": "<run id>"} -> continues an unfinished
+                        run from its last snapshot (see GET status.resumable)
+  POST /v1/sft/load    {"run_id": "<published run>" | "<run>/step-<n>" |
+                        "base"} -> serves it and moves latest.json to it
+                        (durable rollback; a mid-run snapshot is loadable so
+                        a checkpoint can be evaluated before the run ends)
+  GET  /v1/sft/status  also reports `resumable`: unfinished runs with a
+                        snapshot, i.e. what {"resume": id} can continue
 Optional "model" and "prompt" fields are accepted and ignored: the pool
 gateway (EPP) routes on them and rejects POST bodies without "prompt".
 "wait": false returns 202 at once and the run continues (poll status);
@@ -41,10 +52,12 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from suffix_hybrid.sft import Config
 
@@ -142,6 +155,96 @@ def schedule(n, steps, batch_size, seed):
 
 
 # ---------------------------------------------------------------------------
+# dataset (private HF dataset repo, JSONL, one example per line)
+# ---------------------------------------------------------------------------
+DATASET_NAME = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
+FILE_NAME = re.compile(r"^[\w.-]+\.jsonl$")
+
+
+class Dataset:
+    """Examples from a private HF dataset repo, read lazily.
+
+    The inline ``examples`` path is capped at SUFFIX_SFT_MAX_EXAMPLES because
+    every example is encoded up front and the ids stay in the API server's
+    memory. A dataset is read as raw JSONL and encoded per batch, so its cap is
+    SUFFIX_SFT_MAX_DATASET and the memory is O(batch) -- which is what makes a
+    whole-dataset epoch one request instead of a client-side chunk loop.
+
+    The repo must be private: it is training data. ``heldout.jsonl`` (optional,
+    same shapes) is scored at every snapshot so each checkpoint carries its own
+    held-out NLL.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def _file(self, req, key, default):
+        name = req.get(key, default)
+        if name in (None, ""):
+            return None
+        if not isinstance(name, str) or not FILE_NAME.match(name):
+            raise _http(400, f"{key}: a plain .jsonl file name inside the dataset repo")
+        return name
+
+    def spec(self, req):
+        """Validated dataset spec from a train body."""
+        repo = req.get("dataset")
+        if not isinstance(repo, str) or not DATASET_NAME.match(repo) or ".." in repo:
+            raise _http(400, "dataset: '<org>/<name>' of a private HF dataset repo")
+        rev = req.get("revision")
+        if rev is not None and (not isinstance(rev, str) or not rev.strip()):
+            raise _http(400, "revision: a branch, tag or commit sha")
+        return dict(dataset=repo, file=self._file(req, "file", "train.jsonl"),
+                    heldout=self._file(req, "heldout", "heldout.jsonl"), revision=rev)
+
+    def _download(self, repo, name, revision):
+        from huggingface_hub import HfApi, get_token, hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
+        if not get_token():
+            raise _http(503, "a dataset needs HF_TOKEN (or a Hugging Face login)")
+        try:
+            info = HfApi().dataset_info(repo, revision=revision)
+        except RepositoryNotFoundError:
+            raise _http(404, f"dataset {repo} not found or not accessible") from None
+        if not info.private:
+            raise _http(409, f"dataset {repo} is public; training data must be private")
+        try:
+            return Path(hf_hub_download(repo, name, repo_type="dataset", revision=info.sha))
+        except EntryNotFoundError:
+            raise _http(404, f"{repo} has no {name}") from None
+
+    def read(self, spec):
+        """(examples, heldout) as raw dicts -- nothing encoded yet."""
+        ex = self._jsonl(self._download(spec["dataset"], spec["file"], spec["revision"]))
+        held = []
+        if spec.get("heldout"):
+            try:
+                held = self._jsonl(self._download(spec["dataset"], spec["heldout"],
+                                                  spec["revision"]))
+            except Exception as exc:  # noqa: BLE001 - held-out is a measurement, not a gate
+                _log(f"held-out set unavailable ({getattr(exc, 'detail', exc)}); "
+                     "snapshots will carry no heldout_nll")
+        return ex, held
+
+    @staticmethod
+    def _jsonl(path):
+        out = []
+        with open(path, encoding="utf-8") as f:
+            for i, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    raise _http(400, f"{path.name} line {i}: not JSON") from None
+                if not isinstance(obj, dict):
+                    raise _http(400, f"{path.name} line {i}: an example must be an object")
+                out.append(obj)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # checkpoints (private HF Hub repo; local-only when no repo is configured)
 # ---------------------------------------------------------------------------
 class Hub:
@@ -232,9 +335,12 @@ class Hub:
             from huggingface_hub import CommitOperationAdd
             ops = [CommitOperationAdd(path_in_repo="latest.json", path_or_fileobj=payload)]
             if run_dir is not None:
+                files = meta["files"] + ["metadata.json"]
+                if (run_dir / "progress.json").is_file():
+                    files.append("progress.json")   # the resume marker rides along
                 ops = [CommitOperationAdd(path_in_repo=f"{meta['checkpoint']}/{f}",
                                           path_or_fileobj=str(run_dir / f))
-                       for f in meta["files"] + ["metadata.json"]] + ops
+                       for f in files] + ops
             commit = api.create_commit(repo_id=self.repo_id, repo_type="model",
                                        parent_commit=parent, commit_message=message, operations=ops)
         self._write_local_pointer(meta)
@@ -248,6 +354,7 @@ class State:
     def __init__(self, engine, cfg, args):
         self.engine, self.cfg = engine, cfg
         self.hub = Hub(cfg)
+        self.dataset = Dataset(cfg)
         self.running = None   # the in-flight run / load task
         self.status = {"state": "starting", "last_run": None, "checkpoint": None}
         self.started = 0     # runs / loads that passed validation (rejection detection)
@@ -357,11 +464,109 @@ class State:
         self.status.update(state="restore_failed", error=str(err))
         _log("RESTORE FAILED: serving the BASE model; training refused until POST /v1/sft/load")
 
+    # -- progress marker (resume) ---------------------------------------------
+    def _progress_path(self, run_id):
+        return self.hub.directory / "runs" / run_id / "progress.json"
+
+    def _write_progress(self, run_id, prog):
+        """Local, atomic, after every step: a process restart loses no steps."""
+        p = self._progress_path(run_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(prog, indent=2))
+        tmp.replace(p)
+
+    def _read_progress(self, run_id):
+        """The run's marker: local first (freshest), then the Hub (survives a
+        pod re-creation, written with each snapshot)."""
+        p = self._progress_path(run_id)
+        if p.is_file():
+            try:
+                return json.loads(p.read_text())
+            except ValueError:
+                pass
+        if not self.hub.repo_id:
+            return None
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError
+        try:
+            return json.loads(Path(hf_hub_download(
+                self.hub.repo_id, f"runs/{run_id}/progress.json")).read_text())
+        except (EntryNotFoundError, OSError, ValueError):
+            return None
+
+    def resumable(self):
+        """Unfinished runs that have a snapshot: what {"resume": id} continues."""
+        out = []
+        for p in sorted((self.hub.directory / "runs").glob("*/progress.json")):
+            try:
+                d = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue
+            if d.get("done") or not d.get("checkpoints"):
+                continue
+            out.append({k: d.get(k) for k in ("run_id", "step", "steps", "dataset",
+                                              "loss_first", "loss")})
+        return out
+
+    async def _resume_req(self, run_id):
+        """Rebuild a train request from a run's marker and load the adapter at
+        its last snapshot. Returns (request, resume state).
+
+        The schedule is a pure function of (n, steps, batch_size, seed), so
+        step k's batch is reproducible: resume skips the steps already taken.
+        The optimizer state is NOT in a snapshot -- AdamW restarts from zero,
+        which costs a few steps of biased moments, not correctness.
+        """
+        if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id):
+            raise _http(400, "resume: a run id from GET /v1/sft/status")
+        prog = self._read_progress(run_id)
+        if prog is None:
+            raise _http(404, f"no progress marker for run {run_id}")
+        if prog.get("done"):
+            raise _http(409, f"run {run_id} finished; nothing to resume")
+        ck = [x for x in prog.get("checkpoints") or []
+              if isinstance(x, dict) and x.get("step", 0) <= prog.get("step", 0)]
+        if not ck:
+            raise _http(409, f"run {run_id} has no snapshot at or before step "
+                             f"{prog.get('step')}; start a new run")
+        last = max(ck, key=lambda x: x["step"])
+        meta = await asyncio.to_thread(self.hub.run_meta, last["path"][len("runs/"):])
+        if meta.get("fingerprint") != (self.info or {}).get("fingerprint"):
+            raise _http(409, f"run {run_id} was trained for a different model / TP / "
+                             "adapter config")
+        run_dir = await asyncio.to_thread(self.hub.fetch, meta)
+        req = dict(dataset=prog["dataset"], file=prog.get("file"), heldout=prog.get("heldout"),
+                   revision=prog.get("revision"), steps=prog["steps"],
+                   batch_size=prog["batch_size"], learning_rate=prog["learning_rate"],
+                   weight_decay=prog.get("weight_decay", 0.0), seed=prog.get("seed", 0))
+        state: dict[str, Any] = dict(
+            run_id=run_id, step=last["step"], best=last["loss"],
+            checkpoints=list(prog.get("checkpoints") or []),
+            loss_first=prog.get("loss_first"), dir=str(run_dir))
+        return req, state
+
+    async def heldout_nll(self, held):
+        """Mean per-token NLL of the held-out examples under the CURRENT
+        adapter, measured with the training forward (no serving involved)."""
+        if not held:
+            return None
+        tot = n = 0.0
+        for ids, mask in held:
+            r = await self.rpc("eval", dict(ids=ids, mask=mask, seg_lens=[len(ids)]))
+            tot += r["loss_sum"]
+            n += r["tokens"]
+        return round(tot / max(1.0, n), 5)
+
     # -- train --------------------------------------------------------------
-    async def snapshot(self, api, parent, run_id, step, loss):
+    async def snapshot(self, api, parent, run_id, step, loss, heldout_nll=None, progress=None):
         """Mid-run checkpoint: this run's adapters at `step`, uploaded under
         runs/<run_id>/step-<n>/ WITHOUT touching latest.json, so a partial run
-        can never reach serving. Returns (record, new parent sha)."""
+        can never reach serving. Returns (record, new parent sha).
+
+        `progress` (the run's marker) is updated with this snapshot and
+        committed alongside it, so a pod re-creation can still resume.
+        """
         d = self.hub.directory / "runs" / run_id / f"step-{step}"
         d.mkdir(parents=True, exist_ok=True)
         r = await self.rpc("save", {"dir": str(d)})
@@ -370,51 +575,135 @@ class State:
                  for i in range(info.get("tp", 1))]
         meta = dict(run_id=run_id, checkpoint=f"runs/{run_id}/step-{step}", files=files,
                     fingerprint=r["fingerprint"], step=step, loss=round(loss, 5),
+                    heldout_nll=heldout_nll,
                     created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         (d / "metadata.json").write_text(json.dumps(meta, indent=2))
+        rec = dict(step=step, loss=round(loss, 5), path=meta["checkpoint"],
+                   heldout_nll=heldout_nll)
+        if progress is not None:
+            progress.setdefault("checkpoints", []).append(rec)
+            progress.update(step=step, best=round(loss, 5), loss=round(loss, 5))
+            self._write_progress(run_id, progress)
         if api is not None:
             from huggingface_hub import CommitOperationAdd
             ops = [CommitOperationAdd(path_in_repo=f"{meta['checkpoint']}/{f}",
                                       path_or_fileobj=str(d / f))
                    for f in files + ["metadata.json"]]
+            if progress is not None:
+                ops.append(CommitOperationAdd(
+                    path_in_repo=f"runs/{run_id}/progress.json",
+                    path_or_fileobj=str(self._progress_path(run_id))))
             commit = await asyncio.to_thread(
                 api.create_commit, repo_id=self.hub.repo_id, repo_type="model",
                 parent_commit=parent, operations=ops,
-                commit_message=f"SFT {run_id} step {step}: loss {loss:.5f}")
+                commit_message=f"SFT {run_id} step {step}: loss {loss:.5f}"
+                               + (f", heldout {heldout_nll:.5f}" if heldout_nll else ""))
             parent = getattr(commit, "oid", None) or parent
-        _log(f"[suffix sft] checkpoint step {step} loss {loss:.5f} -> {meta['checkpoint']}")
-        return dict(step=step, loss=round(loss, 5), path=meta["checkpoint"]), parent
+        _log(f"[suffix sft] checkpoint step {step} loss {loss:.5f}"
+             + (f" heldout {heldout_nll:.5f}" if heldout_nll else "")
+             + f" -> {meta['checkpoint']}")
+        return rec, parent
 
     async def train(self, req):
         c = self.cfg
-        examples, steps, bs = req.get("examples"), int(req.get("steps", 1)), int(req.get("batch_size", 1))
+        res: dict[str, Any] | None = None
+        if req.get("resume") is not None:
+            req, res = await self._resume_req(req["resume"])
+        steps, bs = int(req.get("steps", 1)), int(req.get("batch_size", 1))
         lr, wd = float(req.get("learning_rate", 1e-4)), float(req.get("weight_decay", 0.0))
-        if not isinstance(examples, list) or not 1 <= len(examples) <= c.max_examples:
-            raise _http(400, f"examples: 1..{c.max_examples} items")
-        if not 1 <= steps <= c.max_steps:
-            raise _http(400, f"steps must be between 1 and {c.max_steps}")
-        if not 1 <= bs <= c.max_examples:
-            raise _http(400, f"batch_size must be between 1 and {c.max_examples}")
         if not math.isfinite(lr) or not 0 < lr <= 1 or not math.isfinite(wd) or wd < 0:
             raise _http(400, "learning_rate must be in (0, 1], weight_decay >= 0")
+        if not 1 <= bs <= c.max_examples:
+            raise _http(400, f"batch_size must be between 1 and {c.max_examples}")
         tok = await self.tokenizer()
         kw = dict(self.template_defaults, **(req.get("chat_template_kwargs") or {}))
-        data = [encode(tok, ex, kw, self.chat_template) for ex in examples]
-        for i, (ids, _) in enumerate(data):
-            if len(ids) > c.max_tokens:
-                raise _http(400, f"example {i} has {len(ids)} tokens > SUFFIX_SFT_MAX_TOKENS="
-                                 f"{c.max_tokens}")
+        spec, held_raw = None, []
+        if req.get("dataset") is not None:
+            spec = self.dataset.spec(req)
+            data, held_raw = await asyncio.to_thread(self.dataset.read, spec)
+            if not 1 <= len(data) <= c.max_dataset:
+                raise _http(400, f"dataset: 1..{c.max_dataset} examples "
+                                 f"(SUFFIX_SFT_MAX_DATASET), got {len(data)}")
+            if req.get("epochs") is not None and req.get("steps") is None:
+                ep = int(req["epochs"])
+                if not 1 <= ep <= 100:
+                    raise _http(400, "epochs must be between 1 and 100")
+                steps = -(-len(data) // bs) * ep
+        else:
+            examples = req.get("examples")
+            if not isinstance(examples, list) or not 1 <= len(examples) <= c.max_examples:
+                raise _http(400, f"examples: 1..{c.max_examples} items, or a dataset")
+            data = examples
+        if not 1 <= steps <= c.max_steps:
+            raise _http(400, f"steps must be between 1 and {c.max_steps}"
+                             + (f" (one epoch of {len(data)} examples at batch_size {bs} is "
+                                f"{-(-len(data) // bs)}; raise SUFFIX_SFT_MAX_STEPS)"
+                                if spec else ""))
+        if spec is None:
+            # inline: encode everything up front, so a bad example fails before
+            # the run starts (the ids are bounded by max_examples)
+            data_enc = [encode(tok, ex, kw, self.chat_template) for ex in data]
+            for i, (ids, _) in enumerate(data_enc):
+                if len(ids) > c.max_tokens:
+                    raise _http(400, f"example {i} has {len(ids)} tokens > SUFFIX_SFT_MAX_TOKENS="
+                                     f"{c.max_tokens}")
+            enc = data_enc.__getitem__
+        else:
+            # dataset: encode per batch (memory O(batch)); preflight the first
+            # few so a systematically too-long dataset still fails up front
+            cache = {}
+
+            def enc(i):
+                hit = cache.get(i)
+                if hit is None:
+                    hit = encode(tok, data[i], kw, self.chat_template)
+                    if len(hit[0]) > c.max_tokens:
+                        raise _http(400, f"example {i} has {len(hit[0])} tokens > "
+                                         f"SUFFIX_SFT_MAX_TOKENS={c.max_tokens}")
+                    if len(cache) >= 64:
+                        cache.pop(next(iter(cache)))
+                    cache[i] = hit
+                return hit
+
+            for i in range(min(len(data), 8)):
+                enc(i)
+        held = []
+        for ex in held_raw[:c.heldout_n]:
+            try:
+                ids, mask = encode(tok, ex, kw, self.chat_template)
+            except Exception:  # noqa: BLE001 - a bad held-out row must not fail the run
+                continue
+            if len(ids) <= c.max_tokens:
+                held.append((ids, mask))
         if self.status["state"] == "restore_failed":
             raise _http(409, "checkpoint restore failed at startup; POST /v1/sft/load first")
 
-        run_id, stage, commit, t0 = uuid.uuid4().hex, "initialization", None, time.monotonic()
+        run_id = res["run_id"] if res else uuid.uuid4().hex
+        stage, commit, t0 = "initialization", None, time.monotonic()
         run_dir = self.hub.directory / "runs" / run_id
         self.status.pop("rejected", None)
         self.started += 1
-        self.status.update(state="training", run_id=run_id, step=0, steps=steps, loss=None)
+        start = res["step"] if res else 0
+        self.status.update(state="training", run_id=run_id, step=start, steps=steps, loss=None,
+                           resumed_from=start if res else None)
+        # the resume marker: written locally after every step, committed with
+        # every snapshot (so it survives a pod re-creation, not just a restart)
+        prog = dict(run_id=run_id, dataset=spec["dataset"] if spec else None,
+                    file=spec.get("file") if spec else None,
+                    heldout=spec.get("heldout") if spec else None,
+                    revision=spec.get("revision") if spec else None,
+                    steps=steps, batch_size=bs, learning_rate=lr, weight_decay=wd,
+                    seed=int(req.get("seed", 0)), examples=len(data),
+                    epochs=req.get("epochs"), step=start, done=False,
+                    checkpoints=list(res["checkpoints"]) if res else [],
+                    loss_first=res.get("loss_first") if res else None)
         try:
             api, parent = await asyncio.to_thread(self.hub.private_repo)
-            pre = await self.parity(*data[0])
+            if res:
+                # the adapter at the last snapshot, then continue from there
+                await self.rpc("load", {"dir": res["dir"]})
+                _log(f"resuming run {run_id} at step {start}/{steps} from {res['dir']}")
+            pre = await self.parity(*enc(0))
             # noise-aware: a numerically sensitive model (LFM2 FP8: per-token NLL moves by
             # ~1 nat between two correct bf16 paths) has a large standard error on a short
             # example; a real forward bug moves the mean by far more than 3 SE
@@ -429,10 +718,14 @@ class State:
             if kv.get("ok"):
                 mem["kv_freed_gib"] = round(kv.get("free_gib", 0.0), 2)
             await self.rpc("begin", dict(lr=lr, weight_decay=wd))
-            losses, first, checked = [], None, False
-            best, ckpts = None, []
+            losses, checked = [], False
+            first = res.get("loss_first") if res else None
+            best = res["best"] if res else None
+            ckpts = list(res["checkpoints"]) if res else []
             for step, idx in enumerate(schedule(len(data), steps, bs, int(req.get("seed", 0)))):
-                batch = [data[i] for i in idx]
+                if step < start:      # already taken before the interruption
+                    continue
+                batch = [enc(i) for i in idx]
                 norm = sum(sum(m[1:]) for _, m in batch)
                 loss_sum = 0.0
                 for mb in pack(batch, c.max_tokens):
@@ -457,30 +750,43 @@ class State:
                 losses.append(loss)
                 self.status.update(step=step + 1, loss=round(loss, 5), grad_norm=r["grad_norm"],
                                    memory=mem)
+                prog.update(step=step + 1, loss=round(loss, 5), best=best, loss_first=first)
+                self._write_progress(run_id, prog)
                 # A checkpoint every time the loss beats the best so far by
                 # ckpt_drop (relative, default 10%). Mid-run checkpoints go to
                 # runs/<run_id>/step-<n>/ and never touch latest.json, so a
-                # partial run can never reach serving.
+                # partial run can never reach serving. Each one carries the
+                # held-out NLL of the adapter it saved.
                 if c.ckpt_drop > 0 and (best is None or loss <= best * (1.0 - c.ckpt_drop)):
                     best = loss
-                    rec, parent = await self.snapshot(api, parent, run_id, step + 1, loss)
+                    hn = await self.heldout_nll(held)
+                    rec, parent = await self.snapshot(api, parent, run_id, step + 1, loss,
+                                                      heldout_nll=hn, progress=prog)
                     ckpts.append(rec)
-                    self.status.update(checkpoints=ckpts)
+                    self.status.update(checkpoints=ckpts, heldout_nll=hn)
                 await self.yield_to_serving(r["ms"])
             stage = "checkpoint"
             run_dir.mkdir(parents=True, exist_ok=True)   # a mid-run snapshot may have made it
             r = await self.rpc("save", {"dir": str(run_dir)})
             info = self.info or {}
             files = [f"adapter-tp{i}-of-{info.get('tp', 1)}.safetensors" for i in range(info.get("tp", 1))]
+            final_loss = losses[-1] if losses else prog.get("loss")
+            hn = await self.heldout_nll(held)
             meta = dict(run_id=run_id, checkpoint=f"runs/{run_id}", files=files,
                         fingerprint=r["fingerprint"], model=info.get("model"), rank=info.get("rank"),
                         alpha=info.get("alpha"), targets=info.get("targets"), tp=info.get("tp"),
                         parent=(self.status.get("checkpoint") or {}).get("run_id"),
                         examples=len(data), steps=steps, batch_size=bs, learning_rate=lr,
-                        weight_decay=wd, loss_first=round(first, 5), loss=round(losses[-1], 5),
+                        weight_decay=wd,
+                        loss_first=round(first, 5) if first is not None else None,
+                        loss=round(final_loss, 5) if final_loss is not None else None,
+                        heldout_nll=hn, dataset=spec, epochs=req.get("epochs"),
+                        resumed_from=start if res else None,
                         checkpoints=ckpts,
                         created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
             (run_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+            prog.update(done=True, step=steps, loss=meta["loss"], heldout_nll=hn)
+            self._write_progress(run_id, prog)
             stage = "upload"
             commit = await asyncio.to_thread(
                 self.hub.publish, api, parent, meta, run_dir,
@@ -489,7 +795,7 @@ class State:
             await self.rpc("kv_restore")
             await self.rpc("commit")
             await self.reset_cache()
-            post = await self.parity(*data[0])
+            post = await self.parity(*enc(0))
             result = dict(meta, parity_before=pre, parity_after=post, served=True, memory=mem,
                           commit_sha=getattr(commit, "oid", None),
                           commit_url=getattr(commit, "commit_url", None),
@@ -517,8 +823,10 @@ class State:
 
     # -- load ---------------------------------------------------------------
     async def load(self, run_id):
-        if not isinstance(run_id, str) or not run_id or "/" in run_id or ".." in run_id:
-            raise _http(400, "run_id: a published run id or 'base'")
+        if not isinstance(run_id, str) or not run_id or ".." in run_id:
+            raise _http(400, "run_id: a published run id, '<run>/step-<n>', or 'base'")
+        if "/" in run_id and not re.fullmatch(r"[0-9a-f]{32}/step-\d+", run_id):
+            raise _http(400, "run_id: a published run id, '<run>/step-<n>', or 'base'")
         keep = {k: self.status[k] for k in ("state", "run_id", "error") if k in self.status}
         self.status.pop("rejected", None)
         self.started += 1
@@ -627,7 +935,8 @@ async def load_route(request):
 async def status_route():
     if _S is None:
         raise _http(503, "SFT is not available on this server")
-    return dict(_S.status, sft=_S.info, repo=_S.hub.repo_id or None)
+    return dict(_S.status, sft=_S.info, repo=_S.hub.repo_id or None,
+                resumable=_S.resumable())
 
 
 async def diag_route(request):
