@@ -1446,3 +1446,44 @@ def test_commit_retries_a_stale_parent():
 
     with pytest.raises(Stale):      # a persistent 412 still fails loud
         A._commit(Always(), "org/m", "a" * 40, [], "msg")
+
+
+def test_api_dataset_preflight_rejects_a_too_long_example_before_step_0(tmp_path, monkeypatch):
+    """A single over-long row must fail the run in the first second, not at the
+    step that happens to draw it. Run aabf4cee trained 233 steps (15 h) and then
+    died on example 1707 (2050 tokens) because only the first 8 rows were
+    preflighted (2026-10-30)."""
+    lm = build()
+    sft = sft_for(lm, rank=4)
+    s = _state(tmp_path, sft)
+    s.cfg.max_tokens = 64
+    long_row = {"prompt": "x " * 400, "completion": "ok"}
+    data = [dict(CHATS[0])] * 3 + [long_row]
+    monkeypatch.setattr(A.Dataset, "read", lambda self, spec: (data, []))
+    try:
+        with pytest.raises(Exception) as ei:
+            asyncio.run(s.train(dict(dataset="org/data", epochs=1, batch_size=2,
+                                     learning_rate=5e-2)))
+        msg = str(ei.value)
+        assert "SUFFIX_SFT_MAX_TOKENS" in msg and "3:" in msg   # names the index
+        assert s.status.get("state") != "training"              # nothing ran
+    finally:
+        W.SFT = None
+
+
+def test_api_snapshots_every_n_steps_even_without_improvement(tmp_path, monkeypatch):
+    """Improvement-only snapshots lose hours on a noisy loss: aabf4cee's last
+    snapshot was step 70 and it failed at 233. ckpt_every forces one anyway."""
+    lm = build()
+    sft = sft_for(lm, rank=4)
+    s = _state(tmp_path, sft)
+    s.cfg.ckpt_drop = 0.0        # never "beats the best"
+    s.cfg.ckpt_every = 2
+    monkeypatch.setattr(A.Dataset, "read", lambda self, spec: (CHATS, []))
+    try:
+        res = asyncio.run(s.train(dict(dataset="org/data", steps=4, batch_size=2,
+                                       learning_rate=5e-2)))
+        steps = [c["step"] for c in res["checkpoints"]]
+        assert steps == [2, 4], steps
+    finally:
+        W.SFT = None

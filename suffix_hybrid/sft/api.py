@@ -687,8 +687,20 @@ class State:
                     cache[i] = hit
                 return hit
 
-            for i in range(min(len(data), 8)):
-                enc(i)
+            # Preflight EVERY example, not the first 8. A single 2050-token row
+            # at index 1707 killed a 15-hour run at step 233 (2026-10-30):
+            # encoding the whole dataset costs seconds, losing a run costs hours.
+            bad = []
+            for i in range(len(data)):
+                try:
+                    enc(i)
+                except Exception as e:      # noqa: BLE001 - collect, then fail once
+                    bad.append(f"{i}: {e}")
+                    if len(bad) >= 8:
+                        break
+            if bad:
+                raise _http(400, f"{len(bad)} example(s) do not fit "
+                                 f"SUFFIX_SFT_MAX_TOKENS={c.max_tokens}: " + "; ".join(bad))
         held = []
         for ex in held_raw[:c.heldout_n]:
             try:
@@ -776,12 +788,19 @@ class State:
                 prog.update(step=step + 1, loss=round(loss, 5), best=best, loss_first=first)
                 self._write_progress(run_id, prog)
                 # A checkpoint every time the loss beats the best so far by
-                # ckpt_drop (relative, default 10%). Mid-run checkpoints go to
-                # runs/<run_id>/step-<n>/ and never touch latest.json, so a
-                # partial run can never reach serving. Each one carries the
-                # held-out NLL of the adapter it saved.
-                if c.ckpt_drop > 0 and (best is None or loss <= best * (1.0 - c.ckpt_drop)):
-                    best = loss
+                # ckpt_drop (relative, default 10%), AND unconditionally every
+                # ckpt_every steps. Improvement-only snapshots are not enough on
+                # a noisy loss: run aabf4cee wrote its last snapshot at step 70
+                # and then failed at step 233, so 163 steps (~7 h) were lost
+                # (2026-10-30). Mid-run checkpoints go to runs/<run_id>/step-<n>/
+                # and never touch latest.json, so a partial run can never reach
+                # serving. Each one carries the held-out NLL of the adapter it
+                # saved.
+                beat = c.ckpt_drop > 0 and (best is None or loss <= best * (1.0 - c.ckpt_drop))
+                due = c.ckpt_every > 0 and (step + 1) % c.ckpt_every == 0
+                if beat or due:
+                    if beat:
+                        best = loss
                     hn = await self.heldout_nll(held)
                     rec, parent = await self.snapshot(api, parent, run_id, step + 1, loss,
                                                       heldout_nll=hn, progress=prog)

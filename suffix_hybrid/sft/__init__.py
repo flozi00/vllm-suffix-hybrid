@@ -117,6 +117,7 @@ class Config:
     dir: str = ""
     parity_nats: float = 0.15
     ckpt_drop: float = 0.10
+    ckpt_every: int = 50
     rpc_timeout_s: float = 600.0
 
     @classmethod
@@ -146,6 +147,7 @@ class Config:
                    dir=_env("DIR", os.path.join(home, "sft")),
                    parity_nats=float(_env("PARITY_NATS", 0.15)),
                    ckpt_drop=float(_env("CKPT_DROP", 0.10)),
+                   ckpt_every=int(_env("CKPT_EVERY", 50)),
                    rpc_timeout_s=float(_env("RPC_TIMEOUT_S", 600)))
 
 
