@@ -277,10 +277,18 @@ class WorkerSFT:
         return dict(grad_norm=self.run.step(), steps=self.run.steps)
 
     def eval(self, p):
-        """Summed NLL with the LIVE adapters (what serving computes)."""
+        """Summed NLL with the LIVE adapters (what serving computes).
+
+        During a run the LIVE weights are the run's, not `self.adapters` (which
+        still holds the adapter that was loaded for serving). Reading
+        `self.adapters` here made every mid-run held-out NLL identical to the
+        pre-run adapter's: run aabf4cee reported 0.85887 at steps 1, 3, 14, 29,
+        37 and 70 while its training loss fell 0.46 -> 0.13 (2026-10-30).
+        """
         self._mem_vote()
         ids, segs, rows, tgt = self._batch(p)
-        live = {id(layer): (lo.A, lo.B, lo.scale) for layer, lo in self.adapters.values()}
+        live = (self.run.params() if self.run is not None else
+                {id(layer): (lo.A, lo.B, lo.scale) for layer, lo in self.adapters.values()})
         with M.TrainMode(self, live, segs, grad=False) as tm:
             loss = tm.nll(ids, rows, tgt, per_token=bool(p.get("per_token")))
         if p.get("per_token"):

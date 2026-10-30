@@ -1487,3 +1487,22 @@ def test_api_snapshots_every_n_steps_even_without_improvement(tmp_path, monkeypa
         assert steps == [2, 4], steps
     finally:
         W.SFT = None
+
+
+def test_eval_during_a_run_uses_the_training_weights():
+    """`eval` must read the RUN's weights while a run is active. It read
+    `self.adapters` (the adapter loaded for serving), so every mid-run held-out
+    NLL was the pre-run adapter's: run aabf4cee reported 0.85887 at steps 1, 3,
+    14, 29, 37 and 70 while its training loss fell 0.46 -> 0.13 (2026-10-30)."""
+    lm = build()
+    sft = sft_for(lm)
+    before = sft.eval(dict(BATCH))["loss_sum"] / 12.0
+    sft.begin(dict(lr=3e-2))
+    try:
+        for _ in range(8):
+            sft.micro(dict(BATCH, norm=12.0))
+            sft.step()
+        during = sft.eval(dict(BATCH))["loss_sum"] / 12.0
+        assert during < before - 0.05, (before, during)
+    finally:
+        sft.abort()
