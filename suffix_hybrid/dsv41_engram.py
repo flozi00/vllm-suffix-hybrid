@@ -5,7 +5,8 @@ Checkpoints in NVIDIA's DeepSeek-V4.1-Flash-NVFP4 layout (also
 LibertAIDAI/DeepSeek-V4.1-Flash-1017-NVFP4) store the Engram tables as packed
 MXFP4 (``engram_embed_quant: "mxfp4"``). Stock vLLM allocates them as FP8 and
 cannot load them until vllm-project/vllm#61530 lands. This ships that PR's
-engram.py (head 1800929afd, applied onto nightly 39983a5e7) and execs it over
+engram.py (head 1800929afd, 3-way ported onto nightly e0d00e4b8; peer-HBM
+tables refuse MXFP4) and execs it over
 the stock module right after its first import.
 
 Fail closed: the stock file must hash to BASE_SHA256 (the file the PR was
@@ -20,7 +21,7 @@ from pathlib import Path
 
 GATE_ENV = "SUFFIX_DSV41_ENGRAM_MXFP4"
 TARGET = "vllm.models.deepseek_v41.common.engram"
-BASE_SHA256 = "80d6f14973c99be431029e0fba4a6a784a428501bd6ba1726cff0879e0e1627f"
+BASE_SHA256 = "e10681d8cb573cd0f192384dbe47786eb5d1e3809996f827eed48b9aa690365c"
 PATCHED = Path(__file__).with_name("dsv41_engram_pr61530.txt")
 TAG = "[suffix dsv41-engram-mxfp4]"
 
