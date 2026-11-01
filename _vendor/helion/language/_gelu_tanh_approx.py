@@ -1,0 +1,183 @@
+"""Internal GELU ops used to keep GELU epilogues as one FX node.
+
+Not a user-facing API. The user-facing surface is
+``torch.nn.functional.gelu(x, approximate="tanh")``; ``device_ir`` installs
+a decomposition (see ``install_gelu_decomp`` below) that maps the
+``approximate="tanh"`` overload onto the single-FX-node
+``_gelu_tanh_approx`` op defined here. The ``approximate="none"`` path maps
+to ``_gelu_erf`` for the same reason: the default erf formula also references
+the input multiple times.
+
+The polynomial form ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 *
+(x * x * x))))`` references ``x`` five times. Spelled
+out as primitive ops, this breaks the linear-chain assumption of
+Helion's tcgen05 epilogue chain analyzer
+(``helion/_compiler/cute/cute_epilogue.py``) and falls back to the
+loud-failure backstop. Folding the whole expression behind a single
+op lets the chain analyzer see exactly one ``_gelu_tanh_approx`` FX
+node and splice the polynomial inline as one chain step against the
+already-bound carrier local.
+
+Inside the tcgen05 chain analyzer, ``_gelu_tanh_approx`` is registered
+as a ``_UnaryOp`` row in ``_ZERO_ARG_TARGETS`` keyed on the api
+wrapper itself (the FX target). The template references the carrier
+local five times in the standard polynomial; the renderer keeps that
+carrier bound before formatting the template.
+
+Backend support: ``cute`` and ``triton`` only. The ``pallas`` backend
+raises :class:`exc.BackendUnsupported` because Mosaic does not have a
+direct ``cute.math.tanh`` analog and the polynomial would need a
+separate Pallas-flavoured lowering (the same primitive can be
+spelled directly with ``jax.nn.gelu(x, approximate=True)`` in user
+code today).
+"""
+
+from __future__ import annotations
+
+from typing import Callable
+
+import torch
+
+from .. import exc
+from . import _decorators
+
+# Tanh-approximation GELU constants. Spelled out as ``float`` literals
+# rather than ``math.sqrt(2.0 / math.pi)`` at import time so the
+# rendered Python literals are byte-identical across machines and
+# pinned by the codegen-marker tests in ``test_cute_lowerings.py``.
+#
+# ``kappa = sqrt(2/pi)`` and the cubic coefficient 0.044715, associated
+# as in PyTorch's CUDA kernel (``kappa * (x + 0.044715 * x_cube)``): with
+# a tanh that matches eager's, the fp32 result is then bit-exact against
+# ``torch.nn.functional.gelu(x, approximate="tanh")``.
+GELU_TANH_APPROX_KAPPA: float = 0.7978845608028654
+GELU_TANH_APPROX_CUBIC: float = 0.044715
+GELU_ERF_INV_SQRT2: float = 0.7071067811865476
+
+
+# Templates for backend codegen.
+#
+# The cute template uses ``{inner}`` directly so it plugs into the
+# tcgen05 chain analyzer's ``_UnaryOp.template`` slot
+# (``cute_epilogue.py`` substitutes ``{inner}`` with the current
+# carrier local). The cute-backend codegen below also calls
+# ``.format(inner=...)`` against the lifted local name to share the
+# same template across the splice site and pointwise paths.
+#
+# The triton template is rendered as two layers: the inner ``{x32}``
+# placeholder is fp32 (cast happens at the codegen-site for fp16 /
+# bf16 inputs to satisfy ``libdevice.tanh``'s fp32-only contract);
+# the outer ``{x}`` is the original-dtype value preserved for the
+# leading ``0.5 * x`` factor that has no transcendental component.
+# This keeps the fp32 round-trip narrow — only the ``tanh`` argument
+# is cast — and matches Helion's existing ``tanh`` lowering shape
+# (``inductor_lowering_extra.FP32_FALLBACK_OPS_UNARY``). For fp32
+# inputs the codegen treats ``{x32}`` and ``{x}`` as the same local.
+# NOTE: the cute template has no bf16/fp16 round-trip on the carrier,
+# unlike the triton template below. The tcgen05 chain analyzer splices
+# this template at a per-thread T2R register where the accumulator is
+# always fp32 (the carrier is the matmul accumulator), so no cast is
+# needed. The standalone cute pointwise codegen path also calls this
+# template; it casts a bf16/fp16 input to fp32 first (``x * x * x``
+# would otherwise round at 16 bits) and rounds the result back to the
+# input dtype once, as eager does.
+_GELU_TANH_APPROX_EXPR_CUTE = (
+    f"(0.5 * ({{inner}}) * (1.0 + cute.math.tanh({GELU_TANH_APPROX_KAPPA!r} *"
+    f" (({{inner}}) + {GELU_TANH_APPROX_CUBIC!r}"
+    f" * (({{inner}}) * ({{inner}}) * ({{inner}}))))))"
+)
+# Exact erf GELU uses a helper so fp32 TensorSSA carriers, including
+# tcgen05 epilogue fragments, can use packed f32x2 mul/fma around the
+# scalar erf while non-fp32 and odd-size TensorSSA inputs keep the
+# scalar cute.math.erf fallback.
+_GELU_ERF_EXPR_CUTE = "_cute_gelu_erf_exact_f32x2({inner})"
+
+
+@_decorators.api(is_device_only=True)
+def _gelu_tanh_approx(x: torch.Tensor) -> torch.Tensor:
+    """Internal tanh-approximation GELU op (see module docstring).
+
+    Computes ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 *
+    (x * x * x))))``. Not user-facing — invoked via the
+    ``aten.gelu.default`` decomposition installed by
+    :func:`install_gelu_decomp`. For fp16 / bf16 inputs the polynomial
+    runs in fp32 (Triton's ``libdevice.tanh`` is fp32-only) and the
+    result is cast back to the input dtype.
+
+    Backend support: ``cute`` and ``triton``. ``pallas`` raises
+    :class:`exc.BackendUnsupported`.
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.api(is_device_only=True)
+def _gelu_erf(x: torch.Tensor) -> torch.Tensor:
+    """Internal exact GELU op using the erf formula.
+
+    Computes ``0.5 * x * (1 + erf(x / sqrt(2)))``. Not user-facing; invoked
+    via the ``aten.gelu.default`` decomposition installed by
+    :func:`install_gelu_decomp`.
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.register_fake(_gelu_tanh_approx)
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@_decorators.register_fake(_gelu_erf)
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@_decorators.ref(_gelu_tanh_approx)
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.gelu(x, approximate="tanh")
+
+
+@_decorators.ref(_gelu_erf)
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.gelu(x)
+
+
+def epilogue_unary_step_template() -> str:
+    """Return the cute-backend template (``{inner}``-keyed) for the
+    tcgen05 epilogue chain analyzer.
+
+    The chain renderer in ``cute_epilogue.py`` substitutes ``{inner}`` with
+    its current carrier local; the template returned here is the same one the
+    cute-backend codegen in this module uses, so the two paths cannot drift
+    apart.
+    """
+    return _GELU_TANH_APPROX_EXPR_CUTE
+
+
+def gelu_erf_epilogue_unary_step_template() -> str:
+    """Return the cute-backend exact-GELU template for tcgen05 epilogues."""
+    return _GELU_ERF_EXPR_CUTE
+
+
+def install_gelu_decomp(
+    decomp_table: dict[torch._ops.OpOverload, Callable[..., object]],
+) -> None:
+    """Route GELU overloads through single-node internal ops.
+
+    ``aten.gelu.default`` is the dispatch target for both
+    ``approximate='none'`` (default, erf form) and ``approximate='tanh'``.
+    Inductor's default decompositions expand both forms into expressions that
+    reference the input multiple times, which the cute epilogue chain analyzer
+    cannot fuse. We replace the entry with a wrapper that branches on the
+    kwarg and leaves unknown approximate values on the original path.
+    """
+    original_decomp = decomp_table[torch.ops.aten.gelu.default]
+
+    def _gelu_decomp(x: torch.Tensor, *, approximate: str = "none") -> torch.Tensor:
+        if approximate == "tanh":
+            return _gelu_tanh_approx(x)
+        if approximate == "none":
+            return _gelu_erf(x)
+        # pyrefly: ignore [bad-return]
+        return original_decomp(x, approximate=approximate)
+
+    decomp_table[torch.ops.aten.gelu.default] = _gelu_decomp
