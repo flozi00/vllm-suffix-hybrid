@@ -1,0 +1,478 @@
+"""Pure-JAX export path for Helion-generated Pallas kernels.
+
+The torch-tensor launchers (``default_pallas_*_launcher``) compile a
+``pl.pallas_call`` and wrap it in a ``JaxCallable`` so that torch tensor
+inputs/outputs cross the torch<->JAX boundary.  This module reuses the
+same compile step (``_pallas_compile_jit_fn``) but skips the JaxCallable
+wrap so the kernel can be invoked from inside a ``jax.jit`` with JAX
+arrays directly — exposed via ``Kernel.jax_fn``.
+
+The Helion-generated wrapper is torch-flavoured (it calls
+``q.size(-2)``, ``q.reshape(...)``, ``torch.empty_like(...)``).  To run
+that wrapper unchanged on JAX inputs, we wrap each input in a
+``_JaxExportTensor`` — a ``torch.Tensor`` subclass whose storage is
+``device='meta'`` (so torch operations only touch shape/dtype) but
+which carries the underlying JAX array on the side.  Operations the
+wrapper performs that *return a tensor we will later read back into
+JAX* — ``reshape`` / ``view`` / ``empty_like`` / ``F.pad`` — must be
+intercepted via ``__torch_function__`` so the JAX side stays in sync.
+Pure-shape introspection (``.size()``, ``.shape``, ``.ndim``,
+``.dim()``) is left to the meta storage (it carries shape).  Anything
+else falls through to torch's meta backend, which will raise from
+``func`` itself if real storage is needed; if a future Helion
+codegen change starts emitting a new tensor-returning op in the
+host wrapper, that op needs adding to the intercept list here.
+
+The export launcher recognises these adapters, extracts the JAX
+arrays, drives the Pallas call, and re-wraps the JAX outputs as
+adapters so the wrapper's trailing ``out.view(...)`` propagates the
+JAX side correctly.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import cast
+
+import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from ..kernel import Kernel
+    from .launcher import _BlockSpecInfo
+
+
+_TORCH_TO_JNP_DTYPE: dict[torch.dtype, object] | None = None
+_JNP_TO_TORCH_DTYPE: dict[object, torch.dtype] | None = None
+
+
+def _build_dtype_maps() -> tuple[dict[torch.dtype, object], dict[object, torch.dtype]]:
+    """Return cached torch<->jnp dtype maps, building them on first use.
+
+    Built lazily so importing this module never imports JAX (which is
+    optional and TPU-only on most checkouts).
+    """
+    global _TORCH_TO_JNP_DTYPE, _JNP_TO_TORCH_DTYPE
+    if _TORCH_TO_JNP_DTYPE is not None and _JNP_TO_TORCH_DTYPE is not None:
+        return _TORCH_TO_JNP_DTYPE, _JNP_TO_TORCH_DTYPE
+    import jax.numpy as jnp
+
+    pairs: list[tuple[torch.dtype, object]] = [
+        (torch.float32, jnp.float32.dtype),
+        (torch.float64, jnp.float64.dtype),
+        (torch.float16, jnp.float16.dtype),
+        (torch.bfloat16, jnp.bfloat16.dtype),
+        (torch.int8, jnp.int8.dtype),
+        (torch.int16, jnp.int16.dtype),
+        (torch.int32, jnp.int32.dtype),
+        (torch.int64, jnp.int64.dtype),
+        (torch.uint8, jnp.uint8.dtype),
+        (torch.bool, jnp.bool_.dtype),
+    ]
+    _TORCH_TO_JNP_DTYPE = dict(pairs)
+    _JNP_TO_TORCH_DTYPE = {j: t for t, j in pairs}
+    return _TORCH_TO_JNP_DTYPE, _JNP_TO_TORCH_DTYPE
+
+
+def _jnp_to_torch_dtype(jnp_dtype: object) -> torch.dtype:
+    _, j2t = _build_dtype_maps()
+    return j2t[jnp_dtype]
+
+
+class _JaxExportTensor(torch.Tensor):
+    """A ``torch.Tensor`` subclass that carries a JAX array on the side.
+
+    The underlying storage is ``device='meta'`` so all torch operations
+    invoked by the Helion-generated wrapper see correct shape/dtype but
+    perform no real compute on the torch side.  ``__torch_function__``
+    intercepts the small set of operations the wrapper actually uses
+    (``reshape``/``view``/``empty_like``/``F.pad``) and mirrors them on
+    the JAX array so the JAX side stays in sync.
+
+    Use ``_JaxExportTensor.from_jax(arr, device=...)`` to construct one;
+    use ``adapter._jax_arr`` (or :func:`_unwrap_jax` on a result) to
+    recover the underlying JAX array.
+    """
+
+    _jax_arr: object
+    _declared_device: torch.device
+    _view_parent: _JaxExportTensor | None
+
+    @staticmethod
+    def from_jax(jax_arr: object, *, device: torch.device) -> _JaxExportTensor:
+        torch_dtype = _jnp_to_torch_dtype(jax_arr.dtype)  # type: ignore[union-attr]
+        meta = torch.empty(
+            tuple(int(s) for s in jax_arr.shape),  # type: ignore[union-attr]
+            dtype=torch_dtype,
+            device="meta",
+        )
+        out = torch.Tensor._make_subclass(_JaxExportTensor, meta, require_grad=False)
+        out._jax_arr = jax_arr
+        out._declared_device = device  # pyrefly: ignore[read-only]
+        out._view_parent = None
+        return out
+
+    def _replace_jax_array(self, jax_arr: object) -> None:
+        """Replace this view and propagate the update to its source adapter."""
+        self._jax_arr = jax_arr
+        parent = self._view_parent
+        if parent is None:
+            return
+        import jax.numpy as jnp
+
+        parent._replace_jax_array(
+            jnp.reshape(jax_arr, tuple(parent.shape))  # type: ignore[arg-type]
+        )
+
+    @property
+    def device(self) -> torch.device:  # pyrefly: ignore[bad-override]
+        # Helion's ``_find_device``/specialization machinery reads this to
+        # decide which backend to compile for; the real meta storage
+        # would otherwise route compilation through the meta device.
+        return self._declared_device
+
+    @classmethod
+    def __torch_function__(
+        cls,
+        func: object,
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        if kwargs is None:
+            kwargs = {}
+
+        # ``torch.empty_like(adapter, device='meta')`` shows up in
+        # generated wrappers when the kernel allocates an output-only
+        # tensor.  Allocate a JAX-side empty with matching shape/dtype
+        # so the export launcher can use the JAX array as the output
+        # placeholder.
+        if func is torch.empty_like:
+            template = args[0] if args else kwargs.get("input")
+            assert isinstance(template, _JaxExportTensor)
+            import jax.numpy as jnp
+
+            new_jax = jnp.empty(
+                tuple(int(s) for s in template._jax_arr.shape),  # type: ignore[union-attr]
+                dtype=template._jax_arr.dtype,  # type: ignore[union-attr]
+            )
+            return cls.from_jax(new_jax, device=template._declared_device)
+
+        # ``q_view = q_in.reshape([...])`` and ``out.view(...)`` are
+        # the wrapper's only shape-mutating operations.  Re-wrap the
+        # JAX array under the new shape so subsequent attribute reads
+        # (``.size(...)``, ``.shape``) on the result stay in sync.
+        if func is torch.Tensor.reshape or func is torch.Tensor.view:
+            t = args[0]
+            assert isinstance(t, _JaxExportTensor)
+            new_shape = _normalize_shape(args[1:], kwargs)
+            import jax.numpy as jnp
+
+            new_jax = jnp.reshape(t._jax_arr, list(new_shape))  # type: ignore[arg-type]
+            out = cls.from_jax(new_jax, device=t._declared_device)
+            out._view_parent = t
+            return out
+
+        # ``_pallas_apply_ds_padding`` calls ``torch.nn.functional.pad``
+        # on adapter inputs to bring tile-misaligned tensors up to a
+        # block multiple before the pallas_call.  Mirror the same
+        # zero-padding on the JAX side so the JAX array passed to the
+        # kernel matches the adapter's reported shape.
+        if func is torch.nn.functional.pad:
+            t = args[0]
+            assert isinstance(t, _JaxExportTensor)
+            pad_widths = args[1] if len(args) > 1 else kwargs["pad"]
+            mode = kwargs.get("mode", "constant")
+            value = kwargs.get("value")
+            import jax.numpy as jnp
+
+            # ``F.pad`` walks dims back-to-front in pairs of
+            # (left_pad, right_pad).  ``jnp.pad`` takes a list of
+            # ``(before, after)`` pairs in dim order — invert.
+            pairs: list[tuple[int, int]] = [(0, 0)] * t.ndim
+            n_pairs = len(pad_widths) // 2  # type: ignore[arg-type]
+            for i in range(n_pairs):
+                left = int(pad_widths[2 * i])  # type: ignore[index]
+                right = int(pad_widths[2 * i + 1])  # type: ignore[index]
+                pairs[t.ndim - 1 - i] = (left, right)
+            assert mode == "constant", (
+                f"_JaxExportTensor only supports F.pad mode='constant', got {mode!r}"
+            )
+            new_jax = jnp.pad(
+                t._jax_arr,  # type: ignore[arg-type]
+                pairs,
+                mode="constant",
+                constant_values=0 if value is None else value,
+            )
+            return cls.from_jax(new_jax, device=t._declared_device)
+
+        # Catch-all: any op the wrapper might invoke that we haven't
+        # special-cased above.  Shape-only ops (``.size()``, ``.shape``,
+        # ``.ndim``, ``.dim()``) work on the meta storage; ops that
+        # need real data raise from torch's meta backend.  If a new
+        # tensor-returning op appears here whose result the wrapper
+        # later passes back into the kernel, it must be added to the
+        # intercept list above so the JAX side stays in sync.
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*args, **kwargs)  # type: ignore[operator]
+
+
+def _normalize_shape(
+    rest: tuple[object, ...], kwargs: dict[str, object]
+) -> tuple[object, ...]:
+    """Normalise the shape arg of ``Tensor.reshape``/``Tensor.view``.
+
+    Accepts both ``t.reshape(2, 3)`` and ``t.reshape([2, 3])`` /
+    ``t.reshape((2, 3))`` calling conventions.
+    """
+    if "shape" in kwargs:
+        candidate = kwargs["shape"]
+        if isinstance(candidate, (list, tuple)):
+            return tuple(candidate)
+        return (candidate,)
+    if len(rest) == 1 and isinstance(rest[0], (list, tuple)):
+        return tuple(rest[0])
+    return rest
+
+
+def _unwrap_jax(obj: object) -> object:
+    """Recursively unwrap ``_JaxExportTensor`` instances to JAX arrays."""
+    if isinstance(obj, _JaxExportTensor):
+        return obj._jax_arr
+    if isinstance(obj, tuple):
+        return tuple(_unwrap_jax(x) for x in obj)
+    if isinstance(obj, list):
+        return [_unwrap_jax(x) for x in obj]
+    return obj
+
+
+def _device_for_jax_export() -> torch.device:
+    """Pick the torch device used to drive Helion compilation in jax_fn.
+
+    Helion's specialization key includes the input device type.  For
+    the JAX-export path we don't actually run any torch ops on real
+    storage, so we just need a device that lines up with the active
+    backend.  Prefer ``tpu`` when ``torch_tpu`` is loaded; otherwise
+    fall back to CPU (this matches the interpret-mode test
+    environment).
+    """
+    if hasattr(torch, "tpu"):
+        try:
+            if torch.accelerator.is_available():
+                return torch.device("tpu", 0)
+        except Exception:
+            pass
+    return torch.device("cpu")
+
+
+def _tensor_arg_to_jax(arg: object) -> object:
+    """Return the JAX array for a kernel tensor argument.
+
+    Most tensor args are ``_JaxExportTensor`` adapters carrying the caller's JAX
+    array. Helion can also lift Python scalar constants used in the kernel body
+    (e.g. an epsilon threshold or a ``-inf`` mask fill) into ``torch.tensor([...])``
+    device constants in the generated host wrapper; those arrive as plain torch
+    tensors (not adapters), so materialize them as JAX arrays here.
+    """
+    if isinstance(arg, _JaxExportTensor):
+        return arg._jax_arr
+    if isinstance(arg, torch.Tensor):
+        import jax.numpy as jnp
+
+        if arg.device.type == "meta":
+            torch_to_jnp, _ = _build_dtype_maps()
+            return jnp.empty(
+                tuple(int(size) for size in arg.shape),
+                dtype=cast("Any", torch_to_jnp[arg.dtype]),
+            )
+        return jnp.asarray(arg.detach().cpu().numpy())
+    return arg
+
+
+def default_pallas_jax_launcher(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    _output_indices: list[int] | None = None,
+    _inplace_indices: list[int] | None = None,
+    _block_spec_info: _BlockSpecInfo | None = None,
+    _scratch_shapes: list[object] | None = None,
+    _hbm_arg_indices: list[int] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _smem_arg_indices: list[int] | None = None,
+    _pallas_interpret: bool | None = None,
+    _collective_id: int | None = None,
+    _use_low_level_scheduler: bool = False,
+    _grid_scalar_prefetch_arg_indices: list[int] | None = None,
+    _uses_remote_copy: bool = False,
+    **kwargs: object,
+) -> object:
+    """Pallas launcher used when running a Helion kernel inside ``jax.jit``.
+
+    Each tensor argument in ``args`` is a ``_JaxExportTensor`` whose
+    underlying ``_jax_arr`` is either a concrete JAX array or a JAX
+    tracer.  This launcher pulls the JAX side out, calls the shared
+    ``_pallas_compile_jit_fn`` (or the compact-worklist variant when
+    ``_compact_build_worklist`` is present) to build a fresh
+    ``pl.pallas_call``, invokes it on the JAX inputs, and re-wraps the
+    output(s) as ``_JaxExportTensor`` so the Helion wrapper's trailing
+    reshape/view operations stay traceable.
+    """
+    from ..settings import is_pallas_interpret
+    from .launcher import _pallas_apply_ds_padding
+    from .launcher import _pallas_jax_call
+
+    interpret = (
+        _pallas_interpret if _pallas_interpret is not None else is_pallas_interpret()
+    )
+
+    output_indices = _output_indices if _output_indices is not None else []
+    inplace_indices = set(_inplace_indices or [])
+    wrapper_args = args
+
+    # Capture original shapes BEFORE padding so output-only tensors can
+    # be sliced back after the pallas_call.  ``_pallas_apply_ds_padding``
+    # calls ``F.pad`` on each entry, which the adapter intercepts and
+    # mirrors on the JAX side, so no JAX-side duplicate is needed here.
+    orig_shapes: dict[int, tuple[int, ...]] = {}
+    if _ds_pad_dims:
+        for arg_idx, _, _, _ in _ds_pad_dims:
+            if arg_idx in orig_shapes:
+                continue
+            a = args[arg_idx]
+            if isinstance(a, _JaxExportTensor):
+                orig_shapes[arg_idx] = tuple(int(s) for s in a._jax_arr.shape)  # type: ignore[union-attr]
+
+        args, _ = _pallas_apply_ds_padding(args, output_indices, _ds_pad_dims)
+
+    device = next(
+        (a._declared_device for a in args if isinstance(a, _JaxExportTensor)),
+        _device_for_jax_export(),
+    )
+
+    # Unwrap the adapters to raw JAX arrays and drive the shared launch core.
+    # The ``_JaxExportTensor`` adapter is only needed by the torch-flavored host
+    # wrapper (reshape/empty_like/pad); ``_pallas_jax_call`` (the same path the
+    # precompiled standalone uses) runs the duck-typed compile core + pl.kernel
+    # jit_fn on raw JAX arrays.
+    core_args = tuple(_tensor_arg_to_jax(a) for a in args)
+
+    # Compact-worklist kernels are discriminated by ``_compact_build_worklist``
+    # (emitted by codegen only for that lowering). Resident caching note: on this
+    # jit path the window IS applied but the host overflow guard is NOT run (the
+    # offsets are jit tracers, so a per-source range > window C cannot be checked
+    # at trace time); the caller must ensure every ordered range <= C.
+    compact_build_worklist = kwargs.get("_compact_build_worklist")
+    compact: dict[str, object] | None = None
+    if compact_build_worklist is not None:
+        compact = {
+            "build_worklist": compact_build_worklist,
+            "offset_arg_indices": kwargs.get("_compact_offset_arg_indices") or [],
+            "metadata_fields": kwargs.get("_compact_metadata_fields") or [],
+            "owner_ref_pos": kwargs.get("_compact_owner_ref_pos", 0),
+            "num_scalar_prefetch": kwargs.get("_compact_num_scalar_prefetch", 0),
+            "aligned_arg_indices": kwargs.get("_compact_aligned_arg_indices") or [],
+            "tile_start_ref_pos": kwargs.get("_compact_tile_start_ref_pos", 1),
+            "compact_block": kwargs.get("_compact_block", 1),
+            "ordered_aligned_arg_indices": kwargs.get(
+                "_compact_ordered_aligned_arg_indices"
+            )
+            or [],
+            "range_start_ref_pos": kwargs.get("_compact_range_start_ref_pos", -1),
+            "ordered_window": kwargs.get("_compact_ordered_window", 0),
+        }
+
+    output_results = _pallas_jax_call(
+        pallas_kernel,
+        grid,
+        core_args,
+        output_indices=output_indices,
+        inplace_indices=_inplace_indices,
+        block_spec_info=_block_spec_info,
+        scratch_shapes=_scratch_shapes,
+        hbm_arg_indices=_hbm_arg_indices,
+        smem_arg_indices=_smem_arg_indices,
+        collective_id=_collective_id,
+        use_low_level_scheduler=_use_low_level_scheduler,
+        grid_scalar_prefetch_arg_indices=_grid_scalar_prefetch_arg_indices,
+        interpret=interpret,
+        compact=compact,
+        orig_shapes=orig_shapes,
+        ds_pad_dims=_ds_pad_dims,
+        return_all_outputs=True,
+    )
+
+    for output_result, arg_index in zip(output_results, output_indices, strict=True):
+        if arg_index not in inplace_indices:
+            continue
+        adapter = wrapper_args[arg_index]
+        assert isinstance(adapter, _JaxExportTensor)
+        adapter._replace_jax_array(output_result)
+
+    returned_results = [
+        output_result
+        for output_result, arg_index in zip(output_results, output_indices, strict=True)
+        if arg_index not in inplace_indices
+    ]
+    if not returned_results:
+        returned_results = output_results
+    if len(returned_results) == 1:
+        return _JaxExportTensor.from_jax(returned_results[0], device=device)
+    return tuple(_JaxExportTensor.from_jax(r, device=device) for r in returned_results)
+
+
+def make_jax_fn(kernel: Kernel) -> Callable[..., Any]:
+    """Build the callable returned by ``Kernel.jax_fn``.
+
+    The returned callable can be invoked with JAX arrays / tracers
+    inside ``jax.jit`` and returns JAX arrays.  Internally it drives
+    the same Helion-generated wrapper that the torch-tensor launchers
+    use; only the launcher kwarg changes.
+    """
+
+    def _runtime_call(*args: object) -> object:
+        device = _device_for_jax_export()
+        adapter_args: list[object] = []
+        for a in args:
+            if (
+                hasattr(a, "shape")
+                and hasattr(a, "dtype")
+                and not isinstance(a, torch.Tensor)
+            ):
+                adapter_args.append(_JaxExportTensor.from_jax(a, device=device))
+            else:
+                adapter_args.append(a)
+
+        # Compile the helion kernel for these (adapter) arg shapes.  We
+        # go through the same Kernel.bind/compile path used by the
+        # torch entrypoint so specialization, autotune, etc. all run
+        # exactly once per shape signature — the adapter is a
+        # torch.Tensor subclass so this just works.
+        bound = kernel.bind(tuple(adapter_args))
+        bound.ensure_config_exists(adapter_args)
+        compiled = bound._run
+        assert compiled is not None
+
+        # ``default_pallas_jax_launcher`` picks the compile path from
+        # the kwargs codegen already emits (``_scratch_shapes``,
+        # ``_hbm_arg_indices``, ``_compact_build_worklist``); no
+        # loop-type discriminator needed.
+        def _launcher(
+            pallas_kernel: object,
+            grid: tuple[int, ...],
+            *launch_args: object,
+            **launch_kwargs: object,
+        ) -> object:
+            return default_pallas_jax_launcher(
+                pallas_kernel,
+                grid,
+                *launch_args,
+                **cast("dict[str, Any]", launch_kwargs),
+            )
+
+        result = compiled(*adapter_args, _launcher=_launcher)
+        return _unwrap_jax(result)
+
+    return _runtime_call
