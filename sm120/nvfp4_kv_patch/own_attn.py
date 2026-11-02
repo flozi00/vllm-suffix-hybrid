@@ -196,9 +196,11 @@ def uniform_decode_excludes_prefill(func=None) -> bool:
     # v0.32 moved eligibility into GPUModelRunner request state and admits
     # one-token prompt extends. Restore the stricter invariant before
     # advertising FULL K2 verify graphs, preserving masked image prefills.
+    # v0.33.0 ships a byte-identical gather_batch_req_state (sha256
+    # 18da780f...), so the same hash-pinned guard applies unchanged.
     if "if decode_graph_eligible and is_uniform_query_len(" in src:
         import vllm
-        if getattr(vllm, "__version__", "").split("+")[0] == "0.32.0":
+        if getattr(vllm, "__version__", "").split("+")[0] in ("0.32.0", "0.33.0"):
             from .v032 import install_prefill_graph_guard
             return install_prefill_graph_guard()
     return False

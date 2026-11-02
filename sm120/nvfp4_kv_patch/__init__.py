@@ -93,6 +93,15 @@ TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 # fail-close on real text drift).
 PINNED_VLLM = "0.30.0"
 PINNED_FLASHINFER = "0.6.18.post1"
+# Upstream-native NVFP4-KV adapters: (vLLM, FlashInfer) pairs whose
+# vllm/v1/attention/backends/flashinfer.py carries the post-0.32 layout that
+# v032.py ports. 0.33.0 keeps every anchor except own_attn_spec_as_decode,
+# which v032.py re-anchors per version. A pair not listed here falls back to
+# the 0.30.0 anchor set and its PINNED_* gate.
+NATIVE_ADAPTERS = frozenset({
+    ("0.32.0", "0.7.0.post1"),
+    ("0.33.0", "0.7.2.post1"),
+})
 
 GATE_ENV = "SUFFIX_SM120_NVP4KV"
 DESWIZZLE_FLAG = "-DFLASHINFER_PAGED_V_SF_DESWIZZLE=1"
@@ -1303,8 +1312,7 @@ def apply(module=None, *, force: bool = False) -> bool:
     fi_ver = getattr(fi_mod, "__version__", "")
 
     drift = []
-    v032 = (vllm_ver.split("+")[0] == "0.32.0"
-            and fi_ver == "0.7.0.post1")
+    v032 = (vllm_ver.split("+")[0], fi_ver) in NATIVE_ADAPTERS
     if not v032 and not vllm_ver.startswith(PINNED_VLLM):
         drift.append(f"vllm {vllm_ver!r} != {PINNED_VLLM}")
     if not v032 and not fi_ver.startswith(PINNED_FLASHINFER):
@@ -1364,7 +1372,7 @@ def apply(module=None, *, force: bool = False) -> bool:
         return True
     if v032:
         from .v032 import patch_backend_source as patch_v032
-        new_src, applied = patch_v032(src, sys.modules[__name__])
+        new_src, applied = patch_v032(src, sys.modules[__name__], vllm_ver)
     else:
         new_src, applied = patch_backend_source(src)
     # K2-NVFP4 adapter (inert unless SUFFIX_SM120_NVP4KV_OWN_ATTN=1).

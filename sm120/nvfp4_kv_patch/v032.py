@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM 0.32.0 adapter for the existing, oracle-gated Gemma K2 lane.
+"""Upstream-native NVFP4-KV adapter for vLLM 0.32.0 and 0.33.0.
 
 Upstream now supports SM120 NVFP4 itself. Keep its dtype/view/forward code;
 port only our image masks, graph-safe K2 dispatch and host planning changes.
@@ -8,6 +8,10 @@ required by both oxide and the tuned Helion kernels. The new FlashInfer
 slot writer uses linear V scales and MUST NOT be mixed with these readers.
 Consequently this adapter uses FA2 (with the existing deswizzle define),
 not XQA. A separate native-format port needs its own numerical gate.
+
+0.33.0 delta: every anchor is unchanged except ``own_attn_spec_as_decode``,
+which is re-anchored (see ``_SPEC_AS_DECODE_033``). The hash-pinned
+``gather_batch_req_state`` guard is byte-identical across both versions.
 """
 from __future__ import annotations
 
@@ -66,7 +70,29 @@ def probe_headers(files, probe):
     return probe(files)
 
 
-def edits(base):
+_SPEC_AS_DECODE_033 = (
+    "own_attn_spec_as_decode",
+    '''        self.use_fa2_native_decode = _use_fa2_native_decode()
+        self._init_reorder_batch_threshold(
+            1,
+            supports_spec_as_decode=(
+                self.flashinfer_trtllm_api_decode_kernel is not None
+                or self.use_fa2_native_decode
+            ),''',
+    '''        self.use_fa2_native_decode = _use_fa2_native_decode()
+        self.use_own_nvfp4_attn = _nvfp4_own_attn_gate(self)
+        self._init_reorder_batch_threshold(
+            1,
+            supports_spec_as_decode=(
+                self.flashinfer_trtllm_api_decode_kernel is not None
+                or self.use_fa2_native_decode
+                or self.use_own_nvfp4_attn
+            ),''',
+    1,
+)
+
+
+def edits(base, vllm_ver="0.32.0"):
     keep = {
         "supports_mm_prefix_nvfp4", "nvfp4_head_major_layouts", "helper_after_logger",
         "impl_route_flag", "cudagraph_support_fa2", "own_attn_no_paged_indices",
@@ -75,6 +101,15 @@ def edits(base):
         "own_attn_decode_wrapper",
     }
     result = [e for e in base._BACKEND_EDITS if e[0] in keep]
+    if vllm_ver.split("+")[0] == "0.33.0":
+        # 0.33.0 inserts `self.use_fa2_native_decode = _use_fa2_native_decode()`
+        # and ORs it into supports_spec_as_decode. That helper is
+        # `not has_device_capability(90)`, i.e. already True on SM120, so the
+        # upstream value is right — but this anchor is the ONLY place that
+        # sets self.use_own_nvfp4_attn, so it must be re-anchored, not dropped
+        # (dropping it would silently disable the own-attn lane).
+        result = [_SPEC_AS_DECODE_033 if e[0] == "own_attn_spec_as_decode" else e
+                  for e in result]
     result.extend([
         ("v032_builder_route",
          "        # Compute per-phase Q dtype.  On SM90 (XQA decode), the prefill and",
@@ -115,16 +150,17 @@ def edits(base):
     return result
 
 
-def patch_backend_source(src, base):
-    transforms = edits(base)
+def patch_backend_source(src, base, vllm_ver="0.32.0"):
+    transforms = edits(base, vllm_ver)
     bad = [f"{name}: expected {count}, found {src.count(old)}"
            for name, old, _new, count in transforms if src.count(old) != count]
     if bad:
-        raise base.PatchDriftError("vLLM 0.32.0 K2 adapter anchor drift: " + "; ".join(bad))
+        raise base.PatchDriftError(
+            f"vLLM {vllm_ver} K2 adapter anchor drift: " + "; ".join(bad))
     out, applied = src, []
     for name, old, new, count in transforms:
         if out.count(old) != count:
-            raise base.PatchDriftError(f"vLLM 0.32.0 overlapping anchor: {name}")
+            raise base.PatchDriftError(f"vLLM {vllm_ver} overlapping anchor: {name}")
         out = out.replace(old, new)
         applied.append(name)
     compile(out, "<nvfp4_kv_patch_v032>", "exec")
