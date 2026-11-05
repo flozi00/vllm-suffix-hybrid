@@ -83,7 +83,7 @@ import sys
 from pathlib import Path
 
 PATCH_NAME = "sm120-nvfp4-kv"
-PATCH_REVISION = "2026-10-07.13"
+PATCH_REVISION = "2026-10-11.1"
 
 TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 
@@ -93,6 +93,14 @@ TARGET_MODULE = "vllm.v1.attention.backends.flashinfer"
 # fail-close on real text drift).
 PINNED_VLLM = "0.30.0"
 PINNED_FLASHINFER = "0.6.18.post1"
+# vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18, image
+# nightly-2eb491e18..., flashinfer 0.7.0.post1) read NVFP4 KV on SM120 natively
+# (fa2 prefill, XQA decode, FlashInfer's slot-mapping writer with LINEAR V
+# scales). There the patch keeps only what upstream lacks: the mm-prefix
+# custom mask (gemma-4 vision) and host-free planning. No de-swizzle flag
+# (upstream's writer does not swizzle) and no K2 (it reads swizzled V scales).
+NIGHTLY_VLLM = "0.31.1"
+NIGHTLY_FLASHINFER = "0.7.0"
 
 GATE_ENV = "SUFFIX_SM120_NVP4KV"
 DESWIZZLE_FLAG = "-DFLASHINFER_PAGED_V_SF_DESWIZZLE=1"
@@ -212,8 +220,8 @@ HEADER_CHECKS = {
     # MaskMode.CUSTOM off _custom_mask_buf and passes _mask_indptr_buf).
     "mm_wrapper_mask_buffers": (
         "prefill.py",
-        ("if self._custom_mask_buf is not None:\n"
-         "            mask_mode = MaskMode.CUSTOM.value",
+        ("if self._custom_mask_buf is not None",
+         "mask_mode = MaskMode.CUSTOM.value",
          "self._mask_indptr_buf = mask_indptr.to(",
          "self._mask_indptr_buf,"),
     ),
@@ -1196,25 +1204,60 @@ _BACKEND_EDITS = [
 ]
 
 
-def patch_backend_source(src: str) -> tuple[str, list[str]]:
+# 0.31.1 nightly: upstream owns the route (nvfp4_fa2 / nvfp4_trtllm, q/o
+# dtypes, wrapper backends, fp8-out detour, sinks/DCP guards, XQA decode,
+# cudagraph level, layouts, the no-spec exact seq_lens). Our mm-prefix and
+# hostfree edits key off use_fa2_nvfp4_kv, so alias it to upstream's flag
+# (SM120 + gate only; upstream's flag also covers SM8x/SM90).
+_NIGHTLY_KEEP = (
+    "supports_mm_prefix_nvfp4", "helper_after_logger", "hostfree_pinned_buffers",
+    "hostfree_no_kv_lens_pin", "hostfree_build_fence", "builder_mm_prefix_mode",
+    "build_mm_prefix_resplit", "prefill_mm_prefix_mask",
+)
+_NIGHTLY_ALIAS = (
+    "self.use_fa2_nvfp4_kv = (\n"
+    "{i}    self.nvfp4_fa2 and _use_fa2_for_nvfp4_kv_on_sm120()\n"
+    "{i})\n"
+)
+_NIGHTLY_EDITS = [
+    edit for edit in _BACKEND_EDITS if edit[0] in _NIGHTLY_KEEP
+] + [
+    # builder __init__ (12-space body) and FlashInferImpl.__init__ (8-space):
+    # the leading newline + exact indent keeps each anchor unique.
+    (f"nightly_alias_{where}",
+     f"\n{ind}self.nvfp4_trtllm = self.is_kvcache_nvfp4 and not self.nvfp4_fa2\n",
+     f"\n{ind}self.nvfp4_trtllm = self.is_kvcache_nvfp4 and not self.nvfp4_fa2\n"
+     f"{ind}" + _NIGHTLY_ALIAS.format(i=ind), 1)
+    for where, ind in (("builder", " " * 12), ("impl", " " * 8))
+] + [
+    ("nightly_alias_default",
+     "            self.nvfp4_fa2 = self.nvfp4_trtllm = False\n",
+     "            self.nvfp4_fa2 = self.nvfp4_trtllm = False\n"
+     "            self.use_fa2_nvfp4_kv = False\n", 1),
+]
+
+
+def patch_backend_source(src: str, nightly: bool = False) -> tuple[str, list[str]]:
     """Pure text transform of vllm/v1/attention/backends/flashinfer.py.
 
     Raises PatchDriftError listing every anchor whose occurrence count
     mismatched (file untouched — nothing is replaced until all counts pass).
     Returns (new_source, [applied anchor names])."""
+    edits = _NIGHTLY_EDITS if nightly else _BACKEND_EDITS
     bad = [
         f"{name}: expected {count}, found {src.count(old)}"
-        for name, old, _new, count in _BACKEND_EDITS
+        for name, old, _new, count in edits
         if src.count(old) != count
     ]
     if bad:
         raise PatchDriftError(
             "vLLM flashinfer backend does not match the pinned anchor text "
-            f"(expected vLLM {PINNED_VLLM}): " + "; ".join(bad)
+            f"(expected vLLM {NIGHTLY_VLLM if nightly else PINNED_VLLM}): "
+            + "; ".join(bad)
         )
     applied = []
     out = src
-    for name, old, new, count in _BACKEND_EDITS:
+    for name, old, new, count in edits:
         # An earlier edit must never have consumed a later anchor.
         if out.count(old) != count:
             raise PatchDriftError(f"internal error: anchor {name} overlaps")
@@ -1295,16 +1338,25 @@ def apply(module=None, *, force: bool = False) -> bool:
         fi_root = Path(search[0])
     fi_ver = getattr(fi_mod, "__version__", "")
 
+    nightly = vllm_ver.startswith(NIGHTLY_VLLM)
+    want_vllm, want_fi = ((NIGHTLY_VLLM, NIGHTLY_FLASHINFER) if nightly
+                          else (PINNED_VLLM, PINNED_FLASHINFER))
     drift = []
-    if not vllm_ver.startswith(PINNED_VLLM):
-        drift.append(f"vllm {vllm_ver!r} != {PINNED_VLLM}")
-    if not fi_ver.startswith(PINNED_FLASHINFER):
-        drift.append(f"flashinfer {fi_ver!r} != {PINNED_FLASHINFER}")
+    if not vllm_ver.startswith(want_vllm):
+        drift.append(f"vllm {vllm_ver!r} != {PINNED_VLLM} / {NIGHTLY_VLLM}")
+    if not fi_ver.startswith(want_fi):
+        drift.append(f"flashinfer {fi_ver!r} != {want_fi} (vllm {want_vllm})")
+    if nightly and os.environ.get(GATE_ENV + "_OWN_ATTN", "").strip() == "1":
+        _fail(f"{GATE_ENV}_OWN_ATTN=1 on vLLM {vllm_ver}: K2-NVFP4 reads "
+              "4-token swizzled V scales, the nightly's FlashInfer writer "
+              "stores them linear. Unset it (upstream XQA decodes NVFP4 on "
+              "SM120 there).")
     if drift:
         message = (
             "version drift: " + ", ".join(drift)
-            + f". This patch is validated for vllm {PINNED_VLLM} + "
-              f"flashinfer {PINNED_FLASHINFER} only."
+            + f". This patch is validated for vllm {PINNED_VLLM} + flashinfer "
+              f"{PINNED_FLASHINFER} and vllm {NIGHTLY_VLLM} + flashinfer "
+              f"{NIGHTLY_FLASHINFER} only."
         )
         if not allow_drift():
             _fail(message + " Override with " + GATE_ENV + "_ALLOW_DRIFT=1 "
@@ -1327,8 +1379,9 @@ def apply(module=None, *, force: bool = False) -> bool:
             f"the image needs flashinfer >= {PINNED_FLASHINFER}."
         )
 
-    # 3. JIT flags (must land before the first attention plan()).
-    if ensure_deswizzle_flag():
+    # 3. JIT flags (must land before the first attention plan()). The nightly
+    # writes V scales linear: de-swizzling there would scramble them.
+    if not nightly and ensure_deswizzle_flag():
         print(
             f"[suffix {PATCH_NAME}] appended {DESWIZZLE_FLAG} to "
             "FLASHINFER_EXTRA_CUDAFLAGS (vLLM's V block-scales are 4-token "
@@ -1349,7 +1402,7 @@ def apply(module=None, *, force: bool = False) -> bool:
         # the anchors (they would match the *unpatched* text zero times).
         setattr(module, MARKER_ATTR, PATCH_REVISION)
         return True
-    new_src, applied = patch_backend_source(src)
+    new_src, applied = patch_backend_source(src, nightly=nightly)
     # K2-NVFP4 adapter (inert unless SUFFIX_SM120_NVP4KV_OWN_ATTN=1).
     module.__dict__["_nvfp4_own_attn"] = own_attn_module()
     exec_patched_source(module, new_src, src_path)
