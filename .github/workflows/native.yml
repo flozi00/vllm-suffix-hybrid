@@ -197,22 +197,26 @@ jobs:
           if find vendor -name '*.so' -o -name '*.pyd' | grep .; then exit 1; fi
       - name: Create directly mountable runtime bundle
         run: |
-          python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA" \
+          python scripts/runtime_bundle.py --wheel dist/*.whl --output native-bundle --revision "$GITHUB_SHA" \
             --vendor-dir vendor \
             $( [ -f oxide_cubins/manifest.json ] && echo --oxide-cubins oxide_cubins )
       # kernels.yml restores this by the same key. It is the base a Python-only
       # push overlays onto, which is what removes the Rust compile from kernel
       # iteration. Saved before the upload so a slow artifact upload cannot
       # leave the cache empty.
+      #
+      # The path MUST be spelled identically in both workflows: actions/cache
+      # folds the path list into the cache version, so `runtime` here and
+      # `native-bundle` there are different caches and the restore misses.
       - name: Publish native bundle for kernels.yml
         uses: actions/cache/save@v4
         with:
-          path: runtime
+          path: native-bundle
           key: native-bundle-${{ steps.native_key.outputs.key }}
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-linux-x86_64
-          path: runtime/
+          path: native-bundle/
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
