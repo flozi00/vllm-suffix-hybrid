@@ -9,7 +9,7 @@ name: Kernels (python)
 # testing this very commit — so this job reports a skip instead of racing it.
 on:
   push:
-    branches: [main]
+    branches: [main, ci/split-native-kernels]
     paths:
       - 'suffix_hybrid/**'
       - 'sm120/**'
