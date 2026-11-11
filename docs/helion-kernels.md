@@ -104,6 +104,23 @@ and `target/`, the ~1 GB of CUDA wheels and their extracted trees, the rustup
 nightly plus the `cargo-oxide` binary (a full compile of the tool), and the
 pip wheels (torch CPU alone is ~200 MB).
 
+Two things about `actions/cache` that cost a full CI run each to find:
+
+- **`hashFiles()` is evaluated when the step runs, not at workflow start.**
+  `oxide_build.py` writes `<crate>.ptx` into `kernels-oxide/` before the save
+  step, so a save key built from `hashFiles('kernels-oxide/**')` hashed build
+  artifacts while the restore key hashed a clean checkout. They never matched.
+  `scripts/native_key.sh` hashes `git ls-tree -r HEAD` instead — committed
+  blobs, identical on both sides, immune to anything a build step drops.
+- **The `path` is part of the cache version.** Saving `path: runtime` and
+  restoring `path: native-bundle` are two different caches under the same key,
+  and the restore misses with no hint that the path is the reason. Both
+  workflows build into `native-bundle` for exactly this reason.
+
+Measured on this split (warm caches): `native.yml` 32 min, `kernels.yml`
+16 min of which 14:19 is the pytest suite — and no Rust compile at all. The
+test suite, not the build, is now the floor for a kernel iteration.
+
 `HELION_VENDOR` (helion 1.5.0 plus the pure-python deps the vLLM image lacks:
 rich, markdown-it-py, mdurl, pygments) is installed with
 `pip install --no-deps --only-binary=:all: --target vendor`, fails on any
