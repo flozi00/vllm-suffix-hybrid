@@ -76,20 +76,65 @@ skip when Helion is not installed. They prove indexing and math, not speed.
 
 ## Bundle
 
-CI (`.github/workflows/native.yml`, env `HELION_VENDOR`) runs
-`pip install --no-deps --only-binary=:all: --target vendor` for helion 1.5.0
-plus the pure-python deps the vLLM image lacks (rich, markdown-it-py, mdurl,
-pygments), fails on any compiled file, and passes the tree to
-`scripts/runtime_bundle.py --vendor-dir`: it lands in `/plugins/_vendor/`,
-hashed in BUILD.json. `ensure_vendor()` appends it to `sys.path`, so an image
-that ships Helion wins. Not vendored: numpy, psutil, typing-extensions,
-torch, triton (the image has them), filecheck (Helion never imports it) and
-scikit-learn/scipy: only the autotuner's surrogate searches import sklearn,
-inside `try/except ImportError`, and serving never autotunes. Tuned configs
-ride in the wheel like `configs/afp4` (maturin ships every file under
-`suffix_hybrid/`). The CI test step installs helion + triton 3.8.0 (the pin
-of PyPI torch 2.14.x, matching the CPU torch it installs) so the interpret
-checks run instead of skipping.
+Two workflows, split on what actually changed. The wheel carries the whole
+Python package (`python-source = "."`), so before this split every kernel
+tweak rebuilt the Rust extension, the cuda-oxide toolchain and the full suite
+— pure tax, because `src/` never mentions Helion.
+
+| workflow | triggers on | does |
+|---|---|---|
+| `native.yml` | `src/**`, `Cargo.*`, `kernels-oxide/**`, `pyproject.toml` | Rust tests, maturin wheel, oxide cubins, full Python suite, publishes the native bundle |
+| `kernels.yml` | `suffix_hybrid/**`, `sm120/**`, the ep modules, `scripts/runtime_bundle.py`, `tests/**` | no Rust at all: restores the native bundle, overlays the checkout, tests the artifact it built |
+
+`native.yml` publishes its bundle to the Actions cache under
+`native-bundle-<hashFiles(src/**, Cargo.toml, Cargo.lock, kernels-oxide/**,
+pyproject.toml)>`; `kernels.yml` restores the same key and calls
+`scripts/runtime_bundle.py --base-bundle native-bundle --output runtime`. The
+`.so` and the CI-built cubins come from the base, every `.py` and every tuned
+config from the commit. A repo `.so` is never taken (a local build is a macOS
+binary), and the builder asserts a `.so` is present at the end.
+
+When a push changes both the Rust inputs and the Python, `kernels.yml` finds
+no bundle and reports a skip instead of racing `native.yml` — that commit is
+already fully tested by `native.yml`, which keeps the full suite for exactly
+this reason.
+
+Caching (none existed before): `Swatinem/rust-cache` for the cargo registry
+and `target/`, the ~1 GB of CUDA wheels and their extracted trees, the rustup
+nightly plus the `cargo-oxide` binary (a full compile of the tool), and the
+pip wheels (torch CPU alone is ~200 MB).
+
+Two things about `actions/cache` that cost a full CI run each to find:
+
+- **`hashFiles()` is evaluated when the step runs, not at workflow start.**
+  `oxide_build.py` writes `<crate>.ptx` into `kernels-oxide/` before the save
+  step, so a save key built from `hashFiles('kernels-oxide/**')` hashed build
+  artifacts while the restore key hashed a clean checkout. They never matched.
+  `scripts/native_key.sh` hashes `git ls-tree -r HEAD` instead — committed
+  blobs, identical on both sides, immune to anything a build step drops.
+- **The `path` is part of the cache version.** Saving `path: runtime` and
+  restoring `path: native-bundle` are two different caches under the same key,
+  and the restore misses with no hint that the path is the reason. Both
+  workflows build into `native-bundle` for exactly this reason.
+
+Measured on this split (warm caches): `native.yml` 32 min, `kernels.yml`
+16 min of which 14:19 is the pytest suite — and no Rust compile at all. The
+test suite, not the build, is now the floor for a kernel iteration.
+
+`HELION_VENDOR` (helion 1.5.0 plus the pure-python deps the vLLM image lacks:
+rich, markdown-it-py, mdurl, pygments) is installed with
+`pip install --no-deps --only-binary=:all: --target vendor`, fails on any
+compiled file, and lands in `/plugins/_vendor/` via
+`scripts/runtime_bundle.py --vendor-dir`, hashed in BUILD.json.
+`ensure_vendor()` appends it to `sys.path`, so an image that ships Helion
+wins. Not vendored: numpy, psutil, typing-extensions, torch, triton (the
+image has them), filecheck (Helion never imports it) and scikit-learn/scipy:
+only the autotuner's surrogate searches import sklearn, inside
+`try/except ImportError`, and serving never autotunes. Tuned configs ride in
+the wheel like `configs/afp4` (maturin ships every file under
+`suffix_hybrid/`), and `kernels.yml` refreshes them from the checkout. Both
+workflows install helion + triton 3.8.0 (the pin of PyPI torch 2.14.x,
+matching the CPU torch) so the interpret checks run instead of skipping.
 
 ## mxfp8_gemm (no oxide twin: DeepSeek-V4.1 FP8 linears on SM120)
 

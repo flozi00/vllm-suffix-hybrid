@@ -142,5 +142,45 @@ class BundleTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.bundle(wheel, root / 'runtime', 'c' * 40)
 
+    def test_base_bundle_keeps_native_and_refreshes_python(self):
+        # The kernel build: no wheel, no Rust. The base bundle's .so and
+        # CI-built cubins must survive; the repo's Python package is overlaid.
+        spec = importlib.util.spec_from_file_location('runtime_bundle', Path(__file__).with_name('runtime_bundle.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / 'base'
+            (base / 'suffix_hybrid' / 'oxide_cubins').mkdir(parents=True)
+            (base / 'suffix_hybrid' / '_native.abi3.so').write_bytes(b'base-native')
+            (base / 'suffix_hybrid' / 'oxide_cubins' / 'k.cubin').write_bytes(b'cubin')
+            (base / 'suffix_hybrid' / 'stale.py').write_text('STALE = 1\n')
+            module.bundle(None, root / 'runtime', 'e' * 40, base_bundle=base)
+            out = root / 'runtime'
+            self.assertEqual((out / 'suffix_hybrid' / '_native.abi3.so').read_bytes(), b'base-native')
+            self.assertEqual((out / 'suffix_hybrid' / 'oxide_cubins' / 'k.cubin').read_bytes(), b'cubin')
+            # a real module from the checkout, not the fixture
+            self.assertTrue((out / 'suffix_hybrid' / 'helion_kernels' / 'nvfp4_gemm.py').is_file())
+            # a repo .so must never be taken from the checkout
+            self.assertEqual((out / 'suffix_hybrid' / '_native.abi3.so').read_bytes(), b'base-native')
+            manifest = json.loads((out / 'BUILD.json').read_text())
+            self.assertIsNone(manifest['wheel'])
+            self.assertEqual(manifest['base_bundle'], str(base))
+            self.assertIn('suffix_hybrid/_native.abi3.so', manifest['sha256'])
+
+    def test_bundle_requires_exactly_one_source(self):
+        spec = importlib.util.spec_from_file_location('runtime_bundle', Path(__file__).with_name('runtime_bundle.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / 'plugin.whl'
+            with zipfile.ZipFile(wheel, 'w') as archive:
+                archive.writestr('suffix_hybrid/_native.abi3.so', b'x')
+            with self.assertRaises(ValueError):
+                module.bundle(None, root / 'a', 'f' * 40)
+            with self.assertRaises(ValueError):
+                module.bundle(wheel, root / 'b', 'f' * 40, base_bundle=root)
+
 if __name__ == '__main__':
     unittest.main()

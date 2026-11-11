@@ -25,23 +25,82 @@ from pathlib import Path, PurePosixPath
 import zipfile
 
 
-def bundle(wheel, output, revision, qgdn_cubins=None, attn_cubins=None,
-           oxide_cubins=None, vendor_dir=None):
+def _write(dest, data, hashes, name):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    hashes[name] = hashlib.sha256(data).hexdigest()
+
+
+def _overlay_python(repo, output, hashes):
+    """Copy the repo's own Python package over an existing bundle.
+
+    `python-source = "."` means the wheel's `suffix_hybrid/**` IS this tree, so
+    a kernel-only change needs no wheel at all: the compiled `.so` and the
+    CI-built cubins stay from the base bundle, everything else is refreshed
+    from the checkout. `.so` files are never taken from the repo (a local
+    build would be a macOS or wrong-arch binary).
+    """
+    pkg = repo / 'suffix_hybrid'
+    if not pkg.is_dir():
+        raise ValueError('runtime bundle requires the suffix_hybrid package')
+    for src in sorted(pkg.rglob('*')):
+        if src.is_dir() or '__pycache__' in src.parts or src.suffix in ('.pyc', '.so'):
+            continue
+        rel = PurePosixPath('suffix_hybrid', *src.relative_to(pkg).parts)
+        if '..' in rel.parts:
+            raise ValueError('unsafe package path')
+        _write(output / PurePosixPath(*rel.parts), src.read_bytes(), hashes, str(rel))
+
+
+def bundle(wheel, output, revision, qgdn_cubins=None,
+           attn_cubins=None, oxide_cubins=None, vendor_dir=None,
+           base_bundle=None):
+    """Build a runtime bundle from a wheel, or refresh one from the checkout.
+
+    Exactly one of `wheel` / `base_bundle` is required:
+
+    * `wheel` — the native build. Extracts `suffix_hybrid/**` from the wheel,
+      which carries the freshly compiled `.so`.
+    * `base_bundle` — the kernel build. Copies an existing bundle (keeping its
+      `.so` and cubins) and overlays the repo's Python package on top. This is
+      what lets a Helion kernel or tuned config ship without a Rust compile.
+    """
+    if (wheel is None) == (base_bundle is None):
+        raise ValueError('runtime bundle needs exactly one of wheel / base_bundle')
     output = Path(output)
     hashes = {}
-    with zipfile.ZipFile(wheel) as archive:
-        members = [n for n in archive.namelist() if n.startswith('suffix_hybrid/') and not n.endswith('/')]
-        if not any(n.endswith('.so') for n in members):
-            raise ValueError('runtime bundle requires a compiled native extension')
-        for name in members:
-            if '..' in PurePosixPath(name).parts:
-                raise ValueError('unsafe wheel path')
-            data = archive.read(name)
-            dest = output / name
+    repo = Path(__file__).resolve().parents[1]
+    if wheel is not None:
+        with zipfile.ZipFile(wheel) as archive:
+            members = [n for n in archive.namelist() if n.startswith('suffix_hybrid/') and not n.endswith('/')]
+            if not any(n.endswith('.so') for n in members):
+                raise ValueError('runtime bundle requires a compiled native extension')
+            for name in members:
+                if '..' in PurePosixPath(name).parts:
+                    raise ValueError('unsafe wheel path')
+                data = archive.read(name)
+                dest = output / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+                hashes[name] = hashlib.sha256(data).hexdigest()
+    else:
+        base = Path(base_bundle)
+        if not base.is_dir():
+            raise ValueError(f'base bundle is not a directory: {base}')
+        for src in sorted(base.rglob('*')):
+            if src.is_dir() or '__pycache__' in src.parts or src.suffix == '.pyc':
+                continue
+            rel = PurePosixPath(*src.relative_to(base).parts)
+            if '..' in rel.parts:
+                raise ValueError('unsafe base bundle path')
+            data = src.read_bytes()
+            dest = output / PurePosixPath(*rel.parts)
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
-            hashes[name] = hashlib.sha256(data).hexdigest()
-    bootstrap = Path(__file__).resolve().parents[1] / 'sitecustomize.py'
+            hashes[str(rel)] = hashlib.sha256(data).hexdigest()
+        _overlay_python(repo, output, hashes)
+    bootstrap = repo / 'sitecustomize.py'
+
     data = bootstrap.read_bytes()
     (output / 'sitecustomize.py').write_bytes(data)
     hashes['sitecustomize.py'] = hashlib.sha256(data).hexdigest()
@@ -218,16 +277,23 @@ def bundle(wheel, output, revision, qgdn_cubins=None, attn_cubins=None,
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
             hashes[str(rel)] = hashlib.sha256(data).hexdigest()
+    if not any((output / 'suffix_hybrid').glob('*.so')):
+        raise ValueError('runtime bundle requires a compiled native extension')
     (output / 'BUILD.json').write_text(json.dumps({
         'source_revision': revision,
-        'wheel': Path(wheel).name,
+        'wheel': Path(wheel).name if wheel is not None else None,
+        'base_bundle': str(base_bundle) if base_bundle is not None else None,
         'sha256': hashes,
     }, indent=2) + '\n')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--wheel', required=True)
+    parser.add_argument('--wheel', default=None,
+                        help='native build: wheel carrying the compiled .so')
+    parser.add_argument('--base-bundle', default=None,
+                        help='kernel build: existing bundle to refresh from the '
+                             'checkout (keeps its .so and cubins)')
     parser.add_argument('--output', required=True)
     parser.add_argument('--revision', required=True)
     parser.add_argument('--qgdn-cubins', default=None,
@@ -240,4 +306,5 @@ if __name__ == '__main__':
                         help='pre-installed pure-python tree -> <output>/_vendor/')
     args = parser.parse_args()
     bundle(args.wheel, args.output, args.revision, args.qgdn_cubins,
-           args.attn_cubins, args.oxide_cubins, args.vendor_dir)
+           args.attn_cubins, args.oxide_cubins, args.vendor_dir,
+           args.base_bundle)

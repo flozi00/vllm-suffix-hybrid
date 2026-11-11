@@ -1,8 +1,17 @@
 name: Native plugin
+# Rust + cuda-oxide only. A Helion kernel, a tuned config or a shim change does
+# NOT run this workflow — see kernels.yml. Everything here is keyed on the Rust
+# and oxide-crate inputs, so a Python-only push costs nothing.
 on:
   push:
     branches: [main]
-    paths-ignore: ['docs/**', 'graphify-out/**']
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'kernels-oxide/**'
+      - 'pyproject.toml'
+      - '.github/workflows/native.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -45,17 +54,60 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # One key for both workflows (scripts/native_key.sh): git blobs, not the
+      # working tree, so the .ptx files oxide_build.py drops into
+      # kernels-oxide/ cannot change it after the build.
+      - name: Compute native cache key
+        id: native_key
+        run: echo "key=$(sh scripts/native_key.sh)" >> "$GITHUB_OUTPUT"
+      # Cargo registry + target/. Without this every push recompiled the whole
+      # dependency graph from scratch; with it an unchanged-deps run is a
+      # relink. cache-on-failure keeps a red run from paying twice.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native
+          cache-on-failure: true
+      # The CUDA wheels are ~1 GB of downloads and never change between runs.
+      - name: Cache CUDA wheels + extracted trees
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cuda13-whl
+            .cuda13
+            .cuda130-whl
+            .cuda130
+          key: cuda-wheels-${{ env.CUDA_WHEEL_VERSION }}-${{ env.CURAND_WHEEL_VERSION }}-${{ env.PTXAS_WHEEL_VERSION }}
+      # `cargo install --git ... cargo-oxide` is a full compile of the tool.
+      # Keyed on the pinned nightly + rev, so it is built once per bump.
+      - name: Cache cuda-oxide toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/bin/cargo-oxide
+          key: oxide-toolchain-${{ env.OXIDE_NIGHTLY }}-${{ env.CUDA_OXIDE_REV }}
+      # torch CPU alone is ~200 MB per run.
+      - name: Cache pip wheels
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ env.TORCH_CPU_VERSION }}-${{ env.TRITON_VERSION }}-${{ env.HELION_VENDOR }}
       - name: CUDA 13 headers + offline tileiras (pip wheels, no GPU)
         run: |
-          python -m pip download --no-deps --only-binary=:all: \
-            --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 \
-            --platform manylinux_2_27_x86_64 --python-version 3.11 \
-            nvidia-cuda-runtime==$CUDA_WHEEL_VERSION nvidia-cuda-crt==$CUDA_WHEEL_VERSION \
-            nvidia-curand==$CURAND_WHEEL_VERSION nvidia-cuda-tileiras==$CUDA_WHEEL_VERSION \
-            nvidia-cuda-cuobjdump==$CUDA_WHEEL_VERSION \
-            nvidia-cuda-nvcc==$CUDA_WHEEL_VERSION nvidia-nvvm==$CUDA_WHEEL_VERSION \
-            nvidia-nvjitlink==$CUDA_WHEEL_VERSION -d .cuda13-whl
-          for w in .cuda13-whl/*.whl; do python -m zipfile -e "$w" .cuda13; done
+          if [ -f .cuda13/nvidia/cu13/include/cuda.h ]; then
+            echo "cached CUDA 13 tree"
+          else
+            python -m pip download --no-deps --only-binary=:all: \
+              --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 \
+              --platform manylinux_2_27_x86_64 --python-version 3.11 \
+              nvidia-cuda-runtime==$CUDA_WHEEL_VERSION nvidia-cuda-crt==$CUDA_WHEEL_VERSION \
+              nvidia-curand==$CURAND_WHEEL_VERSION nvidia-cuda-tileiras==$CUDA_WHEEL_VERSION \
+              nvidia-cuda-cuobjdump==$CUDA_WHEEL_VERSION \
+              nvidia-cuda-nvcc==$CUDA_WHEEL_VERSION nvidia-nvvm==$CUDA_WHEEL_VERSION \
+              nvidia-nvjitlink==$CUDA_WHEEL_VERSION -d .cuda13-whl
+            for w in .cuda13-whl/*.whl; do python -m zipfile -e "$w" .cuda13; done
+          fi
           test -f .cuda13/nvidia/cu13/include/cuda.h
           chmod +x .cuda13/nvidia/cu13/bin/*
           .cuda13/nvidia/cu13/bin/tileiras --version
@@ -75,18 +127,24 @@ jobs:
           cargo check --release --features cutile-kernels
       - name: cuda-oxide toolchain (pinned nightly + its llc/NVPTX) + ptxas 13.0
         run: |
-          rustup toolchain install "$OXIDE_NIGHTLY" --profile minimal -c rust-src,rustc-dev,llvm-tools
+          if ! rustup toolchain list | grep -q "^$OXIDE_NIGHTLY"; then
+            rustup toolchain install "$OXIDE_NIGHTLY" --profile minimal -c rust-src,rustc-dev,llvm-tools
+          fi
           # The real tool (NOT the unrelated crates.io `cuda-oxide` crate).
-          cargo +"$OXIDE_NIGHTLY" install --locked --git https://github.com/NVlabs/cuda-oxide.git \
-            --rev "$CUDA_OXIDE_REV" cargo-oxide
+          if ! command -v cargo-oxide >/dev/null; then
+            cargo +"$OXIDE_NIGHTLY" install --locked --git https://github.com/NVlabs/cuda-oxide.git \
+              --rev "$CUDA_OXIDE_REV" cargo-oxide
+          fi
           llc="$(rustc +"$OXIDE_NIGHTLY" --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llc"
           "$llc" --version | grep -q nvptx64
           echo "CUDA_OXIDE_LLC=$llc" >> "$GITHUB_ENV"
-          python -m pip download --no-deps --only-binary=:all: \
-            --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 \
-            --platform manylinux_2_27_x86_64 --python-version 3.11 \
-            nvidia-cuda-nvcc==$PTXAS_WHEEL_VERSION -d .cuda130-whl
-          for w in .cuda130-whl/*.whl; do python -m zipfile -e "$w" .cuda130; done
+          if [ ! -x "$(find .cuda130 -name ptxas -type f 2>/dev/null | head -1)" ]; then
+            python -m pip download --no-deps --only-binary=:all: \
+              --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 \
+              --platform manylinux_2_27_x86_64 --python-version 3.11 \
+              nvidia-cuda-nvcc==$PTXAS_WHEEL_VERSION -d .cuda130-whl
+            for w in .cuda130-whl/*.whl; do python -m zipfile -e "$w" .cuda130; done
+          fi
           ptxas=$(find .cuda130 -name ptxas -type f | head -1); chmod +x "$ptxas"
           "$ptxas" --version | tee /dev/stderr | grep -q "release 13.0"
           echo "OXIDE_PTXAS=$PWD/$ptxas" >> "$GITHUB_ENV"
@@ -98,6 +156,10 @@ jobs:
           args: --release --locked --features oxide-kernels --out dist
           before-script-linux: dnf install -y clang-devel || yum install -y clang-devel
           docker-options: -e CUDA_TOOLKIT_PATH=${{ github.workspace }}/.cuda13/nvidia/cu13
+      # Full suite, not a smoke test: this workflow only runs when the Rust or
+      # oxide-crate inputs changed, and a Rust change must be tested against
+      # the Python that ships with it. Python-only pushes are covered by
+      # kernels.yml, which reuses this bundle instead of rebuilding it.
       - name: Exercise installed Linux wheel
         run: |
           python -m pip install dist/*.whl numpy pytest safetensors fastapi httpx pillow opencv-python-headless
@@ -114,6 +176,7 @@ jobs:
           if readelf -d "$so" | grep -Ei 'NEEDED.*(libcuda|libcudart|libcurand)'; then exit 1; fi
           python -c "import suffix_hybrid._native as n; assert n.HAS_QWEN_GDN_CUDA and n.HAS_NVFP4_ATTN_CUDA and n.HAS_NVFP4_DSMLA_CUDA and n.HAS_OXIDE_KERNELS"
           python -m pytest "$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/sm120/tests" -q --import-mode=importlib
+          python "$GITHUB_WORKSPACE/scripts/test_runtime_bundle.py"
           python "$GITHUB_WORKSPACE/tests/test_pplx_decider_reference.py" --extension "$so"
       - name: Build cuda-oxide kernels -> sm_120 cubins (ptxas 13.0) + SASS/ISA assertions
         # kernels-oxide/<name>/ -> PTX (ISA <= 9.0) -> ptxas 13.0 -> cubin;
@@ -134,13 +197,26 @@ jobs:
           if find vendor -name '*.so' -o -name '*.pyd' | grep .; then exit 1; fi
       - name: Create directly mountable runtime bundle
         run: |
-          python scripts/runtime_bundle.py --wheel dist/*.whl --output runtime --revision "$GITHUB_SHA" \
+          python scripts/runtime_bundle.py --wheel dist/*.whl --output native-bundle --revision "$GITHUB_SHA" \
             --vendor-dir vendor \
             $( [ -f oxide_cubins/manifest.json ] && echo --oxide-cubins oxide_cubins )
+      # kernels.yml restores this by the same key. It is the base a Python-only
+      # push overlays onto, which is what removes the Rust compile from kernel
+      # iteration. Saved before the upload so a slow artifact upload cannot
+      # leave the cache empty.
+      #
+      # The path MUST be spelled identically in both workflows: actions/cache
+      # folds the path list into the cache version, so `runtime` here and
+      # `native-bundle` there are different caches and the restore misses.
+      - name: Publish native bundle for kernels.yml
+        uses: actions/cache/save@v4
+        with:
+          path: native-bundle
+          key: native-bundle-${{ steps.native_key.outputs.key }}
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-linux-x86_64
-          path: runtime/
+          path: native-bundle/
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:

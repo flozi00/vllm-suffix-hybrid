@@ -1,0 +1,121 @@
+name: Kernels (python)
+# The cheap path: Helion kernels, tuned configs, sm120 shims, the bundle
+# builder and the Python test suite. No Rust, no maturin, no cuda-oxide, no
+# rustup — a kernel iteration is a ~2 minute job instead of a full rebuild.
+#
+# It overlays the checkout onto the native bundle that native.yml published
+# (keyed on the Rust + oxide-crate inputs). When that bundle is absent the
+# commit's Rust inputs changed too, which means native.yml is building and
+# testing this very commit — so this job reports a skip instead of racing it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'suffix_hybrid/**'
+      - 'sm120/**'
+      - 'sitecustomize.py'
+      - 'suffix_hybrid_*_ep.py'
+      - 'suffix_*_ep-1.0.dist-info/**'
+      - 'scripts/runtime_bundle.py'
+      - 'scripts/test_runtime_bundle.py'
+      - 'scripts/native_key.sh'
+      - 'tests/**'
+      - '.github/workflows/kernels.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  HELION_VENDOR: helion==1.5.0 rich==15.0.0 markdown-it-py==4.2.0 mdurl==0.1.2 pygments==2.21.0
+  TORCH_CPU_VERSION: '2.14.1'
+  TRITON_VERSION: '3.8.0'
+jobs:
+  kernels:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      # Same key native.yml saves under (scripts/native_key.sh hashes the git
+      # blobs, so both sides agree regardless of build artifacts).
+      - name: Compute native cache key
+        id: native_key
+        run: echo "key=$(sh scripts/native_key.sh)" >> "$GITHUB_OUTPUT"
+      # A miss is not an error here: it means the Rust inputs moved, and
+      # native.yml owns that commit.
+      - name: Restore native bundle
+        id: native
+        uses: actions/cache/restore@v4
+        with:
+          path: native-bundle
+          key: native-bundle-${{ steps.native_key.outputs.key }}
+      - name: Decide whether this commit needs the python job
+        id: gate
+        run: |
+          if [ -f native-bundle/suffix_hybrid/_native.abi3.so ]; then
+            echo "run=1" >> "$GITHUB_OUTPUT"
+            echo "native bundle restored ($(du -sh native-bundle | cut -f1))"
+          else
+            echo "run=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::No native bundle for this revision — the Rust inputs changed, so 'Native plugin' builds and tests this commit itself. Nothing to do here."
+          fi
+      - name: Cache pip wheels
+        if: steps.gate.outputs.run == '1'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ env.TORCH_CPU_VERSION }}-${{ env.TRITON_VERSION }}-${{ env.HELION_VENDOR }}
+      - name: Install serving-style python deps
+        if: steps.gate.outputs.run == '1'
+        run: |
+          python -m pip install numpy pytest safetensors fastapi httpx pillow opencv-python-headless
+          python -m pip install torch==$TORCH_CPU_VERSION --index-url https://download.pytorch.org/whl/cpu
+          # Helion interpret-mode CPU checks (tests/test_helion_*.py) must run,
+          # not skip: helion imports without a GPU (no device probe at import).
+          python -m pip install triton==$TRITON_VERSION
+          python -m pip install --no-deps $HELION_VENDOR
+          python -c "import helion, sys; assert 'sklearn' not in sys.modules"
+      - name: Vendor Helion (pure python) for the bundle's _vendor/
+        if: steps.gate.outputs.run == '1'
+        run: |
+          python -m pip install --no-deps --only-binary=:all: --target vendor $HELION_VENDOR
+          # pure python only: a compiled file here would be built for the
+          # runner, not the serving image
+          if find vendor -name '*.so' -o -name '*.pyd' | grep .; then exit 1; fi
+      # Overlay the checkout onto the native bundle. The .so and the CI-built
+      # cubins come from native-bundle; every .py and every tuned config comes
+      # from this commit.
+      - name: Build runtime bundle (native base + fresh python)
+        if: steps.gate.outputs.run == '1'
+        run: |
+          python scripts/runtime_bundle.py --base-bundle native-bundle --output runtime \
+            --revision "$GITHUB_SHA" --vendor-dir vendor
+          test -f runtime/suffix_hybrid/_native.abi3.so
+          # the overlay must actually have replaced the python, not kept the base
+          python - <<'PY'
+          import json, pathlib
+          m = json.loads(pathlib.Path('runtime/BUILD.json').read_text())
+          assert m['wheel'] is None, m['wheel']
+          assert m['base_bundle'] == 'native-bundle', m['base_bundle']
+          assert 'suffix_hybrid/helion_kernels/nvfp4_gemm.py' in m['sha256']
+          print(f"bundle: {len(m['sha256'])} files, base {m['base_bundle']}")
+          PY
+      # Test the artifact that ships, not the checkout: PYTHONPATH points at
+      # runtime/ and the cwd leaves the checkout so its source suffix_hybrid/
+      # cannot shadow it.
+      - name: Python test suite against the shipped bundle
+        if: steps.gate.outputs.run == '1'
+        run: |
+          cd "$RUNNER_TEMP"
+          export PYTHONPATH="$GITHUB_WORKSPACE/runtime"
+          so=$(python -c "import suffix_hybrid._native as n; print(n.__file__)")
+          echo "native: $so"
+          python -m pytest "$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/sm120/tests" -q --import-mode=importlib
+          python "$GITHUB_WORKSPACE/scripts/test_runtime_bundle.py"
+          python "$GITHUB_WORKSPACE/tests/test_pplx_decider_reference.py" --extension "$so"
+      - uses: actions/upload-artifact@v4
+        if: steps.gate.outputs.run == '1'
+        with:
+          name: runtime-linux-x86_64
+          path: runtime/
+          if-no-files-found: error
