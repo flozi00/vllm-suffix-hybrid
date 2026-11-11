@@ -18,6 +18,7 @@ on:
       - 'suffix_*_ep-1.0.dist-info/**'
       - 'scripts/runtime_bundle.py'
       - 'scripts/test_runtime_bundle.py'
+      - 'scripts/native_key.sh'
       - 'tests/**'
       - '.github/workflows/kernels.yml'
   workflow_dispatch:
@@ -35,14 +36,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      # Same key native.yml saves under. A miss is not an error here: it means
-      # the Rust inputs moved, and native.yml owns that commit.
+      # Same key native.yml saves under (scripts/native_key.sh hashes the git
+      # blobs, so both sides agree regardless of build artifacts).
+      - name: Compute native cache key
+        id: native_key
+        run: echo "key=$(sh scripts/native_key.sh)" >> "$GITHUB_OUTPUT"
+      # A miss is not an error here: it means the Rust inputs moved, and
+      # native.yml owns that commit.
       - name: Restore native bundle
         id: native
         uses: actions/cache/restore@v4
         with:
           path: native-bundle
-          key: native-bundle-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'kernels-oxide/**', 'pyproject.toml') }}
+          key: native-bundle-${{ steps.native_key.outputs.key }}
       - name: Decide whether this commit needs the python job
         id: gate
         run: |

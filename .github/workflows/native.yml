@@ -54,6 +54,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # One key for both workflows (scripts/native_key.sh): git blobs, not the
+      # working tree, so the .ptx files oxide_build.py drops into
+      # kernels-oxide/ cannot change it after the build.
+      - name: Compute native cache key
+        id: native_key
+        run: echo "key=$(sh scripts/native_key.sh)" >> "$GITHUB_OUTPUT"
       # Cargo registry + target/. Without this every push recompiled the whole
       # dependency graph from scratch; with it an unchanged-deps run is a
       # relink. cache-on-failure keeps a red run from paying twice.
@@ -202,7 +208,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: runtime
-          key: native-bundle-${{ hashFiles('src/**', 'Cargo.toml', 'Cargo.lock', 'kernels-oxide/**', 'pyproject.toml') }}
+          key: native-bundle-${{ steps.native_key.outputs.key }}
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-linux-x86_64
