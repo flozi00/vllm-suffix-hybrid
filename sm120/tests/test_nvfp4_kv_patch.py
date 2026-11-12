@@ -874,3 +874,51 @@ def test_header_probe_mm_checks_gated(monkeypatch):
     assert not res["mm_variant_mask_layout"]
     assert not res["mm_wrapper_mask_buffers"]
     assert res["prefill_cuh_sf_strides"]   # base route unaffected
+
+
+def test_apply_nightly_skips_deswizzle_and_refuses_k2(tmp_path, monkeypatch):
+    # vLLM 0.31.1 nightly + FI 0.7.0.post1: nightly edit set, no de-swizzle
+    # define (its writer stores V scales linear), K2 fails closed.
+    import shutil
+    import sys
+    import types
+    fx = FIXTURES / "flashinfer_0.7.0.post1"
+    stage = tmp_path / "flashinfer"
+    for rel, name in (("data/include/flashinfer", "page.cuh"),
+                      ("data/include/flashinfer/attention", "prefill.cuh"),
+                      ("data/include/flashinfer/attention", "variants.cuh"),
+                      ("data/csrc", "tvm_ffi_utils.h"), ("", "prefill.py")):
+        (stage / rel).mkdir(parents=True, exist_ok=True)
+        shutil.copy(fx / name, stage / rel / name)
+    (stage / "jit" / "attention").mkdir(parents=True)
+    shutil.copy(fx / "jit_attention" / "modules.py", stage / "jit" / "attention")
+    fake_fi = types.ModuleType("flashinfer")
+    fake_fi.__version__ = "0.7.0.post1"
+    fake_fi.__path__ = [str(stage)]
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.__version__ = "0.31.1rc1.dev273+g2eb491e18"
+    backend = types.ModuleType("vllm.v1.attention.backends.flashinfer")
+    backend.__file__ = str(FIXTURES / "vllm_0.31.1rc1.dev273" / "flashinfer_backend.py")
+    seen = {}
+    monkeypatch.setenv("SUFFIX_SM120_NVP4KV", "1")
+    monkeypatch.setenv("SUFFIX_SM120_NVP4KV_MM", "1")
+    monkeypatch.delenv("FLASHINFER_EXTRA_CUDAFLAGS", raising=False)
+    monkeypatch.setattr(PATCH, "is_sm120", lambda capability=None: True)
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setattr(PATCH.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(PATCH.importlib, "import_module",
+                        lambda name: fake_fi if name == "flashinfer"
+                        else importlib.import_module(name))
+    monkeypatch.setattr(PATCH, "exec_patched_source",
+                        lambda module, new_src, path: seen.update(src=new_src))
+    monkeypatch.setenv("SUFFIX_SM120_NVP4KV_OWN_ATTN", "1")
+    with pytest.raises(RuntimeError, match="linear"):
+        PATCH.apply(backend)
+    monkeypatch.delenv("SUFFIX_SM120_NVP4KV_OWN_ATTN")
+    assert PATCH.apply(backend) is True
+    assert "DESWIZZLE" not in os.environ.get("FLASHINFER_EXTRA_CUDAFLAGS", "")
+    assert "self.nvfp4_fa2 and _use_fa2_for_nvfp4_kv_on_sm120()" in seen["src"]
+    # 0.30.0 + FI 0.7.0 (or nightly + FI 0.6.18) is a mismatched pair
+    fake_fi.__version__ = "0.6.18.post1"
+    with pytest.raises(RuntimeError, match="version drift"):
+        PATCH.apply(backend, force=True)
