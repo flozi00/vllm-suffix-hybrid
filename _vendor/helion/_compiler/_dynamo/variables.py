@@ -1,0 +1,575 @@
+from __future__ import annotations
+
+import ast
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Sequence
+from typing import cast
+
+import torch
+from torch._dynamo import variables
+from torch._dynamo.variables.base import VariableTracker
+from torch._dynamo.variables.builder import GuardBuilder
+from torch._dynamo.variables.builder import VariableBuilder
+from torch._dynamo.variables.dicts import ConstDictVariable
+from torch._dynamo.variables.higher_order_ops import OutputSpec as _HopOutputSpec
+from torch._dynamo.variables.higher_order_ops import _call_function_and_unflatten_output
+from torch._dynamo.variables.lists import ListVariable
+from torch._dynamo.variables.lists import TupleVariable
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
+import torch.utils._pytree as pytree
+
+from helion._compat import shape_env_size_hint
+from helion._compat import supports_torch_compile_fusion
+from helion._compat import supports_torch_compile_template_lowering
+from helion._compiler.ast_extension import ExtendedAST
+from helion._compiler.ast_read_writes import ReadWrites
+from helion._compiler.backend_registry import get_backend_class
+from helion._compiler.type_info import TensorType
+import helion.exc as exc
+from helion.runtime.kernel import Kernel
+
+_SYM_SCALAR_TYPES = (torch.SymInt, torch.SymFloat)
+_HOST_SEMANTIC_FINGERPRINT = "_host_semantic_fingerprint"
+_HOST_SEMANTIC_INPUT_NORMALIZATION = "_host_semantic_input_normalization"
+_REQUIRES_ISOLATED_LOWERING = "_requires_isolated_lowering"
+
+if TYPE_CHECKING:
+    from torch._dynamo.symbolic_convert import InstructionTranslator
+    from torch._dynamo.symbolic_convert import InstructionTranslatorBase
+
+    from helion._compiler.host_function import HostFunction
+
+
+def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[str]:
+    """Find params mutated in place via subscript store (x[tile] = ...) or
+    atomic op (hl.atomic_*(x, ...)).
+
+    Uses ``inplace_writes`` rather than ``writes`` so that a plain rebind of a
+    param name (``x, y = torch.broadcast_tensors(x, y)``) is not mistaken for a
+    mutation of the caller's tensor.
+    """
+    rw = ReadWrites.from_list(body)
+    return [name for name in rw.inplace_writes if name in param_names]
+
+
+def _bind_param_tensors(host_function: HostFunction) -> dict[str, torch.Tensor]:
+    """The tensor arguments ``host_function`` was bound with, by param name."""
+    return {
+        n: v
+        for n, v in host_function.params.arguments.items()
+        if isinstance(v, torch.Tensor)
+    }
+
+
+def _params_written_through_host_views(
+    body: list[ast.stmt], bind_param_tensors: dict[str, torch.Tensor]
+) -> list[str]:
+    """Find params the kernel writes in place through a view its host code
+    takes (``xs = x[:2]`` then ``xs[tile] = ...``): in the bound kernel, the
+    view's FakeTensor shares the param's storage."""
+    written = ReadWrites.from_list(body).inplace_writes
+    storage_to_name = {
+        id(v.untyped_storage()): n for n, v in bind_param_tensors.items()
+    }
+    names: list[str] = []
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if (
+                isinstance(node, ast.Name)
+                and node.id in written
+                and node.id not in bind_param_tensors
+                and isinstance(node, ExtendedAST)
+                and isinstance(node._type_info, TensorType)
+                and (
+                    name := storage_to_name.get(
+                        id(node._type_info.fake_value.untyped_storage())
+                    )
+                )
+                is not None
+                and name not in names
+            ):
+                names.append(name)
+    return names
+
+
+def _mutated_params(
+    body: list[ast.stmt], bind_param_tensors: dict[str, torch.Tensor]
+) -> list[str]:
+    """Params the kernel writes in place, directly or through a host view."""
+    mutated = _detect_mutated_inputs(body, set(bind_param_tensors))
+    for name in _params_written_through_host_views(body, bind_param_tensors):
+        if name not in mutated:
+            mutated.append(name)
+    return mutated
+
+
+def _validate_return(
+    body: list[ast.stmt], return_value: ast.expr, flat_leaves: list[object]
+) -> None:
+    """Validate return statement for torch.compile compatibility."""
+    # Check return not in control flow
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if node is not stmt and isinstance(node, ast.Return):
+                raise RuntimeError(
+                    "Return statements inside control flow (if/else/for/while) "
+                    "are not supported with torch.compile. "
+                    "Please restructure the kernel to have a single return at the end."
+                )
+
+    # Check shared storage among distinct output tensors
+    seen_objs: set[int] = set()
+    seen_storages: set[int] = set()
+    for leaf in flat_leaves:
+        if not isinstance(leaf, torch.Tensor) or id(leaf) in seen_objs:
+            continue
+        seen_objs.add(id(leaf))
+        sid = id(leaf.untyped_storage())
+        if sid in seen_storages:
+            raise RuntimeError(
+                "Returning multiple outputs that share storage is not yet supported "
+                "with torch.compile. Please return independent tensors."
+            )
+        seen_storages.add(sid)
+
+
+def _writes_through_a_view(kernel: Kernel, args: tuple[Any, ...]) -> bool:
+    """Whether a call of ``kernel`` with ``args`` writes a param through a view:
+    the param it writes in place is itself a view, or its host code takes a
+    view of a param (``xs = x[:2]``) that the device code writes."""
+    bound = kernel._bind_isolated(args)
+    host_function = bound.host_function
+    assert host_function, "kernel binding succeeded but host_function is None"
+    bind_param_tensors = _bind_param_tensors(host_function)
+    call_args = dict(zip(kernel.signature.parameters, args, strict=False))
+    return any(
+        isinstance(arg := call_args.get(name), torch.Tensor) and arg._is_view()
+        for name in _detect_mutated_inputs(host_function.body, set(bind_param_tensors))
+    ) or bool(
+        _params_written_through_host_views(host_function.body, bind_param_tensors)
+    )
+
+
+def _detect_output_aliases(
+    flat_leaves: list[object],
+    bind_param_tensors: dict[str, torch.Tensor],
+) -> dict[int, tuple[str, bool]]:
+    """Detect output-to-input aliases via tensor identity and storage checks.
+
+    Uses the bound kernel's internal FakeTensors (from host_function.params)
+    which share identity/storage with pass-through and view outputs.
+
+    Returns:
+        {flat_leaf_index: (input_name, is_direct_alias)} where is_direct_alias
+        is True when the output is exactly the input (same tensor object).
+    """
+    id_to_name = {id(v): n for n, v in bind_param_tensors.items()}
+    storage_to_name = {
+        id(v.untyped_storage()): n for n, v in bind_param_tensors.items()
+    }
+    aliases: dict[int, tuple[str, bool]] = {}
+    for i, leaf in enumerate(flat_leaves):
+        if not isinstance(leaf, torch.Tensor):
+            continue
+        name = id_to_name.get(id(leaf))
+        if name is not None:
+            aliases[i] = (name, True)
+        else:
+            name = storage_to_name.get(id(leaf.untyped_storage()))
+            if name is not None:
+                aliases[i] = (name, False)
+    return aliases
+
+
+def _get_flat_output(
+    host_function: object,
+) -> tuple[list[object], pytree.TreeSpec | None, ast.expr | None]:
+    """Get flattened output leaves, tree spec, and return AST from a host function."""
+    body = getattr(host_function, "body", None)
+    if body is None:
+        return [], None, None
+    for stmt in reversed(body):
+        if isinstance(stmt, ast.Return):
+            if stmt.value is None:
+                return [], None, None
+            type_info = getattr(stmt.value, "_type_info", None)
+            if type_info is not None:
+                proxy_result = type_info.proxy()
+                flat, spec = pytree.tree_flatten(proxy_result)
+                return flat, spec, stmt.value
+            break
+    return [], None, None
+
+
+def infer_output_spec(
+    kernel: Kernel,
+    args: tuple[Any, ...],
+) -> dict[str, Any]:
+    """Infer the HOP output_spec by binding the kernel and analyzing its outputs.
+
+    Remaps helion-internal SymInts back to the caller's values so that symbolic
+    shape relationships are preserved for external tracers (make_fx, Dynamo).
+    """
+    names = list(kernel.signature.parameters.keys())
+    param_tensors = {
+        n: v for n, v in zip(names, args, strict=True) if isinstance(v, torch.Tensor)
+    }
+
+    # Dynamo capture must not publish fake-tensor-derived bounds into eager caches.
+    bound = kernel._bind_isolated(args)
+    assert bound.host_function, "kernel binding succeeded but host_function is None"
+    # Any user global can be rebound or mutated between capture and lowering.
+    # The host fingerprint is intentionally conservative rather than a complete
+    # serializer for arbitrary Python state, so such bounds lower in isolation.
+    requires_isolated_lowering = bool(bound.host_function.global_imports)
+
+    flat_leaves, tree_spec, return_value = _get_flat_output(bound.host_function)
+    bind_param_tensors = _bind_param_tensors(bound.host_function)
+    host_semantic_input_normalization = bound._get_host_semantic_input_normalization()
+    host_semantic_fingerprint = bound._get_host_semantic_fingerprint(
+        flat_leaves,
+        input_normalization=host_semantic_input_normalization,
+    )
+
+    if tree_spec is None:
+        return {
+            "leaf_specs": [],
+            "tree_spec_str": None,
+            "mutated_inputs": _mutated_params(
+                bound.host_function.body, bind_param_tensors
+            ),
+            _HOST_SEMANTIC_FINGERPRINT: host_semantic_fingerprint,
+            _HOST_SEMANTIC_INPUT_NORMALIZATION: host_semantic_input_normalization,
+            _REQUIRES_ISOLATED_LOWERING: requires_isolated_lowering,
+        }
+
+    assert return_value is not None
+    _validate_return(bound.host_function.body, return_value, flat_leaves)
+
+    output_aliases = _detect_output_aliases(flat_leaves, bind_param_tensors)
+    direct_aliases = {i: name for i, (name, direct) in output_aliases.items() if direct}
+
+    leaf_specs: list[dict[str, Any]] = []
+    for leaf in flat_leaves:
+        if isinstance(leaf, torch.Tensor):
+            leaf_specs.append(
+                {
+                    "type": "tensor",
+                    "shape": list(leaf.shape),
+                    "stride": list(leaf.stride()),
+                    "dtype": leaf.dtype,
+                    "device": str(leaf.device),
+                }
+            )
+        elif (
+            isinstance(leaf, (*_SYM_SCALAR_TYPES, int, float, bool, str))
+            or leaf is None
+        ):
+            leaf_specs.append({"type": "scalar", "scalar_value": leaf})
+        else:
+            raise RuntimeError(
+                f"Returning {type(leaf).__name__} values from a Helion kernel "
+                f"is not supported with torch.compile."
+            )
+
+    # Remap helion-internal SymInts back to the caller's values.
+    # Kernel binding creates FakeTensors in Helion's own ShapeEnv, so output
+    # SymInts aren't tracked by external tracers (make_fx, Dynamo). Build a
+    # mapping from helion's input symbols to the caller's original values
+    # (which may be tracer SymInts or concrete ints), then substitute.
+    helion_shape_env = bound.env.shape_env
+    sym_remap: dict[Any, Any] = {}
+    for orig_val, fake_val in zip(args, bound.fake_args, strict=True):
+        if isinstance(orig_val, torch.Tensor) and isinstance(fake_val, torch.Tensor):
+            for orig_s, fake_s in zip(orig_val.shape, fake_val.shape, strict=True):
+                if (
+                    isinstance(fake_s, torch.SymInt)
+                    and fake_s.node.shape_env is helion_shape_env
+                ):
+                    sym_remap[fake_s.node.expr] = orig_s
+            for orig_s, fake_s in zip(
+                orig_val.stride(), fake_val.stride(), strict=True
+            ):
+                if (
+                    isinstance(fake_s, torch.SymInt)
+                    and fake_s.node.shape_env is helion_shape_env
+                ):
+                    sym_remap[fake_s.node.expr] = orig_s
+        elif isinstance(fake_val, _SYM_SCALAR_TYPES):
+            if fake_val.node.shape_env is helion_shape_env:
+                sym_remap[fake_val.node.expr] = orig_val
+
+    def _remap_or_resolve(val: object) -> object:
+        if (
+            isinstance(val, _SYM_SCALAR_TYPES)
+            and val.node.shape_env is helion_shape_env
+        ):
+            expr = val.node.expr
+            mapped = sym_remap.get(expr)
+            if mapped is not None:
+                return mapped
+            # For compound expressions like `flag * 2` (= 2*u0), reject
+            # only if some unbacked symbol is NOT an input arg to the Helion kernel
+            # (i.e. was produced by a data-dependent op like `.item()`).
+            unbacked = free_unbacked_symbols(expr)
+            if unbacked and not unbacked.issubset(sym_remap.keys()):
+                assert return_value is not None
+                raise exc.DataDependentOutputShapeNotSupported(
+                    op_desc=f"`{ast.unparse(return_value)}`"
+                )
+            return shape_env_size_hint(helion_shape_env, expr)
+        return val
+
+    for spec in leaf_specs:
+        if spec["type"] == "tensor":
+            spec["shape"] = [_remap_or_resolve(s) for s in spec["shape"]]
+            spec["stride"] = [_remap_or_resolve(s) for s in spec["stride"]]
+        elif spec["type"] == "scalar":
+            sv = spec.get("scalar_value")
+            if isinstance(sv, _SYM_SCALAR_TYPES):
+                spec["scalar_value"] = _remap_or_resolve(sv)
+
+    mutated = _mutated_params(bound.host_function.body, bind_param_tensors)
+    for alias_name in {n for n, _ in output_aliases.values()}:
+        if alias_name not in mutated:
+            mutated.append(alias_name)
+
+    if len(mutated) > 1:
+        storage_to_names: dict[int, list[str]] = {}
+        for mut_name in mutated:
+            if mut_name in param_tensors:
+                sid = id(param_tensors[mut_name].untyped_storage())
+                storage_to_names.setdefault(sid, []).append(mut_name)
+        for shared_names in storage_to_names.values():
+            if len(shared_names) > 1:
+                raise RuntimeError(
+                    f"torch.compile does not support multiple mutated arguments "
+                    f"that share storage ({', '.join(shared_names)}) in a Helion kernel"
+                )
+
+    return {
+        "leaf_specs": leaf_specs,
+        "tree_spec_str": pytree.treespec_dumps(tree_spec),
+        "mutated_inputs": mutated,
+        "direct_aliases": direct_aliases,
+        _HOST_SEMANTIC_FINGERPRINT: host_semantic_fingerprint,
+        _HOST_SEMANTIC_INPUT_NORMALIZATION: host_semantic_input_normalization,
+        _REQUIRES_ISOLATED_LOWERING: requires_isolated_lowering,
+    }
+
+
+def _unwrap_arg(a: VariableTracker) -> object:
+    """Extract a concrete/fake value from a single Dynamo VariableTracker."""
+    if a.is_python_constant():
+        return a.as_python_constant()
+    return pytree.tree_map(
+        lambda p: p.node.meta.get("example_value") if hasattr(p, "node") else p,
+        a.as_proxy(),
+    )
+
+
+def _replace_direct_aliases(
+    result: VariableTracker,
+    output_spec: dict[str, object],
+    param_vars: dict[str, VariableTracker],
+) -> VariableTracker:
+    """Replace direct-alias outputs with the original input variables."""
+    direct_aliases = cast("dict[int, str]", output_spec.get("direct_aliases", {}))
+    replacements = {
+        i: param_vars[name] for i, name in direct_aliases.items() if name in param_vars
+    }
+    if not replacements:
+        return result
+
+    # Walk the variable tree, replacing leaves at aliased positions
+    counter = [0]
+
+    def walk(vt: VariableTracker) -> VariableTracker:
+        if isinstance(vt, (TupleVariable, ListVariable)):
+            new_items = [walk(item) for item in vt.items]
+            return type(vt)(new_items)
+        idx = counter[0]
+        counter[0] += 1
+        return replacements.get(idx, vt)
+
+    return walk(result)
+
+
+class HelionKernelVariable(VariableTracker):
+    """Variable tracker for Helion kernel objects."""
+
+    def __init__(
+        self,
+        kernel: Kernel,
+        kernel_idx: int | None,
+        inline: VariableTracker | None = None,
+        **kwargs: object,
+    ) -> None:  # pyrefly: ignore[bad-argument-type]
+        from helion._compiler._dynamo.higher_order_ops import helion_kernel_side_table
+
+        super().__init__(**kwargs)  # pyrefly: ignore[bad-argument-type]
+        self._kernel = kernel
+        self._kernel_idx = (
+            kernel_idx
+            if kernel_idx is not None
+            else helion_kernel_side_table.add_kernel(kernel)
+        )
+        # The kernel traced as a plain object, which Dynamo inlines down to
+        # the launch; calls that write no input through a view take it.
+        self._inline = inline
+
+    # Older PyTorch builds read attributes through var_getattr; newer ones
+    # dropped it from VariableTracker.
+    def var_getattr(self, tx: InstructionTranslator, name: str) -> VariableTracker:
+        if self._inline is not None:
+            return self._inline.var_getattr(tx, name)  # pyrefly: ignore[missing-attribute]
+        return super().var_getattr(tx, name)  # pyrefly: ignore[missing-attribute]
+
+    def call_function(
+        self,
+        tx: InstructionTranslatorBase,
+        args: Sequence[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker:
+        """Handle a call to a Helion kernel during Dynamo tracing."""
+        # Lazy import: higher_order_ops requires PyTorch >= 2.11 (checked in wrap_helion_kernel)
+        from helion._compiler._dynamo.higher_order_ops import (
+            helion_kernel_wrapper_mutation,
+        )
+
+        sig_params = self._kernel.signature.parameters
+
+        # Map positional args and kwargs to parameter names, partition into constants vs tensors
+        param_vars = dict(zip(sig_params.keys(), args, strict=False))
+        param_vars.update(kwargs)
+        bind_args = tuple(
+            _unwrap_arg(param_vars[name]) if name in param_vars else p.default
+            for name, p in sig_params.items()
+            if name in param_vars or p.default is not p.empty
+        )
+        if self._inline is not None and not _writes_through_a_view(
+            self._kernel, bind_args
+        ):
+            return self._inline.call_function(tx, list(args), kwargs)
+        constant_args: dict[str, object] = {}
+        tensor_args: dict[VariableTracker, VariableTracker] = {}
+        container_specs: dict[str, str] = {}
+        for name, var in param_vars.items():
+            if var.is_python_constant():
+                constant_args[name] = var.as_python_constant()
+            elif isinstance(var, (TupleVariable, ListVariable, ConstDictVariable)):
+                # Flatten container elements into individual tensor_args/constant_args
+                flat_items = (
+                    list(var.items.values())
+                    if isinstance(var, ConstDictVariable)
+                    else var.items
+                )
+                _, spec = pytree.tree_flatten(var.as_proxy())
+                container_specs[name] = pytree.treespec_dumps(spec)
+                for i, item in enumerate(flat_items):
+                    mangled = f"{name}.{i}"
+                    if item.is_python_constant():
+                        constant_args[mangled] = item.as_python_constant()
+                    else:
+                        tensor_args[variables.ConstantVariable.create(mangled)] = item
+            else:
+                tensor_args[variables.ConstantVariable.create(name)] = var
+        if container_specs:
+            constant_args["__container_specs"] = container_specs
+
+        # Emit HOP node into FX graph and unflatten output
+        output_spec = infer_output_spec(self._kernel, bind_args)
+        hop_kwargs = {
+            "kernel_idx": self._kernel_idx,
+            "constant_args": constant_args,
+            "tensor_args": ConstDictVariable(tensor_args).as_proxy(),
+            "output_spec": output_spec,
+        }
+
+        tree_spec_str = cast("str | None", output_spec.get("tree_spec_str"))
+        if tree_spec_str is None:
+            # Pure mutation kernel: emit HOP for side effects, return None
+            tx.output.create_proxy(
+                "call_function",
+                helion_kernel_wrapper_mutation,
+                (),
+                hop_kwargs,
+            )
+            return variables.ConstantVariable.create(None)
+
+        tree_spec = pytree.treespec_loads(tree_spec_str)
+        leaf_specs = cast("list[dict[str, object]]", output_spec["leaf_specs"])
+        masks = [s["type"] == "scalar" for s in leaf_specs]
+        ret_spec = _HopOutputSpec(
+            treespec=tree_spec,
+            masks_to_filter_const_values=masks if any(masks) else None,
+            const_values=[s.get("scalar_value") for s in leaf_specs]
+            if any(masks)
+            else None,
+        )
+        result = _call_function_and_unflatten_output(
+            cast("Any", tx),
+            helion_kernel_wrapper_mutation,
+            (),
+            hop_kwargs,
+            None,
+            ret_spec,
+            None,
+        )
+        return _replace_direct_aliases(result, output_spec, param_vars)
+
+
+def torch_compile_captures_kernel_hop(backend: str) -> bool:
+    """Whether ``torch.compile`` captures ``backend`` kernels as the Helion HOP.
+
+    Builds with Helion's fusion entrypoints capture every kernel as the HOP.
+    Older builds let Dynamo trace the call inline, except on backends whose
+    launch Dynamo cannot trace; those take the HOP with an unfused lowering.
+    """
+    return (
+        supports_torch_compile_fusion()
+        or not get_backend_class(backend)().dynamo_captures_kernel_launch
+    )
+
+
+def register_dynamo_variable() -> None:
+    """Register HelionKernelVariable with Dynamo's VariableBuilder."""
+
+    def wrap_helion_kernel(self: VariableBuilder, value: Kernel) -> VariableTracker:
+        inline = None
+        if not supports_torch_compile_fusion():
+            backend = get_backend_class(value.settings.backend)()
+            # A backend that lowers unfused anyway gains nothing from upgrading.
+            if value.settings.torch_compile_fusion and backend.supports_inductor_fusion:
+                raise RuntimeError(
+                    "torch_compile_fusion=True requires PyTorch nightly build. "
+                    "Please upgrade PyTorch or disable torch_compile_fusion."
+                )
+            # Without the fusion entrypoints, Dynamo traces the call inline
+            # unless it cannot trace the launch (torch_compile_captures_kernel_hop).
+            if backend.dynamo_captures_kernel_launch:
+                if not (
+                    supports_torch_compile_template_lowering()
+                    and backend.dynamo_inline_capture_loses_view_writes
+                ):
+                    return self.wrap_user_defined(value)
+                # A call that writes an input through a view (see
+                # _writes_through_a_view) is captured as the HOP, which
+                # functionalizes the whole input; any other call is still
+                # traced inline.
+                inline = self.wrap_user_defined(value)
+            elif not supports_torch_compile_template_lowering():
+                raise RuntimeError(
+                    "torch.compile of a Helion kernel on the "
+                    f"{value.settings.backend!r} backend requires a PyTorch "
+                    "build with Helion's Inductor template lowering. "
+                    "Please upgrade PyTorch."
+                )
+        # Import template_buffer to register the HOP's Inductor lowering
+        from helion._compiler._inductor import template_buffer  # noqa: F401
+
+        self.install_guards(GuardBuilder.ID_MATCH)
+        return HelionKernelVariable(value, None, inline=inline, source=self.source)
+
+    VariableBuilder._type_dispatch()[Kernel] = wrap_helion_kernel

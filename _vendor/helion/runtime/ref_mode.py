@@ -1,0 +1,657 @@
+from __future__ import annotations
+
+import enum
+import threading
+import typing
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Callable
+from typing import Protocol
+from typing import cast
+
+import torch
+from torch._inductor import inductor_prims
+from torch._prims_common import is_integer_dtype
+from torch.overrides import BaseTorchFunctionMode
+
+from .. import exc
+from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import NoCurrentEnvironment
+from .._compiler.compile_environment import tls as ce_tls
+from .._utils import convert_size_arg
+from .._utils import create_shape_matching_slices
+
+if TYPE_CHECKING:
+    from typing_extensions import Self
+
+    from torch._prims_common import DeviceLikeType
+
+    from .. import Config
+    from ..language.ref_tile import RefTile
+    from .settings import Settings
+
+    class _RefModeTLS(Protocol):
+        context: RefModeContext | None
+
+
+# Thread-local storage for RefModeContext
+ref_mode_tls: _RefModeTLS = typing.cast("_RefModeTLS", threading.local())
+
+
+class RefMode(enum.Enum):
+    """Reference mode for kernel execution."""
+
+    OFF = "off"
+    EAGER = "eager"
+
+
+def is_ref_mode_enabled(settings: Settings) -> bool:
+    """Check if ref mode is enabled based on settings."""
+    return settings.ref_mode != RefMode.OFF
+
+
+def is_in_ref_mode_context() -> bool:
+    """Check if we're currently executing in ref mode context.
+
+    This checks if there's a current CompileEnvironment with ref mode enabled.
+    """
+    try:
+        env = CompileEnvironment.current()
+        return is_ref_mode_enabled(env.settings)
+    except NoCurrentEnvironment:
+        return False
+
+
+def dispatch_reference(
+    function: object, reference: Callable[..., object], args: tuple[object, ...]
+) -> object:
+    """Keep backend-selected semantic policies consistent in eager validation."""
+    env = CompileEnvironment.current()
+    context = RefModeContext.current()
+    context.ref_impl_depth += 1
+    try:
+        matched, result = env.backend.reference_override(function, args)
+        if matched:
+            return result
+        return reference(*args)
+    finally:
+        context.ref_impl_depth -= 1
+
+
+# Names a device load in the error for a store into it.
+DEVICE_LOAD_NAME = "<loaded inside hl.tile/hl.grid>"
+# Marks the copies ``device_load`` returns.
+_DEVICE_LOAD_ATTR = "_helion_ref_device_load"
+
+
+def device_load(value: torch.Tensor) -> torch.Tensor:
+    """``value``, a subscript of a tensor in device code, as a load.
+
+    A load is a value in compiled code; a view would change with later stores
+    to (or in-place ops on) its base.  A view is copied, and the copy marked
+    so a store into it can be refused, as compiled code refuses a store into
+    a device tensor.
+    """
+    if not value._is_view():
+        return value
+    copy = value.clone()
+    setattr(copy, _DEVICE_LOAD_ATTR, True)
+    return copy
+
+
+def is_device_load(target: object) -> bool:
+    """Whether ``target`` is a copy ``device_load`` returned: a value, which a
+    store or atomic cannot target."""
+    return getattr(target, _DEVICE_LOAD_ATTR, False)
+
+
+def cartesian_indices(indices: list[Any]) -> list[Any]:
+    """Expand two or more one-dimensional integer index tensors to their product.
+
+    Compiled Helion indexes with several one-dimensional tensors as a
+    cartesian tile, one dim per indexer (as ``hl.load`` / ``hl.store`` do in
+    ref mode); plain PyTorch indexing would pair them elementwise.  Any other
+    index list is returned unchanged.
+    """
+    positions = [
+        i
+        for i, idx in enumerate(indices)
+        if type(idx) is torch.Tensor and is_integer_dtype(idx.dtype)
+    ]
+    if len(positions) < 2 or any(indices[i].ndim != 1 for i in positions):
+        return indices
+    grids = torch.meshgrid(*(indices[i] for i in positions), indexing="ij")
+    indices = [*indices]
+    for i, grid in zip(positions, grids, strict=True):
+        indices[i] = grid
+    return indices
+
+
+class NoCurrentRefModeContext(RuntimeError):
+    """Raised when RefModeContext.current() is called but no context is active."""
+
+
+class RefModeContext:
+    """Context manager to enable ref mode execution."""
+
+    device_ctx: torch.device
+
+    def __init__(self, env: CompileEnvironment, config: Config | None) -> None:
+        self.env = env
+        self.func_mode = RefModeTorchFunctionMode()
+        self.device_ctx = torch.device(env.device)  # pyrefly: ignore[read-only]
+        self.config = config
+        self.rng_seed_slot_count = 0
+        # How many device loops (``hl.tile`` / ``hl.grid``) enclose the code
+        # running now; zero in host code.
+        self.device_loop_depth = 0
+        # How many Helion API reference implementations are running; what
+        # they index internally is never a value of the kernel.
+        self.ref_impl_depth = 0
+        self._initial_rng_state: torch.Tensor | None = None
+        self._rng_seed_buffer: torch.Tensor | None = None
+
+    def __enter__(self) -> Self:
+        assert getattr(ref_mode_tls, "context", None) is None, (
+            "RefModeContext already active"
+        )
+        ce_tls.env = self.env
+        ref_mode_tls.context = self
+        self.device_ctx.__enter__()
+        self._initial_rng_state = self._get_rng_state().clone()
+        self.func_mode.__enter__()
+        return self
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> bool:
+        self.func_mode.__exit__(exc_type, exc_val, exc_tb)
+        self.device_ctx.__exit__(exc_type, exc_val, exc_tb)
+        ref_mode_tls.context = None
+        ce_tls.env = None
+        return False
+
+    @staticmethod
+    def current() -> RefModeContext:
+        """Get the currently active RefModeContext.
+
+        Returns:
+            The active RefModeContext
+
+        Raises:
+            NoCurrentRefModeContext: If no RefModeContext is active
+        """
+        try:
+            if (context := ref_mode_tls.context) is not None:
+                return context
+        except AttributeError:
+            pass
+        raise NoCurrentRefModeContext from None
+
+    @staticmethod
+    def has_current() -> bool:
+        """Check if a RefModeContext is currently active."""
+        try:
+            RefModeContext.current()
+            return True
+        except NoCurrentRefModeContext:
+            return False
+
+    def allocate_rng_seed_slot(self) -> int:
+        seed_slot = self.rng_seed_slot_count
+        self.rng_seed_slot_count += 1
+        return seed_slot
+
+    def lookup_rng_seed(self, index: int) -> torch.Tensor:
+        if self._rng_seed_buffer is None or index >= len(self._rng_seed_buffer):
+            self._rng_seed_buffer = self._replay_rng_seed_buffer(index + 1)
+        return self._rng_seed_buffer[index].clone()
+
+    def _get_rng_state(self) -> torch.Tensor:
+        if self.device_ctx.type == "cpu":
+            return torch.random.get_rng_state()
+        device_mod = torch.get_device_module(self.device_ctx)
+        return device_mod.get_rng_state(self.device_ctx)
+
+    def _set_rng_state(self, state: torch.Tensor) -> None:
+        if self.device_ctx.type == "cpu":
+            torch.random.set_rng_state(state)
+            return
+        device_mod = torch.get_device_module(self.device_ctx)
+        device_mod.set_rng_state(state, self.device_ctx)
+
+    def _replay_rng_seed_buffer(self, count: int) -> torch.Tensor:
+        assert self._initial_rng_state is not None
+        current_state = self._get_rng_state().clone()
+        self._set_rng_state(self._initial_rng_state)
+        try:
+            seeds = inductor_prims.seeds(count, self.device_ctx)
+            next_state = self._get_rng_state().clone()
+        except Exception:
+            self._set_rng_state(current_state)
+            raise
+        self._set_rng_state(next_state)
+        return seeds
+
+
+class RefModeTorchFunctionMode(BaseTorchFunctionMode):
+    """Torch function mode for Helion ref mode operations."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Map functions to their handlers
+        self._func_handlers: dict[Callable[..., object], Callable[..., object]] = {
+            torch.addmm: lambda args, kwargs: self._handle_mm_with_bias(
+                args, kwargs, torch.mm, "addmm"
+            ),
+            torch.baddbmm: lambda args, kwargs: self._handle_mm_with_bias(
+                args, kwargs, torch.bmm, "baddbmm"
+            ),
+            torch.rand: lambda args, kwargs: self._handle_implicit_random_factory(
+                args, kwargs, normal=False
+            ),
+            torch.randn: lambda args, kwargs: self._handle_implicit_random_factory(
+                args, kwargs, normal=True
+            ),
+            torch.rand_like: lambda args, kwargs: self._handle_implicit_random_like(
+                args, kwargs, normal=False
+            ),
+            torch.randn_like: lambda args, kwargs: self._handle_implicit_random_like(
+                args, kwargs, normal=True
+            ),
+            torch.Tensor.expand: lambda args, kwargs: self._handle_size_arg_method(
+                args, kwargs, "expand"
+            ),
+            torch.Tensor.view: lambda args, kwargs: self._handle_size_arg_method(
+                args, kwargs, "view"
+            ),
+            torch.Tensor.reshape: lambda args, kwargs: self._handle_size_arg_method(
+                args, kwargs, "reshape"
+            ),
+            torch.reshape: lambda args, kwargs: self._handle_size_arg_method(
+                args, kwargs, "reshape"
+            ),
+            # Factory functions with standard pattern
+            **{
+                func: lambda args, kwargs, f=func: self._handle_factory_func(
+                    args, kwargs, f, has_fill=False
+                )
+                for func in [torch.zeros, torch.ones]
+            },
+            torch.full: lambda args, kwargs: self._handle_factory_func(
+                args, kwargs, torch.full, has_fill=True
+            ),
+        }
+
+        # Map method names to their handlers for tensor methods
+        self._method_handlers: dict[str, Callable[..., object]] = {
+            **{
+                method: lambda args, kwargs, m=method: self._handle_factory_method(
+                    args, kwargs, m, has_fill=False
+                )
+                for method in ["new_zeros", "new_ones"]
+            },
+            "new_full": lambda args, kwargs: self._handle_factory_method(
+                args, kwargs, "new_full", has_fill=True
+            ),
+        }
+
+        # Initialize binary operation mappings
+        self._setup_binary_ops_handling()
+
+    def __torch_function__(
+        self,
+        func: Callable[..., object],
+        types: list[type[object]],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        kwargs = kwargs or {}
+
+        if func in self._func_handlers:
+            return self._func_handlers[func](args, kwargs)
+
+        func_name = getattr(func, "__name__", None)
+        if func_name:
+            if func_name in self._method_handlers:
+                return self._method_handlers[func_name](args, kwargs)
+            if func_name in self._binary_op_names:
+                return self._handle_binary_op(func, args, kwargs)
+            if func_name == "__getitem__":
+                return self._handle_getitem(args, kwargs)
+            if func_name == "__setitem__":
+                return self._handle_setitem(args, kwargs)
+
+        if func in self._binary_ops:
+            return self._handle_binary_op(func, args, kwargs)
+
+        return super().__torch_function__(func, types, args, kwargs)
+
+    def _handle_mm_with_bias(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        mm_func: object,
+        op_name: str,
+    ) -> torch.Tensor:
+        """Handle torch.addmm/baddbmm with mixed precision support."""
+        assert len(args) >= 3, f"{op_name} requires at least 3 arguments"
+        bias, mat1, mat2 = (cast("torch.Tensor", args[i]) for i in range(3))
+        beta = cast("float", kwargs.get("beta", 1))
+        alpha = cast("float", kwargs.get("alpha", 1))
+
+        assert mat1.dtype == mat2.dtype, (
+            f"Matrix dtypes must match for torch.{op_name}: "
+            f"mat1.dtype={mat1.dtype}, mat2.dtype={mat2.dtype}"
+        )
+
+        result = cast("Callable[..., torch.Tensor]", mm_func)(
+            mat1, mat2, out_dtype=bias.dtype
+        )
+        if alpha != 1:
+            result = result * alpha
+        if result.dtype != bias.dtype:
+            result = result.to(bias.dtype)
+        return result if beta == 0 else result + (beta * bias)
+
+    def _handle_size_arg_method(
+        self, args: tuple[object, ...], kwargs: dict[str, object], method_name: str
+    ) -> torch.Tensor:
+        """Handle tensor methods that take size arguments (expand, view, reshape)."""
+        tensor = cast("torch.Tensor", args[0])
+
+        if method_name == "reshape":
+            # reshape can take shape as multiple positional args or as a single tuple/list
+            # e.g., tensor.reshape(2, 3) or tensor.reshape((2, 3))
+            if "shape" in kwargs:
+                # Handle kwargs case: tensor.reshape(shape=(2, 3))
+                shape = convert_size_arg(kwargs["shape"])
+                kwargs = dict(kwargs)  # Make a copy to avoid modifying the original
+                kwargs["shape"] = shape
+                return torch.reshape(tensor, **kwargs)  # type: ignore[arg-type]
+            # Handle positional args case
+            sizes = args[1:]
+            new_sizes = convert_size_arg(sizes)
+            method = getattr(tensor, method_name)
+            assert isinstance(new_sizes, list)
+            return method(*new_sizes, **kwargs)
+
+        # view/expand take sizes as positional args
+        sizes = args[1:]
+        new_sizes = convert_size_arg(sizes)
+        method = getattr(tensor, method_name)
+        assert isinstance(new_sizes, list)
+        return method(*new_sizes, **kwargs)
+
+    def _handle_factory_func(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        func: object,
+        has_fill: bool,
+    ) -> torch.Tensor:
+        """Handle torch tensor factory functions (zeros, ones, full) with RefTile arguments."""
+        size = convert_size_arg(args[0])
+        func_callable = cast("Callable[..., torch.Tensor]", func)
+        extra_args = args[1:]
+        return func_callable(size, *extra_args, **kwargs)
+
+    def _handle_factory_method(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        method_name: str,
+        has_fill: bool,
+    ) -> torch.Tensor:
+        """Handle tensor.new_* factory methods (new_zeros, new_ones, new_full) with RefTile arguments."""
+        tensor = cast("torch.Tensor", args[0])
+        if "size" in kwargs:
+            kwargs = dict(kwargs)
+            size = kwargs.pop("size")
+            assert len(args) == 1
+        else:
+            size = args[1]
+        size = convert_size_arg(size)
+        method = getattr(tensor, method_name)
+        extra_args = args[2:]
+        return method(size, *extra_args, **kwargs)
+
+    def _handle_implicit_random_factory(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        *,
+        normal: bool,
+    ) -> torch.Tensor:
+        from ..language.random_ops import ref_implicit_random
+
+        CompileEnvironment.current().backend.validate_implicit_rng_reference()
+
+        shape: list[int | RefTile]
+        if "size" in kwargs:
+            shape_arg = kwargs["size"]
+            assert not args
+        elif len(args) == 1 and isinstance(args[0], (list, tuple, torch.Size)):
+            shape_arg = args[0]
+        else:
+            shape_arg = args
+
+        if isinstance(shape_arg, list):
+            shape = cast("list[int | RefTile]", shape_arg)
+        else:
+            shape = list(cast("tuple[int | RefTile, ...] | torch.Size", shape_arg))
+        device = cast("DeviceLikeType | None", kwargs.get("device"))
+
+        return ref_implicit_random(
+            shape,
+            dtype=cast("torch.dtype | None", kwargs.get("dtype")),
+            default_dtype=torch.float32,
+            device=device,
+            requires_grad=kwargs.get("requires_grad", False),
+            normal=normal,
+        )
+
+    def _handle_implicit_random_like(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        *,
+        normal: bool,
+    ) -> torch.Tensor:
+        from ..language.random_ops import ref_implicit_random
+
+        CompileEnvironment.current().backend.validate_implicit_rng_reference()
+
+        assert args
+        input_tensor = cast("torch.Tensor", args[0])
+        device = cast("DeviceLikeType | None", kwargs.get("device"))
+        return ref_implicit_random(
+            list(input_tensor.shape),
+            dtype=cast("torch.dtype | None", kwargs.get("dtype")),
+            default_dtype=input_tensor.dtype,
+            device=device,
+            requires_grad=kwargs.get("requires_grad", False),
+            normal=normal,
+        )
+
+    def _handle_binary_op(
+        self,
+        func: object,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> torch.Tensor:
+        """Handle binary operations with shape-based masking for power-of-2 tensors."""
+        if len(args) < 2:
+            return cast("Callable[..., torch.Tensor]", func)(*args, **kwargs)
+
+        lhs, rhs = args[0], args[1]
+
+        # Skip if either operand is not a tensor (e.g., scalar operations)
+        if not (isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor)):
+            return cast("Callable[..., torch.Tensor]", func)(*args, **kwargs)
+
+        if not self._should_handle_binary_op(lhs, rhs):
+            return cast("Callable[..., torch.Tensor]", func)(*args, **kwargs)
+
+        # Check if this is an in-place operation
+        func_name = getattr(func, "__name__", "")
+        is_inplace = (
+            func in self._inplace_binary_ops
+            or func_name in self._inplace_binary_op_names
+        )
+
+        # Create slices that take the minimum size in each dimension
+        slices = create_shape_matching_slices(lhs.shape, rhs.shape)
+
+        # Apply the operation on the overlapping region
+        result = cast("Callable[..., torch.Tensor]", func)(
+            lhs[slices], rhs[slices], *args[2:], **kwargs
+        )
+
+        # For in-place ops, the operation already modified lhs, so just return it
+        # For out-of-place ops, return the computed result
+        return lhs if is_inplace else result
+
+    def _should_handle_binary_op(self, lhs: object, rhs: object) -> bool:
+        """Check if binary operation needs special handling.
+
+        Only handle cases where both tensors have the same shape except for
+        dimension size differences (for power-of-2 padding). Skip broadcasting
+        cases where one dimension is 1.
+        """
+        if not (isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor)):
+            return False
+
+        if lhs.shape == rhs.shape or len(lhs.shape) != len(rhs.shape):
+            return False
+
+        # Check if this is a broadcasting case (any dimension is 1)
+        for l_dim, r_dim in zip(lhs.shape, rhs.shape, strict=False):
+            if l_dim == 1 or r_dim == 1:
+                return False  # Let PyTorch handle broadcasting
+
+        # Only handle shape-based masking for non-broadcasting cases
+        return True
+
+    @staticmethod
+    def _is_int_tensor(x: object) -> bool:
+        return type(x) is torch.Tensor and is_integer_dtype(x.dtype)
+
+    def _handle_getitem(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> torch.Tensor:
+        """Handle tensor indexing with out-of-bounds index clamping."""
+        tensor = cast("torch.Tensor", args[0])
+        indices: Any = args[1]
+        is_tuple = isinstance(indices, tuple)
+        indices_list = cartesian_indices(list(indices) if is_tuple else [indices])
+
+        for dim, idx in enumerate(indices_list):
+            if self._is_int_tensor(idx):
+                indices_list[dim] = torch.clamp(idx, min=0, max=tensor.size(dim) - 1)
+
+        result = tensor[tuple(indices_list) if is_tuple else indices_list[0]]
+        context = RefModeContext.current()
+        if context.device_loop_depth and not context.ref_impl_depth:
+            return device_load(result)
+        return result
+
+    def _handle_setitem(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> None:
+        """Handle tensor indexed assignment with out-of-bounds index clamping."""
+        tensor = cast("torch.Tensor", args[0])
+        indices: Any = args[1]
+        value: Any = args[2]
+        if is_device_load(tensor):
+            raise exc.DeviceTensorSubscriptAssignmentNotAllowed(DEVICE_LOAD_NAME)
+        is_tuple = isinstance(indices, tuple)
+        indices_list = cartesian_indices(list(indices) if is_tuple else [indices])
+
+        # Clamp int-tensor indices and record which were in bounds
+        bounds_mask: torch.Tensor | None = None
+        mask_out_pos = 0
+        for dim, idx in enumerate(indices_list):
+            if isinstance(idx, int):
+                continue
+            if self._is_int_tensor(idx):
+                max_idx = tensor.size(dim) - 1
+                dim_mask = (idx >= 0) & (idx <= max_idx)
+                bounds_mask = (
+                    dim_mask if bounds_mask is None else (bounds_mask & dim_mask)
+                )
+                indices_list[dim] = torch.clamp(idx, min=0, max=max_idx)
+            elif bounds_mask is None:
+                mask_out_pos += 1
+
+        # Preserve original values at out-of-bounds positions
+        final_indices = tuple(indices_list) if is_tuple else indices_list[0]
+        if bounds_mask is not None and type(value) is torch.Tensor:
+            current = tensor[final_indices]
+            n_trailing = current.dim() - bounds_mask.dim() - mask_out_pos
+            shape = (1,) * mask_out_pos + bounds_mask.shape + (1,) * n_trailing
+            value = torch.where(bounds_mask.view(shape), value, current)
+
+        tensor[final_indices] = value
+
+    def _setup_binary_ops_handling(self) -> None:
+        """Initialize binary operation tracking sets and mappings."""
+        # Define binary operations and their variants
+        binary_op_info = [
+            # (torch_func, tensor_method, inplace_method, inplace_name, func_names)
+            (torch.add, torch.Tensor.__add__, torch.Tensor.__iadd__, "add_", ["add"]),
+            (torch.sub, torch.Tensor.__sub__, torch.Tensor.__isub__, "sub_", ["sub"]),
+            (torch.mul, torch.Tensor.__mul__, torch.Tensor.__imul__, "mul_", ["mul"]),
+            (
+                torch.div,
+                torch.Tensor.__truediv__,
+                torch.Tensor.__itruediv__,
+                "div_",
+                ["div", "__truediv__"],
+            ),
+            (
+                torch.floor_divide,
+                torch.Tensor.__floordiv__,
+                torch.Tensor.__ifloordiv__,
+                "floor_divide_",
+                ["floordiv", "__floordiv__"],
+            ),
+            (
+                torch.remainder,
+                torch.Tensor.__mod__,
+                torch.Tensor.__imod__,
+                "remainder_",
+                ["mod", "__mod__"],
+            ),
+            (torch.pow, torch.Tensor.__pow__, torch.Tensor.__ipow__, "pow_", ["pow"]),
+        ]
+
+        # Build sets from the info
+        self._inplace_binary_ops = set()
+        self._inplace_binary_op_names = set()
+        self._binary_ops = set()
+        self._binary_op_names = set()
+
+        for (
+            torch_func,
+            method,
+            inplace_method,
+            inplace_name,
+            func_names,
+        ) in binary_op_info:
+            # Add function objects
+            self._binary_ops.add(torch_func)
+            self._binary_ops.add(method)
+            self._binary_ops.add(inplace_method)
+            self._inplace_binary_ops.add(inplace_method)
+
+            # Add inplace op string names
+            self._inplace_binary_op_names.add(inplace_name)
+
+            # Add all function names
+            self._binary_op_names.update(func_names)
+            self._binary_op_names.add(method.__name__)
+            self._binary_op_names.add(inplace_method.__name__)
+            self._binary_op_names.add(inplace_name)
