@@ -140,10 +140,9 @@ def test_layer_configuration_is_checked(monkeypatch):
     kl.apply(mod)
     with pytest.raises(kl.PatchDriftError, match="mamba_cache_mode"):
         mod.Glm5NextLinearAttention(None, cfg, "p")
-    mod, _, cfg = _fake_module(backend="flashkda")
+    mod, _, cfg = _fake_module(backend="flashkda")          # flashkda's prefill checkpoint blocks sit behind the state columns: accepted
     kl.apply(mod)
-    with pytest.raises(kl.PatchDriftError, match="kda_prefill_backend"):
-        mod.Glm5NextLinearAttention(None, cfg, "p")
+    mod.Glm5NextLinearAttention(None, cfg, "p")
 
 
 def test_drifted_module_fails_the_hook_closed(monkeypatch, tmp_path):

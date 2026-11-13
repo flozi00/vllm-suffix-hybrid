@@ -11,7 +11,7 @@ What it touches in vLLM (anchors pinned, refuses to start on drift):
     call (plain decode, prefill never uses it) to the original;
   * `scatter_states` in the same module: after the prefill state is written, the header of those blocks is cleared (a new request must not replay the records a
     previous owner of the block left behind);
-  * `Glm5NextLinearAttention.__init__`: refuses unsupported configurations (prefill backend other than triton, mamba_cache_mode other than none).
+  * `Glm5NextLinearAttention.__init__`: refuses mamba_cache_mode other than none (the prefill backend does not matter: flashkda's checkpoint blocks sit behind the state columns).
 Nothing else changes; with `SUFFIX_KDA_LAZY` unset the module is inert. Works in eager steps and inside the full CUDA graph of a decode step (no host state, the
 row counters live on the device).
 
@@ -146,8 +146,6 @@ def apply(module) -> None:
         mode = getattr(vllm_config.cache_config, "mamba_cache_mode", None)
         if mode != "none":
             raise PatchDriftError(f"{prefix}: mamba_cache_mode={mode!r} (the lazy state needs the static block rows of 'none')")
-        if getattr(self, "kda_prefill_backend", None) != "triton":
-            raise PatchDriftError(f"{prefix}: kda_prefill_backend={getattr(self, 'kda_prefill_backend', None)!r} (prefill checkpoint blocks change the block row)")
         _STATE["layers"] += 1
         _STATE["spec_len"] = max(_STATE["spec_len"], int(self.num_spec) + 1 if self.num_spec else 0)
 
