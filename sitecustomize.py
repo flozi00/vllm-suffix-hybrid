@@ -23,6 +23,11 @@ PYTHONPATH. Each section is independently gated:
   SUFFIX_NVFP4_DENSE=1       -> same patch, NVFP4 W4A4 mode (vLLM ModelOpt
                                method; SUFFIX_NVFP4_DENSE_LAYERS allowlist,
                                SUFFIX_NVFP4_DENSE_ACT_AMAX overrides)
+  SUFFIX_GLM_RECOVERSSM=1   -> GLM-5.3-Flash: vLLM's replay-based KDA state recovery (RecoverSSM, Kimi-K3 only
+                               upstream) wired for glm5next with prefix caching (align mode): verify without
+                               per-token snapshots, one commit after sampling, bit-identical to stock, no
+                               per-draft-token state blocks (suffix_hybrid/glm_recoverssm.py; sha-pinned,
+                               fail closed on vLLM source drift)
   SUFFIX_KDA_LAZY=1         -> GLM-5.3-Flash (vLLM glm5next KDA layer): speculative verify
                                without per-token state snapshots, records + replay at the next
                                step, bit-identical to stock (suffix_hybrid/kda_lazy.py; fail
@@ -467,6 +472,12 @@ if os.environ.get("SUFFIX_KDA_LAZY", "").strip() == "1":
     from suffix_hybrid.kda_lazy import install_post_import_hook as _kda_lazy_hook
     _kda_lazy_hook()
 
+# Upstream RecoverSSM wired for glm5next (suffix_hybrid/glm_recoverssm.py): SUFFIX_GLM_RECOVERSSM=1 (+ SUFFIX_GLM_RECOVERSSM_KERNELS=upstream for A/B against upstream's arithmetic).
+# Works with the console's prefix caching (mamba_cache_mode align) and the V2 runner; rewrites the VllmConfig validator's whitelist at import, so it must be installed before vllm.config.
+if os.environ.get("SUFFIX_GLM_RECOVERSSM", "").strip() == "1":
+    from suffix_hybrid.glm_recoverssm import install_post_import_hook as _glm_rssm_hook
+    _glm_rssm_hook()
+
 if os.environ.get("SUFFIX_PROFILE_WORKER", "").strip():
     try:
         from suffix_hybrid.step_profiler import install_worker_hook
@@ -661,6 +672,10 @@ _BOOT_GATES = {
     # clear, fp32 + bf16 state, CUDA-graph replay); the bench: 34 layers per step, N x T grid. Lines: ORACLE PASS|FAIL / JSON per case.
     "kda_lazy_oracle": (["-m", "suffix_hybrid.kda_lazy", "oracle", "--graph", "--bf16"], {}),
     "kda_lazy_bench": (["-m", "suffix_hybrid.kda_lazy", "bench"], {}),
+    # suffix_hybrid/glm_recoverssm.py (SUFFIX_GLM_RECOVERSSM): the exact verify + one-launch commit against the stock snapshots, bit for bit (cycles, fp32 + bf16 state, null rows,
+    # variable windows) and all 80 align boundary cases (B = 16: n0 around the boundary x acceptance 1..8; final block, boundary block, no other block touched); then the timing grid.
+    "glm_recoverssm_oracle": (["-m", "suffix_hybrid.glm_recoverssm", "oracle", "--bf16"], {}),
+    "glm_recoverssm_bench": (["-m", "suffix_hybrid.glm_recoverssm", "bench"], {}),
     # Same at DeepSeek-V4.1-Flash sizes (hidden 5120, vocab 129280, + the Engram head gather);
     # and the NCCL candidate matrix at tokens x 5120. docs/dsv41-comms.md.
     "host_ar_bench_dsv41": (["-m", "suffix_hybrid.host_ar", "bench", "--hidden", "5120",
