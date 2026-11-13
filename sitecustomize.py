@@ -23,6 +23,10 @@ PYTHONPATH. Each section is independently gated:
   SUFFIX_NVFP4_DENSE=1       -> same patch, NVFP4 W4A4 mode (vLLM ModelOpt
                                method; SUFFIX_NVFP4_DENSE_LAYERS allowlist,
                                SUFFIX_NVFP4_DENSE_ACT_AMAX overrides)
+  SUFFIX_KDA_LAZY=1         -> GLM-5.3-Flash (vLLM glm5next KDA layer): speculative verify
+                               without per-token state snapshots, records + replay at the next
+                               step, bit-identical to stock (suffix_hybrid/kda_lazy.py; fail
+                               closed on vLLM source drift)
   SUFFIX_SM120_NVP4KV_ORACLE=1 -> run the NVFP4-KV on-silicon oracle once per
                                pod before serving (fatal only with NVP4KV=1)
   SUFFIX_FICACHE=seed|dump|both -> FlashInfer autotune cache seed/harvest
@@ -456,6 +460,13 @@ if os.environ.get("SUFFIX_HAR_L2_PREFETCH", "").strip() == "1":
     from suffix_hybrid.har_prefetch import install_post_import_hook as _l2pf_hook
     _l2pf_hook()
 
+# Lazy-state KDA speculative verify for GLM-5.3-Flash (suffix_hybrid/kda_lazy.py): SUFFIX_KDA_LAZY=1.
+# One state per request kept one window behind + compact records, replayed at the next step; the
+# stock per-token snapshots (1 MiB per token, stream and layer) are gone. Refuses to start on drift.
+if os.environ.get("SUFFIX_KDA_LAZY", "").strip() == "1":
+    from suffix_hybrid.kda_lazy import install_post_import_hook as _kda_lazy_hook
+    _kda_lazy_hook()
+
 if os.environ.get("SUFFIX_PROFILE_WORKER", "").strip():
     try:
         from suffix_hybrid.step_profiler import install_worker_hook
@@ -645,6 +656,11 @@ _BOOT_GATES = {
     # pinned host buffer, two-shot / one-shot vs NCCL at GLM token sizes, every rank bit-exact
     # vs the fp32 rank-order sum, graphed us, GPU<->host PCIe probes. Lines: [suffix har].
     "host_ar_bench": (["-m", "suffix_hybrid.host_ar", "bench"], {}),
+    # suffix_hybrid/kda_lazy.py (SUFFIX_KDA_LAZY) at the GLM-5.3-Flash per-rank KDA shapes (16 heads, K = V = 128): the stock fused_recurrent_kda against
+    # the lazy-state verify, outputs and committed states bit for bit over many cycles (random acceptance, variable windows, null rows, skipped rows, prefill
+    # clear, fp32 + bf16 state, CUDA-graph replay); the bench: 34 layers per step, N x T grid. Lines: ORACLE PASS|FAIL / JSON per case.
+    "kda_lazy_oracle": (["-m", "suffix_hybrid.kda_lazy", "oracle", "--graph", "--bf16"], {}),
+    "kda_lazy_bench": (["-m", "suffix_hybrid.kda_lazy", "bench"], {}),
     # Same at DeepSeek-V4.1-Flash sizes (hidden 5120, vocab 129280, + the Engram head gather);
     # and the NCCL candidate matrix at tokens x 5120. docs/dsv41-comms.md.
     "host_ar_bench_dsv41": (["-m", "suffix_hybrid.host_ar", "bench", "--hidden", "5120",
