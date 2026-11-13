@@ -17,7 +17,8 @@ What this module does (every anchor pinned to vLLM 0.33.0, refuses to start on d
   3. the module's fused_recurrent_kda: spec calls go to kda_recoverssm_verify, everything else to the original;
   4. GDNAttentionMetadataBuilder.build (glm5next groups only): every active decode row takes the spec path, the metadata gets a neutral num_accepted_tokens, the commit
      metadata (state rows, query starts, request indices, block table + computed tokens for align mode) and the RecoverSSMMetadata class the V2 runner hooks look for.
-Numerics: upstream's kernels, equal to the stock snapshots up to fp32 rounding (5090, 24 cycles: state max rel diff 3e-7, outputs within one bf16 ulp), not bit-identical.
+Kernels: the verify and the fold are ours (glm_recoverssm_kernels.py), bit-identical to the stock snapshots; upstream's plan kernel (final / boundary blocks from the block table) and conv
+compaction run unchanged inside GlmCommitContext. SUFFIX_GLM_RECOVERSSM_KERNELS=upstream keeps upstream's arithmetic (equal up to fp32 rounding) for A/B comparisons.
 
 Check on a GPU: `python -m suffix_hybrid.glm_recoverssm oracle` (upstream verify + commit against the stock spec kernel over cycles, and timing per step)."""
 from __future__ import annotations
@@ -41,6 +42,8 @@ MODEL_CONFIG_TARGET = "vllm.config.model"
 ARCHS = ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration")
 # sha256 of GDNAttentionMetadataBuilder.build per audited vLLM release
 PINNED_BUILD = {"0.33.0": "e2e6c60cbf1dedd7e2aedf82b7ea3b71e781c9b23cf0c31147c3fa2db979ecd1"}
+# sha256 of vllm/models/kimi_k3/nvidia/ops/recoverssm.py (plan kernel, conv compaction and KDARecoverSSMCommitContext are reused / mirrored) per audited release
+PINNED_K3_OPS = {"0.33.0": "d3092155827d36c6ca56d0292c8f02251a6709a31259ec23d7fb321589deeff6"}
 # sha256 of VllmConfig.validate_mamba_cached_kernel per audited release (the validator whose architecture whitelist is rewritten)
 PINNED_VALIDATOR = {"0.33.0": "c7eaec1f5ba39a88b164fc78236d28f9b8e313e776dfdb3daf92085eb8bedef3"}
 OLD_KDA_ARCHS = '''        kda_architectures = (
@@ -149,6 +152,22 @@ def patch_args(module) -> None:
 
 
 # --------------------------------------------------------------------------------------------------------------------------------------------------- layer
+def _exact() -> bool:
+    return _env("SUFFIX_GLM_RECOVERSSM_KERNELS", "exact") != "upstream"
+
+
+def check_k3_ops() -> str:
+    """Pin of the upstream ops file the exact commit mirrors (its plan and conv kernels run unchanged)."""
+    spec = importlib.util.find_spec("vllm.models.kimi_k3.nvidia.ops.recoverssm")
+    if spec is None or not spec.origin:
+        raise PatchDriftError("vllm.models.kimi_k3.nvidia.ops.recoverssm not found")
+    digest = hashlib.sha256(Path(spec.origin).read_bytes()).hexdigest()
+    for release, pinned in PINNED_K3_OPS.items():
+        if digest == pinned:
+            return release
+    raise PatchDriftError(f"{spec.origin} sha256 {digest} matches no audited release {sorted(PINNED_K3_OPS)}")
+
+
 def _layer_for_state(state):
     """The KDA layer whose recurrent-state tensor OBJECT this is (id(), NOT data_ptr: the layers of different KV groups are views into the same raw tensors and share it; the call passes
     the very object the layer holds, `recurrent_state = self.kv_cache[1]`). The map is rebuilt on a miss: layers constructed later and KV caches bound later are picked up."""
@@ -176,7 +195,10 @@ def recoverssm_frk(**kw):
             "sigmoid_beta", "a_log", "g_bias", "compute_gate", "lower_bound"}
     if set(kw) != want or not (kw["use_qk_l2norm_in_kernel"] and kw["sigmoid_beta"] and kw["compute_gate"]) or kw["lower_bound"] is None:
         raise PatchDriftError(f"spec call of fused_recurrent_kda not in the audited form: {sorted(set(kw) ^ want)} / flags")
-    from vllm.models.kimi_k3.nvidia.ops.recoverssm import kda_recoverssm_verify
+    if _exact():
+        from suffix_hybrid.glm_recoverssm_kernels import kda_glm_verify as kda_recoverssm_verify
+    else:
+        from vllm.models.kimi_k3.nvidia.ops.recoverssm import kda_recoverssm_verify
     state = kw["initial_state"]
     layer = _layer_for_state(state)
     idx = kw["ssm_state_indices"]
@@ -191,6 +213,7 @@ def recoverssm_frk(**kw):
 
 def patch_kda(module) -> None:
     check_source(Path(module.__file__).read_text())
+    check_k3_ops()
     cls = module.Glm5NextLinearAttention
     orig_init = cls.__init__
 
@@ -200,10 +223,15 @@ def patch_kda(module) -> None:
         if not (cc.use_replayssm and cc.use_kda_recoverssm):
             raise PatchDriftError(f"{prefix}: RecoverSSM flags are not set on the cache config (EngineArgs hook missing, or no speculative decoding)")
         import torch
-        from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMRecords
-        self.recoverssm_records = KDARecoverSSMRecords.allocate(
-            vllm_config.scheduler_config.max_num_seqs, self.local_num_heads, 1 + vllm_config.num_speculative_tokens, self.head_dim,
-            vllm_config.model_config.dtype, torch.device("cuda"))
+        if _exact():
+            from suffix_hybrid.glm_recoverssm_kernels import GlmRecords
+            self.recoverssm_records = GlmRecords.allocate(vllm_config.scheduler_config.max_num_seqs, self.local_num_heads, 1 + vllm_config.num_speculative_tokens, self.head_dim,
+                                                          torch.device("cuda"))
+        else:
+            from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMRecords
+            self.recoverssm_records = KDARecoverSSMRecords.allocate(
+                vllm_config.scheduler_config.max_num_seqs, self.local_num_heads, 1 + vllm_config.num_speculative_tokens, self.head_dim,
+                vllm_config.model_config.dtype, torch.device("cuda"))
         _STATE["layers"].append(self)
 
     cls.__init__ = __init__
@@ -217,7 +245,10 @@ def _commit_context(builder):
     ctx = _STATE["ctx"].get(id(builder))
     if ctx is not None:
         return ctx
-    from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMCommitContext
+    if _exact():
+        from suffix_hybrid.glm_recoverssm_kernels import GlmCommitContext as KDARecoverSSMCommitContext
+    else:
+        from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMCommitContext
     fc = builder.vllm_config.compilation_config.static_forward_context
     layers = [fc[name] for name in builder.layer_names]
     adapters = [types.SimpleNamespace(kv_cache=layer.kv_cache, recoverssm_records=layer.recoverssm_records, A_log=layer.A_log.view(layer.local_num_heads),
@@ -320,6 +351,9 @@ def patch_builder(module) -> None:
         if getattr(md, "recoverssm_commit", None) is not None and md.spec_state_indices_tensor is not None:
             md.spec_state_indices_tensor = md.spec_state_indices_tensor[:, :1].expand(-1, self.num_spec + 1)
             md.recoverssm_context = _commit_context(self)         # THIS group's layers: the replace() copied group 1's context
+            request_indices, align = md.recoverssm_commit
+            if align is not None:                                  # ... and group 1's block table: the commit writes the final / boundary states by block id, per group
+                md.recoverssm_commit = (request_indices, (blk_table, align[1], align[2]))
         return md
 
     cls.update_block_table = update_block_table

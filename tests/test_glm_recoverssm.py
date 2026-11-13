@@ -11,6 +11,8 @@ from suffix_hybrid.kda_lazy import PatchDriftError
 FIX = Path(__file__).resolve().parents[1] / "sm120/tests/fixtures/vllm_0.33.0"
 GDN = FIX / "gdn_attn.py"
 CFG = FIX / "config_vllm.py"
+K3OPS = FIX / "k3_ops_recoverssm.py"
+REAL_CHECK_K3_OPS = gr.check_k3_ops                      # before the autouse fixture stubs it
 KDA = FIX / "glm5next_common_kda.py"
 
 
@@ -18,6 +20,7 @@ KDA = FIX / "glm5next_common_kda.py"
 def _reset(monkeypatch):
     monkeypatch.setattr(gr, "_STATE", {"layers": [], "by_state": {}, "ctx": {}, "engaged": 0, "orig_frk": None, "ones": {}})
     monkeypatch.delenv(gr.ENV, raising=False)
+    monkeypatch.setattr(gr, "check_k3_ops", lambda: "0.33.0")        # needs vllm; covered by test_k3_ops_pin below
 
 
 def test_builder_pin_accepts_the_audited_source():
@@ -148,3 +151,60 @@ def test_supports_replayssm_is_true_for_glm_and_unchanged_otherwise():
     assert ModelConfig("Qwen3NextForCausalLM", False).supports_replayssm is False
     with pytest.raises(PatchDriftError, match="not a property"):
         gr.patch_model_config(types.SimpleNamespace(ModelConfig=type("M", (), {"supports_replayssm": True})))
+
+
+def test_update_block_table_gives_each_kv_group_its_own_context_block_table_and_width(monkeypatch):
+    """KV groups 2..N get a dataclasses.replace() copy of group 1's metadata from update_block_table: it must carry THIS group's commit context and block table (the commit writes the
+    final / boundary state by block id) and the state rows must keep the width of the verify window."""
+    import dataclasses
+
+    @dataclasses.dataclass
+    class Md:
+        spec_state_indices_tensor: object = None
+        recoverssm_commit: object = None
+        recoverssm_context: object = None
+
+    class FakeIdx:
+        def __init__(self, width):
+            self.width = width
+
+        def __getitem__(self, key):
+            return FakeIdx(1)
+
+        def expand(self, a, w):
+            return ("expanded", w)
+
+    class Builder:
+        num_spec = 3
+        use_spec_decode = True
+
+        def build(self, *a, **kw):
+            raise AssertionError
+
+        def update_block_table(self, metadata, blk_table, slot_mapping):
+            return dataclasses.replace(metadata, spec_state_indices_tensor=FakeIdx(1))
+
+    mod = types.SimpleNamespace(__file__=str(GDN), GDNAttentionMetadataBuilder=Builder)
+    gr.patch_builder(mod)
+    group1 = Md(spec_state_indices_tensor=FakeIdx(4), recoverssm_commit=("req", ("table-of-group-1", "computed", 2304)), recoverssm_context="ctx-1")
+    monkeypatch.setattr(gr, "_commit_context", lambda builder: "ctx-of-this-group")
+    md = Builder().update_block_table(group1, "table-of-this-group", None)
+    assert md.recoverssm_context == "ctx-of-this-group"
+    assert md.recoverssm_commit == ("req", ("table-of-this-group", "computed", 2304))
+    assert md.spec_state_indices_tensor == ("expanded", 4)
+    # a metadata without a commit plan (non-spec step, other model) passes through untouched
+    other = Md(spec_state_indices_tensor=FakeIdx(1))
+    assert Builder().update_block_table(other, "t", None).spec_state_indices_tensor.width == 1
+
+
+def test_k3_ops_pin(monkeypatch, tmp_path):
+    real = REAL_CHECK_K3_OPS
+    import importlib.util as iu
+    monkeypatch.setattr(gr, "check_k3_ops", real)
+    monkeypatch.setattr(iu, "find_spec", lambda name: types.SimpleNamespace(origin=str(K3OPS)))
+    assert gr.check_k3_ops() == "0.33.0"
+    bad = tmp_path / "recoverssm.py"
+    bad.write_text(K3OPS.read_text().replace("commit_len = tl.minimum(tl.maximum(num_accepted, 0), query_len)", "commit_len = query_len"))
+    monkeypatch.setattr(iu, "find_spec", lambda name: types.SimpleNamespace(origin=str(bad)))
+    with pytest.raises(PatchDriftError, match="matches no audited release"):
+        gr.check_k3_ops()
