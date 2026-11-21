@@ -11,6 +11,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .block_scales import _scale_offsets
+from .fast_sm120 import moe_config
 from .trtllm_bmm import ExpertPlan
 
 
@@ -178,6 +179,10 @@ def bmm(
             block_n, block_t, num_warps = 128, 64, 4
         else:
             block_n, block_t, num_warps = 256, 128, 8
+        block_k, num_stages = 128, 3
+        tuned = moe_config("mxfp8", plan.tile, n, k)
+        if tuned is not None:
+            block_n, block_t, block_k, num_warps, num_stages = tuned
         out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
         _mxfp8_gemm[
             (triton.cdiv(n, block_n), plan.max_ctas * triton.cdiv(plan.tile, block_t))
@@ -195,9 +200,9 @@ def bmm(
             TILE=plan.tile,
             BN=block_n,
             BT=block_t,
-            BK=128,
+            BK=block_k,
             num_warps=num_warps,
-            num_stages=3,
+            num_stages=num_stages,
             launch_pdl=True,
         )
         return out
@@ -209,6 +214,10 @@ def bmm(
         block_m = 128
         block_n = 128 if plan.tile >= 256 else 64
         num_warps = 8
+    block_k, num_stages = 512, 2
+    tuned = moe_config("nvfp4", plan.tile, n, k)
+    if tuned is not None:
+        block_m, block_n, block_k, num_warps, num_stages = tuned
     out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
     _expert_gemm[
         (plan.max_ctas, triton.cdiv(plan.tile, block_m), triton.cdiv(n, block_n))
@@ -227,8 +236,8 @@ def bmm(
         TILE=plan.tile,
         BM=block_m,
         BN=block_n,
-        BK=512,
+        BK=block_k,
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=num_stages,
     )
     return out
