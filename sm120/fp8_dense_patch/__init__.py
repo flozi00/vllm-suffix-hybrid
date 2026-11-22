@@ -63,7 +63,10 @@ PATCH_REVISION = "2026-09-28.1"
 PINNED_VLLM = "0.30.0"
 # + vLLM 0.31.1 nightlies (validated on 0.31.1rc1.dev273+g2eb491e18): same anchors.
 # + vLLM 0.33.0: convert_after_post_load anchor unchanged (line 208).
-SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1", "0.32.0", "0.33.0")
+# + vLLM 0.34.0: the attention + model-level post-load hooks moved into
+#   weight_utils.finalize_model_weights (children first, the model itself
+#   last); re-anchored right after that call (EDITS_V034), same position.
+SUPPORTED_VLLM = (PINNED_VLLM, "0.31.1", "0.32.0", "0.33.0", "0.34.0")
 GATE_ENV = "SUFFIX_FP8_DENSE"
 LAYERS_ENV = "SUFFIX_FP8_DENSE_LAYERS"
 NVFP4_GATE_ENV = "SUFFIX_NVFP4_DENSE"
@@ -184,21 +187,41 @@ EDITS = [
 ]
 
 
-def patch_source(src: str) -> tuple[str, list[str]]:
+# vLLM 0.34.0: finalize_model_weights runs every module's post-load hook,
+# deferred attention layers included and the model-level one last, so the
+# conversion still lands after the per-layer quant finalize and the MLA absorb.
+EDITS_V034 = [
+    (
+        "convert_after_finalize_model_weights",
+        '    finalize_model_weights(model, target_device)\n',
+        '    finalize_model_weights(model, target_device)\n'
+        f'    # {HELPER_TAG}: BF16 linears -> FP8 W8A8 (after the MLA absorb)\n'
+        '    _suffix_fp8_dense_convert(model)\n',
+        1,
+    ),
+]
+
+
+def edits_for(vllm_ver: str = "") -> list:
+    return EDITS_V034 if vllm_ver.split("+")[0] == "0.34.0" else EDITS
+
+
+def patch_source(src: str, vllm_ver: str = "") -> tuple[str, list[str]]:
     """Pure transform of utils.py; anchors count-verified before replacing."""
+    edits = edits_for(vllm_ver)
     if HELPER_TAG in src:
         raise PatchDriftError(f"{FIXTURE} already carries the {PATCH_NAME} rewrite")
     bad = [f"{n}: expected {c}, found {src.count(old)}"
-           for n, old, _new, c in EDITS if src.count(old) != c]
+           for n, old, _new, c in edits if src.count(old) != c]
     if bad:
         raise PatchDriftError(
             f"{FIXTURE} does not match the pinned anchor text (expected vLLM "
-            f"{PINNED_VLLM}): " + "; ".join(bad))
+            f"{vllm_ver or PINNED_VLLM}): " + "; ".join(bad))
     out = src
-    for _n, old, new, _c in EDITS:
+    for _n, old, new, _c in edits:
         out = out.replace(old, new)
     compile(out, f"<{PATCH_NAME}:{FIXTURE}>", "exec")  # syntax gate
-    return out, [n for n, *_ in EDITS]
+    return out, [n for n, *_ in edits]
 
 
 def _suffix_fp8_dense_convert(model) -> None:
@@ -241,7 +264,7 @@ def apply(module) -> bool:
     src = src_path.read_text()
     if HELPER_TAG in src:
         raise PatchDriftError(f"{src_path} already carries the rewrite on disk")
-    new_src, applied = patch_source(src)
+    new_src, applied = patch_source(src, ver)
     module.__dict__["_suffix_fp8_dense_convert"] = _suffix_fp8_dense_convert
     import linecache
 

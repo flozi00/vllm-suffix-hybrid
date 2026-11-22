@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Upstream-native NVFP4-KV adapter for vLLM 0.32.0 and 0.33.0.
+"""Upstream-native NVFP4-KV adapter for vLLM 0.32.0, 0.33.0 and 0.34.0.
 
 Upstream now supports SM120 NVFP4 itself. Keep its dtype/view/forward code;
 port only our image masks, graph-safe K2 dispatch and host planning changes.
@@ -12,6 +12,10 @@ not XQA. A separate native-format port needs its own numerical gate.
 0.33.0 delta: every anchor is unchanged except ``own_attn_spec_as_decode``,
 which is re-anchored (see ``_SPEC_AS_DECODE_033``). The hash-pinned
 ``gather_batch_req_state`` guard is byte-identical across both versions.
+
+0.34.0 delta: none in the anchored text -- the 0.33.0 anchor set applies
+19/19 (``own_attn_spec_as_decode`` keeps the 0.33.0 re-anchor), and
+``gather_batch_req_state`` is still byte-identical (sha256 18da780f...).
 """
 from __future__ import annotations
 
@@ -101,13 +105,14 @@ def edits(base, vllm_ver="0.32.0"):
         "own_attn_decode_wrapper",
     }
     result = [e for e in base._BACKEND_EDITS if e[0] in keep]
-    if vllm_ver.split("+")[0] == "0.33.0":
+    if vllm_ver.split("+")[0] in ("0.33.0", "0.34.0"):
         # 0.33.0 inserts `self.use_fa2_native_decode = _use_fa2_native_decode()`
         # and ORs it into supports_spec_as_decode. That helper is
-        # `not has_device_capability(90)`, i.e. already True on SM120, so the
-        # upstream value is right — but this anchor is the ONLY place that
-        # sets self.use_own_nvfp4_attn, so it must be re-anchored, not dropped
-        # (dropping it would silently disable the own-attn lane).
+        # `not has_device_capability(90)`, i.e. False on SM120 (cc 12.0 >= 9.0),
+        # so on SM120 our OR is what turns spec-as-decode on. This anchor is
+        # also the ONLY place that sets self.use_own_nvfp4_attn, so it must be
+        # re-anchored, not dropped (dropping it would silently disable the
+        # own-attn lane). 0.34.0 carries the identical text.
         result = [_SPEC_AS_DECODE_033 if e[0] == "own_attn_spec_as_decode" else e
                   for e in result]
     result.extend([

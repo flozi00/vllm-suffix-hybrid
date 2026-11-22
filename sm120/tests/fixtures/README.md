@@ -53,3 +53,13 @@ fixture + anchor set is required.
   from their named tags. `test_nvfp4_ordered_finalize.py` pins hashes and
   checks the optional ordered NVFP4 reduction keeps other quantization paths
   on their default fused finalize. Upstream diagnosis: vllm-project/vllm#54945.
+
+- `vllm_0.34.0/` — exact files from tag `v0.34.0` (image pairs FlashInfer
+  0.7.3): `flashinfer_backend.py` (K2 adapter: the 0.33.0 anchor set applies
+  19/19), `model_loader_utils.py` (dense hook re-anchored after
+  `finalize_model_weights`), `gather_batch_req_state.py.txt` (byte-identical
+  to 0.33.0), `flashinfer_cutlass_moe.py` (ordered finalize), `lfm2_moe.py`
+  (SUFFIX_SHORTCONV_FP8), and `gpu_cudagraph_utils.py` + `config_compilation.py`,
+  whose real `_init_candidates` / `dispatch` / `CUDAGraphMode` /
+  `decode_cudagraph_capture_shapes` `test_nvfp4_kv_v034.py` executes to
+  replay the K2 every-width FULL graph port on the query-length-keyed table.

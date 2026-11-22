@@ -196,11 +196,11 @@ def uniform_decode_excludes_prefill(func=None) -> bool:
     # v0.32 moved eligibility into GPUModelRunner request state and admits
     # one-token prompt extends. Restore the stricter invariant before
     # advertising FULL K2 verify graphs, preserving masked image prefills.
-    # v0.33.0 ships a byte-identical gather_batch_req_state (sha256
-    # 18da780f...), so the same hash-pinned guard applies unchanged.
+    # v0.33.0 and v0.34.0 ship a byte-identical gather_batch_req_state
+    # (sha256 18da780f...), so the same hash-pinned guard applies unchanged.
     if "if decode_graph_eligible and is_uniform_query_len(" in src:
         import vllm
-        if getattr(vllm, "__version__", "").split("+")[0] in ("0.32.0", "0.33.0"):
+        if getattr(vllm, "__version__", "").split("+")[0] in ("0.32.0", "0.33.0", "0.34.0"):
             from .v032 import install_prefill_graph_guard
             return install_prefill_graph_guard()
     return False
@@ -223,21 +223,27 @@ def install_uniform_graph_lens() -> bool:
     if os.environ.get("SUFFIX_SM120_NVP4KV_GRAPH_ALL_WIDTHS", "1").strip() == "0":
         return False
     try:
+        import vllm
         from vllm.v1.worker.gpu import cudagraph_utils as cgu
     except ImportError:
         return False
-    return wrap_init_candidates(cgu.ModelCudaGraphManager, cgu.CUDAGraphMode)
+    return wrap_init_candidates(cgu.ModelCudaGraphManager, cgu.CUDAGraphMode,
+                                getattr(vllm, "__version__", ""))
 
 
-def wrap_init_candidates(cls, modes) -> bool:
+def wrap_init_candidates(cls, modes, vllm_ver="0.33.0") -> bool:
     cur = cls.__dict__.get("_init_candidates")
     if getattr(cur, "_suffix_k2_lens", False):
         return True
     base = cls._init_candidates
+    keyed = vllm_ver.split("+")[0] == "0.34.0"
 
     def _init_candidates(self):
-        base(self)
-        added = add_uniform_lens(self, base, modes)
+        if keyed:
+            added = add_decode_query_lens(self, base, modes)
+        else:
+            base(self)
+            added = add_uniform_lens(self, base, modes)
         if added:
             print(f"[suffix sm120-nvfp4-kv] K2 graphs: FULL uniform-decode "
                   f"graphs also for q_len {added} (vLLM default: "
@@ -249,18 +255,44 @@ def wrap_init_candidates(cls, modes) -> bool:
     return True
 
 
+def _widths_wanted(mgr, modes) -> bool:
+    mode = mgr.cudagraph_mode
+    spec = getattr(mgr.vllm_config, "speculative_config", None)
+    dynamic = spec is not None and getattr(
+        spec, "uses_dynamic_speculative_decoding", lambda: False)()
+    return not (mgr.decode_query_len <= 1 or not mode or not mode.separate_routine()
+                or mode.decode_mode() != modes.FULL or mgr.varlen_decode or dynamic)
+
+
+def add_decode_query_lens(mgr, base, modes) -> list:
+    """vLLM 0.34.0: CudaGraphManager keys uniform decode graphs by query
+    length itself (``decode_max_reqs`` {q: max reqs}, filled in __init__ from
+    get_decode_cudagraph_query_lens, consumed by _init_candidates via
+    decode_cudagraph_capture_shapes into ``_decode_descs[(q, loras,
+    ubatches)]``, which dispatch() reads by uniform_token_count). A static
+    1+k spec run lists only q = 1+k, so add every narrower width with the
+    stock request cap BEFORE the stock builder runs once; it then captures
+    and dispatches them exactly like its own widths. Missing 0.34 attributes
+    raise here, inside runner init (fail loud, never a silent 1+k-only run)."""
+    if not _widths_wanted(mgr, modes):
+        base(mgr)
+        return []
+    lens = mgr.decode_max_reqs
+    added = [u for u in range(1, mgr.decode_query_len) if u not in lens]
+    for u in added:
+        lens[u] = mgr.max_num_reqs
+    mgr.decode_max_reqs = dict(sorted(lens.items()))
+    base(mgr)
+    return [u for u in added if any(key[0] == u for key in mgr._decode_descs)]
+
+
 def add_uniform_lens(mgr, base, modes) -> list:
     """Run the stock candidate builder once per extra width and merge its
     FULL uniform descriptors (captures + dispatch candidates, FULL entries
     ahead of PIECEWISE ones as stock orders them)."""
     full = modes.FULL
-    mode = mgr.cudagraph_mode
-    spec = getattr(mgr.vllm_config, "speculative_config", None)
     dq = mgr.decode_query_len
-    dynamic = spec is not None and getattr(
-        spec, "uses_dynamic_speculative_decoding", lambda: False)()
-    if (dq <= 1 or not mode or not mode.separate_routine()
-            or mode.decode_mode() != full or mgr.varlen_decode or dynamic):
+    if not _widths_wanted(mgr, modes):
         return []
     descs, cands = mgr._capture_descs, mgr._candidates
     added = []

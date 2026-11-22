@@ -96,11 +96,14 @@ PINNED_FLASHINFER = "0.6.18.post1"
 # Upstream-native NVFP4-KV adapters: (vLLM, FlashInfer) pairs whose
 # vllm/v1/attention/backends/flashinfer.py carries the post-0.32 layout that
 # v032.py ports. 0.33.0 keeps every anchor except own_attn_spec_as_decode,
-# which v032.py re-anchors per version. A pair not listed here falls back to
-# the 0.30.0 anchor set and its PINNED_* gate.
+# which v032.py re-anchors per version. 0.34.0 (+ FlashInfer 0.7.3) keeps the
+# 0.33.0 anchor set byte-for-byte (19/19) and passes the header probe (7/7).
+# A pair not listed here falls back to the 0.30.0 anchor set and its PINNED_*
+# gate.
 NATIVE_ADAPTERS = frozenset({
     ("0.32.0", "0.7.0.post1"),
     ("0.33.0", "0.7.2.post1"),
+    ("0.34.0", "0.7.3"),
 })
 
 GATE_ENV = "SUFFIX_SM120_NVP4KV"
