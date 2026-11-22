@@ -1,0 +1,474 @@
+from __future__ import annotations
+
+import ast
+import collections
+import typing
+from typing import TYPE_CHECKING
+from typing import TypeVar
+
+from .ast_extension import ExtendedAST
+
+if TYPE_CHECKING:
+    _A = TypeVar("_A", bound=ast.AST)
+
+
+HELION_LANE_LOOP_VAR_ATTR = "_helion_lane_loop_var"
+# On a CuTe atomic call: the lane variables of the synthetic lane loops along
+# whose tile axes the atomic is uniform (``cute/atomic_ops.py``); the lane-loop
+# distribution pins the atomic to their first lane when it runs inside them.
+HELION_ATOMIC_UNIFORM_LANES_ATTR = "_helion_atomic_uniform_lanes"
+# On a CuTe ``cute.arch.sync_threads()`` statement: the barrier ordering every
+# thread's accesses around a release / acquire atomic (``cute/atomic_ops.py``),
+# ``"release"`` before the atomic or ``"acquire"`` after it.  The lane-loop
+# distribution places it in that atomic's lane loops, as a fence of its own,
+# instead of pinning it inside every lane loop.
+HELION_FENCE_BARRIER_ATTR = "_helion_fence_barrier"
+# Set on a VecLaneWrapper's constexpr V-loop: the lane variable it is nested in.
+HELION_VEC_LANE_OF_ATTR = "_helion_vec_lane_of"
+# On a CuTe load or store call: the elements the tile program's access covers,
+# per tensor dimension, as ``(begin, end)`` SymPy bounds or None for a
+# dimension without a known interval (``language/memory_ops.py``,
+# ``_cute_access_regions``); the lane-loop distribution's barrier analysis
+# needs no barrier between accesses whose regions are apart.
+HELION_ACCESS_REGIONS_ATTR = "_helion_access_regions"
+# On a CuTe statement: the tensors whose accesses across the lanes of one lane
+# loop the emitter has already proven ordered as the program reads them (the
+# staging buffer of an ``hl.split`` exchange, ``cute/split_exchange.py``); the
+# lane-loop distribution's barrier analysis does not pair two such statements
+# on those tensors at the lane level.
+HELION_LANE_ORDERED_ATTR = "_helion_lane_ordered"
+# On a CuTe ``if`` statement: its condition is the same for every thread of the
+# CTA (``cute/block_uniform.py``), so a block-wide barrier may be placed inside
+# either side.
+HELION_BLOCK_UNIFORM_ATTR = "_helion_block_uniform"
+
+# Accessing these tensor attributes only reads host-side metadata, not tensor
+# storage.  Keep counting them as ordinary reads for liveness, but identify them
+# separately for analyses that specifically care about memory dependencies.
+# Keep this list conservative: unknown tensor attributes remain storage reads.
+_TENSOR_METADATA_ATTRIBUTES = frozenset(
+    {"device", "dim", "dtype", "ndim", "ndimension", "shape", "size", "stride"}
+)
+
+
+def _is_tensor_metadata_read(node: ast.Attribute) -> bool:
+    if (
+        not isinstance(node.ctx, ast.Load)
+        or node.attr not in _TENSOR_METADATA_ATTRIBUTES
+        or not isinstance(node.value, ExtendedAST)
+    ):
+        return False
+
+    # Import lazily: type_info imports CompileEnvironment, whose finalization
+    # imports this module after type propagation has annotated the AST.
+    from .type_info import TensorType
+
+    return isinstance(node.value._type_info, TensorType)
+
+
+# TODO(oulgen): This visitor is extremely primitive, does not consider alpha renaming or scopes
+class _ReadWriteVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rw = ReadWrites(
+            collections.Counter(),
+            collections.Counter(),
+            collections.Counter(),
+            collections.Counter(),
+            set(),
+            set(),
+        )
+
+    def _update(self, name: str, ctx: ast.expr_context) -> None:
+        if isinstance(ctx, ast.Load):
+            self.rw.reads[name] += 1
+        elif isinstance(ctx, ast.Store):
+            self.rw.writes[name] += 1
+
+    def visit_Name(self, node: ast.Name) -> None:
+        self._update(node.id, node.ctx)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if _is_tensor_metadata_read(node) and isinstance(node.value, ast.Name):
+            self.rw.tensor_metadata_reads[node.value.id] += 1
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if isinstance(node.value, ast.Name):
+            self._update(node.value.id, node.ctx)
+            if isinstance(node.ctx, ast.Store):
+                self.rw.inplace_writes[node.value.id] += 1
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        # Detect explicit memory/atomic operations as writes to their first
+        # argument.  e.g. hl.store(x, [i], value) and hl.atomic_add(x, ...).
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and (func.attr == "store" or func.attr.startswith("atomic_"))
+            and isinstance(func.value, ast.Name)
+            and node.args
+        ):
+            first_arg = node.args[0]
+            if isinstance(first_arg, ast.Name):
+                self.rw.writes[first_arg.id] += 1
+                self.rw.inplace_writes[first_arg.id] += 1
+                if func.attr.startswith("atomic_"):
+                    self.rw.atomic_reads.add(first_arg.id)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        target = node.target
+        if isinstance(target, ast.Name):
+            self.rw.reads[target.id] += 1
+            self.rw.augassign_reads.add(target.id)
+        elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+            self.rw.reads[target.value.id] += 1
+            self.rw.augassign_reads.add(target.value.id)
+        self.generic_visit(node)
+
+    def visit_For(self, node: ast.For) -> None:
+        # Skip target
+        self.visit(node.iter)
+        for stmt in node.body:
+            self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
+
+
+class ReadWrites(typing.NamedTuple):
+    reads: dict[str, int]
+    writes: dict[str, int]
+    # TODO(tcombes): inplace_writes only tracks subscript stores (x[tile] = ...) and
+    # atomic ops (hl.atomic_*(x, ...)).  If Helion adds support for in-place
+    # methods inside kernels (e.g. x.copy_(), x.fill_()), the visitor should
+    # be updated to detect those as well.
+    inplace_writes: dict[str, int]
+    # Reads of tensor shape/type/device metadata do not access tensor storage.
+    # They remain present in ``reads`` for general dependency tracking.
+    tensor_metadata_reads: dict[str, int]
+    # AugAssign targets are reads semantically, but branch argument ordering
+    # historically placed them with writes. Keep that ordering stable while
+    # exposing the read to analyses that consume ``reads`` directly.
+    augassign_reads: set[str]
+    # Atomic operations are read-modify-writes even when the generic Name walk
+    # sees only the synthetic first-argument read paired with the in-place write.
+    atomic_reads: set[str]
+
+    def __iter__(self) -> typing.Iterator[str]:
+        return iter({**self.reads, **self.writes})
+
+    @staticmethod
+    def from_list(body: list[ast.AST] | list[ast.stmt]) -> ReadWrites:
+        visitor = _ReadWriteVisitor()
+        for node in body:
+            visitor.visit(node)
+        return visitor.rw
+
+    def read_and_write_name_frozensets(self) -> tuple[frozenset[str], frozenset[str]]:
+        """Pair of (read names, write names) for inter-loop / barrier metadata.
+
+        ``_ReadWriteVisitor.visit_Subscript`` and ``visit_Call`` already
+        increment ``writes`` for both Store-context subscripts and atomic
+        first-args, so ``inplace_writes`` is a strict subset of ``writes``
+        today and adding it explicitly would be redundant.
+        """
+        reads = frozenset(self.reads.keys())
+        writes = frozenset(self.writes.keys())
+        return reads, writes
+
+    @staticmethod
+    def from_ast(node: ast.AST) -> ReadWrites:
+        """
+        Analyze an Abstract Syntax Tree (AST) node to determine the variables
+        that are read and written within it.
+
+        This function traverses the given AST node and collects information
+        about variable reads and writes using the `_ReadWriteVisitor` class.
+
+        Args:
+            node: The root AST node to analyze.
+
+        Returns:
+            A `ReadWrites` object containing dictionaries of read and
+            written variable names.
+        """
+        visitor = _ReadWriteVisitor()
+        visitor.visit(node)
+        return visitor.rw
+
+
+class _RenameVisitor(ast.NodeVisitor):
+    def __init__(self, renames: dict[str, str]) -> None:
+        super().__init__()
+        self.renames = renames
+
+    def visit_Name(self, node: ast.Name) -> None:
+        node.id = self.renames.get(node.id, node.id)
+
+
+def ast_rename(node: _A, renames: dict[str, str]) -> _A:
+    """
+    Rename variables in an Abstract Syntax Tree (AST) node, in-place.
+
+    This function traverses the given AST node and renames variables
+    based on the provided mapping of old names to new names.
+
+    Args:
+        node: The root AST node to rename variables in.
+        renames: A dictionary mapping old variable names to new variable names.
+
+    Returns:
+        The modified AST node with variables renamed.
+    """
+    visitor = _RenameVisitor(renames)
+    visitor.visit(node)
+    return node
+
+
+class _DeleteAssignments(ast.NodeTransformer):
+    def __init__(self, to_remove: set[str]) -> None:
+        super().__init__()
+        self.to_remove = to_remove
+
+    def visit_Assign(self, node: ast.Assign) -> ast.Assign | None:
+        """
+        Visit an assignment node and remove it if the target variable is in the to_remove set.
+
+        Args:
+            node: The assignment node to visit.
+
+        Returns:
+            The modified assignment node, or None if it should be removed.
+        """
+        if len(node.targets) == 1:
+            (target,) = node.targets
+            if isinstance(target, ast.Name) and target.id in self.to_remove:
+                return None
+        return node
+
+
+def ast_delete_assignments(body: list[ast.AST], to_remove: set[str]) -> list[ast.AST]:
+    new_body = []
+    transformer = _DeleteAssignments(to_remove)
+    for node in body:
+        new_node = transformer.visit(node)
+        if new_node is not None:
+            new_body.append(new_node)
+    return new_body
+
+
+class _DeleteDeadLaneLoops(ast.NodeTransformer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.changed = False
+
+    def _visit_stmt_list(self, body: list[ast.stmt]) -> list[ast.stmt]:
+        new_body: list[ast.stmt] = []
+        for stmt in body:
+            new_stmt = self.visit(stmt)
+            if isinstance(new_stmt, list):
+                new_body.extend(new_stmt)
+            elif new_stmt is not None:
+                new_body.append(new_stmt)
+        return new_body
+
+    def generic_visit(self, node: ast.AST) -> ast.AST:
+        for field in ("body", "orelse", "finalbody"):
+            old_value = getattr(node, field, None)
+            if isinstance(old_value, list) and all(
+                isinstance(stmt, ast.stmt) for stmt in old_value
+            ):
+                setattr(node, field, self._visit_stmt_list(old_value))
+        return node
+
+    def visit_For(self, node: ast.For) -> ast.For | list[ast.stmt]:
+        self.generic_visit(node)
+        lane_var = getattr(node, HELION_LANE_LOOP_VAR_ATTR, None)
+        if (
+            lane_var is None
+            or node.orelse
+            or not isinstance(node.target, ast.Name)
+            or node.target.id != lane_var
+        ):
+            return node
+        if lane_var in ReadWrites.from_list(node.body).reads:
+            return node
+        self.changed = True
+        return node.body
+
+
+def dead_lane_loop_elimination(body: list[ast.AST]) -> bool:
+    """Splice generated lane loops whose lane variable became dead.
+
+    CuTe lane loops are compiler-generated scalarization loops whose target
+    variable is expected to feed lane-dependent indices. Normal DCE can remove
+    those index assignments, leaving an invariant loop that repeats identical
+    side effects. Only loops explicitly marked by codegen are eligible here.
+    """
+    transformer = _DeleteDeadLaneLoops()
+    new_body: list[ast.AST] = []
+    for node in body:
+        new_node = transformer.visit(node)
+        if isinstance(new_node, list):
+            new_body.extend(new_node)
+        elif new_node is not None:
+            new_body.append(new_node)
+    if transformer.changed:
+        body[:] = new_body
+    return transformer.changed
+
+
+class _NotPureException(Exception):
+    pass
+
+
+class _PureExpressionVisitor(ast.NodeVisitor):
+    """
+    AST visitor that determines if an expression is guaranteed to be pure.
+    """
+
+    def __init__(self, *, allow_compiler_shape_helpers: bool = False) -> None:
+        super().__init__()
+        self.allow_compiler_shape_helpers = allow_compiler_shape_helpers
+
+    def generic_visit(self, node: ast.AST) -> None:
+        # Anything without a specific visitor is not pure
+        raise _NotPureException
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        pass
+
+    def visit_Name(self, node: ast.Name) -> None:
+        pass
+
+    def visit_Tuple(self, node: ast.Tuple) -> None:
+        for elt in node.elts:
+            self.visit(elt)
+
+    def visit_List(self, node: ast.List) -> None:
+        for elt in node.elts:
+            self.visit(elt)
+
+    def visit_Set(self, node: ast.Set) -> None:
+        for elt in node.elts:
+            self.visit(elt)
+
+    def visit_Dict(self, node: ast.Dict) -> None:
+        for key in node.keys:
+            if key is not None:  # Handle dict unpacking
+                self.visit(key)
+        for value in node.values:
+            self.visit(value)
+
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        self.visit(node.left)
+        self.visit(node.right)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> None:
+        self.visit(node.operand)
+
+    def visit_Starred(self, node: ast.Starred) -> None:
+        self.visit(node.value)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        # Math methods and compiler-emitted integer shape helpers are pure.
+        is_math = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "math"
+        )
+        is_triton_shape_helper = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "triton"
+            and node.func.attr in {"cdiv", "next_power_of_2"}
+        )
+        # ``max`` clamps a dynamic reduction block to 1 (dynamic_rdim_size_expr).
+        is_backend_shape_helper = isinstance(node.func, ast.Name) and node.func.id in {
+            "_cdiv",
+            "_next_power_of_2",
+            "max",
+        }
+        is_compiler_shape_helper = (
+            is_triton_shape_helper or is_backend_shape_helper
+        ) and self.allow_compiler_shape_helpers
+        if not (is_math or is_compiler_shape_helper):
+            raise _NotPureException
+
+        # Recurse into children except for func
+        for arg in node.args:
+            self.visit(arg)
+
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+
+
+def definitely_does_not_have_side_effects(
+    expr: ast.expr,
+    *,
+    allow_compiler_shape_helpers: bool = False,
+) -> bool:
+    try:
+        _PureExpressionVisitor(
+            allow_compiler_shape_helpers=allow_compiler_shape_helpers
+        ).visit(expr)
+        return True
+    except _NotPureException:
+        return False
+
+
+class _DeletePureExpressions(ast.NodeTransformer):
+    def visit_Expr(self, node: ast.Expr) -> ast.Expr | None:
+        if definitely_does_not_have_side_effects(node.value):
+            return None
+        return node
+
+
+def dead_assignment_elimination(
+    body: list[ast.AST],
+    dce_vars: list[str],
+    num_iterations: int = 8,
+    input_rw: ReadWrites | None = None,
+) -> None:
+    """
+    Eliminates dead assignments from body
+    """
+
+    # num_iterations and input_rw are not compatible with each other
+    assert num_iterations == 1 or input_rw is None
+    for _ in range(num_iterations):
+        rw = input_rw if input_rw is not None else ReadWrites.from_list(body)
+        to_remove = set()
+        for name in dce_vars:
+            if name in rw.writes and name not in rw.reads:
+                to_remove.add(name)
+        if not to_remove:
+            break
+        body[:] = ast_delete_assignments(body, to_remove)
+
+
+def is_string_expr(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+
+
+def dead_expression_elimination(body: list[ast.AST]) -> None:
+    """
+    Eliminates dead expressions from body
+    """
+    new_body = []
+    for node in body:
+        if is_string_expr(node):
+            # triple quoted comments and strings are indistinguishable
+            # do not eliminate them
+            new_body.append(node)
+            continue
+        new_node = _DeletePureExpressions().visit(node)
+        if new_node is not None:
+            new_body.append(new_node)
+    body[:] = new_body
