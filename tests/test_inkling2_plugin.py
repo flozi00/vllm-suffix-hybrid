@@ -39,7 +39,7 @@ class Inkling2PluginTest(unittest.TestCase):
             self.assertIsNone(f.moe_config("nvfp4", 128, 2304, 2304))
         with patch.object(f, "MOE_TUNE", True):
             self.assertEqual(f.moe_config("nvfp4", 128, 2304, 2304), (64, 128, 256, 4, 2))
-            self.assertIsNone(f.moe_config("nvfp4", 16, 2304, 1152))  # <3% gain: dropped
+            self.assertIsNone(f.moe_config("nvfp4", 8, 2304, 2304))  # decode tiles: dropped
             self.assertIsNone(f.moe_config("nvfp4", 64, 2304, 2304))  # never swept
 
     def test_vendored_package_has_no_upstream_self_imports(self):
