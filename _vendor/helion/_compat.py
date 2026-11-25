@@ -1,0 +1,799 @@
+from __future__ import annotations
+
+import contextlib
+import functools
+import importlib
+import inspect
+import re
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Callable
+from typing import cast
+
+from packaging import version
+import torch
+from torch._inductor.runtime.hints import DeviceProperties
+
+from ._utils import triton_is_available
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    import sympy
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    from .autotuner.config_fragment import ConfigSpecFragment
+
+if triton_is_available():
+    from torch._inductor.utils import triton_type
+    import triton
+    from triton.backends.compiler import BaseBackend
+    from triton.backends.compiler import GPUTarget
+    import triton.language as tl
+    import triton.runtime.jit as triton_jit
+
+    NativeSpecializeImpl = Callable[
+        [type[BaseBackend], object, bool, bool, bool], tuple[object, ...]
+    ]
+    CreateSpecializeImpl = Callable[
+        [Callable[..., object]], Callable[..., tuple[object, ...]]
+    ]
+
+    def _make_specialize_impl_wrapper(
+        *,
+        native_impl: NativeSpecializeImpl | None = None,
+        create_factory: CreateSpecializeImpl | None = None,
+    ) -> Callable[..., object]:
+        if native_impl is None:
+            native_impl = cast(
+                "NativeSpecializeImpl | None",
+                getattr(triton_jit, "native_specialize_impl", None),
+            )
+        if native_impl is None and create_factory is None:
+            raise AttributeError("native_specialize_impl unavailable")
+
+        def specialize_impl_wrapper(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            specialize_extra = cast(
+                "Callable[..., object] | None",
+                kwargs.pop("specialize_extra", None),
+            )
+            kwargs.pop("specialize_zero_one", None)
+            backend_param = kwargs.pop("backend", None)
+            args_list: list[object] = list(args)
+            backend_type: type[BaseBackend]
+            if backend_param is None and args_list:
+                first = args_list[0]
+                if isinstance(first, type) and issubclass(first, BaseBackend):
+                    backend_type = first
+                    args_list.pop(0)
+                elif isinstance(first, BaseBackend):
+                    backend_type = type(first)
+                    args_list.pop(0)
+                else:
+                    backend_type = BaseBackend
+            elif isinstance(backend_param, type) and issubclass(
+                backend_param, BaseBackend
+            ):
+                backend_type = backend_param
+            elif isinstance(backend_param, BaseBackend):
+                backend_type = type(backend_param)
+            else:
+                backend_type = BaseBackend
+
+            arg = kwargs.pop("arg", None)
+            if arg is None:
+                if args_list:
+                    arg = args_list.pop(0)
+                else:
+                    raise TypeError(
+                        "specialize_impl() missing positional argument 'arg'"
+                    )
+
+            def _pop_flag(
+                key: str,
+                *,
+                alt_keys: tuple[str, ...] = (),
+                default: bool | None = None,
+            ) -> bool:
+                value = kwargs.pop(key, None)
+                if value is None:
+                    for alt in alt_keys:
+                        value = kwargs.pop(alt, None)
+                        if value is not None:
+                            break
+                if value is None:
+                    if args_list:
+                        value = args_list.pop(0)
+                    elif default is not None:
+                        value = default
+                    else:
+                        raise TypeError(f"specialize_impl() missing argument '{key}'")
+                return bool(value)
+
+            is_const = _pop_flag("is_const")
+            specialize_value = _pop_flag(
+                "specialize_value",
+                alt_keys=("specialize",),
+                default=True,
+            )
+            align = _pop_flag("align", default=True)
+
+            if native_impl is not None:
+                result = native_impl(
+                    backend_type,
+                    arg,
+                    is_const,
+                    specialize_value,
+                    align,
+                )
+                if specialize_extra is not None:
+                    with contextlib.suppress(Exception):
+                        specialize_extra(arg)
+            else:
+                assert create_factory is not None
+
+                def _call_specialize_extra(
+                    extra_arg: object,
+                    kind: object,
+                    *,
+                    align: bool = True,
+                ) -> object:
+                    if specialize_extra is None:
+                        return None
+                    try:
+                        return specialize_extra(extra_arg)
+                    except TypeError:
+                        try:
+                            return specialize_extra(extra_arg, kind, align=align)
+                        except Exception:
+                            return None
+                    except Exception:
+                        return None
+
+                impl = create_factory(_call_specialize_extra)
+                result = impl(
+                    arg,
+                    is_const=is_const,
+                    specialize_value=specialize_value,
+                    align=align,
+                )
+            return result
+
+        return specialize_impl_wrapper
+
+    def _ensure_triton_specialize_impl_alias() -> None:
+        if hasattr(triton_jit, "specialize_impl"):
+            return
+        if hasattr(triton_jit, "native_specialize_impl"):
+            module: Any = triton_jit
+            module.specialize_impl = _make_specialize_impl_wrapper()  # type: ignore[assignment]
+            return
+        create_specialize_impl = getattr(triton_jit, "create_specialize_impl", None)
+        if create_specialize_impl is not None:
+            module: Any = triton_jit
+            module.specialize_impl = _make_specialize_impl_wrapper(
+                create_factory=create_specialize_impl,
+            )  # type: ignore[assignment]
+
+    _ensure_triton_specialize_impl_alias()
+
+    def _ensure_backend_specialization_alias() -> None:
+        if hasattr(BaseBackend, "get_arg_specialization"):
+            return
+        if hasattr(BaseBackend, "get_tensor_specialization"):
+            BaseBackend.get_arg_specialization = BaseBackend.get_tensor_specialization  # type: ignore[attr-defined]
+
+    _ensure_backend_specialization_alias()
+
+    @functools.cache
+    def get_triton_find_paths_if() -> Callable[..., object]:
+        if hasattr(triton_jit, "find_paths_if"):
+            return triton_jit.find_paths_if
+        if hasattr(triton_jit, "_find_paths_if"):
+            return triton_jit._find_paths_if  # type: ignore[attr-defined]
+        raise AttributeError("Unable to locate Triton find_paths_if helper")
+
+    @functools.cache
+    def get_triton_iterable_path() -> Callable[..., object]:
+        if hasattr(triton_jit, "get_iterable_path"):
+            return triton_jit.get_iterable_path
+        if hasattr(triton_jit, "_get_iterable_path"):
+            return triton_jit._get_iterable_path  # type: ignore[attr-defined]
+        raise AttributeError("Unable to locate Triton get_iterable_path helper")
+
+    @functools.cache
+    def _supports_tensor_descriptor() -> bool:
+        # AMD ROCm does not support tensor_descriptor
+        if torch.version.hip is not None:
+            return False
+
+        def _cuda_tensor_desc_available() -> bool:
+            if not torch.cuda.is_available():
+                return False
+            major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+            return major >= 9
+
+        def _xpu_tensor_desc_available() -> bool:
+            if not torch.xpu.is_available():
+                return False
+
+            return get_triton_version() >= version.parse("3.5")
+
+        if not (_cuda_tensor_desc_available() or _xpu_tensor_desc_available()):
+            return False
+
+        return hasattr(triton.language, "make_tensor_descriptor") or hasattr(
+            triton.language, "_experimental_make_tensor_descriptor"
+        )
+
+    @functools.cache
+    def _supports_block_ptr() -> bool:
+        """Whether this Triton still lowers ``tl.make_block_ptr``.
+
+        triton-lang/triton#10833 ("Remove block pointer support") drops
+        ``tl.advance`` and keeps ``tl.make_block_ptr`` as a stub whose body is
+        ``raise NotImplementedError(...)``, so presence alone proves nothing:
+        look at the builtin's body.  Without source (frozen or compiled
+        installs) only the 3.7 line is known to have block pointers; main
+        reported 3.8.0 for two months after the removal.
+        """
+        make_block_ptr = getattr(tl, "make_block_ptr", None)
+        if make_block_ptr is None or getattr(tl, "advance", None) is None:
+            return False
+        try:
+            source = inspect.getsource(make_block_ptr)
+        except (OSError, TypeError):
+            return get_triton_version() < version.parse("3.8")
+        return "NotImplementedError" not in source
+
+    @functools.cache
+    def _supports_host_tensor_descriptor() -> bool:
+        """Whether this Triton install provides the host descriptor API."""
+        if torch.version.hip is not None or not (
+            hasattr(triton.language, "make_tensor_descriptor")
+            or hasattr(triton.language, "_experimental_make_tensor_descriptor")
+        ):
+            return False
+        try:
+            module = importlib.import_module("triton.tools.tensor_descriptor")
+        except ImportError:
+            return False
+        return getattr(module, "TensorDescriptor", None) is not None
+
+    @functools.cache
+    def get_tensor_descriptor_fn_name() -> str:
+        if hasattr(triton.language, "make_tensor_descriptor"):
+            return "tl.make_tensor_descriptor"
+        assert hasattr(triton.language, "_experimental_make_tensor_descriptor")
+        return "tl._experimental_make_tensor_descriptor"
+
+    @functools.cache
+    def torch_dtype_to_tl(torch_dtype: torch.dtype) -> object:
+        """Return the `triton.language` dtype that matches a `torch.dtype`."""
+        name_str = triton_type(torch_dtype).replace("tl.", "")
+        return getattr(tl, name_str)
+
+    @functools.cache
+    def _min_dot_size(
+        device: torch.device, lhs: torch.dtype, rhs: torch.dtype
+    ) -> tuple[int, int, int]:
+        # Helion's Pallas backend always targets TPU's Mosaic MXU, even in
+        # interpret mode where the actual device is "cpu".
+        from .runtime.settings import _get_backend
+
+        if _get_backend() == "pallas":
+            # TPU Mosaic MXU tile: (8, 128) sublane × lane.
+            # pl.dot(lhs[M,K], rhs[K,N]) needs M>=8, K>=128, N>=128.
+            return (8, 128, 128)
+
+        if device.type == "xpu" and torch.xpu.is_available():
+            # pyrefly: ignore [missing-import]
+            from triton.backends.intel.compiler import min_dot_size as min_dot_size_xpu
+
+            device_properties = torch.xpu.get_device_properties()
+            gpu_target_info = {
+                k: getattr(device_properties, k)
+                for k in device_properties.__dir__()
+                if not k.startswith("_")
+            }
+
+            dot_size_val = min_dot_size_xpu(gpu_target_info)(
+                torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs)
+            )
+            # pyrefly: ignore [bad-return]
+            return tuple(int(v) for v in dot_size_val)
+
+        if device.type == "cuda":
+            props = DeviceProperties.create(device)
+            target = GPUTarget(
+                backend=props.type,
+                arch=props.cc,
+                warp_size=props.warp_size or 32,
+            )
+            if is_hip():
+                from triton.backends.amd.compiler import get_min_dot_size
+
+                get_min_size = get_min_dot_size(target)
+            else:
+                from triton.backends.nvidia.compiler import (
+                    min_dot_size as min_dot_size_cuda,
+                )
+
+                get_min_size = min_dot_size_cuda(target)
+            return get_min_size(torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs))
+
+        return (16, 16, 16)
+
+    @functools.cache
+    def use_tileir_tunables() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        try:
+            major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+        except Exception:
+            return False
+        # Currently only device with compute capability 10.x and 12.x support tileir backend.
+        if major not in [10, 12]:
+            return False
+        try:
+            from triton.backends.compiler import GPUTarget
+
+            target = triton.runtime.driver.active.get_current_target()
+            return isinstance(target, GPUTarget) and target.backend == "tileir"
+        except Exception:
+            return False
+
+else:
+    # Triton is not available — provide stubs / safe defaults
+
+    def get_triton_find_paths_if() -> Callable[..., object]:  # type: ignore[misc]
+        raise RuntimeError("triton is not installed")
+
+    def get_triton_iterable_path() -> Callable[..., object]:  # type: ignore[misc]
+        raise RuntimeError("triton is not installed")
+
+    def _supports_tensor_descriptor() -> bool:  # type: ignore[misc]
+        return False
+
+    def _supports_host_tensor_descriptor() -> bool:  # type: ignore[misc]
+        return False
+
+    def _supports_block_ptr() -> bool:  # type: ignore[misc]
+        return False
+
+    def get_tensor_descriptor_fn_name() -> str:  # type: ignore[misc]
+        return "tl.make_tensor_descriptor"
+
+    def torch_dtype_to_tl(torch_dtype: torch.dtype) -> object:  # type: ignore[misc]
+        raise RuntimeError("triton is not installed")
+
+    def _min_dot_size(  # type: ignore[misc]
+        device: torch.device, lhs: torch.dtype, rhs: torch.dtype
+    ) -> tuple[int, int, int]:
+        from .runtime.settings import _get_backend
+
+        if _get_backend() == "pallas":
+            return (8, 128, 128)
+        return (16, 16, 16)
+
+    def use_tileir_tunables() -> bool:  # type: ignore[misc]
+        return False
+
+
+@functools.cache
+def get_triton_version() -> version.Version:
+    """Return the installed Triton version as a parsed, cached value."""
+    import triton
+
+    return version.parse(triton.__version__)
+
+
+def supports_tensor_descriptor() -> bool:
+    # call private func we can patch in testing
+    return _supports_tensor_descriptor()
+
+
+def supports_host_tensor_descriptor() -> bool:
+    # call private func we can patch in testing
+    return _supports_host_tensor_descriptor()
+
+
+def supports_block_ptr() -> bool:
+    """Whether ``indexing="block_ptr"`` can be lowered by the installed Triton."""
+    # call private func we can patch in testing
+    return _supports_block_ptr()
+
+
+def target_device_capability(
+    device: torch.device | None = None,
+) -> tuple[int, int] | None:
+    """Return CUDA compute capability, or None for non-CUDA/unavailable targets."""
+    if device is not None and device.type != "cuda":
+        return None
+    if device is not None and device.index is not None:
+        return _target_device_capability(device.index)
+    if not torch.cuda.is_available():
+        return None
+    # device=None means the current device; resolve it per call so a later
+    # set_device is not frozen under one cache key.
+    return _target_device_capability(torch.cuda.current_device())
+
+
+@functools.cache
+def _target_device_capability(index: int) -> tuple[int, int] | None:
+    # Memoize per index (capability is fixed per device). Tests patch the
+    # public wrapper above, mirroring is_hip / _is_hip.
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_capability(index)
+
+
+def min_dot_size(
+    device: torch.device, lhs: torch.dtype, rhs: torch.dtype
+) -> tuple[int, int, int]:
+    # call private func we can patch in testing
+    return _min_dot_size(device, lhs, rhs)
+
+
+def is_hip() -> bool:
+    """Check if the current device uses the HIP (AMD ROCm) backend."""
+    return _is_hip()
+
+
+@functools.cache
+def _is_hip() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        props = DeviceProperties.create(
+            torch.device("cuda", torch.cuda.current_device())
+        )
+        return props.type == "hip"
+    except Exception:
+        return False
+
+
+@functools.cache
+def get_device_name(device: torch.device | None = None) -> str | None:
+    """Return a human-readable name for the given device."""
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        elif hasattr(torch, "tpu") and torch.accelerator.is_available():
+            # torch_tpu (PrivateUse1) exposes no per-chip name; report the
+            # generation so dashboard rows land on the "tpu" platform instead of
+            # "unknown" (matches benchmarks/run_tpu.py).
+            return "TPU v7"
+        else:
+            return None
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(device)
+        name = torch.cuda.get_device_name(device)
+        if torch.version.hip is not None:
+            arch = getattr(props, "gcnArchName", None)
+            return name if arch is None else f"{name} {arch}"
+        # Inconsistent name reporting, so lets fix H100 to report simple name
+        if name.startswith("NVIDIA H100"):
+            return "NVIDIA H100"
+        return name
+
+    if (
+        device.type == "xpu"
+        and getattr(torch, "xpu", None) is not None
+        and torch.xpu.is_available()
+    ):
+        return torch.xpu.get_device_properties(device).name
+
+    if device.type == "mps":
+        return torch.backends.mps.get_name()
+
+    try:
+        import jax  # type: ignore[import-untyped]
+
+        devices = jax.devices()
+        if devices:
+            return devices[0].device_kind
+    except Exception:
+        pass
+    return None
+
+
+def warps_to_threads(num_warps: int) -> int:
+    if torch.cuda.is_available():
+        props = DeviceProperties.create(
+            torch.device("cuda", torch.cuda.current_device())
+        )
+        return num_warps * (props.warp_size or 32)
+    return num_warps * 32
+
+
+@functools.cache
+def num_compute_units() -> int:
+    """Return the number of SMs (NVIDIA) or CUs (AMD) on the current device."""
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+    return 128
+
+
+def supports_amd_cdna_tunables() -> bool:
+    # Keep is_hip() outside the cache: tests patch is_hip/_is_hip to model
+    # other targets, and a result cached under such a patch would leak into
+    # every later test in the process.
+    return is_hip() and _is_amd_cdna()
+
+
+@functools.cache
+def _is_amd_cdna() -> bool:
+    # CDNA architectures are gfx908 and above but less than gfx1000
+    # Reference: https://llvm.org/docs/AMDGPUUsage.html
+    match = re.match(r"gfx([0-9a-f]{3})", _amd_base_arch() or "")
+    return match is not None and int(match.group(1), 16) >= 0x908
+
+
+@functools.cache
+def _amd_base_arch() -> str | None:
+    """Base AMD GPU architecture, e.g. "gfx942" from "gfx942:sramecc+:xnack-"."""
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = getattr(props, "gcnArchName", None)
+    except Exception:
+        return None
+    return None if arch is None else arch.split(":")[0]
+
+
+def device_num_sm(device: torch.device | int | None = None) -> int:
+    """SM/CU count for ``device`` (or the current device), or 1 if unavailable.
+
+    Used as the default for ``ConfigSpec.num_sm`` so direct ConfigSpec
+    constructions derive a value consistent with ``get_num_xcd`` instead of
+    assuming 1.  The real compile path passes the reserved-adjusted count.
+    """
+    if not torch.cuda.is_available():
+        return 1
+    try:
+        return torch.cuda.get_device_properties(
+            device if device is not None else torch.cuda.current_device()
+        ).multi_processor_count
+    except Exception:
+        return 1
+
+
+def supports_mtia_tunables() -> bool:
+    """Check if running on MTIA hardware.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns False in open source builds where the fb module doesn't exist.
+    """
+    return _supports_mtia_tunables()
+
+
+@functools.cache
+def _supports_mtia_tunables() -> bool:
+    try:
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            supports_mtia_tunables as _fb_supports_mtia,
+        )
+
+        return _fb_supports_mtia()
+    except ImportError:
+        return False
+
+
+def get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
+    """Get MTIA-specific tunable fragments for autotuning.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns an empty dict in open source builds where the fb module doesn't exist.
+    """
+    return _get_mtia_tunable_fragments()
+
+
+@functools.cache
+def _get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
+    try:
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            get_mtia_tunable_fragments as _fb_get_mtia_tunable_fragments,
+        )
+
+        return _fb_get_mtia_tunable_fragments()
+    except ImportError:
+        return {}
+
+
+def supports_tf32_precision_on_amd() -> bool:
+    """Check if the AMD GPU supports TF32 (XF32) precision.
+
+    Only CDNA3 (gfx942) supports TF32/XF32 in Triton's AMD backend.
+    Earlier CDNA architectures (gfx908, gfx90a) and later ones (gfx950+)
+    only support 'ieee' precision for dot operations.
+    Reference: triton/backends/amd/compiler.py only enables tf32 for gfx942.
+    """
+    # is_hip() stays uncached for the same reason as in supports_amd_cdna_tunables.
+    return is_hip() and _amd_base_arch() == "gfx942"
+
+
+def shape_env_size_hint(
+    shape_env: ShapeEnv,
+    expr: sympy.Basic | int,
+) -> int:
+    """Compat wrapper: use optimization_hint (nightly) or size_hint (stable)."""
+    if hasattr(shape_env, "optimization_hint"):
+        return int(shape_env.optimization_hint(expr))  # type: ignore[attr-defined]
+    return int(shape_env.size_hint(expr))  # type: ignore[attr-defined]
+
+
+def supports_maxnreg() -> bool:
+    # call private func we can patch in testing
+    return _supports_maxnreg()
+
+
+@functools.cache
+def _supports_maxnreg() -> bool:
+    return (
+        torch.version.hip is None
+        and torch.version.xpu is None
+        and torch.cuda.is_available()
+    )
+
+
+def fp8_block_ptr_padding_broken() -> bool:
+    # call private func we can patch in testing
+    return _fp8_block_ptr_padding_broken()
+
+
+@functools.cache
+def _fp8_block_ptr_padding_broken() -> bool:
+    """Whether a block-pointer ``tl.load`` with ``padding_option='zero'`` fails to
+    compile for FP8 tensors.
+
+    Regression from triton-lang/triton#9668 ("Rewrite block pointer to be
+    python-only"), tracked in triton-lang/triton#10751: the python lowering emits
+    an ``int`` zero for ``other``, which Triton cannot cast to FP8. Present in the
+    triton 3.8 series; gated by version so the workaround drops automatically once
+    a fix ships in a later release. See ``BlockPtrIndexingStrategy.codegen_load``.
+    """
+    if not triton_is_available():
+        return False
+    triton_version = get_triton_version()
+    return version.parse("3.8.0") <= triton_version < version.parse("3.9.0")
+
+
+def sm100_dot_tmem_lhs_broken(device: torch.device) -> bool:
+    # call private func we can patch in testing
+    return _sm100_dot_tmem_lhs_broken(device)
+
+
+def _sm100_dot_tmem_lhs_broken(device: torch.device) -> bool:
+    """Whether ``tl.dot`` crashes with a misaligned address on sm100 when its LHS
+    operand is promoted to tensor memory and the accumulator is wider than 256.
+
+    On Blackwell, Triton's ``PromoteLHSToTMem`` pass places any dot LHS that is
+    not a plain load (e.g. the result of another dot, or any elementwise op) in
+    tensor memory.  With an M block of 64 the resulting TMEM allocation must
+    share rows with the accumulator, but an accumulator wider than 256 columns
+    is interleaved across both row halves, which the tcgen05 lowering
+    mishandles (triton-lang/triton#10309, unfixed as of triton 3.8/main).
+    Worked around in ``emit_tl_dot_with_padding`` by splitting the dot into two
+    M=32 halves; drop the workaround once the upstream fix ships.
+    """
+    capability = target_device_capability(device)
+    return capability is not None and capability[0] == 10
+
+
+@functools.cache
+def _regs_per_block() -> int:
+    """Max 32-bit registers per block on the current CUDA device."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.regs_per_multiprocessor  # pyrefly: ignore[missing-attribute]
+
+
+@functools.cache
+def requires_torch_version(min_version: str) -> bool:
+    """Check if PyTorch version meets the minimum requirement.
+
+    Uses base version for comparison, ignoring pre-release/dev/post suffixes.
+    For example, "2.11.0.dev20251104" satisfies min_version="2.11".
+
+    Args:
+        min_version: Minimum required PyTorch version (e.g., "2.11")
+
+    Returns:
+        True if current PyTorch version >= min_version
+    """
+    current_version = version.parse(torch.__version__.split("+")[0])
+    current_base = version.parse(current_version.base_version)
+    return current_base >= version.parse(min_version)
+
+
+@functools.cache
+def requires_cuda_version(min_version: str) -> bool:
+    """Check if PyTorch's CUDA runtime version meets the minimum requirement.
+
+    Args:
+        min_version: Minimum required CUDA version (e.g., "13").
+
+    Returns:
+        True if ``torch.version.cuda`` is set and >= ``min_version``.
+        False if PyTorch was not built with CUDA support.
+    """
+    cuda_version = torch.version.cuda
+    if cuda_version is None:
+        return False
+    return version.parse(cuda_version) >= version.parse(min_version)
+
+
+@functools.cache
+def torch_uses_template_producer_fusion() -> bool:
+    """Whether this PyTorch version provides the template producer-fusion API."""
+    # pytorch/pytorch#198809 first appears in the 2026-10-07 nightly.
+    # Keep the dev date: earlier 2.16 nightlies still use the prologue API.
+    if version.parse(torch.__version__.split("+")[0]) < version.parse(
+        "2.16.0.dev20261007"
+    ):
+        return False
+    try:
+        from torch._inductor.ir import TemplateBuffer
+    except ImportError:
+        return False
+    return (
+        hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_producer_fusion")
+        and "load_input_fusion_allowed_inputs"
+        in inspect.signature(TemplateBuffer.__init__).parameters
+    )
+
+
+@functools.cache
+def supports_torch_compile_template_lowering() -> bool:
+    """Check whether Inductor can lower Helion's kernel HOP as a template.
+
+    This is the unfused subset of :func:`supports_torch_compile_fusion`: the
+    external template kernel and the template buffer fusion flags, without the
+    scheduler's prologue/producer fusion hook.
+    """
+    if torch.xpu.is_available():
+        return False
+    if not requires_torch_version("2.11"):
+        return False
+    try:
+        select_algorithm = importlib.import_module("torch._inductor.select_algorithm")
+        from torch._inductor.ir import TemplateBuffer
+
+        assert hasattr(select_algorithm, "ExternalTritonTemplateKernel")
+
+        init_names = TemplateBuffer.__init__.__code__.co_names
+        assert "allow_prologue_fusion" in init_names
+        assert "allow_epilogue_fusion" in init_names
+    except (ImportError, AttributeError, AssertionError):
+        return False
+    return True
+
+
+@functools.cache
+def supports_torch_compile_fusion() -> bool:
+    """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
+    if not supports_torch_compile_template_lowering():
+        return False
+    from torch._inductor.ir import TemplateBuffer
+
+    fusion_hook = (
+        "has_aliasing_or_mutation_for_producer_fusion"
+        if torch_uses_template_producer_fusion()
+        else "has_aliasing_or_mutation_for_prologue_fusion"
+    )
+    return hasattr(TemplateBuffer, fusion_hook)
+
+
+def extract_device(args: Sequence[object]) -> torch.device | None:
+    """Return the first torch.device found in *args*."""
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            return arg.device
+        if isinstance(arg, list) and len(arg) > 0 and isinstance(arg[0], torch.Tensor):
+            return arg[0].device
+    return None
