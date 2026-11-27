@@ -662,6 +662,37 @@ _BT_HOST_SITE2_NEW = (
     '        if state_indices_tensor.dim() == 1:\n'
 )
 
+# 0.34.0 dropped seq_lens/query_start_loc from Qwen4ExpQSAMetadata (it carries
+# only num_actual_tokens/max_query_len/block_table/slot_mapping); the dense
+# short-request path still needs per-request lengths and query offsets. Declare
+# them on the dataclass (so dataclasses.replace() carries them through
+# update_block_table) and populate them in the builder from
+# CommonAttentionMetadata, which still has both.
+_QSA_META_FIELDS = Patch(
+    "vllm.models.qwen4_exp.common.qsa",
+    "QSA metadata declares the stashed seq_lens/query_start_loc",
+    "    block_table: torch.Tensor\n"
+    "    slot_mapping: torch.Tensor\n",
+    "    block_table: torch.Tensor\n"
+    "    slot_mapping: torch.Tensor\n"
+    "    # suffix SUFFIX_ROCM_QSA_DENSE: 0.34 dropped seq_lens /\n"
+    "    # query_start_loc from this metadata; the dense short-request path\n"
+    "    # still needs them. Declared fields so dataclasses.replace() carries\n"
+    "    # them through update_block_table.\n"
+    "    _suffix_seq_lens: torch.Tensor | None = None\n"
+    "    _suffix_query_start_loc: torch.Tensor | None = None\n",
+)
+_QSA_META_BUILD = Patch(
+    "vllm.models.qwen4_exp.common.qsa",
+    "QSA metadata builder populates the stashed seq_lens/query_start_loc",
+    "            slot_mapping=common_attn_metadata.slot_mapping,\n"
+    "        )\n",
+    "            slot_mapping=common_attn_metadata.slot_mapping,\n"
+    "            _suffix_seq_lens=common_attn_metadata.seq_lens,\n"
+    "            _suffix_query_start_loc=common_attn_metadata.query_start_loc,\n"
+    "        )\n",
+)
+
 PATCHES = {
     "SUFFIX_ROCM_AITER_PAD": Patch(
         "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe",
@@ -780,7 +811,13 @@ PATCHES = {
         _QSA_SPARSE_BODY,
         "        if tl.max(logical_token, axis=0) >= 0:  # suffix: an all -1 tile is a no-op\n"
         + textwrap.indent(_QSA_SPARSE_BODY, "    ")),
-    "SUFFIX_ROCM_QSA_DENSE": Patch(
+    "SUFFIX_ROCM_QSA_DENSE": (
+        # 0.34 dropped seq_lens/query_start_loc from Qwen4ExpQSAMetadata; the
+        # dense short-request path still needs them, so the gate carries the
+        # dataclass fields, the builder population and the dense call together.
+        _QSA_META_FIELDS,
+        _QSA_META_BUILD,
+        Patch(
         "vllm.models.qwen4_exp.amd.qsa",
         "QSA attention: dense path for requests within the token top-k",
         "        from .ops.qsa import qsa_sparse_paged_attention\n"
@@ -802,12 +839,12 @@ PATCHES = {
         "            attn_metadata.block_table,\n"
         "            token_to_req,\n"
         "            output[:num_tokens],\n"
-        "            attn_metadata.seq_lens,\n"
-        "            attn_metadata.query_start_loc,\n"
+        "            attn_metadata._suffix_seq_lens,\n"
+        "            attn_metadata._suffix_query_start_loc,\n"
         "            layer.indexer.token_topk,\n"
         "            dense=not layer.indexer.skip_topk,  # MTP steps > 0 reuse step 0's rows\n"
         "        )\n",
-        "suffix_hybrid.kernels.qsa_dense_rocm:install"),
+        "suffix_hybrid.kernels.qsa_dense_rocm:install")),
     "SUFFIX_ROCM_TOPK_GATING": Patch(
         "vllm._aiter_ops", "MoE top-k gating: one Triton program per token",
         "    from aiter import topk_softmax\n"
