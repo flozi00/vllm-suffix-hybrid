@@ -2,7 +2,7 @@
 """Qwen3.8-Flash-Next block-FP8 checkpoint -> AMD Quark OCP-MX MXFP4 (W4A4), on CPU.
 
     python -m suffix_hybrid.tools.quantize_qwen4exp_mxfp4 --src DIR --out DIR \
-        [--risky mxfp4|bf16] [--workers 4] [--threads 1]
+        [--risky mxfp4|bf16] [--scale-mode even|mse] [--workers 4] [--threads 1]
     S3_BUCKET=... python -m suffix_hybrid.tools.quantize_qwen4exp_mxfp4 --s3-src PREFIX \
         --s3-out PREFIX --out DIR [--tmp DIR] [--overwrite] [...]   (streaming, no staging)
 
@@ -18,7 +18,10 @@ MXFP4 activations, so there is no W4A16 variant):
   <linear>.weight_scale  uint8 [N, K/32]  e8m0, 2**(v - 127), one per 32 inputs
 No input scales and no swizzle; vLLM shuffles for AITER at load.
 The rounding is bit-exact with amd/Qwen3.8-Flash-Next-Quark-MXFP4
-(tests/test_quantize_qwen4exp_mxfp4.py).
+(tests/test_quantize_qwen4exp_mxfp4.py). --scale-mode mse searches the shared
+exponent per 32-block for minimum dequant MSE instead of taking it from the
+block amax (better quality on outlier-heavy blocks, ~6x the CPU); "even" stays
+the default so the default output remains bit-exact with AMD's checkpoint.
 
 Layer policy (the PLE table needs text_config.ple_embedding_dtype, set here):
   MXFP4  routed + shared experts (main layers and the MTP layer), linear_attn.out_proj,
@@ -157,14 +160,22 @@ _MIDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)  # boundaries between the e2m1 m
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
-def mxfp4_quantize(w):
+def mxfp4_quantize(w, scale_mode="even"):
     """[N, K] float -> (uint8 [N, K/2] packed e2m1, uint8 [N, K/32] e8m0).
 
-    Quark's scale_calculation_mode "even" (quark/torch/quantization/utils.py even_round):
-    amax's fp32 mantissa is rounded at 1.75 (add 2**21 to the bits), and the shared
-    exponent is floor(log2(that)) - 2 (emax of e2m1), clamped to [-127, 127].
-    Elements: x / 2**exp, saturated at 6, round-half-to-even onto
+    scale_mode="even" — Quark's scale_calculation_mode "even"
+    (quark/torch/quantization/utils.py even_round): amax's fp32 mantissa is
+    rounded at 1.75 (add 2**21 to the bits), and the shared exponent is
+    floor(log2(that)) - 2 (emax of e2m1), clamped to [-127, 127]. Elements:
+    x / 2**exp, saturated at 6, round-half-to-even onto
     {0, .5, 1, 1.5, 2, 3, 4, 6}; a value that rounds to 0 is written as +0.
+
+    scale_mode="mse" — same code grid, but the shared exponent is searched:
+    candidates around the amax exponent (e8m0 has no mantissa, so the
+    candidates are integer exponents), and each block keeps the exponent with
+    the smallest dequant squared error. One huge weight must not set the
+    scale for its 31 block neighbours: a lower exponent clips the outlier and
+    shrinks the error on the rest, which is where the even mode loses most.
     """
     import torch
     n, k = w.shape
@@ -176,6 +187,33 @@ def mxfp4_quantize(w):
         raise ValueError("non-finite weight")
     biased = ((amax.view(torch.int32) + 0x200000) >> 23) & 0xFF
     exp = (biased - 129).clamp_(-127, 127)
+    if scale_mode == "mse":
+        # Sequential candidate loop (not a broadcast): keeps the temporaries
+        # at even-mode size. Candidates exp-4..exp+1 cover clipping the block
+        # amax down (the common win) and the even rounding's own bias.
+        mids = torch.tensor(_MIDS + (float("inf"),), dtype=torch.float32)
+        e2m1 = torch.tensor(E2M1, dtype=torch.float32)
+        best_err = None
+        for off in range(-4, 2):
+            c = (exp + off).clamp_(-127, 127)
+            cbits = torch.where(
+                c > -127, (c + 127) << 23, torch.full_like(c, 0x400000)
+            ).view(torch.float32)
+            q = blk / cbits.unsqueeze(-1)
+            mag = q.abs().clamp_(max=6.0)
+            code = torch.bucketize(mag, mids[:-1])
+            code += (code & 1).bool() & (mag == mids[code])
+            val = e2m1[code] * (1.0 - 2.0 * (q < 0).float()) * cbits.unsqueeze(-1)
+            err = (val - blk).square().sum(-1)  # [n, nb]
+            if best_err is None:
+                best_err, best_exp = err, c
+            else:
+                take = err < best_err
+                best_err = torch.where(take, err, best_err)
+                best_exp = torch.where(take, c, best_exp)
+        exp = best_exp
+    elif scale_mode != "even":
+        raise ValueError(f"unknown scale_mode {scale_mode!r}")
     # 2**exp built from its bits (exact; 2**-127 is the fp32 subnormal 0x400000)
     bits = torch.where(exp > -127, (exp + 127) << 23, torch.full_like(exp, 0x400000))
     q = blk / bits.view(torch.float32).unsqueeze(-1)
@@ -200,12 +238,14 @@ def mxfp4_dequantize(packed, scale):
     return (val.reshape(n, k // GROUP, GROUP) * s.unsqueeze(-1)).reshape(n, k)
 
 
-def quantize_rows(w, rows: int = ROW_CHUNK):
+def quantize_rows(w, rows: int = ROW_CHUNK, scale_mode: str = "even"):
     """mxfp4_quantize in row chunks, so big dense matrices stay within a few 100 MB."""
     import torch
+    if scale_mode == "mse":
+        rows = max(1, rows // 4)  # the search holds one extra [rows, K] temporary
     if w.shape[0] <= rows:
-        return mxfp4_quantize(w)
-    parts = [mxfp4_quantize(w[i:i + rows]) for i in range(0, w.shape[0], rows)]
+        return mxfp4_quantize(w, scale_mode)
+    parts = [mxfp4_quantize(w[i:i + rows], scale_mode) for i in range(0, w.shape[0], rows)]
     return torch.cat([p for p, _ in parts]), torch.cat([s for _, s in parts])
 
 
@@ -269,7 +309,7 @@ def source_plan(src: Path, risky: str) -> tuple[dict, dict, Counter]:
 # conversion (one input shard per call; runs in worker processes)
 # ---------------------------------------------------------------------------
 def convert_shard(src: str, out: str, name: str, keys: list, scale_files: dict, risky: str,
-                  threads: int) -> dict:
+                  threads: int, scale_mode: str = "even") -> dict:
     """Convert input shard `name` (holding exactly `keys`) into out/name.
 
     scale_files maps each expert weight_scale_inv this shard needs to the shard that
@@ -301,11 +341,12 @@ def convert_shard(src: str, out: str, name: str, keys: list, scale_files: dict, 
             if kind == "expert":
                 if t.dtype != torch.float8_e4m3fn:
                     raise ValueError(f"{key}: expected F8_E4M3, got {t.dtype}")
-                packed, scale = quantize_rows(dequant_fp8_block(t, scale_inv(key + "_scale_inv")))
+                packed, scale = quantize_rows(dequant_fp8_block(t, scale_inv(key + "_scale_inv")),
+                                              scale_mode=scale_mode)
             elif kind == "mxfp4":
                 if t.dtype != torch.bfloat16 or t.dim() != 2:
                     raise ValueError(f"{key}: expected a 2-D BF16 weight, got {t.dtype} {tuple(t.shape)}")
-                packed, scale = quantize_rows(t)
+                packed, scale = quantize_rows(t, scale_mode=scale_mode)
             else:
                 ple = PLE_TABLE_RE.match(key)
                 if t.dtype == torch.float8_e4m3fn and not ple:
@@ -357,7 +398,8 @@ def _pool(fn_name: str, args: list[tuple], workers: int) -> list[dict]:
 
 
 def _write_meta(dst: Path, src_meta: Path, config: dict, results: list, expected: Counter,
-                risky: str, workers: int, threads: int, started: float):
+                risky: str, workers: int, threads: int, started: float,
+                scale_mode: str = "even"):
     """Index, side files, config.json and the manifest into dst -> (stats, kinds)."""
     import torch
     kinds, out_map = Counter(), {}
@@ -391,7 +433,7 @@ def _write_meta(dst: Path, src_meta: Path, config: dict, results: list, expected
         "source_sha256": source_sha,
         "quantization": config["quantization_config"],
         "text_config_overrides": {"ple_embedding_dtype": PLE_EMBEDDING_DTYPE},
-        "recipe": {"weights": "RTN OCP-MX MXFP4 (Quark scale_calculation_mode even), CPU",
+        "recipe": {"weights": f"OCP-MX MXFP4 (scale_mode {scale_mode}), CPU",
                    "experts": "block-FP8 source dequantized (w * weight_scale_inv) then MXFP4",
                    "activations": "dynamic MXFP4 at runtime; no calibration",
                    "risky": risky, "ple": "FP8 table copied unchanged",
@@ -406,16 +448,19 @@ def _write_meta(dst: Path, src_meta: Path, config: dict, results: list, expected
     return stats, kinds
 
 
-def _done(kinds, stats, risky) -> None:
-    print(f"{DONE_MARKER} quark-mxfp4 risky={risky}: {kinds['expert']} experts + "
+def _done(kinds, stats, risky, scale_mode="even") -> None:
+    print(f"{DONE_MARKER} quark-mxfp4 risky={risky} scale_mode={scale_mode}: "
+          f"{kinds['expert']} experts + "
           f"{kinds['mxfp4']} dense -> MXFP4, {kinds['copy']} copied, "
           f"{stats['file_bytes'] / 2**30:.2f} GiB in {stats['seconds']} s", flush=True)
 
 
-def convert(src, out, risky="mxfp4", workers=4, threads=1) -> dict:
+def convert(src, out, risky="mxfp4", workers=4, threads=1, scale_mode="even") -> dict:
     src, out = Path(src).absolute(), Path(out).absolute()
     if risky not in RISKY_CHOICES or workers < 1 or threads < 1:
         raise ValueError("bad --risky/--workers/--threads")
+    if scale_mode not in ("even", "mse"):
+        raise ValueError(f"unknown --scale-mode {scale_mode!r}")
     if out.is_symlink() or (out.exists() and (not out.is_dir() or any(out.iterdir()))):
         raise SystemExit(f"--out {out} is not empty (refusing to overwrite)")
     started = time.time()
@@ -428,10 +473,11 @@ def convert(src, out, risky="mxfp4", workers=4, threads=1) -> dict:
     pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=out))
     published = []
     try:
-        results = _pool("convert_shard", [(str(src), str(pending), n, keys, scales, risky, threads)
+        results = _pool("convert_shard", [(str(src), str(pending), n, keys, scales, risky, threads,
+                                           scale_mode)
                                           for n, keys, scales in _shard_args(weight_map)], workers)
         stats, kinds = _write_meta(pending, src, config, results, expected, risky, workers,
-                                   threads, started)
+                                   threads, started, scale_mode)
         if set(out.iterdir()) != {pending}:
             raise ValueError("output changed while converting; refusing to publish")
         last = {"config.json": 2, "model.safetensors.index.json": 1}
@@ -444,7 +490,7 @@ def convert(src, out, risky="mxfp4", workers=4, threads=1) -> dict:
             f.unlink(missing_ok=True)
         shutil.rmtree(pending, ignore_errors=True)
         raise
-    _done(kinds, stats, risky)
+    _done(kinds, stats, risky, scale_mode)
     return stats
 
 
@@ -473,7 +519,8 @@ def _list(s3, bucket: str, prefix: str) -> dict:
             for o in page.get("Contents", [])}
 
 
-def stream_shard(bucket, src_prefix, out_prefix, tmp, name, keys, scale_files, risky, threads):
+def stream_shard(bucket, src_prefix, out_prefix, tmp, name, keys, scale_files, risky, threads,
+                 scale_mode="even"):
     """Worker: fetch input shard `name` (+ any shard holding its scales), convert it,
     upload the output shard, delete the local copies."""
     s3 = _s3()
@@ -485,7 +532,7 @@ def stream_shard(bucket, src_prefix, out_prefix, tmp, name, keys, scale_files, r
         for shard in sorted({name, *scale_files.values()}):
             s3.download_file(bucket, src_prefix + shard, str(work / "in" / shard))
         r = convert_shard(str(work / "in"), str(work / "out"), name, keys, scale_files, risky,
-                          threads)
+                          threads, scale_mode)
         s3.upload_file(str(work / "out" / name), bucket, out_prefix + name)
         return r
     finally:
@@ -493,13 +540,15 @@ def stream_shard(bucket, src_prefix, out_prefix, tmp, name, keys, scale_files, r
 
 
 def convert_s3(bucket, src_prefix, out_prefix, out, tmp, risky="mxfp4", workers=4, threads=1,
-               overwrite=False) -> dict:
+               overwrite=False, scale_mode="even") -> dict:
     """s3://bucket/src_prefix (block FP8) -> s3://bucket/out_prefix (MXFP4) without a
     staged copy: scratch holds ~2 shards per worker. config.json is uploaded LAST
     (weight staging treats it as the commit marker); `out` keeps the metadata files
     and the manifest, where the console job's run gate looks for them."""
     if risky not in RISKY_CHOICES or workers < 1 or threads < 1:
         raise ValueError("bad --risky/--workers/--threads")
+    if scale_mode not in ("even", "mse"):
+        raise ValueError(f"unknown --scale-mode {scale_mode!r}")
     started, s3 = time.time(), _s3()
     sp, op = src_prefix.strip("/") + "/", out_prefix.strip("/") + "/"
     if sp.startswith(op) or op.startswith(sp):
@@ -529,16 +578,17 @@ def convert_s3(bucket, src_prefix, out_prefix, out, tmp, risky="mxfp4", workers=
     print(f"[mxfp4] streaming s3://{bucket}/{sp} -> {op}: {len(weight_map)} tensors in "
           f"{len(set(weight_map.values()))} shards; plan {dict(expected)} (risky={risky})",
           flush=True)
-    results = _pool("stream_shard", [(bucket, sp, op, str(tmp), n, keys, scales, risky, threads)
+    results = _pool("stream_shard", [(bucket, sp, op, str(tmp), n, keys, scales, risky, threads,
+                                      scale_mode)
                                      for n, keys, scales in _shard_args(weight_map)], workers)
     out.mkdir(parents=True, exist_ok=True)
     stats, kinds = _write_meta(out, meta, config, results, expected, risky, workers, threads,
-                               started)
+                               started, scale_mode)
     for f in sorted((p for p in out.iterdir() if p.is_file()),
                     key=lambda p: (p.name == "config.json", p.name)):  # config.json last
         s3.upload_file(str(f), bucket, op + f.name)
     shutil.rmtree(meta, ignore_errors=True)
-    _done(kinds, stats, risky)
+    _done(kinds, stats, risky, scale_mode)
     return stats
 
 
@@ -555,6 +605,10 @@ def main(argv=None) -> int:
                     help="streaming mode: replace a non-empty output prefix")
     ap.add_argument("--risky", choices=RISKY_CHOICES, default="mxfp4",
                     help="attention q/k/v + linear_attn in_proj_qkv/z: MXFP4 (default) or BF16")
+    ap.add_argument("--scale-mode", choices=("even", "mse"), default="even",
+                    help="shared-exponent choice per 32-block: 'even' = Quark amax rounding "
+                         "(bit-exact with amd/Qwen3.8-Flash-Next-Quark-MXFP4), 'mse' = per-block "
+                         "MSE search over exponents amax-4..amax+1 (better quality, ~6x CPU)")
     ap.add_argument("--workers", type=int, default=4, help="input shards converted in parallel")
     ap.add_argument("--threads", type=int, default=1, help="torch threads per worker")
     args = ap.parse_args(argv)
@@ -562,9 +616,9 @@ def main(argv=None) -> int:
         ap.error("give either --src, or --s3-src with --s3-out")
     if args.s3_src:
         convert_s3(os.environ["S3_BUCKET"], args.s3_src, args.s3_out, args.out, args.tmp,
-                   args.risky, args.workers, args.threads, args.overwrite)
+                   args.risky, args.workers, args.threads, args.overwrite, args.scale_mode)
     else:
-        convert(args.src, args.out, args.risky, args.workers, args.threads)
+        convert(args.src, args.out, args.risky, args.workers, args.threads, args.scale_mode)
     return 0
 
 

@@ -96,6 +96,43 @@ def test_roundtrip_error_and_row_chunks():
     assert torch.equal(pc, p) and torch.equal(sc, s)
 
 
+def test_mse_scale_mode_never_worse_and_default_unchanged():
+    torch.manual_seed(1)
+    w = torch.randn(64, 256) * 0.02
+    pe, se = q.mxfp4_quantize(w)  # default stays "even"
+    assert torch.equal(pe, q.mxfp4_quantize(w, "even")[0])
+    assert torch.equal(se, q.mxfp4_quantize(w, "even")[1])
+    pm, sm = q.mxfp4_quantize(w, "mse")
+    err_even = (q.mxfp4_dequantize(pe, se) - w).square().sum()
+    err_mse = (q.mxfp4_dequantize(pm, sm) - w).square().sum()
+    # the candidate set contains the even exponent itself, so mse can only win
+    assert float(err_mse) <= float(err_even)
+    with pytest.raises(ValueError):
+        q.mxfp4_quantize(w, "bogus")
+    with pytest.raises(ValueError):
+        q.convert("x", "y", scale_mode="bogus")
+
+
+def test_mse_scale_mode_wins_where_even_rounds_up():
+    # amax 7.0: Quark's 1.75 mantissa bump raises the exponent to 1 (scale 2).
+    # The 7.0 itself is fine either way (3.5 ties to 4 -> dequant 8, error 1;
+    # saturated 6, error 1), but 31 values at 1.4 lose: at scale 2 they land on
+    # 2.0 (error 0.36 each), at scale 1 on 1.5 (error 0.01 each). The mse
+    # search keeps the exponent at 0 and the block error drops ~9x.
+    w = torch.tensor([[7.0] + [1.4] * 31])
+    pe, se = q.mxfp4_quantize(w)
+    assert se.tolist() == [[128]]
+    pm, sm = q.mxfp4_quantize(w, "mse")
+    assert sm.tolist() == [[127]]
+    err_even = float((q.mxfp4_dequantize(pe, se) - w).square().sum())
+    err_mse = float((q.mxfp4_dequantize(pm, sm) - w).square().sum())
+    assert err_mse < err_even / 4
+    # chunked mse == whole mse (quantize_rows quarters the chunk for the search)
+    pc, sc = q.quantize_rows(w.repeat(80, 1), rows=40, scale_mode="mse")
+    pw, sw = q.mxfp4_quantize(w.repeat(80, 1), "mse")
+    assert torch.equal(pc, pw) and torch.equal(sc, sw)
+
+
 @pytest.mark.parametrize("n,k", [(256, 384), (200, 300)])
 def test_fp8_block_dequant(n, k):
     torch.manual_seed(1)
@@ -365,6 +402,22 @@ def test_end_to_end(tmp_path, capsys, risky, workers):
         if q.classify(key, risky) == "copy" and not key.endswith("_scale_inv"):
             assert seen[key].dtype == t.dtype and torch.equal(seen[key].view(torch.uint8),
                                                               t.view(torch.uint8)), key
+
+
+def test_end_to_end_mse_manifest_and_marker(tmp_path, capsys):
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    _tiny_fp8_checkpoint(src)
+    assert q.main(["--src", str(src), "--out", str(out), "--scale-mode", "mse"]) == 0
+    log = capsys.readouterr().out
+    assert f"{q.DONE_MARKER} quark-mxfp4 risky=mxfp4 scale_mode=mse" in log
+    man = json.loads((out / q.MANIFEST_NAME).read_text())
+    assert "scale_mode mse" in man["recipe"]["weights"]
+    # the even run of the same checkpoint records its own mode
+    out2 = tmp_path / "out2"
+    assert q.main(["--src", str(src), "--out", str(out2)]) == 0
+    man2 = json.loads((out2 / q.MANIFEST_NAME).read_text())
+    assert "scale_mode even" in man2["recipe"]["weights"]
 
 
 def test_refuses_nonempty_out_and_wrong_source(tmp_path):
