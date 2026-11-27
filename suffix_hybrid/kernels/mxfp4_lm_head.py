@@ -38,6 +38,7 @@ GATE = "SUFFIX_MXFP4_LMHEAD"
 MARKER = "[suffix mxfp4-lmhead]"
 MAX_M_ENV = "SUFFIX_MXFP4_LMHEAD_MAX_M"
 GRAPH_ENV = "SUFFIX_MXFP4_LMHEAD_GRAPH"
+STOP_IDS_ENV = "SUFFIX_MXFP4_LMHEAD_STOP_IDS"
 MAX_M = 16
 RESCORE = 64
 ORACLE_MS = (1, 2, 4, 16, 64, 160)
@@ -87,11 +88,22 @@ def _ops():
     def prepare(w, max_m):
         n, k = w.shape
         wq, ws = dynamic_mxfp4_quant(w)  # [N, K/2] e2m1 pairs, [N, K/32] e8m0
-        return dict(n=n, k=k, w=w, wq=wq, ws_t=ws.T.contiguous(), max_m=max_m)
+        st = dict(n=n, k=k, w=w, wq=wq, ws_t=ws.T.contiguous(), max_m=max_m)
+        raw = os.environ.get(STOP_IDS_ENV, "").strip()
+        ids = sorted({int(t) for t in raw.replace(";", ",").split(",") if t.strip()})
+        if ids:
+            if any(i < 0 or i >= n for i in ids):
+                raise RuntimeError(f"{MARKER} {STOP_IDS_ENV} out of range for n={n}: {ids}")
+            st["stop_ids"] = torch.tensor(ids, dtype=torch.int64, device=w.device)
+            _log(f"stop ids always exact: {ids}")
+        return st
 
     def run(st, x2, out=None, topk=None):
         """x2 bf16 [M, K] -> bf16 [M, N]: MXFP4 screen + exact rescore (topk(y, r) ->
-        candidate indices, row_topk by default; the oracle passes torch's)."""
+        candidate indices, row_topk by default; the oracle passes torch's).
+        Stop ids (STOP_IDS_ENV) are forced into the rescore set: an inflated MXFP4
+        value for a stop id outside the top-r would otherwise win the sample with
+        its approximate logit (observed as mid-think EOS on the dialogues)."""
         xq, xs = dynamic_mxfp4_quant(x2)
         y = out if out is not None else torch.empty(
             x2.shape[0], st["n"], dtype=torch.bfloat16, device=x2.device)
@@ -100,6 +112,10 @@ def _ops():
         if topk is None:
             topk = row_topk if r == RESCORE else (lambda t, c: t.topk(c, dim=-1).indices)
         top = topk(y, r)  # [M, R]
+        stops = st.get("stop_ids")
+        if stops is not None:
+            k2 = min(stops.numel(), r)
+            top[:, r - k2:].copy_(stops[:k2])
         exact = torch.bmm(st["w"][top], x2.unsqueeze(-1)).squeeze(-1)  # [M, R] bf16
         return y.scatter_(1, top, exact)
 
