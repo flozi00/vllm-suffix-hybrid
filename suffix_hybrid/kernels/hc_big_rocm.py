@@ -210,8 +210,8 @@ def _tail(self, xn):
     w_down = (self.input_mix_weight_down_block_inject if self.use_combine
               else self.input_mix_weight_down).weight
     block_input, down = torch.ops.vllm.suffix_hc_tail(
-        xn, w_down, self.input_mix_weight_up.weight, self.hc_count, self.lora_rank)
-    injection = (down[:, self.lora_rank:self.lora_rank + self.hc_count] if self.use_combine
+        xn, w_down, self.input_mix_weight_up.weight, self.hc_count, self.hc_lowrank)
+    injection = (down[:, self.hc_lowrank:self.hc_lowrank + self.hc_count] if self.use_combine
                  else None)
     return block_input, injection
 
@@ -353,7 +353,7 @@ def main() -> int:
         # The patched method bodies (hc_big_mix / hc_big_combine_and_mix) on a stand-in
         # GatedResidual: norm + op + the injection slice, as the model calls them.
         lin = [SimpleNamespace(weight=w) for w in (norm_w, w_dn[n][0], w_up[0])]
-        gr = SimpleNamespace(use_combine=n == 336, hc_count=hc, lora_rank=rank, hc_norm=lin[0],
+        gr = SimpleNamespace(use_combine=n == 336, hc_count=hc, hc_lowrank=rank, hc_norm=lin[0],
                              config=SimpleNamespace(rms_norm_eps=eps), input_mix_weight_up=lin[2],
                              input_mix_weight_down_block_inject=lin[1], input_mix_weight_down=lin[1])
         h_w, blk_w, inj_w = (hc_big_mix(gr, hidden) if kind == "mix"
