@@ -7,10 +7,11 @@ found exactly once -> that import fails: an enabled pool must never serve the
 unpatched path silently. Stdlib only at import (hooks import lazily).
 
 SUFFIX_ROCM_AITER_PAD=1: vLLM pre-rounds hidden_pad/intermediate_pad before
-  rocm_aiter_ops.fused_moe and doubles intermediate_pad at TP1; AITER's CK
-  stage1 doubles it again, so the kernel zero-pads live rows (MXFP4 W4A4 MoE at
-  TP1 on gfx950: Qwen3.8-Flash-Next GSM8K 0.735 vs 0.964). Same edit as
-  vllm-project/vllm#46201 (open).
+  rocm_aiter_ops.fused_moe and doubled intermediate_pad at TP1; AITER's CK
+  stage1 doubled it again, so the kernel zero-padded live rows (MXFP4 W4A4 MoE
+  at TP1 on gfx950: Qwen3.8-Flash-Next GSM8K 0.735 vs 0.964). Same fix as
+  vllm-project/vllm#46201, merged upstream in 0.33.0 — the patch is now a
+  fail-closed guard asserting the conditioned doubling is present.
 SUFFIX_ROCM_QSA_TOPK_ROWS=1: the Qwen4Exp QSA indexer runs top_k_per_row_decode
   over every row of a step at once. Above 384 rows vLLM's gfx950 dispatch
   leaves the length-aware kernel for the generic radix topKPerRowDecode, whose
@@ -183,15 +184,17 @@ class Patch(NamedTuple):
 # tells the two anchors apart.
 _HC = "vllm.models.qwen4_exp.amd.hyperconnection"
 _HC_TAIL = (
-    "        lora = hc_silu(lora, self.hc_count)\n"
-    "        gate = self.input_mix_weight_up(lora)  # [M, D]\n"
+    # vLLM 0.34.0 renamed the low-rank variable lora -> lowrank (and
+    # self.lora_rank -> self.hc_lowrank); re-anchored 2026-11-27.
+    "        lowrank = hc_silu(lowrank, self.hc_count)\n"
+    "        gate = self.input_mix_weight_up(lowrank)  # [M, D]\n"
     "        block_input = hc_gate_mix(xn, gate, self.hc_count)\n"
     "\n"
     "        return hidden_states, block_input, injection\n"
     "\n")
 _HC_FUSED = (
     "        block_input = hc_up_gate_mix(  # suffix rocm-hc-fuse: silu + up GEMM + gate mix\n"
-    "            lora, self.input_mix_weight_up.weight, xn, self.hc_count\n"
+    "            lowrank, self.input_mix_weight_up.weight, xn, self.hc_count\n"
     "        )\n"
     "\n"
     "        return hidden_states, block_input, injection\n"
@@ -217,11 +220,11 @@ _HC_DOWN = (
     "\n"
     "        if self.use_combine:\n"
     "            # produce injection logits for combine\n"
-    "            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]\n"
+    "            split_sizes = [self.hc_lowrank, self.hc_count, self.pad_size]\n"
     "            down_and_injection = self.input_mix_weight_down_block_inject(xn)\n"
-    "            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)\n"
+    "            lowrank, injection, _ = down_and_injection.split(split_sizes, dim=-1)\n"
     "        else:\n"
-    "            lora = self.input_mix_weight_down(xn)\n")
+    "            lowrank = self.input_mix_weight_down(xn)\n")
 _HC_DOWN_NEW = _HC_DOWN.replace(
     "self.input_mix_weight_down_block_inject(xn)",
     "hc_down(  # suffix rocm-hc-down: split-K at small M\n"
@@ -268,6 +271,16 @@ _QSA_SPARSE_BODY = (  # vllm/models/qwen4_exp/amd/ops/qsa.py @81198e97: tile bod
     '            mask=valid[:, None],\n'
     '            other=0.0,\n'
     '        )\n'
+    # vLLM 0.34.0 inserted this IS_FP8 block between the V load and the QK
+    # dot (upstream fp8-QSA tuning); the sparse-skip wrapper carries it.
+    '        if IS_FP8:\n'
+    '            # e4m3 -> Q dtype is exact; keep the QK dot in Q\'s dtype (an fp8\n'
+    '            # QK dot measured slower and less accurate on the NVIDIA port).\n'
+    '            keys = keys.to(query.dtype)\n'
+    '            # Dequant V to fp16 for the PV dot: P <= 1 (online softmax) so\n'
+    '            # fp16 has the range, its wider mantissa is more accurate, and\n'
+    '            # the fp8->fp16 upcast with an fp16 PV dot is faster.\n'
+    '            values = values.to(tl.float16)\n'
     '        scores = tl.dot(query, keys)\n'
     '        # Scaling scores avoids re-quantizing a scaled query to BF16.\n'
     '        scores *= softmax_scale_log2\n'
@@ -652,12 +665,21 @@ _BT_HOST_SITE2_NEW = (
 PATCHES = {
     "SUFFIX_ROCM_AITER_PAD": Patch(
         "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe",
-        "raw MoE padding to AITER",
-        "            hidden_pad = hidden_pad // 128 * 128\n"
-        "            intermediate_pad = (\n"
-        "                intermediate_pad // 64 * 64 * (2 if moe_config.tp_size == 1 else 1)\n"
-        "            )\n",
-        "            pass  # suffix rocm-aiter-pad: AITER aligns internally (vllm#46201)\n"),
+        "AITER W4A4 SiLU pad guard (upstream merged vllm#46201)",
+        # 0.31.1 doubled the intermediate pad for W4A4 SiLU and masked live
+        # rows; our patch used to replace the computation with `pass`. vLLM
+        # 0.33.0+ conditions the doubling instead — the patch is now a
+        # fail-closed assertion that the upstream fix is present.
+        "    double = (\n"
+        "        tp_size == 1\n"
+        "        and not use_mxfp4_w4a16\n"
+        "        and not (use_mxfp4_w4a4 and activation == MoEActivation.SILU)\n"
+        "    )\n",
+        "    double = (  # suffix rocm-aiter-pad: upstream undoubled-pad fix (vllm#46201) verified\n"
+        "        tp_size == 1\n"
+        "        and not use_mxfp4_w4a16\n"
+        "        and not (use_mxfp4_w4a4 and activation == MoEActivation.SILU)\n"
+        "    )\n"),
     "SUFFIX_ROCM_QSA_TOPK_ROWS": Patch(
         "vllm.models.qwen4_exp.amd.ops.qsa",
         "QSA top-k in <=384-row chunks",

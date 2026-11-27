@@ -22,18 +22,18 @@ FAKE_HC = (
     "class GatedResidual:\n"
     "    hc_count = 4\n"
     "    input_mix_weight_up = Up()\n"
-    "    def mix(self, hidden_states, lora, xn, injection):\n" + MIX.old +
-    "        self, hidden_states, lora, xn, injection):\n" + CAM.old +
+    "    def mix(self, hidden_states, lowrank, xn, injection):\n" + MIX.old +
+    "        self, hidden_states, lowrank, xn, injection):\n" + CAM.old +
     "        self, hidden_states, block_output, injection):\n"
     "        return 'combine'\n")
 KERNEL = "def install(module):\n    module.hc_up_gate_mix = lambda *a: ('fused',) + a\n"
-STOCK = ("h", ("mix", "xn", ("up", ("silu", "lora", 4)), 4), "inj")
-FUSED = ("h", ("fused", "lora", "W_up", "xn", 4), "inj")
+STOCK = ("h", ("mix", "xn", ("up", ("silu", "lowrank", 4)), 4), "inj")
+FUSED = ("h", ("fused", "lowrank", "W_up", "xn", 4), "inj")
 
 
 def _calls(ns):
     gr = ns["GatedResidual"]()
-    return gr.mix("h", "lora", "xn", "inj"), gr.combine_and_mix("h", "lora", "xn", "inj")
+    return gr.mix("h", "lowrank", "xn", "inj"), gr.combine_and_mix("h", "lowrank", "xn", "inj")
 
 
 def test_anchors_rewrite_both_tails_once():
