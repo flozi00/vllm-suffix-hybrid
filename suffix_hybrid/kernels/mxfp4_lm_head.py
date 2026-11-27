@@ -106,9 +106,10 @@ def _ops():
     def run(st, x2, out=None, topk=None):
         """x2 bf16 [M, K] -> bf16 [M, N]: MXFP4 screen + exact rescore (topk(y, r) ->
         candidate indices, row_topk by default; the oracle passes torch's).
-        Stop ids (STOP_IDS_ENV) are forced into the rescore set: an inflated MXFP4
-        value for a stop id outside the top-r would otherwise win the sample with
-        its approximate logit (observed as mid-think EOS on the dialogues)."""
+        Stop ids (STOP_IDS_ENV) are APPENDED to the rescore set (never evicting
+        screen slots): an inflated MXFP4 value for a stop id outside the top-r
+        would otherwise win the sample with its approximate logit (observed as
+        mid-think EOS on the dialogues)."""
         xq, xs = dynamic_mxfp4_quant(x2)
         y = out if out is not None else torch.empty(
             x2.shape[0], st["n"], dtype=torch.bfloat16, device=x2.device)
@@ -119,8 +120,13 @@ def _ops():
         top = topk(y, r)  # [M, R]
         stops = st.get("stop_ids")
         if stops is not None:
-            k2 = min(stops.numel(), r)
-            top[:, r - k2:].copy_(stops[:k2])
+            # APPEND, never overwrite: evicting screen slots would drop a true
+            # bf16 argmax sitting at screen rank R-k2+1..R and break greedy
+            # exactness (the load oracle catches exactly that). The rescore set
+            # grows to R+k2 rows instead — <=2 extra bmm rows, negligible.
+            k2 = stops.numel()
+            top = torch.cat(
+                [top, stops.expand(top.shape[0], k2)], dim=1)  # [M, R+k2]
         exact = torch.bmm(st["w"][top], x2.unsqueeze(-1)).squeeze(-1)  # [M, R] bf16
         return y.scatter_(1, top, exact)
 
