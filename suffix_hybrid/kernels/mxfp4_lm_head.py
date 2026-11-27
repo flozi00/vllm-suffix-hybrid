@@ -75,6 +75,14 @@ def eligible(n: int, k: int, dtype: str) -> str | None:
     return None
 
 
+def parse_stop_ids(raw, n):
+    """STOP_IDS_ENV value -> sorted unique ids; raises on out-of-range."""
+    ids = sorted({int(t) for t in (raw or "").strip().replace(";", ",").split(",") if t.strip()})
+    if ids and any(i < 0 or i >= n for i in ids):
+        raise RuntimeError(f"{MARKER} {STOP_IDS_ENV} out of range for n={n}: {ids}")
+    return ids
+
+
 def _ops():
     """(prepare, run, capture); imports aiter, i.e. initializes HIP: worker side only."""
     if "ops" in _state:
@@ -89,11 +97,8 @@ def _ops():
         n, k = w.shape
         wq, ws = dynamic_mxfp4_quant(w)  # [N, K/2] e2m1 pairs, [N, K/32] e8m0
         st = dict(n=n, k=k, w=w, wq=wq, ws_t=ws.T.contiguous(), max_m=max_m)
-        raw = os.environ.get(STOP_IDS_ENV, "").strip()
-        ids = sorted({int(t) for t in raw.replace(";", ",").split(",") if t.strip()})
+        ids = parse_stop_ids(os.environ.get(STOP_IDS_ENV, ""), n)
         if ids:
-            if any(i < 0 or i >= n for i in ids):
-                raise RuntimeError(f"{MARKER} {STOP_IDS_ENV} out of range for n={n}: {ids}")
             st["stop_ids"] = torch.tensor(ids, dtype=torch.int64, device=w.device)
             _log(f"stop ids always exact: {ids}")
         return st

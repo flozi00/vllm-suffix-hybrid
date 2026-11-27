@@ -29,3 +29,16 @@ def test_eligible():
     assert m.eligible(248320, 2560, "torch.bfloat16") is None
     assert "bf16" in m.eligible(248320, 2560, "torch.float16")
     assert "% 32" in m.eligible(248320, 2550, "torch.bfloat16")
+
+
+def test_parse_stop_ids(monkeypatch):
+    assert m.parse_stop_ids("", 100) == []
+    assert m.parse_stop_ids(None, 100) == []
+    assert m.parse_stop_ids(" 7, 3 ; 3 ", 100) == [3, 7]
+    assert m.parse_stop_ids("99", 100) == [99]
+    with pytest.raises(RuntimeError):
+        m.parse_stop_ids("100", 100)
+    with pytest.raises(RuntimeError):
+        m.parse_stop_ids("-1", 100)
+    with pytest.raises(ValueError):
+        m.parse_stop_ids("x", 100)
