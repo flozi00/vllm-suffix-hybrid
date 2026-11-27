@@ -17,11 +17,17 @@ PAD = rp.PATCHES["SUFFIX_ROCM_AITER_PAD"]
 TOPK = rp.PATCHES["SUFFIX_ROCM_QSA_TOPK_ROWS"]
 MQA = rp.PATCHES["SUFFIX_ROCM_QSA_MQA"]
 FAKE = {
+    # 0.34-shaped aiter_moe_pads: the guard asserts the conditioned doubling
+    # (vllm#46201) is present; W4A4 SiLU at TP1 must stay UNdoubled.
     "fake_aiter_moe": (
-        "def pads(hidden_pad, intermediate_pad, moe_config, activation):\n"
-        "    if True:\n"
-        "        if activation != 'situ':\n" + PAD.old +
-        "    return hidden_pad, intermediate_pad\n"),
+        "class MoEActivation:  # stub for the guard's comparison\n"
+        "    SILU = 'silu'\n"
+        "def pads(hidden_pad, intermediate_pad, tp_size, activation,"
+        " use_mxfp4_w4a4=False, use_mxfp4_w4a16=False):\n"
+        "    if activation == 'situ':\n"
+        "        return hidden_pad, intermediate_pad\n" + PAD.old +
+        "    return hidden_pad // 128 * 128,"
+        " intermediate_pad // 64 * 64 * (2 if double else 1)\n"),
     "fake_qsa_ops": (
         "_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024\n"
         "def chunk(columns):\n" + TOPK.old +
@@ -57,9 +63,11 @@ def test_hook_rewrites_every_enabled_target(tmp_path, monkeypatch):
     assert rp.install_post_import_hook()
     try:
         moe = importlib.import_module("fake_aiter_moe")
-        cfg = type("C", (), {"tp_size": 1})()
-        # Unpatched: (0, 768) for raw (100, 384); patched passes raw through.
-        assert moe.pads(100, 384, cfg, "silu") == (100, 384)
+        # W4A4 SiLU at TP1: the conditioned doubling must stay OFF (the
+        # vllm#46201 semantics the guard asserts) -> intermediate undoubled.
+        assert moe.pads(100, 384, 1, "silu", use_mxfp4_w4a4=True) == (0, 384)
+        # FP8 at TP1: doubling stays on.
+        assert moe.pads(100, 384, 1, "silu") == (0, 768)
         qsa = importlib.import_module("fake_qsa_ops")
         assert qsa.chunk(1024) == 384 and qsa.chunk(1 << 20) == 32  # cap, workspace bound kept
         import inspect  # Triton's @jit reads kernels through inspect.getsource: patched text

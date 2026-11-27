@@ -20,9 +20,9 @@ DOWN_MIX, DOWN_CAM = rp.PATCHES[DOWN]
 STUBS = '''from __future__ import annotations
 
 
-class Tag(tuple):  # every tensor; .split tags the lora / injection / pad columns
+class Tag(tuple):  # every tensor; .split tags the lowrank / injection / pad columns
     def split(self, sizes, dim):
-        return [Tag((part,) + self) for part in ("lora", "inj", "pad")]
+        return [Tag((part,) + self) for part in ("lowrank", "inj", "pad")]
 
 
 class Lin:  # a stock vLLM Linear
@@ -56,7 +56,7 @@ def hc_combine(*args):
 class GatedResidual:
     config = type("Cfg", (), {"rms_norm_eps": 1e-6})()
     hc_norm = Lin("W_norm")
-    hc_count, lora_rank, pad_size = 4, 320, 12
+    hc_count, hc_lowrank, pad_size = 4, 320, 12
     input_mix_weight_down_block_inject = Lin("W_dbi")
     input_mix_weight_down = Lin("W_d")
     input_mix_weight_up = Lin("W_up")
@@ -77,15 +77,15 @@ METHODS = '''    def mix(
 
         if self.use_combine:
             # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+            split_sizes = [self.hc_lowrank, self.hc_count, self.pad_size]
             down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+            lowrank, injection, _ = down_and_injection.split(split_sizes, dim=-1)
         else:
-            lora = self.input_mix_weight_down(xn)
+            lowrank = self.input_mix_weight_down(xn)
             injection = None
 
-        lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
+        lowrank = hc_silu(lowrank, self.hc_count)
+        gate = self.input_mix_weight_up(lowrank)  # [M, D]
         block_input = hc_gate_mix(xn, gate, self.hc_count)
 
         return hidden_states, block_input, injection
@@ -113,15 +113,15 @@ METHODS = '''    def mix(
 
         if self.use_combine:
             # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+            split_sizes = [self.hc_lowrank, self.hc_count, self.pad_size]
             down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+            lowrank, injection, _ = down_and_injection.split(split_sizes, dim=-1)
         else:
-            lora = self.input_mix_weight_down(xn)
+            lowrank = self.input_mix_weight_down(xn)
             injection = None
 
-        lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
+        lowrank = hc_silu(lowrank, self.hc_count)
+        gate = self.input_mix_weight_up(lowrank)  # [M, D]
         block_input = hc_gate_mix(xn, gate, self.hc_count)
 
         return hidden_states, block_input, injection
@@ -137,7 +137,7 @@ METHODS = '''    def mix(
 FAKE_HC = STUBS + METHODS
 KERNELS = (
     "def install_fuse(module):\n"
-    "    module.hc_up_gate_mix = lambda lora, w, xn, hc: ('fused', lora, w, xn, hc)\n"
+    "    module.hc_up_gate_mix = lambda lowrank, w, xn, hc: ('fused', lowrank, w, xn, hc)\n"
     "def install_down(module):\n"
     "    module.hc_down = lambda x, w: module.Tag(('down', w, x))\n")
 
@@ -153,10 +153,10 @@ def _expected(gates):
     g = "down" if DOWN in gates else "gemm"
     out = []
     for hidden in ("h", "h2"):  # mix keeps hidden_states, combine_and_mix returns the combine
-        for lora, inj in ((("lora", g, "W_dbi", "xn"), ("inj", g, "W_dbi", "xn")),
+        for lowrank, inj in ((("lowrank", g, "W_dbi", "xn"), ("inj", g, "W_dbi", "xn")),
                           ((g, "W_d", "xn"), None)):
-            block = (("fused", lora, "W_up", "xn", 4) if FUSE in gates
-                     else ("gmix", "xn", ("gemm", "W_up", ("silu", lora))))
+            block = (("fused", lowrank, "W_up", "xn", 4) if FUSE in gates
+                     else ("gmix", "xn", ("gemm", "W_up", ("silu", lowrank))))
             out.append((hidden, block, inj))
     return out
 
